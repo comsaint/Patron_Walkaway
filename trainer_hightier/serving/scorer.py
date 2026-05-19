@@ -36,6 +36,7 @@ from trainer_hightier.serving.feature_builder import (
     attach_synthetic_etl_and_prediction_visible,
     attach_trial_bet_behavior_1h,
     coerce_categoricals,
+    join_fe_derived_snapshot,
     join_slow_patron_snapshot,
 )
 from trainer_hightier.serving.feature_state_store import ActiveSnapshotManifest, read_active_manifest
@@ -133,6 +134,8 @@ def _effective_etl_cursor(bets: pd.DataFrame) -> pd.Series:
 
 #: ``t_bet`` has no loyalty id; keep a nullable column for downstream schema / API parity.
 _TBET_CASINO_PLAYER_ID_SELECT = "CAST(NULL AS Nullable(String)) AS casino_player_id"
+_TBET_WAGER_SELECT = "CAST(wager AS Float64) AS wager"
+_TBET_CASINO_WIN_SELECT = "CAST(casino_win AS Float64) AS casino_win"
 
 
 def _incremental_params_and_etl_filter(
@@ -275,8 +278,8 @@ def fetch_bets_incremental(
                 player_id,
                 table_id,
                 position_idx,
-                wager,
-                casino_win,
+                {_TBET_WAGER_SELECT},
+                {_TBET_CASINO_WIN_SELECT},
                 payout_odds,
                 status,
                 {cid_sel}
@@ -312,8 +315,8 @@ def fetch_bets_incremental(
                     player_id,
                     table_id,
                     position_idx,
-                    wager,
-                    casino_win,
+                    {_TBET_WAGER_SELECT},
+                    {_TBET_CASINO_WIN_SELECT},
                     payout_odds,
                     status,
                     {cid_sel}
@@ -389,8 +392,8 @@ def fetch_bet_pool_window(
                 player_id,
                 table_id,
                 position_idx,
-                wager,
-                casino_win,
+                {_TBET_WAGER_SELECT},
+                {_TBET_CASINO_WIN_SELECT},
                 payout_odds,
                 status,
                 {cid_sel}
@@ -446,6 +449,7 @@ def score_once(
     bundle: HightierModelBundle,
     *,
     slow_parquet: Path,
+    fe_parquet: Path | None = None,
     mapping_parquet: Path | None = None,
     high_adt_only: bool,
     allowlist_ids: frozenset[int],
@@ -521,6 +525,8 @@ def score_once(
     staged = attach_canonical_id(staged, mapping_parquet=mapping_parquet)
     staged = attach_trial_bet_behavior_1h(staged, pool2)
     staged = join_slow_patron_snapshot(staged, slow_parquet)
+    if fe_parquet is not None and fe_parquet.is_file():
+        staged = join_fe_derived_snapshot(staged, fe_parquet)
     assert_features_ready(staged, bundle.feature_columns)
     X = coerce_categoricals(
         staged[list(bundle.feature_columns)].copy(),
@@ -553,7 +559,7 @@ def score_once(
         conn.commit()
         return 0
     out = staged.loc[m].copy()
-    out["score"] = prob[m.to_numpy()]
+    out["score"] = prob[m]
     now_iso = scored_at_iso
     nom = out["casino_player_id"] if "casino_player_id" in out.columns else pd.Series("", index=out.index)
     rated = nom.notna() & (nom.astype(str).str.strip() != "")
@@ -641,6 +647,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             raise RuntimeError("No active snapshot manifest; run snapshot_updater or pass --slow-parquet")
         return man.slow_patron_parquet
 
+    def resolve_fe(man: ActiveSnapshotManifest | None) -> Path | None:
+        if man is None:
+            return None
+        fp = man.fe_derived_parquet
+        return fp if fp is not None and str(fp).strip() else None
+
     while True:
         conn = connect_state_db(Path(cfg.state_db_path))
         try:
@@ -687,6 +699,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             sp = resolve_slow()
             if not sp.is_file():
                 raise FileNotFoundError(f"slow patron parquet missing: {sp}")
+            fe_sp = resolve_fe(man)
             allow_ids = al_cache.get("ids", frozenset()) if high_adt_only else frozenset()
             if high_adt_only and not isinstance(allow_ids, frozenset):
                 allow_ids = frozenset(allow_ids)
@@ -694,6 +707,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 conn,
                 bundle,
                 slow_parquet=sp,
+                fe_parquet=fe_sp,
                 mapping_parquet=map_path,
                 high_adt_only=high_adt_only,
                 allowlist_ids=allow_ids,

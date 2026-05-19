@@ -1,734 +1,940 @@
-# trainer_hightier — Feature Candidate Registry (selection / governance ledger).
-#
-# Responsibility boundary (no overlap with semantic contracts):
-# - Time semantics + Feast mapping: trainer_hightier/contracts/time_semantics_and_feast_mapping.md
-# - Trial 1h features (bet__*):    trainer_hightier/contracts/trial_bet_behavior_1h_features.yaml
-# - Slow patron 180d (patron__*): trainer_hightier/contracts/slow_patron_180d_monthly_features.yaml
-# - fe__* DuckDB derivations:      trainer_hightier/feature_experiment/materialize_fe_derived.py (semantic owner today)
-#
-# This file governs: status, enabled_for flags, drop_reason_code, experiment trace notes.
-# Pipeline reads this file for baseline / candidate / ablation column selection (v0).
-# Governance: ablation + Gate1 from run_20260515T175157Z (see notes on fe__* rows).
-# v0.5: KEEP-group fe__* also enabled for main trainer baseline (Step 3.5 materialize+enrich).
-# Baseline `wager_nn` removed v0.4: overnight baseline LightGBM gain/split importance was 0 (passthrough still in cleaned bet; not in Feast view / model).
-
-registry_version: v0.5
-updated_at: "2026-05-16"
-
+registry_version: v0.6
+updated_at: '2026-05-16'
 features:
-  # --- Baseline MODEL columns (YAML order; status active|experimental, enabled_for includes baseline) ---
-  - feature_id: wager
-    group_id: baseline_model
-    source: baseline_model
-    semantic_owner: trainer_hightier/05_lgbm_train.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    note: null
-
-  - feature_id: casino_win
-    group_id: baseline_model
-    source: baseline_model
-    semantic_owner: trainer_hightier/05_lgbm_train.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    note: null
-
-  - feature_id: is_back_bet
-    group_id: baseline_model
-    source: baseline_model
-    semantic_owner: trainer_hightier/05_lgbm_train.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    note: null
-
-  - feature_id: bet_type
-    group_id: baseline_model
-    source: baseline_model
-    semantic_owner: trainer_hightier/05_lgbm_train.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    note: null
-
-  - feature_id: type_of_bet
-    group_id: baseline_model
-    source: baseline_model
-    semantic_owner: trainer_hightier/05_lgbm_train.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    note: null
-
-  - feature_id: bet__bets_cnt__w1h
-    group_id: existing_trial_1h
-    source: feast_trial_1h
-    semantic_owner: trainer_hightier/contracts/trial_bet_behavior_1h_features.yaml
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    note: null
-
-  - feature_id: bet__wager_sum__w1h
-    group_id: existing_trial_1h
-    source: feast_trial_1h
-    semantic_owner: trainer_hightier/contracts/trial_bet_behavior_1h_features.yaml
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    note: null
-
-  - feature_id: bet__back_bet_ratio__w1h
-    group_id: existing_trial_1h
-    source: feast_trial_1h
-    semantic_owner: trainer_hightier/contracts/trial_bet_behavior_1h_features.yaml
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    note: null
-
-  - feature_id: bet__payout_odds_avg__w1h
-    group_id: existing_trial_1h
-    source: feast_trial_1h
-    semantic_owner: trainer_hightier/contracts/trial_bet_behavior_1h_features.yaml
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    note: null
-
-  - feature_id: patron__theo_win_sum__w180d_m1snap
-    group_id: existing_slow_patron_180d_m1snap
-    source: feast_slow_180d
-    semantic_owner: trainer_hightier/contracts/slow_patron_180d_monthly_features.yaml
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    note: null
-
-  - feature_id: patron__gaming_days_cnt__w180d_m1snap
-    group_id: existing_slow_patron_180d_m1snap
-    source: feast_slow_180d
-    semantic_owner: trainer_hightier/contracts/slow_patron_180d_monthly_features.yaml
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    note: null
-
-  - feature_id: patron__adt__w180d_m1snap
-    group_id: existing_slow_patron_180d_m1snap
-    source: feast_slow_180d
-    semantic_owner: trainer_hightier/contracts/slow_patron_180d_monthly_features.yaml
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    note: null
-
-  # --- Experimental DuckDB fe__* (materialize_fe_derived parity; disabled rows kept for history) ---
-  - feature_id: fe__wager_sum__w15m
-    group_id: group_a_velocity_ratios
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass.'
-
-  - feature_id: fe__bets_cnt__w15m
-    group_id: group_a_velocity_ratios
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass.'
-
-  - feature_id: fe__bets_cnt__w1d
-    group_id: group_a_velocity_ratios
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass.'
-
-  - feature_id: fe__wager_sum__w15m_over_w1d
-    group_id: group_a_velocity_ratios
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass.'
-
-  - feature_id: fe__wager_sum__w1d
-    group_id: group_a_velocity_ratios
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: disabled
-    enabled_for: [candidate, ablation]
-    drop_reason_code: governance_fqg_warn_removed
-    first_seen_experiment: run_20260515T101619Z
-    last_updated_experiment: run_20260515T101619Z
-    note: >-
-      Removed from experimental candidate sets (FQG PSI + uplift flip). SQL still emits column for parity.
-
-  - feature_id: fe__bets_cnt__w15m_over_w1d
-    group_id: group_a_velocity_ratios
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: disabled
-    enabled_for: [candidate, ablation]
-    drop_reason_code: governance_fqg_warn_removed
-    first_seen_experiment: run_20260515T101619Z
-    last_updated_experiment: run_20260515T101619Z
-    note: FQG uplift_sign_flip_frac_warn (rate≈0.9).
-
-  - feature_id: fe__time_since_last_bet_sec
-    group_id: group_b_rfm
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0006, ΔRecall +0.0038 (mixed_leave_one_out_signals).
-
-  - feature_id: fe__wager_sum__w7d
-    group_id: group_b_rfm
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0006, ΔRecall +0.0038 (mixed_leave_one_out_signals).
-
-  - feature_id: fe__wager_sum__w7d_over_w30d
-    group_id: group_b_rfm
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0006, ΔRecall +0.0038 (mixed_leave_one_out_signals).
-
-  - feature_id: fe__bets_cnt__w7d
-    group_id: group_b_rfm
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: disabled
-    enabled_for: [candidate, ablation]
-    drop_reason_code: governance_fqg_warn_removed
-    first_seen_experiment: run_20260515T101619Z
-    last_updated_experiment: run_20260515T101619Z
-    note: FQG train_vs_val/test PSI warn.
-
-  - feature_id: fe__bets_cnt__w30d
-    group_id: group_b_rfm
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: disabled
-    enabled_for: [candidate, ablation]
-    drop_reason_code: governance_fqg_warn_removed
-    first_seen_experiment: run_20260515T101619Z
-    last_updated_experiment: run_20260515T101619Z
-    note: FQG PSI warn.
-
-  - feature_id: fe__wager_sum__w30d
-    group_id: group_b_rfm
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: disabled
-    enabled_for: [candidate, ablation]
-    drop_reason_code: governance_fqg_warn_removed
-    first_seen_experiment: run_20260515T101619Z
-    last_updated_experiment: run_20260515T101619Z
-    note: FQG uplift_sign_flip_frac_warn.
-
-  - feature_id: fe__bets_density_proxy_w30d
-    group_id: group_b_rfm
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: disabled
-    enabled_for: [candidate, ablation]
-    drop_reason_code: governance_fqg_warn_removed
-    first_seen_experiment: run_20260515T101619Z
-    last_updated_experiment: run_20260515T101619Z
-    note: FQG PSI warn (alias of fe__bets_cnt__w30d density).
-
-  - feature_id: fe__wager_cv_w7d
-    group_id: group_c_burstiness
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass.'
-
-  - feature_id: fe__interarrival_mean_sec_w7d
-    group_id: group_c_burstiness
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: disabled
-    enabled_for: [candidate, ablation]
-    drop_reason_code: governance_fqg_warn_removed
-    first_seen_experiment: run_20260515T101619Z
-    last_updated_experiment: run_20260515T101619Z
-    note: FQG PSI warn.
-
-  - feature_id: fe__payout_odds_z_prior_w30d
-    group_id: group_d_personal_z
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass.'
-
-  - feature_id: fe__wager_z_prior_w30d
-    group_id: group_d_personal_z
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: disabled
-    enabled_for: [candidate, ablation]
-    drop_reason_code: governance_fqg_warn_removed
-    first_seen_experiment: run_20260515T101619Z
-    last_updated_experiment: run_20260515T101619Z
-    note: FQG uplift_sign_flip_frac_warn.
-
-  # === Overnight expansion (materialize_fe_derived); governance run_20260515T175157Z ===
-  # KEEP→active: group_k_canonical_today, group_g_interarrival_dynamics, group_q_payout_odds_dynamics.
-  # REVIEW→experimental retained: group_l_clock_context, group_m_outcome_state, group_n_stake_dynamics,
-  #   group_o_table_switch, group_e_session_position, group_f_rate_decay (and group_b_rfm active trio noted above).
-  # DROP→disabled: group_i_theo_exposure (remaining trainable columns; fe__theo__base_ha already FQG-blocked).
-
-  # --- Group L: clock_context (REVIEW) ---
-  - feature_id: fe__clock__hour_of_day
-    group_id: group_l_clock_context
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0019, ΔRecall +0.0140 (mixed_leave_one_out_signals).
-
-  - feature_id: fe__clock__day_of_week
-    group_id: group_l_clock_context
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0019, ΔRecall +0.0140 (mixed_leave_one_out_signals).
-
-  - feature_id: fe__clock__is_weekend
-    group_id: group_l_clock_context
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0019, ΔRecall +0.0140 (mixed_leave_one_out_signals).
-
-  - feature_id: fe__clock__is_late_night
-    group_id: group_l_clock_context
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0019, ΔRecall +0.0140 (mixed_leave_one_out_signals).
-
-  # --- Group M: outcome_state (REVIEW) ---
-  - feature_id: fe__outcome__casino_win_sum__w15m
-    group_id: group_m_outcome_state
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP -0.0002, ΔRecall +0.0042 (mixed_leave_one_out_signals).
-
-  - feature_id: fe__outcome__casino_win_sum__w1h
-    group_id: group_m_outcome_state
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP -0.0002, ΔRecall +0.0042 (mixed_leave_one_out_signals).
-
-  - feature_id: fe__outcome__loss_rate__w1h
-    group_id: group_m_outcome_state
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP -0.0002, ΔRecall +0.0042 (mixed_leave_one_out_signals).
-
-  - feature_id: fe__outcome__net_pnl_to_wager_ratio__w1h
-    group_id: group_m_outcome_state
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP -0.0002, ΔRecall +0.0042 (mixed_leave_one_out_signals).
-
-  - feature_id: fe__outcome__last_3_bets_loss_count
-    group_id: group_m_outcome_state
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP -0.0002, ΔRecall +0.0042 (mixed_leave_one_out_signals).
-
-  # --- Group N: stake_dynamics (REVIEW) ---
-  - feature_id: fe__stake__wager_z__w1h
-    group_id: group_n_stake_dynamics
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0007, ΔRecall +0.0024 (mixed_leave_one_out_signals).
-
-  - feature_id: fe__stake__wager_to_recent_max_ratio__w1h
-    group_id: group_n_stake_dynamics
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0007, ΔRecall +0.0024 (mixed_leave_one_out_signals).
-
-  - feature_id: fe__stake__wager_step_pct
-    group_id: group_n_stake_dynamics
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0007, ΔRecall +0.0024 (mixed_leave_one_out_signals).
-
-  - feature_id: fe__stake__wager_cv__w1h
-    group_id: group_n_stake_dynamics
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0007, ΔRecall +0.0024 (mixed_leave_one_out_signals).
-
-  # --- Group K: canonical_today (KEEP; partition by canonical_id × gaming_day) ---
-  - feature_id: fe__canonical__bets_cnt__today
-    group_id: group_k_canonical_today
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0026, dRecall +0.0119.'
-
-  - feature_id: fe__canonical__wager_sum__today
-    group_id: group_k_canonical_today
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0026, dRecall +0.0119.'
-
-  - feature_id: fe__canonical__avg_wager__today
-    group_id: group_k_canonical_today
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0026, dRecall +0.0119.'
-
-  - feature_id: fe__canonical__elapsed_sec_since_first_bet__today
-    group_id: group_k_canonical_today
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0026, dRecall +0.0119.'
-
-  # --- Group O: table_switch (REVIEW) ---
-  - feature_id: fe__tableswitch__changed_table_vs_lag1
-    group_id: group_o_table_switch
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0012, ΔRecall +0.0055 (mixed_leave_one_out_signals).
-
-  - feature_id: fe__tableswitch__changed_table_vs_lag2
-    group_id: group_o_table_switch
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0012, ΔRecall +0.0055 (mixed_leave_one_out_signals).
-
-  - feature_id: fe__tableswitch__changes_in_last_5_bets
-    group_id: group_o_table_switch
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0012, ΔRecall +0.0055 (mixed_leave_one_out_signals).
-
-  # --- Group E: session_position (REVIEW; bet-table session_id; PIT-safe) ---
-  - feature_id: fe__session__bet_idx_in_session
-    group_id: group_e_session_position
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0005, ΔRecall +0.0041 (mixed_leave_one_out_signals).
-
-  - feature_id: fe__session__elapsed_sec_since_first_bet_in_session
-    group_id: group_e_session_position
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0005, ΔRecall +0.0041 (mixed_leave_one_out_signals).
-
-  - feature_id: fe__session__wager_sum_in_session_so_far
-    group_id: group_e_session_position
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0005, ΔRecall +0.0041 (mixed_leave_one_out_signals).
-
-  # --- Group F: rate_decay (REVIEW) ---
-  - feature_id: fe__rate__bets_cnt__w5m
-    group_id: group_f_rate_decay
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP -0.0001, ΔRecall +0.0025 (mixed_leave_one_out_signals).
-
-  - feature_id: fe__rate__velocity__w5m_over_w15m
-    group_id: group_f_rate_decay
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP -0.0001, ΔRecall +0.0025 (mixed_leave_one_out_signals).
-
-  - feature_id: fe__rate__velocity__w15m_over_w1h
-    group_id: group_f_rate_decay
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: experimental
-    enabled_for: [candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP -0.0001, ΔRecall +0.0025 (mixed_leave_one_out_signals).
-
-  # --- Group G: interarrival_dynamics (KEEP) ---
-  - feature_id: fe__interarrival__lag2_sec
-    group_id: group_g_interarrival_dynamics
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0018, dRecall +0.0071.'
-
-  - feature_id: fe__interarrival__last_gap_z__w7d
-    group_id: group_g_interarrival_dynamics
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0018, dRecall +0.0071.'
-
-  - feature_id: fe__interarrival__last_gap_to_recent_mean_ratio__w1h
-    group_id: group_g_interarrival_dynamics
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0018, dRecall +0.0071.'
-
-  - feature_id: fe__interarrival__cv__w1h
-    group_id: group_g_interarrival_dynamics
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0018, dRecall +0.0071.'
-
-  # --- Group I: theo_exposure (DROP group; SQL parity columns retained) ---
-  - feature_id: fe__theo__theo_win_to_wager_ratio
-    group_id: group_i_theo_exposure
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: disabled
-    enabled_for: [candidate, ablation]
-    drop_reason_code: governance_ablation_drop_v0
-    first_seen_experiment: run_20260515T175157Z
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation DROP (run_20260515T175157Z): add-one Gate1 failed and LOO removal not harmful (removal_from_full_not_harmful_add_one_failed).
-
-  - feature_id: fe__theo__base_ha
-    group_id: group_i_theo_exposure
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: disabled
-    enabled_for: [candidate, ablation]
-    drop_reason_code: governance_fqg_block_removed
-    first_seen_experiment: run_20260515T174824Z
-    last_updated_experiment: run_20260515T174824Z
-    note: FQG train_vs_val PSI block (PSI≈1.82); game-mix drift across day splits.
-
-  - feature_id: fe__theo__theo_win_sum__w1h
-    group_id: group_i_theo_exposure
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: disabled
-    enabled_for: [candidate, ablation]
-    drop_reason_code: governance_ablation_drop_v0
-    first_seen_experiment: run_20260515T175157Z
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation DROP (run_20260515T175157Z): add-one Gate1 failed and LOO removal not harmful (removal_from_full_not_harmful_add_one_failed).
-
-  - feature_id: fe__theo__theo_win_to_wager_ratio__w1h
-    group_id: group_i_theo_exposure
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: disabled
-    enabled_for: [candidate, ablation]
-    drop_reason_code: governance_ablation_drop_v0
-    first_seen_experiment: run_20260515T175157Z
-    last_updated_experiment: run_20260515T175157Z
-    note: >-
-      Ablation DROP (run_20260515T175157Z): add-one Gate1 failed and LOO removal not harmful (removal_from_full_not_harmful_add_one_failed).
-
-  # --- Group Q: payout_odds_dynamics (KEEP) ---
-  - feature_id: fe__odds__payout_odds_z__w1h
-    group_id: group_q_payout_odds_dynamics
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0004, dRecall +0.0030.'
-
-  - feature_id: fe__odds__payout_odds_z__w7d
-    group_id: group_q_payout_odds_dynamics
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0004, dRecall +0.0030.'
-
-  - feature_id: fe__odds__payout_odds_to_recent_max_ratio__w1h
-    group_id: group_q_payout_odds_dynamics
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0004, dRecall +0.0030.'
-
-  - feature_id: fe__odds__payout_odds_step_ratio
-    group_id: group_q_payout_odds_dynamics
-    source: fe_derived
-    semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-    status: active
-    enabled_for: [baseline, candidate, ablation]
-    drop_reason_code: null
-    last_updated_experiment: run_20260515T175157Z
-    note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0004, dRecall +0.0030.'
+- feature_id: wager
+  group_id: baseline_model
+  source: baseline_model
+  semantic_owner: trainer_hightier/05_lgbm_train.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: null
+  time_horizon: none
+- feature_id: casino_win
+  group_id: baseline_model
+  source: baseline_model
+  semantic_owner: trainer_hightier/05_lgbm_train.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: null
+  time_horizon: none
+- feature_id: is_back_bet
+  group_id: baseline_model
+  source: baseline_model
+  semantic_owner: trainer_hightier/05_lgbm_train.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: null
+  time_horizon: none
+- feature_id: bet_type
+  group_id: baseline_model
+  source: baseline_model
+  semantic_owner: trainer_hightier/05_lgbm_train.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: null
+  time_horizon: none
+- feature_id: type_of_bet
+  group_id: baseline_model
+  source: baseline_model
+  semantic_owner: trainer_hightier/05_lgbm_train.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: null
+  time_horizon: none
+- feature_id: bet__bets_cnt__w1h
+  group_id: existing_trial_1h
+  source: feast_trial_1h
+  semantic_owner: trainer_hightier/contracts/trial_bet_behavior_1h_features.yaml
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: null
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: bet__wager_sum__w1h
+  group_id: existing_trial_1h
+  source: feast_trial_1h
+  semantic_owner: trainer_hightier/contracts/trial_bet_behavior_1h_features.yaml
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: null
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: bet__back_bet_ratio__w1h
+  group_id: existing_trial_1h
+  source: feast_trial_1h
+  semantic_owner: trainer_hightier/contracts/trial_bet_behavior_1h_features.yaml
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: null
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: bet__payout_odds_avg__w1h
+  group_id: existing_trial_1h
+  source: feast_trial_1h
+  semantic_owner: trainer_hightier/contracts/trial_bet_behavior_1h_features.yaml
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: null
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: patron__theo_win_sum__w180d_m1snap
+  group_id: existing_slow_patron_180d_m1snap
+  source: feast_slow_180d
+  semantic_owner: trainer_hightier/contracts/slow_patron_180d_monthly_features.yaml
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: null
+  time_horizon: long_term
+  max_lookback: P180D
+- feature_id: patron__gaming_days_cnt__w180d_m1snap
+  group_id: existing_slow_patron_180d_m1snap
+  source: feast_slow_180d
+  semantic_owner: trainer_hightier/contracts/slow_patron_180d_monthly_features.yaml
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: null
+  time_horizon: long_term
+  max_lookback: P180D
+- feature_id: patron__adt__w180d_m1snap
+  group_id: existing_slow_patron_180d_m1snap
+  source: feast_slow_180d
+  semantic_owner: trainer_hightier/contracts/slow_patron_180d_monthly_features.yaml
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: null
+  time_horizon: long_term
+  max_lookback: P180D
+- feature_id: fe__wager_sum__w15m
+  group_id: group_a_velocity_ratios
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass.'
+  time_horizon: short_term
+  max_lookback: PT15M
+- feature_id: fe__bets_cnt__w15m
+  group_id: group_a_velocity_ratios
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass.'
+  time_horizon: short_term
+  max_lookback: PT15M
+- feature_id: fe__bets_cnt__w1d
+  group_id: group_a_velocity_ratios
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass.'
+  time_horizon: mid_term
+  max_lookback: P1D
+- feature_id: fe__wager_sum__w15m_over_w1d
+  group_id: group_a_velocity_ratios
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass.'
+  time_horizon: mid_term
+  max_lookback: P1D
+- feature_id: fe__wager_sum__w1d
+  group_id: group_a_velocity_ratios
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: disabled
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: governance_fqg_warn_removed
+  first_seen_experiment: run_20260515T101619Z
+  last_updated_experiment: run_20260515T101619Z
+  note: Removed from experimental candidate sets (FQG PSI + uplift flip). SQL still
+    emits column for parity.
+  time_horizon: mid_term
+  max_lookback: P1D
+- feature_id: fe__bets_cnt__w15m_over_w1d
+  group_id: group_a_velocity_ratios
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: disabled
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: governance_fqg_warn_removed
+  first_seen_experiment: run_20260515T101619Z
+  last_updated_experiment: run_20260515T101619Z
+  note: FQG uplift_sign_flip_frac_warn (rate≈0.9).
+  time_horizon: mid_term
+  max_lookback: P1D
+- feature_id: fe__time_since_last_bet_sec
+  group_id: group_b_rfm
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0006,
+    ΔRecall +0.0038 (mixed_leave_one_out_signals).'
+  time_horizon: mid_term
+  max_lookback: PT24H
+- feature_id: fe__wager_sum__w7d
+  group_id: group_b_rfm
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0006,
+    ΔRecall +0.0038 (mixed_leave_one_out_signals).'
+  time_horizon: mid_term
+  max_lookback: P7D
+- feature_id: fe__wager_sum__w7d_over_w30d
+  group_id: group_b_rfm
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0006,
+    ΔRecall +0.0038 (mixed_leave_one_out_signals).'
+  time_horizon: mid_term
+  max_lookback: P30D
+- feature_id: fe__bets_cnt__w7d
+  group_id: group_b_rfm
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: disabled
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: governance_fqg_warn_removed
+  first_seen_experiment: run_20260515T101619Z
+  last_updated_experiment: run_20260515T101619Z
+  note: FQG train_vs_val/test PSI warn.
+  time_horizon: mid_term
+  max_lookback: P7D
+- feature_id: fe__bets_cnt__w30d
+  group_id: group_b_rfm
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: disabled
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: governance_fqg_warn_removed
+  first_seen_experiment: run_20260515T101619Z
+  last_updated_experiment: run_20260515T101619Z
+  note: FQG PSI warn.
+  time_horizon: mid_term
+  max_lookback: P30D
+- feature_id: fe__wager_sum__w30d
+  group_id: group_b_rfm
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: disabled
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: governance_fqg_warn_removed
+  first_seen_experiment: run_20260515T101619Z
+  last_updated_experiment: run_20260515T101619Z
+  note: FQG uplift_sign_flip_frac_warn.
+  time_horizon: mid_term
+  max_lookback: P30D
+- feature_id: fe__bets_density_proxy_w30d
+  group_id: group_b_rfm
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: disabled
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: governance_fqg_warn_removed
+  first_seen_experiment: run_20260515T101619Z
+  last_updated_experiment: run_20260515T101619Z
+  note: FQG PSI warn (alias of fe__bets_cnt__w30d density).
+  time_horizon: mid_term
+  max_lookback: P30D
+- feature_id: fe__wager_cv_w7d
+  group_id: group_c_burstiness
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass.'
+  time_horizon: mid_term
+  max_lookback: P7D
+- feature_id: fe__interarrival_mean_sec_w7d
+  group_id: group_c_burstiness
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: disabled
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: governance_fqg_warn_removed
+  first_seen_experiment: run_20260515T101619Z
+  last_updated_experiment: run_20260515T101619Z
+  note: FQG PSI warn.
+  time_horizon: mid_term
+  max_lookback: P7D
+- feature_id: fe__payout_odds_z_prior_w30d
+  group_id: group_d_personal_z
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass.'
+  time_horizon: mid_term
+  max_lookback: P30D
+- feature_id: fe__wager_z_prior_w30d
+  group_id: group_d_personal_z
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: disabled
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: governance_fqg_warn_removed
+  first_seen_experiment: run_20260515T101619Z
+  last_updated_experiment: run_20260515T101619Z
+  note: FQG uplift_sign_flip_frac_warn.
+  time_horizon: mid_term
+  max_lookback: P30D
+- feature_id: fe__clock__hour_of_day
+  group_id: group_l_clock_context
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0019,
+    ΔRecall +0.0140 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__clock__day_of_week
+  group_id: group_l_clock_context
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0019,
+    ΔRecall +0.0140 (mixed_leave_one_out_signals).'
+  time_horizon: mid_term
+  max_lookback: P7D
+- feature_id: fe__clock__is_weekend
+  group_id: group_l_clock_context
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0019,
+    ΔRecall +0.0140 (mixed_leave_one_out_signals).'
+  time_horizon: mid_term
+  max_lookback: P7D
+- feature_id: fe__clock__is_late_night
+  group_id: group_l_clock_context
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0019,
+    ΔRecall +0.0140 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__outcome__casino_win_sum__w15m
+  group_id: group_m_outcome_state
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP -0.0002,
+    ΔRecall +0.0042 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT15M
+- feature_id: fe__outcome__casino_win_sum__w1h
+  group_id: group_m_outcome_state
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP -0.0002,
+    ΔRecall +0.0042 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__outcome__loss_rate__w1h
+  group_id: group_m_outcome_state
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP -0.0002,
+    ΔRecall +0.0042 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__outcome__net_pnl_to_wager_ratio__w1h
+  group_id: group_m_outcome_state
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP -0.0002,
+    ΔRecall +0.0042 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__outcome__last_3_bets_loss_count
+  group_id: group_m_outcome_state
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP -0.0002,
+    ΔRecall +0.0042 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__stake__wager_z__w1h
+  group_id: group_n_stake_dynamics
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0007,
+    ΔRecall +0.0024 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__stake__wager_to_recent_max_ratio__w1h
+  group_id: group_n_stake_dynamics
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0007,
+    ΔRecall +0.0024 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__stake__wager_step_pct
+  group_id: group_n_stake_dynamics
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0007,
+    ΔRecall +0.0024 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__stake__wager_cv__w1h
+  group_id: group_n_stake_dynamics
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0007,
+    ΔRecall +0.0024 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__canonical__bets_cnt__today
+  group_id: group_k_canonical_today
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0026,
+    dRecall +0.0119.'
+  time_horizon: mid_term
+  max_lookback: P1D
+- feature_id: fe__canonical__wager_sum__today
+  group_id: group_k_canonical_today
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0026,
+    dRecall +0.0119.'
+  time_horizon: mid_term
+  max_lookback: P1D
+- feature_id: fe__canonical__avg_wager__today
+  group_id: group_k_canonical_today
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0026,
+    dRecall +0.0119.'
+  time_horizon: mid_term
+  max_lookback: P1D
+- feature_id: fe__canonical__elapsed_sec_since_first_bet__today
+  group_id: group_k_canonical_today
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0026,
+    dRecall +0.0119.'
+  time_horizon: mid_term
+  max_lookback: P1D
+- feature_id: fe__tableswitch__changed_table_vs_lag1
+  group_id: group_o_table_switch
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0012,
+    ΔRecall +0.0055 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__tableswitch__changed_table_vs_lag2
+  group_id: group_o_table_switch
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0012,
+    ΔRecall +0.0055 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__tableswitch__changes_in_last_5_bets
+  group_id: group_o_table_switch
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0012,
+    ΔRecall +0.0055 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__session__bet_idx_in_session
+  group_id: group_e_session_position
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0005,
+    ΔRecall +0.0041 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__session__elapsed_sec_since_first_bet_in_session
+  group_id: group_e_session_position
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0005,
+    ΔRecall +0.0041 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__session__wager_sum_in_session_so_far
+  group_id: group_e_session_position
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0005,
+    ΔRecall +0.0041 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__rate__bets_cnt__w5m
+  group_id: group_f_rate_decay
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP -0.0001,
+    ΔRecall +0.0025 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT5M
+- feature_id: fe__rate__velocity__w5m_over_w15m
+  group_id: group_f_rate_decay
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP -0.0001,
+    ΔRecall +0.0025 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT15M
+- feature_id: fe__rate__velocity__w15m_over_w1h
+  group_id: group_f_rate_decay
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP -0.0001,
+    ΔRecall +0.0025 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__interarrival__lag2_sec
+  group_id: group_g_interarrival_dynamics
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0018,
+    dRecall +0.0071.'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__interarrival__last_gap_z__w7d
+  group_id: group_g_interarrival_dynamics
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0018,
+    dRecall +0.0071.'
+  time_horizon: mid_term
+  max_lookback: P7D
+- feature_id: fe__interarrival__last_gap_to_recent_mean_ratio__w1h
+  group_id: group_g_interarrival_dynamics
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0018,
+    dRecall +0.0071.'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__interarrival__cv__w1h
+  group_id: group_g_interarrival_dynamics
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0018,
+    dRecall +0.0071.'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__theo__theo_win_to_wager_ratio
+  group_id: group_i_theo_exposure
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: disabled
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: governance_ablation_drop_v0
+  first_seen_experiment: run_20260515T175157Z
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation DROP (run_20260515T175157Z): add-one Gate1 failed and LOO removal
+    not harmful (removal_from_full_not_harmful_add_one_failed).'
+  time_horizon: mid_term
+  max_lookback: P1D
+- feature_id: fe__theo__base_ha
+  group_id: group_i_theo_exposure
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: disabled
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: governance_fqg_block_removed
+  first_seen_experiment: run_20260515T174824Z
+  last_updated_experiment: run_20260515T174824Z
+  note: FQG train_vs_val PSI block (PSI≈1.82); game-mix drift across day splits.
+  time_horizon: mid_term
+  max_lookback: P1D
+- feature_id: fe__theo__theo_win_sum__w1h
+  group_id: group_i_theo_exposure
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: disabled
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: governance_ablation_drop_v0
+  first_seen_experiment: run_20260515T175157Z
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation DROP (run_20260515T175157Z): add-one Gate1 failed and LOO removal
+    not harmful (removal_from_full_not_harmful_add_one_failed).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__theo__theo_win_to_wager_ratio__w1h
+  group_id: group_i_theo_exposure
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: disabled
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: governance_ablation_drop_v0
+  first_seen_experiment: run_20260515T175157Z
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation DROP (run_20260515T175157Z): add-one Gate1 failed and LOO removal
+    not harmful (removal_from_full_not_harmful_add_one_failed).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__odds__payout_odds_z__w1h
+  group_id: group_q_payout_odds_dynamics
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0004,
+    dRecall +0.0030.'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__odds__payout_odds_z__w7d
+  group_id: group_q_payout_odds_dynamics
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0004,
+    dRecall +0.0030.'
+  time_horizon: mid_term
+  max_lookback: P7D
+- feature_id: fe__odds__payout_odds_to_recent_max_ratio__w1h
+  group_id: group_q_payout_odds_dynamics
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0004,
+    dRecall +0.0030.'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__odds__payout_odds_step_ratio
+  group_id: group_q_payout_odds_dynamics
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260515T175157Z
+  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0004,
+    dRecall +0.0030.'
+  time_horizon: short_term
+  max_lookback: PT1H

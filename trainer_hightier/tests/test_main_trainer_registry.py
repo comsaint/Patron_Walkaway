@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -18,6 +19,8 @@ from trainer_hightier.config import (
 )
 from trainer_hightier.feature_experiment.candidate_registry_loader import load_candidate_registry
 from trainer_hightier.trainer import HighTierTrainArgs, fit_model
+
+_trainer_mod = importlib.import_module("trainer_hightier.trainer")
 
 _b5_mod = importlib.import_module("trainer_hightier.05_lgbm_train")
 
@@ -125,3 +128,43 @@ def test_fit_model_preflight_missing_parquet_column(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="missing baseline columns.*wager"):
         fit_model(args, metrics=None)
+
+
+def test_freeze_deploy_inputs_manifest_has_freshness_metadata(monkeypatch, tmp_path: Path) -> None:
+    """Training-side deploy manifest must satisfy packaging mid-term freshness gate inputs."""
+
+    bundle_dir = tmp_path / "bundle"
+    bundle_dir.mkdir()
+    map_p = tmp_path / "canonical_player_mapping.parquet"
+    allow_p = tmp_path / "adt_allowed_players_q0p99.parquet"
+    slow_p = tmp_path / "slow_patron_180d_monthly.parquet"
+    pd.DataFrame({"player_id": [1], "canonical_id": [10]}).to_parquet(map_p, index=False)
+    pd.DataFrame({"player_id": [1]}).to_parquet(allow_p, index=False)
+    pd.DataFrame({"player_id": [1], "gaming_day": [20250101]}).to_parquet(slow_p, index=False)
+    (bundle_dir / "feature_candidate_registry.snapshot.yaml").write_text(
+        "registry_version: test\nfeatures: []\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(_trainer_mod, "default_canonical_mapping_parquet_path", lambda: map_p)
+    monkeypatch.setattr(_trainer_mod, "default_adt_allowed_players_parquet_path", lambda _q: allow_p)
+    monkeypatch.setattr(_trainer_mod, "default_slow_patron_180d_monthly_parquet_path", lambda: slow_p)
+
+    metrics: dict[str, object] = {"training_cutoff_iso": "2026-05-19T00:00:00+00:00"}
+    args = HighTierTrainArgs(
+        output_dir=tmp_path / "out",
+        objective=HighTierObjectiveConfig(theo_train_quantile=0.99),
+    )
+    _trainer_mod._freeze_deploy_inputs(
+        args,
+        metrics,
+        bundle_dir=bundle_dir,
+        model_version="mv-test",
+    )
+
+    manifest = json.loads((bundle_dir / "deploy_inputs" / "active_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["version"] == "mv-test"
+    assert manifest["model_version"] == "mv-test"
+    assert manifest["training_cutoff_iso"] == "2026-05-19T00:00:00+00:00"
+    assert isinstance(manifest["coverage_end_exclusive"], str)
+    pd.Timestamp(manifest["coverage_end_exclusive"])

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterable
 
 import duckdb  # type: ignore[import-untyped]
+import pyarrow.parquet as pq
 import numpy as np
 import pandas as pd
 
@@ -200,18 +201,149 @@ FROM ordered
     return merged
 
 
+def _infer_slow_patron_snap_date_column(schema_cols: Iterable[str]) -> str:
+    """Pick ASOF anchor date column present in patron-grain monthly slow snapshot Parquet."""
+
+    cols = tuple(str(c) for c in schema_cols)
+    by_lower = {c.lower(): c for c in cols}
+    for token in ("anchor_gaming_day", "gaming_day"):
+        if token in by_lower:
+            pick = by_lower[token]
+            logger.info("[feature_builder] slow patron ASOF anchor column inferred as %s", pick)
+            return pick
+    raise ValueError(
+        "slow patron snapshot parquet must expose 'anchor_gaming_day' "
+        "(preferred) or 'gaming_day'; "
+        f"got columns (sample): {sorted(cols)[:40]}"
+    )
+
+
+def _slow_parquet_join_mode(schema_cols: Iterable[str]) -> str:
+    """Return ``bet_merge`` or ``player_asof`` for slow patron parquet shape."""
+
+    by_lower = {str(c).lower(): str(c) for c in schema_cols}
+    feast_bet = ("bet_id" in by_lower) and ("prediction_visible_ts_cf" in by_lower)
+    legacy_player = ("player_id" in by_lower) and (
+        ("anchor_gaming_day" in by_lower) or ("gaming_day" in by_lower)
+    )
+
+    # Prefer Feast bet-grain materialization output (canonical for slow_patron_180d_monthly.parquet).
+    if feast_bet and not legacy_player:
+        return "bet_merge"
+
+    # Legacy trainer-style monthly snapshots (player_id + anchor day).
+    if legacy_player and not feast_bet:
+        return "player_asof"
+
+    if feast_bet and legacy_player:
+        logger.warning(
+            "[feature_builder] slow patron parquet exposes both player+anchor and Feast bet timestamps; "
+            "using Feast bet-merge path (ambiguous schema). columns=%s",
+            sorted(by_lower.keys())[:30],
+        )
+        return "bet_merge"
+
+    raise ValueError(
+        "[feature_builder] slow patron parquet unsupported schema "
+        "(need Feast bet-grain: bet_id + prediction_visible_ts_cf, "
+        "or player snapshot with player_id + anchor_gaming_day|gaming_day); "
+        f"columns sample={sorted(by_lower.keys())[:40]}"
+    )
+
+
+def _join_slow_patron_bet_snapshot(
+    bets: pd.DataFrame,
+    slow_parquet: Path,
+) -> pd.DataFrame:
+    """Left-merge Feast bet-grain slow features on normalized ``bet_id``."""
+
+    if "bet_id" not in bets.columns:
+        raise ValueError("[feature_builder] bets missing bet_id column for Feast slow merge")
+
+    slow_df = pd.read_parquet(Path(slow_parquet).resolve())
+    by_lower = {str(c).lower(): str(c) for c in slow_df.columns}
+    rk = by_lower.get("bet_id")
+    if rk is None:
+        raise ValueError("[feature_builder] bet-grain slow parquet missing bet_id column")
+
+    if rk not in slow_df.columns:
+        raise ValueError(f"[feature_builder] slow parquet lacks bet key column {rk!r}")
+
+    feat_cols = [c for c in slow_df.columns if str(c).lower() != "bet_id"]
+
+    left = bets.copy()
+    left["_slow_bid_merge"] = pd.to_numeric(left["bet_id"], errors="coerce")
+
+    right = pd.DataFrame({"_slow_bid_merge": pd.to_numeric(slow_df[rk], errors="coerce")})
+    for c in feat_cols:
+        right[c] = slow_df[c]
+
+    out = left.merge(right, on="_slow_bid_merge", how="left")
+    return out.drop(columns=["_slow_bid_merge"], errors="ignore")
+
+
+def join_fe_derived_snapshot(bets: pd.DataFrame, fe_parquet: Path) -> pd.DataFrame:
+    """Left-merge bundled ``fe_derived`` features on normalized ``bet_id``."""
+
+    if bets.empty:
+        return bets
+    sp = Path(fe_parquet).resolve()
+    if not sp.is_file():
+        raise FileNotFoundError(f"fe_derived parquet missing: {sp}")
+    if "bet_id" not in bets.columns:
+        raise ValueError("[feature_builder] bets missing bet_id column for fe_derived merge")
+    fe_df = pd.read_parquet(sp)
+    by_lower = {str(c).lower(): str(c) for c in fe_df.columns}
+    rk = by_lower.get("bet_id")
+    if rk is None:
+        raise ValueError("[feature_builder] fe_derived parquet missing bet_id column")
+    feat_cols = [c for c in fe_df.columns if str(c).lower() != "bet_id"]
+    left = bets.copy()
+    left["_fe_bid_merge"] = pd.to_numeric(left["bet_id"], errors="coerce")
+    right = pd.DataFrame({"_fe_bid_merge": pd.to_numeric(fe_df[rk], errors="coerce")})
+    for c in feat_cols:
+        right[c] = fe_df[c]
+    out = left.merge(right, on="_fe_bid_merge", how="left")
+    logger.info("[feature_builder] joined fe_derived via bundled parquet %s (%d cols)", sp, len(feat_cols))
+    return out.drop(columns=["_fe_bid_merge"], errors="ignore")
+
+
 def join_slow_patron_snapshot(
     bets: pd.DataFrame,
     slow_parquet: Path,
     *,
-    key_days: str = "anchor_gaming_day",
+    key_days: str | None = None,
 ) -> pd.DataFrame:
-    """ASOF-join slow patron monthly snapshot on ``player_id`` / ``gaming_day``."""
+    """Attach slow patron 180d features from bundled Parquet (Feast bet-grain or legacy player ASOF snapshot)."""
+
     if bets.empty:
         return bets
     sp = Path(slow_parquet).resolve()
     if not sp.is_file():
         raise FileNotFoundError(f"slow patron snapshot parquet missing: {sp}")
+    schema_cols = list(pq.read_schema(sp).names)
+    mode = _slow_parquet_join_mode(schema_cols)
+    if mode == "bet_merge":
+        logger.info("[feature_builder] joining slow patron via Feast bet-grain parquet %s", sp)
+        return _join_slow_patron_bet_snapshot(bets, sp)
+
+    by_lower = {str(c).lower(): str(c) for c in schema_cols}
+    exp = (
+        key_days.strip()
+        if key_days is not None and str(key_days).strip()
+        else ""
+    )
+    if exp:
+        el = exp.lower()
+        if el not in by_lower:
+            raise ValueError(
+                f"slow patron parquet lacks explicit ASOF column {exp!r}; columns={sorted(schema_cols)}"
+            )
+        anchor_sql_col = by_lower[el]
+        logger.debug("[feature_builder] slow patron ASOF column from kwarg=%s", anchor_sql_col)
+    else:
+        anchor_sql_col = _infer_slow_patron_snap_date_column(schema_cols)
+
     if "gaming_day" not in bets.columns:
         raise ValueError("bets must contain gaming_day for slow patron join")
     con = duckdb.connect(database=":memory:")
@@ -234,7 +366,7 @@ FROM b
 ASOF JOIN (
   SELECT
     player_id,
-    CAST({key_days} AS DATE) AS anchor_gday,
+    CAST("{anchor_sql_col.replace('"', '""')}" AS DATE) AS anchor_gday,
     patron__theo_win_sum__w180d_m1snap,
     patron__gaming_days_cnt__w180d_m1snap,
     patron__adt__w180d_m1snap

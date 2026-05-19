@@ -30,6 +30,12 @@ DEFAULT_TRAINING_FEATURE_SERVICE: Final[str] = "walkaway_bet_trial_v1"
 
 # --- Shared domain constants (keep aligned with defaults in ``HightierServingConfig``) ---
 HK_TZ: Final[str] = "Asia/Hong_Kong"
+# Frozen next to Step 5 ``model.pkl`` for packaging/schema gate (training-time registry bytes + hash).
+FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME: Final[str] = "feature_candidate_registry.snapshot.yaml"
+# Copied into deploy_inputs / bundled snapshots when training uses fe__* baseline features.
+FE_DERIVED_DEPLOY_PARQUET_BASENAME: Final[str] = "fe_derived_features.parquet"
+# Mid-term snapshot freshness vs active_manifest.coverage_end_exclusive (ISO-8601 duration).
+MID_TERM_FRESHNESS_SLA_ISO8601: Final[str] = "PT36H"
 PLACEHOLDER_PLAYER_ID: Final[int] = -1
 CASINO_PLAYER_ID_CLEAN_SQL: Final[str] = (
     "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') "

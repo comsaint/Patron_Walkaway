@@ -2,6 +2,13 @@
 
 給要**跑離線管線、除錯或調資源**的人用；產品規格仍以程式與測試為準。
 
+## Full rollout（registry `time_horizon` / mid-term freshness）
+
+- **訓練**：使用更新後之 [`contracts/feature_candidate_registry.yaml`](contracts/feature_candidate_registry.yaml)（含 `time_horizon` / `max_lookback`）；Step 5 會凍結 `feature_candidate_registry.snapshot.yaml`。
+- **建包**：`python -m trainer_hightier.build_deploy_package --model-version <run_id>`；gate 會檢 **`fe_derived_parquet`**、**`coverage_end_exclusive`**（`MID_TERM_FRESHNESS_SLA_ISO8601`，預設 `PT36H`）與 **trial online-only**（bundled trial parquet 不計入通過條件）。
+- **日更**：`python -m trainer_hightier.run_hightier_snapshot_updater`（可 `--fe-derived-source`）更新 slow + fe manifest 與 `coverage_end_exclusive`。
+- **上線 / 回滾**：先 shadow；保留上一 bundle；監看 `[feature-supply]` / `mid-term snapshot stale` log。
+
 ## 1. 資料與路徑
 
 | 項目 | 預設 / 慣例 |
@@ -30,7 +37,7 @@
 | Scorer | ``python -m trainer_hightier.run_hightier_scorer``（``--once`` 單輪） |
 | Validator | ``python -m trainer_hightier.run_hightier_validator`` |
 | ML API | ``python -m trainer_hightier.run_hightier_api`` → ``/alerts``、``/validation``、``/health``、``/predictions`` |
-| Snapshot（每日） | ``python -m trainer_hightier.run_hightier_snapshot_updater``（``--rematerialize-slow`` 需清洗後 Parquet 輸入） |
+| Snapshot（每日） | ``python -m trainer_hightier.run_hightier_snapshot_updater``（``--rematerialize-slow`` 需清洗後 Parquet 輸入；``--fe-derived-source <parquet>`` 可覆寫 **fe** 來源；否則沿用上一版 manifest 或 repo 下 ``_main_trainer_fe_derived.parquet``） |
 
 **快照目錄**：預設 ``trainer_hightier/artifacts/serving_snapshots/active_manifest.json``；scorer 會讀其中 ``slow_patron_parquet`` 並在版本變更時寫入共用 ``state.db`` meta。
 
@@ -54,12 +61,14 @@
 | 項目 | 說明 |
 |------|------|
 | **Frozen 語意（預設）** | 建包將 **封存** snapshot（slow patron、ADT allowlist）與 canonical mapping，與訓練所選 model bundle 對齊；不依賴之後異動的全域 `active_manifest`。`trial_bet_behavior_parquet`：manifest **未宣告**則不要求；manifest **宣告**且在 **`--strict`**（預設）下來源檔須存在。 |
-| **`deploy_inputs/`（自包含 bundle）** | Step 5 成功後，`out/models_high_tier_mvp/<run_id>/deploy_inputs/` 會 **best-effort** 自動複製 `canonical_player_mapping.parquet`、`adt_allowed_players_*.parquet`、`slow_patron_180d_monthly.parquet`，並寫入 **相對檔名的** `active_manifest.json`，且把 **`adt_allowlist_sha256`** 併回同目錄的 `training_metrics.json`。缺來源時僅 WARN、不中斷訓練；整份 `<run_id>/` bundle 仍可搬機。 |
+| **Schema gate（`--strict` 預設）** | **`models/feature_candidate_registry.snapshot.yaml`**：Step 5 成功後將訓練當下台帳位元組凍結於此檔。**動態門檻**：對照 `model.pkl` 的 `feature_columns` 與快照列的 **`source`** — 例如 **`feast_slow_180d`** 欄需出現在 bundled slow Parquet；**`feast_trial_1h`**：production 主路徑為 **online** scorer（`attach_trial_bet_behavior_1h`）；bundled trial parquet **不**當通過條件；**`baseline_model`** 不重查 Parquet。**Feature supplyability（`[feature-supply]`）**：任一 `source: fe_derived` 的 model 欄位必須有 **`fe_derived_parquet`**；若有任一 registry **`time_horizon: mid_term`** 欄在模型中，尚須 **`active_manifest.json` 的 `coverage_end_exclusive`** 在 **`MID_TERM_FRESHNESS_SLA_ISO8601`**（預設 `PT36H`）內。否則建包與 `deploy.main` preflight fail-fast。Scorer 以 `bet_id` merge 該層。**哈希**：若 `training_metrics.json` 含 **`feature_candidate_registry_sha256`**，會與快照檔 **SHA-256** 對齊，不符即失敗。**靜態門檻（slow 二擇一 grain）**：**(A) Feast bet-grain**（`slow_patron_180d_monthly.parquet` 契約，見 `contracts/slow_patron_180d_monthly_features.yaml`）：`bet_id`、`prediction_visible_ts_cf`、以及欄名含 **`etl_insert`** 且 **`synthetic`** 的 created-timestamp（例 **`__etl_insert_Dtm_synthetic`**）。(B) **舊式 player 月快照**：`player_id` +（`gaming_day` 或 `anchor_gaming_day`）。mapping：`player_id`、`canonical_id`；ADT allowlist：`player_id`。錯誤訊息以 **`[pack-schema]`** 或 **`[feature-supply]`** 前綴標示。 |
+| **`--no-strict`（舊 bundle／過渡）** | **缺快照檔**：略過動態 gate（程式 **WARNING**，仍跑靜態 + allowlist／慢層必填檢查）。**請勿**視為長期解法：應以新版 trainer **重訓並帶快照**後再發版。 |
+| **`deploy_inputs/`（自包含 bundle）** | Step 5 成功後，`out/models_high_tier_mvp/<run_id>/deploy_inputs/` 會 **best-effort** 自動複製 `canonical_player_mapping.parquet`、`adt_allowed_players_*.parquet`、`slow_patron_180d_monthly.parquet`、訓練若物化過 DuckDB **`fe__*`** 則 **`fe_derived_features.parquet`**（來源 `_main_trainer_fe_derived.parquet`）、同一 run 根的 **`feature_candidate_registry.snapshot.yaml`**（若已由 Step 5 寫入），並寫入 **相對檔名的** `active_manifest.json`（含可選 **`fe_derived_parquet`**），且把 **`adt_allowlist_sha256`** 併回同目錄（或 bundle 根）的 **`training_metrics.json`**。缺來源時僅 WARN、不中斷訓練；整份 `<run_id>/` bundle 仍可搬機。 |
 | **最短命令（建議）** | 在完成上述訓練產物的機器／目錄上，於 repo 根執行：`python -m trainer_hightier.build_deploy_package --model-version <YYYYMMDD-HHMMSS-<git7>> [--archive]`（或 `--model-source <bundle 路徑>`）。**不需** `--snapshot-manifest-source`、`--mapping-source`——若 bundle 含有 `deploy_inputs/active_manifest.json` 與 `deploy_inputs/canonical_player_mapping.parquet`，建包器會自動採用。未給 `--output-dir` 時輸出到 **`out/deploy_hightier/<model_version>/`**。 |
 | **預設路徑（override）** | 省略 `--snapshot-manifest-source`：**優先** `<model-bundle>/deploy_inputs/`（指 `deploy_inputs/active_manifest.json`），否則 → `default_hightier_serving_config().snapshot_manifest_dir`（須先有 `active_manifest.json`）。省略 `--mapping-source`：**優先** `deploy_inputs/canonical_player_mapping.parquet`，否則 → `default_canonical_mapping_parquet_path()`。`--snapshot-manifest-source`／`--mapping-source` **永遠可手動覆寫**。 |
 | **建包（完整 CLI）** | `python -m trainer_hightier.build_deploy_package [--model-source … \| --model-version …] [--snapshot-manifest-source …] [--mapping-source …] [--output-dir …] [--archive] [--strict/--no-strict]`。**`--model-source` 與 `--model-version` 互斥**；優先順序：**顯式 `--model-source` > `--model-version` > latest**。預設 **`--strict`**：缺 slow / allowlist / `model.pkl` / mapping 即失敗。若 `training_metrics.json` 含 **`adt_allowlist_sha256`**，建置時**一律**比對打包後 allowlist 檔 SHA，不符即失敗。 |
 | **體積基準（約）** | 僅必要的 slow + allowlist + mapping + `model.pkl` 約數十 MB／版；若在 manifest 附上 `trial_bet_behavior` 層 parquet 會再增一檔個位數～數十 MB 級（視資料量）。磁碟請預留重複版本的空間。 |
-| **可追溯** | `bundle_info.json` 含 `frozen_fingerprint_sha256`（model_version + manifest_version + slow/allowlist/mapping SHA，不含 build_time）；同輸入重跑應維持相同 fingerprint。 |
+| **可追溯** | `bundle_info.json` 含 `frozen_fingerprint_sha256`（model_version + manifest_version + slow/allowlist/mapping SHA，不含 build_time）；同輸入重跑應維持相同 fingerprint。若 bundle 來自含 registry 哈希之訓練，會多 **`feature_candidate_registry_sha256`**，與 `training_metrics.json` 可追溯對齊。 |
 | **交付目錄** | `main.py`、`wheels/trainer_hightier-*.whl`、`requirements.txt`、`.env.example`、`models/`、`snapshots/active_manifest.json`（內 Parquet 路徑相對 **`snapshots/`** 目錄）、`snapshots/artifacts/*.parquet`、`mapping/`、`local_state/`（空）、`bundle_info.json`、`deploy_bundle_paths.json`、`README_DEPLOY.md`；`--archive` 另產 `<output-dir 名稱>.zip` 於其上一層。 |
 | **目標機啟動（Standalone）** | 在交付根目錄執行（相對路徑 wheel 依此目錄解析）：`python -m venv .venv` → `pip install -r requirements.txt` →（可選）自 `.env.example` 複製 `.env`。啟動：`python main.py --mode <all／api／scorer／validator>`。等效：`python -m trainer_hightier.deploy.main --bundle-dir <交付根> ...`。**不需** repo。 |
 | **驗收** | `GET /health`（須有 `local_state/state.db`；與 **同時** 建立的 `local_state/prediction_log.db`（若未停用 prediction log））；`GET /predictions` 在 scorer 寫入後應有列；檢查 `deploy` 啟動 log 與 `bundle_info.json` 之版本／allowlist 摘要；正式環境勿關閉 `high_adt_only` 的除錯旗標。 |
@@ -73,13 +82,21 @@
 
 - **`python -m trainer_hightier.trainer` 的 Step 5** 會讀 `trainer_hightier/contracts/feature_candidate_registry.yaml`（或 `--feature-candidate-registry`），以台帳中 **可選 baseline** 欄位（`status` 為 `active|experimental` 且 `enabled_for` 含 `baseline`）作為 `feature_columns`。
 - **單一真相**：baseline / candidate / ablation 選欄皆以 [`feature_candidate_registry.yaml`](trainer_hightier/contracts/feature_candidate_registry.yaml) 為準；baseline 列为 YAML 順序下 `enabled_for` 含 **`baseline`** 且 `status` 為 `active` 或 `experimental` 的列（**不可**對 `fe__*` 使用 baseline 槽）。主線 Step 5 與實驗皆由 `candidate_registry_loader` 載入。
-- **`run_report.json`** 會多出 `candidate_registry`：`registry_version`、`resolved_path`、`n_baseline_features` 等；以及 **`feast_auto_apply`**：`feast_auto_apply_attempted`、`feast_apply_wall_sec`、`feast_registry_path`（Step 3 前 registry 準備紀錄），便於對齊實驗與主線。
+- **`run_report.json`** 會多出 `candidate_registry`：`registry_version`、`resolved_path`、`n_baseline_features` 等；Step 5 成功且凍結台帳時另有 **`feature_candidate_registry_snapshot`** / **`feature_candidate_registry_sha256`** / **`feature_candidate_registry_frozen_from`**（與 `training_metrics.json` 可對齊）。另含 **`feast_auto_apply`**：`feast_auto_apply_attempted`、`feast_apply_wall_sec`、`feast_registry_path`（Step 3 前 registry 準備紀錄），便於對齊實驗與主線。
 
 **常見錯誤**
 
 | 現象 | 處理 |
 |------|------|
 | `Registry ... baseline` / 台帳 baseline 列設定錯誤 | 編輯 `feature_candidate_registry.yaml`：`baseline` 槽只給非 `fe__*` 欄；缺欄或少欄會在載入或 Step 5 前檢查時失敗 |
+| **`[pack-schema] missing feature_candidate_registry.snapshot.yaml`** | 無凍結台帳（通常為舊版 Step 5 bundle）；**解法**：新版 trainer **重跑 Step 5**，或將正確快照放進 **`models/`** 並讓 **`training_metrics.json`** 含對應 **`feature_candidate_registry_sha256`**。**過渡**：`build_deploy_package --no-strict` 僅跳過動態 gate（仍建議盡快重訓）。 |
+| **`[pack-schema] feature registry SHA mismatch`** | **`models/feature_candidate_registry.snapshot.yaml`** 與 **`training_metrics.json`** 紀錄的 SHA 不一致（常見於手拷檔或未整包複製）；從同一訓練目錄整包取用 `models/`／`deploy_inputs`。 |
+| **`[pack-schema] … slow_patron parquet missing columns …`**（或 trial） | Frozen 台的 **`feast_slow_180d`／`feast_trial_1h`** 欄在某層 parquet 缺席；對齊 Feast 重新物化或由訓練端驗資料。 |
+| **`[pack-schema] … slow parquet (player-grain)`** / 需 `gaming_day`/`anchor_gaming_day` | Slow 為**舊式 player 月快照**時缺 ASOF 錨日期欄；補其一。 |
+| **`[pack-schema] slow_patron (bet-grain) … Feast created-timestamp`** | Slow 為 **Feast bet-grain** 物化檔但缺 synthetic ETL lineage 欄（欄名需同時含 **`etl_insert`** 與 **`synthetic`**）；重跑 `materialize_slow_patron_180d_monthly` 或檢查 parquet 是否遭手動裁剪。 |
+| **`[pack-schema] slow_patron parquet unsupported structure`** | Slow 既非 bet-grain Feast 形、也非 player+anchor 形；對照 `contracts/slow_patron_180d_monthly_features.yaml` 或修正檔案。 |
+| **`[pack-schema] canonical_mapping … missing`** | Mapping 缺少 **`player_id`／`canonical_id`**（拼字可比對欄不分大小寫）；重新匯出 mapping。 |
+| **`[pack-schema] adt_allowlist … missing … player_id`** | Allowlist 缺 join key **`player_id`**；重新輸出名單。 |
 | `Feature candidate registry file not found` | 確認預設檔存在或傳入正確 `--feature-candidate-registry` |
 | `missing baseline columns …` / `Step 5 schema gate failed` | Step 4 splits 缺欄：重跑 Step 3/4 或改台帳不要選不存在的欄位 |
 

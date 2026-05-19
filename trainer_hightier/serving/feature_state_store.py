@@ -28,6 +28,7 @@ class ActiveSnapshotManifest:
 
     version: str
     slow_patron_parquet: Path
+    fe_derived_parquet: Path | None
     trial_bet_behavior_parquet: Path | None
     adt_allowlist_parquet: Path | None
     adt_allowlist_version: str | None
@@ -49,12 +50,14 @@ class ActiveSnapshotManifest:
             return p.expanduser().resolve()
 
         slow = _resolve_path(d.get("slow_patron_parquet")) or Path("")
+        fe_derived = _resolve_path(d.get("fe_derived_parquet"))
         trial = _resolve_path(d.get("trial_bet_behavior_parquet"))
         allow = _resolve_path(d.get("adt_allowlist_parquet"))
         ver = d.get("adt_allowlist_version")
         return cls(
             version=str(d.get("version", "")),
             slow_patron_parquet=slow,
+            fe_derived_parquet=fe_derived,
             trial_bet_behavior_parquet=trial,
             adt_allowlist_parquet=allow,
             adt_allowlist_version=(str(ver).strip() if ver is not None and str(ver).strip() else None),

@@ -6,7 +6,7 @@ Layout (resolved ``--output-dir``, default ``trainer_hightier.config.DEFAULT_DEP
 - ``wheels/trainer_hightier-*.whl`` — serving package wheel (``pip wheel --no-deps`` from ``trainer_hightier/pyproject.toml``)
 - ``requirements.txt`` — local wheel line (transitive deps from PyPI per wheel metadata)
 - ``.env.example`` — optional ClickHouse / log overrides for :mod:`trainer_hightier.deploy.main`
-- ``models/`` — ``model.pkl``, ``training_metrics.json``, ``model_version``, …
+- ``models/`` — ``model.pkl``, ``training_metrics.json``, ``feature_candidate_registry.snapshot.yaml`` (frozen feature registry YAML from Step 5), ``model_version``, …
 - ``snapshots/active_manifest.json`` — paths rewritten to bundle-relative
 - ``snapshots/artifacts/*.parquet`` — copied snapshot layers (slow / trial / allowlist)
 - ``mapping/`` — canonical mapping Parquet
@@ -19,21 +19,35 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import pickle
 import shutil
 import subprocess
 import sys
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import hashlib
+
+import pyarrow.parquet as pq
 
 from trainer_hightier.core.model_bundle_paths import resolve_model_bundle_dir
 
 from trainer_hightier import config as th_config
-from trainer_hightier.config import default_hightier_serving_config
+from trainer_hightier.config import (
+    FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME,
+    default_hightier_serving_config,
+)
+from trainer_hightier.serving.candidate_registry_loader import (
+    CandidateRegistrySnapshot,
+    load_candidate_registry,
+)
 from trainer_hightier.serving.adt_allowlist import sha256_file
+from trainer_hightier.serving.feature_supply import (
+    MANIFEST_KEY_FE_DERIVED,
+    assert_feature_supplyability_or_raise,
+)
 from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_parquet_path
 
 logger = logging.getLogger(__name__)
@@ -256,6 +270,192 @@ def _verify_allowlist_training_hash_or_raise(
     )
 
 
+def _model_feature_columns_from_pickle(models_dir: Path) -> tuple[str, ...]:
+    """Ordered feature names stored in bundled ``model.pkl``."""
+
+    pkl = Path(models_dir) / "model.pkl"
+    raw = pickle.loads(pkl.read_bytes())
+    if not isinstance(raw, dict):
+        raise ValueError(f"{pkl}: expected dict pickle payload")
+    feat = raw.get("feature_columns") or raw.get("feature_cols")
+    if not feat:
+        raise ValueError(f"{pkl} missing feature_columns/feature_cols")
+    return tuple(str(x) for x in list(feat))
+
+
+def _parquet_lower_column_index(path: Path) -> dict[str, str]:
+    """Map lower-case Parquet column name -> original spelling."""
+
+    names = pq.read_schema(path).names
+    return {str(c).lower(): str(c) for c in names}
+
+
+def _ensure_parquet_columns(path: Path, *, role: str, required: Iterable[str]) -> None:
+    """Raise when ``path`` is missing required column spellings."""
+
+    idx = _parquet_lower_column_index(path)
+    miss = sorted({c for c in required if c.lower() not in idx})
+    if miss:
+        sample = sorted(idx.keys())
+        tip = ", ".join(sample[:50])
+        ellipsis = "" if len(sample) <= 50 else ", …"
+        raise ValueError(
+            f"[pack-schema] {role} parquet missing columns {miss} at {path}. "
+            f"schema(lowercase-sample)=[{tip}{ellipsis}]"
+        )
+
+
+def _static_slow_minimum_contract_pack(slow_pack_path: Path) -> None:
+    """Structural gate for bundled slow parquet (trainer_hightier materialization).
+
+    Two supported shapes:
+
+    - **Bet-grain (Feast)** — canonical for ``slow_patron_180d_monthly.parquet``: one row per ``bet_id`` with
+      PIT timestamps (see ``contracts/slow_patron_180d_monthly_features.yaml``).
+    - **Legacy player-grain snapshot** — used by tests / older tooling: ``player_id`` + calendar anchor.
+    """
+
+    slow_idx = _parquet_lower_column_index(slow_pack_path)
+    bet_snapshot = ("bet_id" in slow_idx) and ("prediction_visible_ts_cf" in slow_idx)
+    player_snapshot = ("player_id" in slow_idx) and (
+        ("anchor_gaming_day" in slow_idx) or ("gaming_day" in slow_idx)
+    )
+
+    if bet_snapshot and not player_snapshot:
+        _ensure_parquet_columns(
+            slow_pack_path,
+            role="slow_patron",
+            required=(
+                "bet_id",
+                "prediction_visible_ts_cf",
+            ),
+        )
+        etl_hit = [
+            cn
+            for cn in sorted(slow_idx.keys())
+            if "etl_insert" in cn and "synthetic" in cn
+        ]
+        if not etl_hit:
+            sample = sorted(slow_idx.keys())
+            tip = ", ".join(sample[:50])
+            ellipsis = "" if len(sample) <= 50 else ", …"
+            raise ValueError(
+                "[pack-schema] slow_patron (bet-grain) parquet missing Feast created-timestamp "
+                "(expected a column akin to '__etl_insert_Dtm_synthetic'). "
+                f"schema(lowercase-sample)=[{tip}{ellipsis}] — file={slow_pack_path}"
+            )
+        return
+
+    if player_snapshot and not bet_snapshot:
+        _ensure_parquet_columns(slow_pack_path, role="slow_patron", required=("player_id",))
+        if "anchor_gaming_day" not in slow_idx and "gaming_day" not in slow_idx:
+            raise ValueError(
+                "[pack-schema] slow parquet (player-grain) must expose anchor_gaming_day or gaming_day "
+                f"for legacy ASOF join; got {slow_pack_path}"
+            )
+        return
+
+    sample = sorted(slow_idx.keys())
+    tip = ", ".join(sample[:50])
+    ellipsis = "" if len(sample) <= 50 else ", …"
+    raise ValueError(
+        "[pack-schema] slow_patron parquet unsupported structure: "
+        "need Feast bet-grain (bet_id + prediction_visible_ts_cf + __etl_insert_*synthetic*) "
+        "or legacy player snapshot (player_id + gaming_day|anchor_gaming_day); "
+        f"schema(lowercase-sample)=[{tip}{ellipsis}] — file={slow_pack_path}"
+    )
+
+
+def _static_parquet_minimum_contracts(
+    *,
+    strict: bool,
+    slow_pack_path: Path | None,
+    map_dest_path: Path,
+    allow_pack_path: Path | None,
+) -> None:
+    """Structural gates independent of frozen registry (keys + slow anchor)."""
+
+    _ensure_parquet_columns(map_dest_path, role="canonical_mapping", required=("player_id", "canonical_id"))
+    if allow_pack_path is not None and allow_pack_path.is_file():
+        _ensure_parquet_columns(allow_pack_path, role="adt_allowlist", required=("player_id",))
+    if slow_pack_path is None or not slow_pack_path.is_file():
+        if strict:
+            raise FileNotFoundError("[pack-schema] slow patron parquet unresolved for static gate")
+        return
+    _static_slow_minimum_contract_pack(slow_pack_path)
+
+
+def _load_and_verify_frozen_registry(
+    *,
+    models_dir: Path,
+    metrics: dict[str, Any],
+    strict: bool,
+) -> CandidateRegistrySnapshot | None:
+    """Parse frozen YAML next to ``model.pkl`` when present; optionally verify SHA-256."""
+
+    snap_p = Path(models_dir) / FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME
+    if not snap_p.is_file():
+        if strict:
+            raise FileNotFoundError(
+                f"[pack-schema] missing {FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME} under models dir {models_dir}; "
+                "retrain or copy snapshot from Step 5 bundle. Use --no-strict to bypass dynamic gate temporarily."
+            )
+        logger.warning(
+            "[pack-schema] skipping dynamic feature gate (%s absent); rebuild with recent trainer.",
+            FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME,
+        )
+        return None
+    act = sha256_file(snap_p)
+    expected = metrics.get("feature_candidate_registry_sha256") if metrics else None
+    if expected and isinstance(expected, str) and expected.strip():
+        e = expected.strip().lower()
+        if e != act.strip().lower():
+            raise ValueError(
+                f"[pack-schema] feature registry SHA mismatch: training_metrics expects {e[:16]}… "
+                f"but models/{FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME} hashes to {act[:16]}…"
+            )
+    return load_candidate_registry(snap_p)
+
+
+def _dynamic_registry_parquet_gate(
+    snap: CandidateRegistrySnapshot,
+    *,
+    model_feats: tuple[str, ...],
+    slow_pack_path: Path | None,
+    trial_pack_path: Path | None,
+) -> None:
+    """Ensure Parquet-backed features align with frozen registry rows × model.pkl columns."""
+
+    by_id = {r.feature_id: r for r in snap.rows}
+    skip_sources = frozenset({"baseline_model"})
+    for feat in model_feats:
+        row = by_id.get(feat)
+        if row is None:
+            raise ValueError(
+                f"[pack-schema] model.pkl lists feature_columns={feat!r} "
+                "not present in frozen feature_candidate_registry snapshot"
+            )
+        src = row.source
+        if src in skip_sources:
+            continue
+        if src == "fe_derived":
+            continue
+        if src == "feast_slow_180d":
+            if slow_pack_path is None or not slow_pack_path.is_file():
+                raise FileNotFoundError(f"[pack-schema] model expects {feat!r} (feast_slow_180d) but slow parquet missing")
+            _ensure_parquet_columns(slow_pack_path, role="slow_patron", required=(feat,))
+        elif src == "feast_trial_1h":
+            if trial_pack_path is not None and trial_pack_path.is_file():
+                _ensure_parquet_columns(trial_pack_path, role="trial_bet_behavior_1h", required=(feat,))
+            else:
+                logger.info(
+                    "[pack-schema] feast_trial_1h feature %s: no trial parquet in bundle (trial features recomputed serving-side)",
+                    feat,
+                )
+        else:
+            logger.warning("[pack-schema] unknown registry source=%r for %s; skipping Parquet gate", src, feat)
+
+
 def _stable_fingerprint_payload(
     *,
     model_version: str,
@@ -285,6 +485,7 @@ def _write_bundle_info(
     canonical_mapping_sha: str | None,
     frozen_fingerprint_sha256: str,
     build_time_iso: str,
+    feature_candidate_registry_sha256: str | None = None,
 ) -> None:
     payload = {
         "model_version": model_version,
@@ -296,6 +497,8 @@ def _write_bundle_info(
         "build_time": build_time_iso,
         "high_adt_only_default": True,
     }
+    if feature_candidate_registry_sha256 is not None:
+        payload["feature_candidate_registry_sha256"] = feature_candidate_registry_sha256
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -543,7 +746,12 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
     allow_pack_path: Path | None = None
     slow_pack_path: Path | None = None
     new_man = dict(man)
-    for key in ("slow_patron_parquet", "trial_bet_behavior_parquet", "adt_allowlist_parquet"):
+    for key in (
+        "slow_patron_parquet",
+        "trial_bet_behavior_parquet",
+        "adt_allowlist_parquet",
+        MANIFEST_KEY_FE_DERIVED,
+    ):
         rel, _src = _maybe_copy_layer(
             key,
             man.get(key),
@@ -584,6 +792,44 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
     map_dest_path = map_dir / map_name
     shutil.copy2(map_src, map_dest_path)
 
+    trial_pack_path: Path | None = None
+    tr_rel = new_man.get("trial_bet_behavior_parquet")
+    if isinstance(tr_rel, str) and tr_rel:
+        tp = (snap_dir / tr_rel).resolve()
+        if tp.is_file():
+            trial_pack_path = tp
+
+    fe_pack_path: Path | None = None
+    fe_rel = new_man.get(MANIFEST_KEY_FE_DERIVED)
+    if isinstance(fe_rel, str) and fe_rel:
+        fp = (snap_dir / fe_rel).resolve()
+        if fp.is_file():
+            fe_pack_path = fp
+
+    model_cols = _model_feature_columns_from_pickle(models_dir)
+    _static_parquet_minimum_contracts(
+        strict=strict,
+        slow_pack_path=slow_pack_path,
+        map_dest_path=map_dest_path,
+        allow_pack_path=allow_pack_path,
+    )
+    frozen_snap = _load_and_verify_frozen_registry(models_dir=models_dir, metrics=metrics, strict=strict)
+    if frozen_snap is not None:
+        _dynamic_registry_parquet_gate(
+            frozen_snap,
+            model_feats=model_cols,
+            slow_pack_path=slow_pack_path,
+            trial_pack_path=trial_pack_path,
+        )
+        assert_feature_supplyability_or_raise(
+            frozen_snap,
+            model_cols,
+            slow_pack_path=slow_pack_path,
+            trial_pack_path=trial_pack_path,
+            fe_pack_path=fe_pack_path,
+            manifest=dict(new_man) if isinstance(new_man, dict) else None,
+        )
+
     out_manifest = snap_dir / "active_manifest.json"
     out_manifest.write_text(json.dumps(new_man, indent=2), encoding="utf-8")
 
@@ -591,6 +837,9 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
     slow_sha = sha256_file(slow_pack_path) if slow_pack_path and slow_pack_path.is_file() else None
     map_sha = sha256_file(map_dest_path) if map_dest_path.is_file() else None
     _verify_allowlist_training_hash_or_raise(metrics, allow_pack_path)
+
+    reg_sha_metric = metrics.get("feature_candidate_registry_sha256") if metrics else None
+    reg_sha_s = reg_sha_metric.strip() if isinstance(reg_sha_metric, str) and reg_sha_metric.strip() else None
 
     man_version = str(new_man.get("version", "") or man.get("version", "") or "unknown")
     build_time_iso = datetime.now(timezone.utc).isoformat()
@@ -610,6 +859,7 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
         canonical_mapping_sha=map_sha,
         frozen_fingerprint_sha256=fingerprint,
         build_time_iso=build_time_iso,
+        feature_candidate_registry_sha256=reg_sha_s,
     )
     _write_deploy_paths(root / "deploy_bundle_paths.json", mapping_name=map_name)
     _write_readme(root / "README_DEPLOY.md")

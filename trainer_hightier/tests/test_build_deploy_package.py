@@ -6,6 +6,7 @@ import importlib
 import json
 import pickle
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -13,6 +14,7 @@ import pytest
 from sklearn.dummy import DummyClassifier
 
 from trainer_hightier.build_deploy_package import build_deploy_package
+from trainer_hightier.config import FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME
 from trainer_hightier.serving.adt_allowlist import sha256_file
 from trainer_hightier.serving.feature_state_store import ActiveSnapshotManifest
 
@@ -32,8 +34,538 @@ def _write_minimal_model_bundle(dest: Path) -> None:
     (dest / "model_version").write_text("test-ver\n", encoding="utf-8")
 
 
+# Minimal frozen registry aligning with DummyClassifier pickle feature_columns=["a","b","c"]:
+# baseline_model → a,b; feast_slow_180d → b (model col b); baseline_model → c
+_REGISTRY_SNAPSHOT_BODY_ABC = """
+registry_version: "pack-test-registry-v1"
+updated_at: "2026-01-01"
+features:
+  - feature_id: "a"
+    group_id: "group_pack_test"
+    source: "baseline_model"
+    status: "active"
+    enabled_for: ["baseline"]
+    time_horizon: none
+  - feature_id: "b"
+    group_id: "group_pack_test"
+    source: "feast_slow_180d"
+    status: "active"
+    enabled_for: ["baseline"]
+    time_horizon: long_term
+    max_lookback: P180D
+  - feature_id: "c"
+    group_id: "group_pack_test"
+    source: "baseline_model"
+    status: "active"
+    enabled_for: ["baseline"]
+    time_horizon: none
+"""
+
+_REGISTRY_SNAPSHOT_BODY_WITH_FE = """
+registry_version: "pack-test-registry-fe-v1"
+updated_at: "2026-01-01"
+features:
+  - feature_id: "a"
+    group_id: "group_pack_test"
+    source: "baseline_model"
+    status: "active"
+    enabled_for: ["baseline"]
+    time_horizon: none
+  - feature_id: "b"
+    group_id: "group_pack_test"
+    source: "feast_slow_180d"
+    status: "active"
+    enabled_for: ["baseline"]
+    time_horizon: long_term
+    max_lookback: P180D
+  - feature_id: "c"
+    group_id: "group_pack_test"
+    source: "fe_derived"
+    status: "active"
+    enabled_for: ["baseline"]
+    time_horizon: mid_term
+    max_lookback: P1D
+"""
+
+
+def _write_frozen_registry_abc_fixture(
+    model_bundle: Path,
+    metrics_extras: dict | None = None,
+    *,
+    with_fe_derived: bool = False,
+) -> None:
+    snap = Path(model_bundle) / FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME
+    body_yaml = _REGISTRY_SNAPSHOT_BODY_WITH_FE if with_fe_derived else _REGISTRY_SNAPSHOT_BODY_ABC
+    snap.write_text(body_yaml.strip() + "\n", encoding="utf-8")
+    body = dict(metrics_extras or {})
+    body["feature_candidate_registry_sha256"] = sha256_file(snap)
+    (model_bundle / "training_metrics.json").write_text(json.dumps(body), encoding="utf-8")
+
+
+def _write_fe_derived_fixture(path: Path, *, include_registry_feat: bool = True) -> None:
+    """Minimal bet-grain fe parquet aligned with ``_REGISTRY_SNAPSHOT_BODY_ABC`` feature ``c``."""
+
+    data: dict[str, object] = {"bet_id": [101.0, 102.0]}
+    if include_registry_feat:
+        data["c"] = [0.1, 0.2]
+    pd.DataFrame(data).to_parquet(path, index=False)
+
+
+def _manifest_abc_layers(*, slow: Path, allow: Path, fe: Path | None, version: str = "mv") -> dict:
+    man = {
+        "version": version,
+        "slow_patron_parquet": str(slow.resolve()),
+        "adt_allowlist_parquet": str(allow.resolve()),
+        "coverage_end_exclusive": datetime.now(timezone.utc).isoformat(),
+    }
+    if fe is not None:
+        man["fe_derived_parquet"] = str(fe.resolve())
+    return man
+
+
+def _write_slow_bet_fixture(path: Path, *, include_registry_slow_feat: bool = True) -> None:
+    """Feast-aligned slow parquet: one row per bet_id (trainer materializer contract)."""
+
+    pit = pd.to_datetime(
+        pd.Series(["2025-01-15 10:00:00+08:00", "2025-02-15 11:30:00+08:00"]),
+        errors="coerce",
+    ).dt.tz_convert("UTC")
+    syn = pit
+    d: dict[str, object] = {
+        "bet_id": [101.0, 102.0],
+        "prediction_visible_ts_cf": pit,
+        "__etl_insert_Dtm_synthetic": syn,
+        "patron__theo_win_sum__w180d_m1snap": [10.0, 20.0],
+        "patron__gaming_days_cnt__w180d_m1snap": [2, 3],
+        "patron__adt__w180d_m1snap": [10.0, 20.0],
+    }
+    if include_registry_slow_feat:
+        d["b"] = [0.1, 0.2]
+    pd.DataFrame(d).to_parquet(path, index=False)
+
+
+def _write_slow_player_fixture(
+    path: Path,
+    *,
+    anchor_kind: str = "gaming_day",
+    include_registry_slow_feat: bool = True,
+) -> None:
+    """Legacy player-grain snapshot for scorer ASOF path (tests / older parquet)."""
+
+    data: dict[str, list[float | int]] = {"player_id": [1, 2]}
+    if anchor_kind == "gaming_day":
+        data["gaming_day"] = [20250101, 20250201]
+    elif anchor_kind == "anchor_gaming_day":
+        data["anchor_gaming_day"] = [20250101, 20250201]
+    else:
+        raise ValueError(f"unknown anchor_kind: {anchor_kind!r}")
+    if include_registry_slow_feat:
+        data["b"] = [0.1, 0.2]
+    pd.DataFrame(data).to_parquet(path, index=False)
+
+
 def _write_parquet(path: Path) -> None:
-    pd.DataFrame({"player_id": [1, 2]}).to_parquet(path, index=False)
+    """Generic layer/mapping parquet with structural keys used by packaging gates."""
+
+    pd.DataFrame({"player_id": [1, 2], "canonical_id": [901, 902]}).to_parquet(path, index=False)
+
+
+def test_schema_registry_sha256_mismatch_fails(tmp_path: Path) -> None:
+    """training_metrics.registry sha must match frozen snapshot bytes."""
+
+    model_src = tmp_path / "model_in"
+    snap_src = tmp_path / "snap_in"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_slow_bet_fixture(slow)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    snap_path = Path(model_src) / FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME
+    snap_path.write_text(_REGISTRY_SNAPSHOT_BODY_ABC.strip() + "\n", encoding="utf-8")
+    (model_src / "training_metrics.json").write_text(
+        json.dumps({"feature_candidate_registry_sha256": "0" * 64}),
+        encoding="utf-8",
+    )
+    man = {"version": "mv", "slow_patron_parquet": str(slow.resolve()), "adt_allowlist_parquet": str(allow.resolve())}
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-hash.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "bad-reg-hash"
+    with pytest.raises(ValueError, match=r"feature registry SHA mismatch"):
+        build_deploy_package(
+            ["--model-source", str(model_src), "--snapshot-manifest-source", str(snap_src),
+             "--mapping-source", str(mapping), "--output-dir", str(out)]
+        )
+
+
+def test_strict_missing_frozen_registry_snapshot_fails(tmp_path: Path) -> None:
+    model_src = tmp_path / "model_in"
+    snap_src = tmp_path / "snap_in"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_slow_bet_fixture(slow)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    (model_src / "training_metrics.json").write_text("{}", encoding="utf-8")
+    man = {"version": "mv", "slow_patron_parquet": str(slow.resolve()), "adt_allowlist_parquet": str(allow.resolve())}
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-noreg.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "no-reg-snapshot"
+    with pytest.raises(FileNotFoundError, match=r"feature_candidate_registry\.snapshot\.yaml"):
+        build_deploy_package(
+            ["--model-source", str(model_src), "--snapshot-manifest-source", str(snap_src),
+             "--mapping-source", str(mapping), "--output-dir", str(out)]
+        )
+
+
+def test_no_strict_skips_gate_without_snapshot(tmp_path: Path) -> None:
+    model_src = tmp_path / "model_in_ns"
+    snap_src = tmp_path / "snap_in_ns"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_slow_bet_fixture(slow)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    (model_src / "training_metrics.json").write_text("{}", encoding="utf-8")
+    man = {"version": "mv", "slow_patron_parquet": str(slow.resolve()), "adt_allowlist_parquet": str(allow.resolve())}
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-ns.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "bundle-no-strict-no-snap"
+    build_deploy_package(
+        [
+            "--model-source",
+            str(model_src),
+            "--snapshot-manifest-source",
+            str(snap_src),
+            "--mapping-source",
+            str(mapping),
+            "--output-dir",
+            str(out),
+            "--no-strict",
+        ]
+    )
+    assert (out / "models" / "model.pkl").is_file()
+
+
+def test_static_slow_missing_anchor_fails(tmp_path: Path) -> None:
+    model_src = tmp_path / "model_in_sa"
+    snap_src = tmp_path / "snap_in_sa"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    pd.DataFrame({"player_id": [1, 2], "b": [0.0, 0.0]}).to_parquet(slow, index=False)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    _write_frozen_registry_abc_fixture(model_src)
+    man = {"version": "mv", "slow_patron_parquet": str(slow.resolve()), "adt_allowlist_parquet": str(allow.resolve())}
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-slow-anchor.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "slow-no-anchor"
+    with pytest.raises(ValueError, match=r"unsupported structure"):
+        build_deploy_package(
+            ["--model-source", str(model_src), "--snapshot-manifest-source", str(snap_src),
+             "--mapping-source", str(mapping), "--output-dir", str(out)]
+        )
+
+
+def test_dynamic_slow_missing_model_column_fails(tmp_path: Path) -> None:
+    model_src = tmp_path / "model_in_dyn"
+    snap_src = tmp_path / "snap_in_dyn"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_slow_bet_fixture(slow, include_registry_slow_feat=False)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    _write_frozen_registry_abc_fixture(model_src)
+    man = {"version": "mv", "slow_patron_parquet": str(slow.resolve()), "adt_allowlist_parquet": str(allow.resolve())}
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-dyn.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "dyn-missing-b"
+    with pytest.raises(ValueError, match=r"\bb\b"):
+        build_deploy_package(
+            ["--model-source", str(model_src), "--snapshot-manifest-source", str(snap_src),
+             "--mapping-source", str(mapping), "--output-dir", str(out)]
+        )
+
+
+def test_static_slow_feast_missing_etl_synthetic_raises(tmp_path: Path) -> None:
+    """Bet-grain slow must expose synthetic ETL timestamp column aligned with Feast materialization."""
+
+    model_src = tmp_path / "model_in_etl"
+    snap_src = tmp_path / "snap_in_etl"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    pit = pd.to_datetime(pd.Series(["2025-01-01T00:00:00Z"]), utc=True)
+    pd.DataFrame(
+        {
+            "bet_id": [1.0],
+            "prediction_visible_ts_cf": pit,
+            "patron__adt__w180d_m1snap": [0.42],
+        },
+    ).to_parquet(slow, index=False)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    _write_frozen_registry_abc_fixture(model_src)
+    man = {"version": "mv", "slow_patron_parquet": str(slow.resolve()), "adt_allowlist_parquet": str(allow.resolve())}
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-etl.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "slow-no-etl"
+    with pytest.raises(ValueError, match=r"Feast created-timestamp"):
+        build_deploy_package(
+            ["--model-source", str(model_src), "--snapshot-manifest-source", str(snap_src),
+             "--mapping-source", str(mapping), "--output-dir", str(out)]
+        )
+
+
+def test_build_bundle_accepts_anchor_gaming_day_slow(tmp_path: Path) -> None:
+    """Static gate accepts anchor_gaming_day as slow ASOF anchor."""
+
+    model_src = tmp_path / "model_in_agd"
+    snap_src = tmp_path / "snap_in_agd"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_slow_player_fixture(slow, anchor_kind="anchor_gaming_day")
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    _write_frozen_registry_abc_fixture(model_src)
+    man = {"version": "mv", "slow_patron_parquet": str(slow.resolve()), "adt_allowlist_parquet": str(allow.resolve())}
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-agd.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "ok-anchor-gaming-day"
+    build_deploy_package(
+        ["--model-source", str(model_src), "--snapshot-manifest-source", str(snap_src),
+         "--mapping-source", str(mapping), "--output-dir", str(out)]
+    )
+    assert (out / "bundle_info.json").is_file()
+
+
+def test_static_canonical_mapping_missing_canonical_id_fails(tmp_path: Path) -> None:
+    model_src = tmp_path / "model_in_map"
+    snap_src = tmp_path / "snap_in_map"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_slow_bet_fixture(slow)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    _write_frozen_registry_abc_fixture(model_src)
+    man = {"version": "mv", "slow_patron_parquet": str(slow.resolve()), "adt_allowlist_parquet": str(allow.resolve())}
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-bad-structure.parquet"
+    pd.DataFrame({"player_id": [1, 2]}).to_parquet(mapping, index=False)
+    out = tmp_path / "bad-map"
+    with pytest.raises(ValueError, match=r"canonical_mapping.*canonical_id"):
+        build_deploy_package(
+            [
+                "--model-source",
+                str(model_src),
+                "--snapshot-manifest-source",
+                str(snap_src),
+                "--mapping-source",
+                str(mapping),
+                "--output-dir",
+                str(out),
+            ]
+        )
+
+
+def test_static_allowlist_missing_player_id_fails(tmp_path: Path) -> None:
+    model_src = tmp_path / "model_in_al"
+    snap_src = tmp_path / "snap_in_al"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_slow_bet_fixture(slow)
+    pd.DataFrame({"canonical_id": [1, 2]}).to_parquet(allow, index=False)
+    _write_minimal_model_bundle(model_src)
+    _write_frozen_registry_abc_fixture(model_src)
+    man = {"version": "mv", "slow_patron_parquet": str(slow.resolve()), "adt_allowlist_parquet": str(allow.resolve())}
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-al.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "bad-allowlist"
+    with pytest.raises(ValueError, match=r"adt_allowlist.*player_id"):
+        build_deploy_package(
+            [
+                "--model-source",
+                str(model_src),
+                "--snapshot-manifest-source",
+                str(snap_src),
+                "--mapping-source",
+                str(mapping),
+                "--output-dir",
+                str(out),
+            ]
+        )
+
+
+def test_feature_supplyability_missing_fe_derived_fails(tmp_path: Path) -> None:
+    """Models with fe_derived columns must bundle fe_derived_parquet (strict)."""
+
+    model_src = tmp_path / "model_fe_miss"
+    snap_src = tmp_path / "snap_fe_miss"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_slow_bet_fixture(slow)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    _write_frozen_registry_abc_fixture(model_src, with_fe_derived=True)
+    man = _manifest_abc_layers(slow=slow, allow=allow, fe=None)
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-fe-miss.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "fe-supply-miss"
+    with pytest.raises(ValueError, match=r"feature-supply.*fe_derived"):
+        build_deploy_package(
+            [
+                "--model-source",
+                str(model_src),
+                "--snapshot-manifest-source",
+                str(snap_src),
+                "--mapping-source",
+                str(mapping),
+                "--output-dir",
+                str(out),
+            ]
+        )
+
+
+def test_feature_supplyability_bundled_fe_parquet_succeeds(tmp_path: Path) -> None:
+    model_src = tmp_path / "model_fe_ok"
+    snap_src = tmp_path / "snap_fe_ok"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    fe = art / "fe_derived.parquet"
+    _write_slow_bet_fixture(slow)
+    _write_parquet(allow)
+    _write_fe_derived_fixture(fe)
+    _write_minimal_model_bundle(model_src)
+    _write_frozen_registry_abc_fixture(model_src, with_fe_derived=True)
+    man = _manifest_abc_layers(slow=slow, allow=allow, fe=fe)
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-fe-ok.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "fe-supply-ok"
+    build_deploy_package(
+        [
+            "--model-source",
+            str(model_src),
+            "--snapshot-manifest-source",
+            str(snap_src),
+            "--mapping-source",
+            str(mapping),
+            "--output-dir",
+            str(out),
+        ]
+    )
+    man_out = json.loads((out / "snapshots" / "active_manifest.json").read_text(encoding="utf-8"))
+    assert "fe_derived_parquet" in man_out
+    fe_rel = man_out["fe_derived_parquet"]
+    assert (out / "snapshots" / fe_rel).is_file()
+
+
+def test_trial_parquet_dynamic_gate_when_present(tmp_path: Path) -> None:
+    """feast_trial_1h feature must exist in bundled trial parquet when layer is packaged."""
+
+    model_src = tmp_path / "model_trial_gate"
+    snap_src = tmp_path / "snap_trial"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    trial = art / "trial.parquet"
+    _write_slow_bet_fixture(slow)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    clf = DummyClassifier(strategy="constant", constant=0)
+    clf.fit([[0, 0, 0, 0]] * 5, [0] * 5)
+    payload = {
+        "model": clf,
+        "feature_columns": ["a", "b", "c", "trial_feat"],
+        "threshold": 0.5,
+        "categorical_columns": [],
+        "category_categories": {},
+    }
+    (model_src / "model.pkl").write_bytes(pickle.dumps(payload))
+
+    yaml_body = """
+registry_version: "trial-gate-test"
+updated_at: "2026-01-01"
+features:
+  - feature_id: "a"
+    group_id: "g"
+    source: "baseline_model"
+    status: "active"
+    enabled_for: ["baseline"]
+    time_horizon: none
+  - feature_id: "b"
+    group_id: "g"
+    source: "feast_slow_180d"
+    status: "active"
+    enabled_for: ["baseline"]
+    time_horizon: long_term
+    max_lookback: P180D
+  - feature_id: "c"
+    group_id: "g"
+    source: "baseline_model"
+    status: "active"
+    enabled_for: ["baseline"]
+    time_horizon: none
+  - feature_id: "trial_feat"
+    group_id: "g"
+    source: "feast_trial_1h"
+    status: "active"
+    enabled_for: ["baseline"]
+    time_horizon: short_term
+    max_lookback: PT1H
+"""
+    snap_p = Path(model_src) / FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME
+    snap_p.write_text(yaml_body.strip() + "\n", encoding="utf-8")
+    metrics = {"feature_candidate_registry_sha256": sha256_file(snap_p)}
+    (model_src / "training_metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+
+    pd.DataFrame({"player_id": [1], "trial_feat": [0.42]}).to_parquet(trial, index=False)
+    man = {
+        "version": "mv",
+        "slow_patron_parquet": str(slow.resolve()),
+        "adt_allowlist_parquet": str(allow.resolve()),
+        "trial_bet_behavior_parquet": str(trial.resolve()),
+    }
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-trial.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "bundle-trial-ok"
+    build_deploy_package(
+        ["--model-source", str(model_src), "--snapshot-manifest-source", str(snap_src),
+         "--mapping-source", str(mapping), "--output-dir", str(out)]
+    )
+    bio = json.loads((out / "bundle_info.json").read_text(encoding="utf-8"))
+    assert bio.get("feature_candidate_registry_sha256") and len(bio["feature_candidate_registry_sha256"]) == 64
 
 
 def test_build_bundle_rewrites_manifest_relative_paths(tmp_path: Path) -> None:
@@ -43,10 +575,10 @@ def test_build_bundle_rewrites_manifest_relative_paths(tmp_path: Path) -> None:
     art.mkdir(parents=True)
     slow = art / "slow.parquet"
     allow = art / "allow.parquet"
-    _write_parquet(slow)
+    _write_slow_bet_fixture(slow)
     _write_parquet(allow)
     _write_minimal_model_bundle(model_src)
-    (model_src / "training_metrics.json").write_text("{}", encoding="utf-8")
+    _write_frozen_registry_abc_fixture(model_src)
     man = {
         "version": "m1",
         "slow_patron_parquet": str(slow.resolve()),
@@ -93,10 +625,10 @@ def test_build_bundle_archive_zip(tmp_path: Path) -> None:
     art.mkdir(parents=True)
     slow = art / "slow.parquet"
     allow = art / "allow.parquet"
-    _write_parquet(slow)
+    _write_slow_bet_fixture(slow)
     _write_parquet(allow)
     _write_minimal_model_bundle(model_src)
-    (model_src / "training_metrics.json").write_text("{}", encoding="utf-8")
+    _write_frozen_registry_abc_fixture(model_src)
     man = {
         "version": "mv",
         "slow_patron_parquet": str(slow),
@@ -139,12 +671,11 @@ def test_allowlist_hash_mismatch_fails(tmp_path: Path) -> None:
     art.mkdir(parents=True)
     slow = art / "slow.parquet"
     allow = art / "allow.parquet"
-    _write_parquet(slow)
+    _write_slow_bet_fixture(slow)
     _write_parquet(allow)
     _write_minimal_model_bundle(model_src)
     bad_sha = "a" * 64
-    metrics = {"adt_allowlist_sha256": bad_sha}
-    (model_src / "training_metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+    _write_frozen_registry_abc_fixture(model_src, metrics_extras={"adt_allowlist_sha256": bad_sha})
     man = {
         "version": "mv",
         "slow_patron_parquet": str(slow),
@@ -176,14 +707,11 @@ def test_allowlist_hash_match_succeeds(tmp_path: Path) -> None:
     art.mkdir(parents=True)
     slow = art / "slow.parquet"
     allow = art / "allow.parquet"
-    _write_parquet(slow)
+    _write_slow_bet_fixture(slow)
     _write_parquet(allow)
     h = sha256_file(allow)
     _write_minimal_model_bundle(model_src)
-    (model_src / "training_metrics.json").write_text(
-        json.dumps({"adt_allowlist_sha256": h}),
-        encoding="utf-8",
-    )
+    _write_frozen_registry_abc_fixture(model_src, metrics_extras={"adt_allowlist_sha256": h})
     man = {
         "version": "mv",
         "slow_patron_parquet": str(slow),
@@ -216,10 +744,10 @@ def test_deploy_api_health_after_bundle_config(tmp_path: Path) -> None:
     art.mkdir(parents=True)
     slow = art / "slow.parquet"
     allow = art / "allow.parquet"
-    _write_parquet(slow)
+    _write_slow_bet_fixture(slow)
     _write_parquet(allow)
     _write_minimal_model_bundle(model_src)
-    (model_src / "training_metrics.json").write_text("{}", encoding="utf-8")
+    _write_frozen_registry_abc_fixture(model_src)
     man = {"version": "mv", "slow_patron_parquet": str(slow), "adt_allowlist_parquet": str(allow)}
     (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
     mapping = tmp_path / "map5.parquet"
@@ -267,10 +795,10 @@ def test_strict_trial_declared_but_missing_raises(tmp_path: Path) -> None:
     art.mkdir(parents=True)
     slow = art / "slow.parquet"
     allow = art / "allow.parquet"
-    _write_parquet(slow)
+    _write_slow_bet_fixture(slow)
     _write_parquet(allow)
     _write_minimal_model_bundle(model_src)
-    (model_src / "training_metrics.json").write_text("{}", encoding="utf-8")
+    _write_frozen_registry_abc_fixture(model_src)
     missing_trial = (art / "nope.parquet").resolve()
     man = {
         "version": "mv",
@@ -312,14 +840,14 @@ def test_model_version_defaults_and_fingerprint_repeatable(monkeypatch, tmp_path
     bundle_dir.mkdir(parents=True)
     _write_minimal_model_bundle(bundle_dir)
     (bundle_dir / "model_version").write_text(vid + "\n", encoding="utf-8")
-    (bundle_dir / "training_metrics.json").write_text("{}", encoding="utf-8")
+    _write_frozen_registry_abc_fixture(bundle_dir)
 
     snap_dir = tmp_path / "serving_snapshots"
     art = snap_dir / "staging"
     art.mkdir(parents=True)
     slow = art / "slow.parquet"
     allow = art / "allow.parquet"
-    _write_parquet(slow)
+    _write_slow_bet_fixture(slow)
     _write_parquet(allow)
     man = {
         "version": "mv-def",
@@ -371,12 +899,12 @@ def test_deploy_inputs_autodiscovery_model_source_only(tmp_path: Path) -> None:
     allow_name = "adt_allowed_players_q0p99.parquet"
     slow = di / slow_name
     allow_f = di / allow_name
-    _write_parquet(slow)
+    _write_slow_bet_fixture(slow)
     _write_parquet(allow_f)
     cmap = di / "canonical_player_mapping.parquet"
     _write_parquet(cmap)
     _write_minimal_model_bundle(model_src)
-    (model_src / "training_metrics.json").write_text("{}", encoding="utf-8")
+    _write_frozen_registry_abc_fixture(model_src)
     man = {
         "version": "frozen-di",
         "slow_patron_parquet": slow_name,
@@ -396,6 +924,45 @@ def test_deploy_inputs_autodiscovery_model_source_only(tmp_path: Path) -> None:
     assert copied_map.is_file()
 
 
+def test_deploy_inputs_mid_term_manifest_freshness_passes(tmp_path: Path) -> None:
+    """Self-contained deploy_inputs must carry freshness metadata for mid-term fe_derived models."""
+
+    model_src = tmp_path / "self_contained_fe_bundle"
+    di = model_src / "deploy_inputs"
+    di.mkdir(parents=True)
+    slow_name = "slow_patron_180d_monthly.parquet"
+    allow_name = "adt_allowed_players_q0p99.parquet"
+    fe_name = "fe_derived_features.parquet"
+    slow = di / slow_name
+    allow_f = di / allow_name
+    fe = di / fe_name
+    _write_slow_bet_fixture(slow)
+    _write_parquet(allow_f)
+    _write_fe_derived_fixture(fe)
+    cmap = di / "canonical_player_mapping.parquet"
+    _write_parquet(cmap)
+    _write_minimal_model_bundle(model_src)
+    _write_frozen_registry_abc_fixture(model_src, with_fe_derived=True)
+    man = {
+        "version": "frozen-di-fe",
+        "slow_patron_parquet": slow_name,
+        "fe_derived_parquet": fe_name,
+        "adt_allowlist_parquet": allow_name,
+        "adt_allowlist_version": "x",
+        "coverage_end_exclusive": datetime.now(timezone.utc).isoformat(),
+        "training_cutoff_iso": "2026-05-19T00:00:00+00:00",
+        "model_version": "frozen-di-fe",
+    }
+    (di / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+
+    out = tmp_path / "from_deploy_inputs_fe"
+    build_deploy_package(["--model-source", str(model_src), "--output-dir", str(out)])
+    payload = json.loads((out / "snapshots" / "active_manifest.json").read_text(encoding="utf-8"))
+    assert payload["coverage_end_exclusive"] == man["coverage_end_exclusive"]
+    assert payload["fe_derived_parquet"]
+    assert (out / "snapshots" / payload["fe_derived_parquet"]).is_file()
+
+
 def test_deploy_inputs_fallback_when_absent(monkeypatch, tmp_path: Path) -> None:
     """No ``deploy_inputs/`` → defaults to patched serving snapshot dir + canonical mapping."""
 
@@ -403,14 +970,14 @@ def test_deploy_inputs_fallback_when_absent(monkeypatch, tmp_path: Path) -> None
 
     model_src = tmp_path / "no_di_bundle"
     _write_minimal_model_bundle(model_src)
-    (model_src / "training_metrics.json").write_text("{}", encoding="utf-8")
+    _write_frozen_registry_abc_fixture(model_src)
 
     snap_dir = tmp_path / "legacy_serv_snap"
     art = snap_dir / "staging"
     art.mkdir(parents=True)
     slow = art / "slow.parquet"
     allow = art / "allow.parquet"
-    _write_parquet(slow)
+    _write_slow_bet_fixture(slow)
     _write_parquet(allow)
     man = {
         "version": "legacy",
@@ -450,10 +1017,10 @@ def test_archive_zip_file_list_matches_folder(tmp_path: Path) -> None:
     art.mkdir(parents=True)
     slow = art / "slow.parquet"
     allow = art / "allow.parquet"
-    _write_parquet(slow)
+    _write_slow_bet_fixture(slow)
     _write_parquet(allow)
     _write_minimal_model_bundle(model_src)
-    (model_src / "training_metrics.json").write_text("{}", encoding="utf-8")
+    _write_frozen_registry_abc_fixture(model_src)
     man = {
         "version": "mv",
         "slow_patron_parquet": str(slow),
@@ -484,6 +1051,17 @@ def test_archive_zip_file_list_matches_folder(tmp_path: Path) -> None:
     assert folder_files == zip_files
 
 
+def test_feature_supply_uses_serving_registry_loader() -> None:
+    """Deploy preflight path must not import ``trainer_hightier.feature_experiment``."""
+
+    import importlib
+
+    import trainer_hightier.serving.feature_supply as fs
+
+    importlib.reload(fs)
+    assert fs.load_candidate_registry.__module__ == "trainer_hightier.serving.candidate_registry_loader"
+
+
 def test_phase_b_wheel_excludes_junk_and_includes_serving(tmp_path: Path) -> None:
     """Phase B: wheel must not ship ``build/lib`` pollution or training-only subtrees."""
     model_src = tmp_path / "model_in_pb"
@@ -492,10 +1070,10 @@ def test_phase_b_wheel_excludes_junk_and_includes_serving(tmp_path: Path) -> Non
     art.mkdir(parents=True)
     slow = art / "slow.parquet"
     allow = art / "allow.parquet"
-    _write_parquet(slow)
+    _write_slow_bet_fixture(slow)
     _write_parquet(allow)
     _write_minimal_model_bundle(model_src)
-    (model_src / "training_metrics.json").write_text("{}", encoding="utf-8")
+    _write_frozen_registry_abc_fixture(model_src)
     man = {
         "version": "mv",
         "slow_patron_parquet": str(slow),
@@ -527,6 +1105,8 @@ def test_phase_b_wheel_excludes_junk_and_includes_serving(tmp_path: Path) -> Non
     assert not any(n.startswith("trainer_hightier/feast_repo/") for n in names)
     assert any(n.endswith("trainer_hightier/utils/__init__.py") for n in names)
     assert any(n.endswith("trainer_hightier/serving/scorer.py") for n in names)
+    assert any(n.endswith("trainer_hightier/serving/candidate_registry_loader.py") for n in names)
+    assert any(n.endswith("trainer_hightier/serving/feature_supply.py") for n in names)
     assert any(n.endswith("trainer_hightier/deploy/main.py") for n in names)
     assert any(n.endswith("trainer_hightier/config.py") for n in names)
     assert any(n.endswith("trainer_hightier/contracts/feature_candidate_registry.yaml") for n in names)
@@ -544,10 +1124,10 @@ def test_no_repo_smoke_venv_pip_install_imports(tmp_path: Path) -> None:
     art.mkdir(parents=True)
     slow = art / "slow.parquet"
     allow = art / "allow.parquet"
-    _write_parquet(slow)
+    _write_slow_bet_fixture(slow)
     _write_parquet(allow)
     _write_minimal_model_bundle(model_src)
-    (model_src / "training_metrics.json").write_text("{}", encoding="utf-8")
+    _write_frozen_registry_abc_fixture(model_src)
     man = {
         "version": "mv",
         "slow_patron_parquet": str(slow),

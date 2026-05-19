@@ -135,6 +135,48 @@ def _preflight_frozen_artifacts(bundle_root: Path, rel: dict[str, Any]) -> None:
             )
 
 
+def _preflight_feature_supplyability(bundle_root: Path, rel: dict[str, Any]) -> None:
+    """Verify model feature columns have runtime suppliers (registry + bundled parquet)."""
+
+    from trainer_hightier.serving.feature_supply import (
+        assert_feature_supplyability_or_raise,
+        load_frozen_registry_for_bundle,
+        model_feature_columns_from_pickle,
+    )
+
+    model_bundle = bundle_root / str(rel.get("model_bundle_dir", "models"))
+    snap_p = model_bundle / "feature_candidate_registry.snapshot.yaml"
+    if not snap_p.is_file():
+        logging.warning(
+            "[deploy] skip feature-supply preflight (%s missing); rebuild bundle with frozen registry",
+            snap_p.name,
+        )
+        return
+    snap = load_frozen_registry_for_bundle(model_bundle)
+    model_feats = model_feature_columns_from_pickle(model_bundle)
+    snap_root = bundle_root / str(rel.get("snapshot_manifest_dir", "snapshots"))
+    man_path = snap_root / "active_manifest.json"
+    man = json.loads(man_path.read_text(encoding="utf-8"))
+    if not isinstance(man, dict):
+        raise ValueError("active_manifest.json root must be a JSON object")
+
+    def _layer_path(key: str) -> Path | None:
+        rel_p = man.get(key)
+        if not rel_p:
+            return None
+        fp = (snap_root / str(rel_p)).resolve()
+        return fp if fp.is_file() else None
+
+    assert_feature_supplyability_or_raise(
+        snap,
+        model_feats,
+        slow_pack_path=_layer_path("slow_patron_parquet"),
+        trial_pack_path=_layer_path("trial_bet_behavior_parquet"),
+        fe_pack_path=_layer_path("fe_derived_parquet"),
+        manifest=man if isinstance(man, dict) else None,
+    )
+
+
 def _emit_deploy_boot_info(bundle_root: Path, cfg: HightierServingConfig, rel: dict[str, Any]) -> None:
     bi: dict[str, Any] = {}
     p = bundle_root / "bundle_info.json"
@@ -199,6 +241,7 @@ def main(argv: list[str] | None = None) -> int:
     import trainer_hightier.serving.runtime_config  # noqa: F401  # establish paths
 
     _preflight_frozen_artifacts(br, rel)
+    _preflight_feature_supplyability(br, rel)
     _emit_deploy_boot_info(br, cfg, rel)
 
     model_bundle = br / rel.get("model_bundle_dir", "models")

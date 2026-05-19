@@ -55,6 +55,9 @@
   - `feature_id`
   - `group_id`
   - `source`（例如 `baseline_model`, `fe_derived`, `feast_trial_1h`, `feast_slow_180d`）
+  - `time_horizon`（窗特徵必填）：`none` | `short_term` | `mid_term` | `long_term`
+  - `max_lookback`（窗特徵必填）：**ISO-8601 duration**（如 `PT1H`、`P1D`、`P30D`；複合欄填最長依賴）
+  - `runtime_supplier_hint`（可選）：`raw` | `online` | `micro_batch_parquet` | `snapshot_parquet`
   - `status`
   - `enabled_for`
   - `drop_reason_code`
@@ -62,7 +65,59 @@
   - `last_updated_experiment`
   - `note`
 
-> 設計原則：先維持扁平與可讀，避免 v0 就導入過度巢狀與多層繼承。
+> 設計原則：先維持扁平與可讀，避免 v0 就導入過度巢狀與多層繼承。`time_horizon` / `max_lookback` 與 Packaging plan 的 term 定義一致；loader 須驗證格式與 term/lookback 一致性（見 §2.2.1）。
+
+### 2.2.1 時間視野（Time-Horizon / Term）— 治理定義
+
+與 [`Packaging - IMPLEMENTATION_PLAN.md`](Packaging%20-%20IMPLEMENTATION_PLAN.md) 對齊。**Term** 描述特徵語義上需要多長歷史；**不等於** `source`，也**不等於** production supplier（online / parquet）。
+
+| Term | `max_lookback` 邊界（ISO-8601） | 說明 |
+|------|-------------------------------|------|
+| `short_term` | `< PT24H` | 例：`bet__*__w1h`（`feast_trial_1h`，`PT1H`）；未來 `w6h`/`w12h` 仍屬此類 |
+| `mid_term` | `PT24H` … `P30D`（含端點） | 例：多數 `fe__*`（`fe_derived`）；**不是** `feast_slow_180d` |
+| `long_term` | `> P30D` | 例：`patron__*__w180d_m1snap`（`feast_slow_180d`，`P180D`） |
+
+**分類規則（必填治理）**
+
+1. 以該欄位（含 ratio/zscore/多窗複合）的**最大需求 lookback** 定 `time_horizon`，不看欄位名前綴或 `source`。
+2. 邊界（與 Packaging plan 一致）：
+   - `max_lookback < PT24H` → `short_term`
+   - `PT24H <= max_lookback <= P30D` → `mid_term`
+   - `max_lookback > P30D` → `long_term`
+3. `baseline_model` 原始欄：`time_horizon=none`，`max_lookback` 可省略或留空；窗特徵兩欄**必填**。
+4. `max_lookback` 一律使用 **ISO-8601 duration**（`PT15M`、`PT1H`、`PT6H`、`P1D`、`P7D`、`P30D`、`P180D` 等），禁止混用 `1h`/`1d` 等非標準寫法。
+5. 複合特徵範例：`fe__wager_sum__w15m_over_w1d` → `max_lookback=P1D` → `time_horizon=mid_term`（因依賴 1 日窗，非 15 分鐘）。
+6. 新增/變更欄位時，在 PR 註明 lookback 推導；loader 應在載入時驗證 `time_horizon` 與 `max_lookback` 一致。
+
+**與 `source` 的常見對照（勿混淆）**
+
+| `source` | 典型 `time_horizon` | 典型 `max_lookback`（示例） | 備註 |
+|----------|---------------------|---------------------------|------|
+| `feast_trial_1h` | `short_term` | `PT1H` | production：**online-only primary** |
+| `fe_derived` | `mid_term`（逐欄標，勿整包） | `PT15M`…`P30D` 依欄 | 非 slow；1d–30d 族 |
+| `feast_slow_180d` | `long_term` | `P180D` | 月快照 |
+
+**`runtime_supplier_hint`（可選）**
+
+| 值 | 含義 |
+|----|------|
+| `online` | scorer 每輪即時計算（`feast_trial_1h` **唯一** production 主路徑） |
+| `micro_batch_parquet` | 週期物化 parquet，scorer merge |
+| `snapshot_parquet` | 訓練凍結或低頻快照（`fe_derived`、`slow`） |
+| `raw` | ClickHouse 原始欄（baseline） |
+
+**Term vs supplier 範例**
+
+- `fe__bets_cnt__w6h`：`time_horizon=short_term`，`max_lookback=PT6H`；production 可選 `runtime_supplier_hint=micro_batch_parquet`，term 不變。
+- `fe__wager_sum__w15m_over_w1d`：`time_horizon=mid_term`，`max_lookback=P1D`（非 `PT15M`）。
+
+**Production supplier 與 Packaging 對齊（摘要）**
+
+| `source` | `runtime_supplier_hint`（production） | 備註 |
+|----------|--------------------------------------|------|
+| `feast_trial_1h` | `online` | `trial_bet_behavior_parquet` 僅診斷/回歸，見 Packaging **D-009** |
+| `fe_derived` | `snapshot_parquet` | 須通過 mid-term **freshness 硬 gate**（`coverage_end_exclusive` SLA），見 Packaging **D-010** |
+| `feast_slow_180d` | `snapshot_parquet` | `snapshot_updater` / slow 月更語意 |
 
 ### 2.3 與既有模組整合策略
 
@@ -105,8 +160,8 @@
 
 ### Workstream A: Registry 規格與契約
 
-- 定義 YAML schema（欄位、型別、必要條件、枚舉值）
-- 建立最小驗證器（讀檔、必填欄位、重複 `feature_id` 檢查）
+- 定義 YAML schema（欄位、型別、必要條件、枚舉值），含 `time_horizon`、`max_lookback`（ISO-8601）
+- 建立驗證器：讀檔、必填欄位、重複 `feature_id`、`time_horizon`↔`max_lookback` 一致性、ISO-8601 duration 解析
 - 建立與 `feature_experiment_report.json` 對齊的 metadata 欄位
 
 ### Workstream B: Pipeline 讀取與路由
@@ -127,12 +182,23 @@
   - 停用必填 `drop_reason_code`
   - 更新需填 `last_updated_experiment`
   - `note` 建議記錄 FQG/Gate1 依據
+  - 窗特徵（非 `baseline_model`）**必填** `time_horizon` 與 `max_lookback`（ISO-8601）；重訓前須完成全表回填
+  - 禁止用 `source` 代替 `time_horizon`（例如不得將 `fe_derived` 誤標為 `long_term`）
+  - `feast_trial_1h` 列：`runtime_supplier_hint=online`（與 Packaging D-009 一致）
+  - `fe_derived` 列：`runtime_supplier_hint=snapshot_parquet`；並確保 production manifest 的 `coverage_end_exclusive` 滿足 mid-term SLA（Packaging D-010）
 - 形成每輪實驗後更新清單（可手動）
+
+## 3.1) 決策紀錄（與 Packaging 對齊）
+
+- **R-001**：窗特徵必填 `time_horizon` + ISO-8601 `max_lookback`；`baseline_model` 原始欄標 `none`。
+- **R-002**：`feast_trial_1h` production 主路徑為 **online-only**；registry 建議 `runtime_supplier_hint=online`（Packaging D-009）。
+- **R-003**：`fe_derived` 為 **mid-term**（逐欄標 term，禁止整包誤標）；Packaging 對 mid-term 執行 **freshness 硬 gate**（D-010）。
+- **R-004**：frozen registry snapshot 為建包 feature supplyability 的 source 分派依據；`runtime_supplier_hint` 不取代 gate 實際檢查。
 
 ## 4) 里程碑（Milestones）
 
 - **M1 - Schema Ready**
-  - registry YAML 草案與驗證規則完成，並可覆蓋現有 baseline + `fe__*`
+  - registry YAML 草案與驗證規則完成（含 `time_horizon` / ISO-8601 `max_lookback`），並可覆蓋現有 baseline + `fe__*`
 - **M2 - Read Path Online**
   - pipeline 已由 YAML 讀取 active features，且報表可落盤 registry metadata
 - **M3 - Backward Compatibility Verified**
@@ -143,12 +209,14 @@
 ## 5) 交付物（Deliverables）
 
 - D1: `trainer_hightier/contracts/` 下 registry YAML（v0）
-- D2: registry loader 與 schema 驗證邏輯
+- D2: registry loader 與 schema 驗證邏輯（ISO-8601 duration 解析、term↔lookback 一致性）
 - D3: `run_pipeline` 整合與報表 metadata 回寫
 - D4: 回歸測試與最小操作指引（可放在既有 RUNBOOK 章節）
 
 ## 6) 風險與緩解（Risks & Mitigations）
 
+- 風險：`time_horizon` / `max_lookback` 未填或格式不統一導致 gate 無法自動分 term  
+  - 緩解：loader 強制驗證；重訓前一次性回填 registry；CI 檢查 ISO-8601 與 term 邊界
 - 風險：YAML、Python 常數、SQL 三處定義漂移  
   - 緩解：v0 先做到「YAML 驅動 candidate 選欄」，避免多入口可寫
 - 風險：人工註記品質不一，造成審計失真  
@@ -162,6 +230,7 @@
 
 - 功能驗證
   - YAML 欄位集合與 pipeline 實際訓練欄位一致
+  - 每個窗特徵具備合法 `time_horizon` + ISO-8601 `max_lookback`，且兩者一致
   - `enabled_for` 可正確影響 baseline/candidate/ablation
 - 回歸驗證
   - 既有 `feature_experiment` 測試通過
@@ -172,6 +241,7 @@
 
 ## 8) 文件邊界
 
-- 本文件：定義「YAML 台帳如何落地到實驗管線」
+- 本文件：定義「YAML 台帳如何落地到實驗管線」；含 **term** 治理定義
 - SSOT：定義為何需要特徵治理與審計
+- [`Packaging - IMPLEMENTATION_PLAN.md`](Packaging%20-%20IMPLEMENTATION_PLAN.md)：term 在 **runtime supplier**、建包 gate、release 驗收的落地
 - Working Plan：承接 ticket 分解、順序、DoD 與排程

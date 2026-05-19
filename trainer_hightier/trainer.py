@@ -38,6 +38,7 @@ from trainer_hightier.config import (
     CanonicalMappingConfig,
     DEFAULT_MODEL_DIR,
     DEFAULT_RANDOM_SEED,
+    FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME,
     DEFAULT_RUN_PROFILE_NAME,
     DEFAULT_TRAINING_FEATURE_SERVICE,
     DuckDbRuntimeConfig,
@@ -1083,6 +1084,7 @@ def _ensure_fe_enriched_training_parquet_for_step4(
         metrics["main_trainer_fe_materialize_sec"] = mat_sec
         metrics["main_trainer_fe_enrich_sec"] = enr_sec
         metrics["main_trainer_training_parquet_for_step4"] = str(enriched.resolve())
+        metrics["main_trainer_fe_derived_parquet"] = str(fe_out.resolve())
     logger.info(
         "[Step 3.5] baseline includes fe__*: materialized %s, enriched -> %s (%.3fs + %.3fs)",
         fe_out.name,
@@ -1220,7 +1222,46 @@ def fit_model(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None)
     if metrics is not None:
         metrics.update(result.report)
         metrics["candidate_registry"] = reg_echo
+        _freeze_feature_registry_snapshot(
+            bundle_dir=Path(step5_out_dir),
+            registry_path=snap.path,
+            metrics=metrics,
+        )
     return result
+
+
+def _freeze_feature_registry_snapshot(
+    bundle_dir: Path,
+    *,
+    registry_path: Path,
+    metrics: dict[str, Any],
+) -> None:
+    """Copy training-time ``feature_candidate_registry`` YAML into bundle; record SHA-256 in metrics + JSON."""
+
+    src = Path(registry_path).resolve()
+    if not src.is_file():
+        logger.warning("[registry_frozen] skip: registry path not a file: %s", src)
+        return
+    raw = src.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    bd = Path(bundle_dir).resolve()
+    bd.mkdir(parents=True, exist_ok=True)
+    dest = bd / FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME
+    dest.write_bytes(raw)
+    metrics["feature_candidate_registry_snapshot"] = dest.name
+    metrics["feature_candidate_registry_sha256"] = digest
+    metrics["feature_candidate_registry_frozen_from"] = str(src)[:500]
+    tm_path = bd / _b5.DEFAULT_METRICS_FILENAME
+    if tm_path.is_file():
+        try:
+            body = json.loads(tm_path.read_text(encoding="utf-8"))
+            if isinstance(body, dict):
+                body["feature_candidate_registry_snapshot"] = dest.name
+                body["feature_candidate_registry_sha256"] = digest
+                body["feature_candidate_registry_frozen_from"] = str(src)[:500]
+                tm_path.write_text(json.dumps(body, indent=2, default=str), encoding="utf-8")
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            logger.warning("[registry_frozen] skip training_metrics merge: %s", exc)
 
 
 def write_artifacts(args: HighTierTrainArgs, *, step5_result: _b5.Step5Result | None = None) -> None:
@@ -1269,6 +1310,16 @@ def _persist_adt_allowlist_sha(
     return None
 
 
+def _training_cutoff_iso_from_metrics(metrics: dict[str, Any]) -> str | None:
+    """Return the first known training cutoff timestamp from metrics, if present."""
+
+    for key in ("training_cutoff_iso", "step5_training_cutoff_iso", "data_cutoff_iso"):
+        val = metrics.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
 def _freeze_deploy_inputs(
     args: HighTierTrainArgs,
     metrics: dict[str, Any],
@@ -1291,6 +1342,23 @@ def _freeze_deploy_inputs(
     _deploy_inputs_copy_maybe(di, "canonical_mapping", map_src)
     allow_dest = _deploy_inputs_copy_maybe(di, "adt_allowlist", allow_src)
     _deploy_inputs_copy_maybe(di, "slow_patron", slow_src)
+    snap_frozen = bd / FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME
+    _deploy_inputs_copy_maybe(di, "feature_candidate_registry_snapshot", snap_frozen)
+    from trainer_hightier.config import FE_DERIVED_DEPLOY_PARQUET_BASENAME
+
+    fe_src: Path | None = None
+    fe_metric = metrics.get("main_trainer_fe_derived_parquet")
+    if isinstance(fe_metric, str) and fe_metric.strip():
+        fe_src = Path(fe_metric.strip()).expanduser().resolve()
+    if fe_src is None or not fe_src.is_file():
+        alt = bd / "_main_trainer_fe_derived.parquet"
+        if alt.is_file():
+            fe_src = alt
+    fe_dest: Path | None = None
+    if fe_src is not None and fe_src.is_file():
+        fe_dest = di / FE_DERIVED_DEPLOY_PARQUET_BASENAME
+        shutil.copy2(fe_src, fe_dest)
+        logger.info("[deploy_inputs] copied fe_derived -> %s", fe_dest.name)
 
     al_sha: str | None = None
     if allow_dest is not None:
@@ -1301,9 +1369,17 @@ def _freeze_deploy_inputs(
             training_metrics_rel=_b5.DEFAULT_METRICS_FILENAME,
         )
 
-    man: dict[str, Any] = {"version": str(model_version)}
+    coverage_end = datetime.now(timezone.utc).isoformat()
+    man: dict[str, Any] = {
+        "version": str(model_version),
+        "coverage_end_exclusive": coverage_end,
+        "training_cutoff_iso": _training_cutoff_iso_from_metrics(metrics),
+        "model_version": str(model_version),
+    }
     if slow_src.is_file() and (di / slow_src.name).is_file():
         man["slow_patron_parquet"] = slow_src.name
+    if fe_dest is not None and fe_dest.is_file():
+        man["fe_derived_parquet"] = fe_dest.name
     if allow_dest is not None and allow_dest.is_file():
         man["adt_allowlist_parquet"] = allow_dest.name
         man["adt_allowlist_version"] = al_sha if al_sha else ""

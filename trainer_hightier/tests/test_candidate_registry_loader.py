@@ -1,4 +1,4 @@
-"""Tests for :mod:`trainer_hightier.feature_experiment.candidate_registry_loader`."""
+"""Tests for :mod:`trainer_hightier.serving.candidate_registry_loader` (via experiment re-export)."""
 
 from __future__ import annotations
 
@@ -126,6 +126,8 @@ def test_no_baseline_rows_rejected(tmp_path: Path) -> None:
                         "source": "fe_derived",
                         "status": "active",
                         "enabled_for": ["candidate", "ablation"],
+                        "time_horizon": "mid_term",
+                        "max_lookback": "P1D",
                     },
                 ],
             },

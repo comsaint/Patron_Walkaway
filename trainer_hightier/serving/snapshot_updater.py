@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from trainer_hightier.config import default_hightier_serving_config
+from trainer_hightier.serving.feature_supply import MANIFEST_KEY_FE_DERIVED
 from trainer_hightier.serving.adt_allowlist import parquet_player_id_row_count, sha256_file
 from trainer_hightier.serving.feature_state_store import (
     init_feature_state_db,
@@ -34,6 +35,25 @@ def _utc_run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
+def _resolve_fe_derived_source_for_publish(
+    *,
+    fe_derived_source: Optional[Path],
+    previous_path: Optional[Path],
+) -> Optional[Path]:
+    """Pick a local ``fe_derived`` parquet to copy into the staged manifest (no network I/O)."""
+
+    if fe_derived_source is not None and Path(fe_derived_source).is_file():
+        return Path(fe_derived_source).resolve()
+    if previous_path is not None and Path(previous_path).is_file():
+        return Path(previous_path).resolve()
+    repo_fe = (
+        Path(__file__).resolve().parents[1] / "artifacts" / "training_data" / "_main_trainer_fe_derived.parquet"
+    )
+    if repo_fe.is_file():
+        return repo_fe.resolve()
+    return None
+
+
 def run_snapshot_updater(
     *,
     bundle_dir: Optional[Path] = None,
@@ -41,6 +61,7 @@ def run_snapshot_updater(
     cleaned_session: Optional[Path] = None,
     cleaned_bet: Optional[Path] = None,
     canonical_mapping: Optional[Path] = None,
+    fe_derived_source: Optional[Path] = None,
 ) -> Path:
     """Build staging artifacts and atomically flip ``active_manifest.json``.
 
@@ -92,13 +113,24 @@ def run_snapshot_updater(
             if p.is_file():
                 trial_path = str(p.resolve())
 
+        prev_fe: Optional[Path] = None
+        if prev is not None:
+            prev_fe = prev.fe_derived_parquet
+        fe_src = _resolve_fe_derived_source_for_publish(fe_derived_source=fe_derived_source, previous_path=prev_fe)
+        fe_staged: Optional[Path] = None
+        if fe_src is not None:
+            fe_staged = manifest_dir / f"fe_derived_{run_id}.parquet"
+            shutil.copy2(fe_src, fe_staged)
+
+        cov_iso = datetime.now(timezone.utc).isoformat()
         payload = {
             "version": run_id,
             "slow_patron_parquet": str(staging_slow.resolve()),
             "trial_bet_behavior_parquet": trial_path,
+            MANIFEST_KEY_FE_DERIVED: str(fe_staged.resolve()) if fe_staged is not None else None,
             "adt_allowlist_parquet": str(staging_allow.resolve()),
             "adt_allowlist_version": al_sha,
-            "coverage_end_exclusive": datetime.now(timezone.utc).isoformat(),
+            "coverage_end_exclusive": cov_iso,
             "training_cutoff_iso": cutoff,
             "model_version": bundle.model_version,
         }
@@ -109,7 +141,9 @@ def run_snapshot_updater(
             sha256_hex=al_sha,
             row_count=al_rows,
         )
-        update_watermark("slow", payload["coverage_end_exclusive"])
+        update_watermark("slow", cov_iso)
+        if fe_staged is not None:
+            update_watermark("fe_derived", cov_iso)
         log_job_finish(run_id, status="ok", detail=str(staging_slow))
         return staging_slow
     except Exception as exc:
@@ -125,6 +159,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--cleaned-session", type=Path, default=None)
     p.add_argument("--cleaned-bet", type=Path, default=None)
     p.add_argument("--canonical-mapping", type=Path, default=None)
+    p.add_argument("--fe-derived-source", type=Path, default=None)
     args = p.parse_args(argv)
     run_snapshot_updater(
         bundle_dir=args.bundle_dir,
@@ -132,6 +167,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         cleaned_session=args.cleaned_session,
         cleaned_bet=args.cleaned_bet,
         canonical_mapping=args.canonical_mapping,
+        fe_derived_source=args.fe_derived_source,
     )
     return 0
 

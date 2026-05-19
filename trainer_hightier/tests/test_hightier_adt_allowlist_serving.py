@@ -40,6 +40,7 @@ def test_resolve_adt_allowlist_path_cli_over_manifest(tmp_path: Path) -> None:
     m = ActiveSnapshotManifest(
         version="v",
         slow_patron_parquet=tmp_path / "s.parquet",
+        fe_derived_parquet=None,
         trial_bet_behavior_parquet=None,
         adt_allowlist_parquet=man_p,
         adt_allowlist_version=None,
@@ -60,6 +61,7 @@ def test_resolve_adt_allowlist_path_manifest_before_cfg(tmp_path: Path) -> None:
     m = ActiveSnapshotManifest(
         version="v",
         slow_patron_parquet=tmp_path / "s.parquet",
+        fe_derived_parquet=None,
         trial_bet_behavior_parquet=None,
         adt_allowlist_parquet=man_p,
         adt_allowlist_version="abc",
