@@ -50,6 +50,12 @@ from trainer_hightier.serving.feature_builder import (
     attach_trial_bet_behavior_1h,
     coerce_categoricals,
 )
+from trainer_hightier.serving.feast_readiness import (
+    evaluate_feast_readiness_gate,
+    load_feast_online_readiness,
+    resolve_feast_readiness_path,
+    run_deploy_feast_readiness_check,
+)
 from trainer_hightier.serving.feast_online_adapter import (
     FeastLookupDiagnostics,
     FeastLookupResult,
@@ -101,6 +107,27 @@ from trainer_hightier.serving.state_db import (
 )
 
 logger = logging.getLogger(__name__)
+
+_LAST_SCORER_CYCLE_METRICS: dict[str, Any] | None = None
+
+
+def get_last_scorer_cycle_metrics() -> dict[str, Any] | None:
+    """Metrics from the most recent :func:`score_once` call (for P6-3 dry-run reports)."""
+    return _LAST_SCORER_CYCLE_METRICS
+
+
+def _record_scorer_cycle_metrics(
+    *,
+    model_version: str,
+    cycle_readiness: dict[str, Any],
+    n_alerts: int,
+) -> None:
+    global _LAST_SCORER_CYCLE_METRICS
+    _LAST_SCORER_CYCLE_METRICS = {
+        "model_version": str(model_version),
+        "cycle_readiness": dict(cycle_readiness),
+        "n_alerts": int(n_alerts),
+    }
 UTC_TZ = timezone.utc
 
 
@@ -740,7 +767,8 @@ def score_once(
         entity_missing_fail_fraction=fail_frac,
         feast_diag=feast_diag,
     )
-    logger.info("[hightier_scorer] cycle_readiness %s", cycle_summary.to_log_dict())
+    cycle_log = cycle_summary.to_log_dict()
+    logger.info("[hightier_scorer] cycle_readiness %s", cycle_log)
     scored_at_iso = datetime.now(ZoneInfo(HK_TZ)).isoformat()
     pl_path = cfg.prediction_log_db_path
     if skipped.shape[0] and pl_path is not None and str(pl_path).strip():
@@ -762,6 +790,11 @@ def score_once(
     if staged.empty:
         _commit_scoring_cursor(conn, batch.cursor, batch.bets.index)
         conn.commit()
+        _record_scorer_cycle_metrics(
+            model_version=str(bundle.model_version),
+            cycle_readiness=cycle_log,
+            n_alerts=0,
+        )
         return 0
 
     mid_cols = tuple(
@@ -811,54 +844,53 @@ def score_once(
             )
         )
     )
+    feast_readiness = (
+        load_feast_online_readiness(resolve_feast_readiness_path(cfg))
+        if (uses_feast_mid or supplier_plan.feast_slow_cols)
+        else None
+    )
     mid_anchor = (
-        None
-        if uses_feast_mid
+        feast_readiness.mid_term.anchor_gaming_day_max
+        if uses_feast_mid and feast_readiness and feast_readiness.mid_term
         else read_mid_term_anchor_max(Path(mid_path) if mid_path else None, manifest.raw if manifest else None)
     )
-    slow_anchor = read_slow_anchor_max(
-        Path(manifest.slow_patron_parquet) if manifest is not None else None,
-        manifest.raw if manifest else None,
-    ) if not supplier_plan.feast_slow_cols else None
+    slow_anchor = (
+        feast_readiness.slow_patron.anchor_gaming_day_max
+        if supplier_plan.feast_slow_cols and feast_readiness and feast_readiness.slow_patron
+        else read_slow_anchor_max(
+            Path(manifest.slow_patron_parquet) if manifest is not None else None,
+            manifest.raw if manifest else None,
+        )
+    )
     mid_fresh = (
-        LayerFreshnessResult(
+        evaluate_mid_term_freshness(
+            anchor_max=mid_anchor,
+            hard_cap_days=int(cfg.mid_term_stale_hard_cap_days),
+            close_hour=int(cfg.gaming_day_close_hour),
+        )
+        if mid_cols
+        else LayerFreshnessResult(
             layer="mid_term",
             status="fresh",
             staleness_days=0,
             anchor_max=None,
-            message="feast online supplier",
-        )
-        if uses_feast_mid
-        else (
-            evaluate_mid_term_freshness(
-                anchor_max=mid_anchor,
-                hard_cap_days=int(cfg.mid_term_stale_hard_cap_days),
-                close_hour=int(cfg.gaming_day_close_hour),
-            )
-            if mid_cols
-            else LayerFreshnessResult(
-                layer="mid_term",
-                status="fresh",
-                staleness_days=0,
-                anchor_max=None,
-                message="mid_term not required",
-            )
+            message="mid_term not required",
         )
     )
     slow_fresh = (
-        LayerFreshnessResult(
-            layer="slow_patron",
-            status="fresh",
-            staleness_days=0,
-            anchor_max=None,
-            message="feast online supplier",
-        )
-        if supplier_plan.feast_slow_cols
-        else evaluate_slow_freshness(
+        evaluate_slow_freshness(
             anchor_max=slow_anchor,
             monthly_grace_days=int(cfg.slow_monthly_grace_days),
             hard_cap_days=int(cfg.slow_stale_hard_cap_days),
             close_hour=int(cfg.gaming_day_close_hour),
+        )
+        if supplier_plan.feast_slow_cols
+        else LayerFreshnessResult(
+            layer="slow_patron",
+            status="fresh",
+            staleness_days=0,
+            anchor_max=None,
+            message="slow not required",
         )
     )
     gate = build_scoring_snapshot_gate(
@@ -939,6 +971,11 @@ def score_once(
     if n == 0:
         _commit_scoring_cursor(conn, batch.cursor, scored_indices)
         conn.commit()
+        _record_scorer_cycle_metrics(
+            model_version=str(bundle.model_version),
+            cycle_readiness=cycle_log,
+            n_alerts=0,
+        )
         return 0
     out = staged.loc[m].copy()
     out["score"] = prob[m]
@@ -984,6 +1021,11 @@ def score_once(
     append_alerts(conn, alerts)
     _commit_scoring_cursor(conn, batch.cursor, scored_indices)
     conn.commit()
+    _record_scorer_cycle_metrics(
+        model_version=str(bundle.model_version),
+        cycle_readiness=cycle_log,
+        n_alerts=n,
+    )
     logger.info("[hightier_scorer] wrote %d alerts (threshold=%.6f)", n, thr)
     return n
 
@@ -1006,6 +1048,24 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="score all players (debug/regression only; not for routine production)",
     )
+    pr.add_argument(
+        "--feast-deploy-smoke",
+        action="store_true",
+        help="run Feast readiness + allowlist online lookup smoke then exit (no scoring)",
+    )
+    pr.add_argument(
+        "--refresh-feast-readiness",
+        action="store_true",
+        help="rebuild feast_online_readiness.json from spike reports then exit",
+    )
+    pr.add_argument(
+        "--dry-run-report",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="after --once, write scorer_dry_run_report.json (optional PATH)",
+    )
     args = pr.parse_args(argv)
     cfg = default_hightier_serving_config()
     init_state_db(Path(cfg.state_db_path))
@@ -1020,6 +1080,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     assert_scorer_supplier_plan_or_raise(supplier_plan)
     if args.slow_parquet is not None:
         logger.warning("[hightier_scorer] --slow-parquet is ignored in scorer v2 (Feast mid/long supplier)")
+    if args.refresh_feast_readiness:
+        from trainer_hightier.serving.feast_readiness import refresh_readiness_from_spike_reports
+
+        doc = refresh_readiness_from_spike_reports()
+        logger.info("[hightier_scorer] feast_readiness refreshed %s", doc.to_dict())
+        return 0
     if cfg.scorer_feast_schema_smoke_enabled and (
         supplier_plan.feast_mid_cols or supplier_plan.feast_slow_cols
     ):
@@ -1030,9 +1096,40 @@ def main(argv: Optional[list[str]] = None) -> int:
             probe_canonical_id=str(cfg.scorer_feast_schema_smoke_probe_canonical_id),
         )
         logger.info("[hightier_scorer] feast_schema_smoke ok %s", smoke.to_log_dict())
+    if cfg.scorer_feast_readiness_enabled and (
+        supplier_plan.feast_mid_cols or supplier_plan.feast_slow_cols
+    ):
+        feast_gate = evaluate_feast_readiness_gate(
+            load_feast_online_readiness(resolve_feast_readiness_path(cfg)),
+            require_mid=bool(supplier_plan.feast_mid_cols),
+            require_slow=bool(supplier_plan.feast_slow_cols),
+            readiness_path=resolve_feast_readiness_path(cfg),
+            close_hour=int(cfg.gaming_day_close_hour),
+            mid_hard_cap_days=int(cfg.mid_term_stale_hard_cap_days),
+            slow_hard_cap_days=int(cfg.slow_stale_hard_cap_days),
+            slow_grace_days=int(cfg.slow_monthly_grace_days),
+        )
+        if not feast_gate.ok:
+            raise RuntimeError(feast_gate.hard_failure_reason)
+        logger.info("[hightier_scorer] feast_readiness ok %s", feast_gate.to_log_dict())
+    if args.feast_deploy_smoke:
+        if map_path is None or cli_al is None:
+            raise SystemExit("--feast-deploy-smoke requires --canonical-mapping and --adt-allowlist")
+        deploy_gate = run_deploy_feast_readiness_check(
+            require_mid=bool(supplier_plan.feast_mid_cols),
+            require_slow=bool(supplier_plan.feast_slow_cols),
+            allowlist_parquet=cli_al,
+            canonical_mapping_parquet=map_path,
+            mid_columns=supplier_plan.feast_mid_cols,
+            slow_columns=supplier_plan.feast_slow_cols,
+            run_lookup_smoke=True,
+        )
+        logger.info("[hightier_scorer] feast_deploy_smoke %s", deploy_gate.to_log_dict())
+        return 0 if deploy_gate.ok else 1
     _log_scorer_readiness_summary(bundle=bundle, supplier_plan=supplier_plan)
     al_cache: dict[str, Any] = {}
     boot_logged = False
+    cycle_t0 = time.perf_counter() if args.dry_run_report is not None else None
 
     while True:
         conn = connect_state_db(Path(cfg.state_db_path))
@@ -1092,6 +1189,34 @@ def main(argv: Optional[list[str]] = None) -> int:
         finally:
             conn.close()
         if args.once:
+            if args.dry_run_report is not None:
+                from trainer_hightier.serving.scorer_dry_run import (
+                    build_dry_run_report_from_cycle,
+                    default_scorer_dry_run_report_path,
+                    write_scorer_dry_run_report,
+                )
+
+                metrics = get_last_scorer_cycle_metrics()
+                if metrics is None:
+                    logger.warning("[hightier_scorer] dry-run-report skipped: no cycle metrics recorded")
+                else:
+                    elapsed = (
+                        round(time.perf_counter() - cycle_t0, 3) if cycle_t0 is not None else None
+                    )
+                    report = build_dry_run_report_from_cycle(
+                        model_version=str(metrics["model_version"]),
+                        cycle_readiness=dict(metrics["cycle_readiness"]),
+                        n_alerts=int(metrics["n_alerts"]),
+                        elapsed_seconds=elapsed,
+                        feast_readiness_path=resolve_feast_readiness_path(cfg),
+                        notes="scorer --once --dry-run-report",
+                    )
+                    out = (
+                        default_scorer_dry_run_report_path()
+                        if args.dry_run_report == ""
+                        else Path(args.dry_run_report)
+                    )
+                    write_scorer_dry_run_report(report, out)
             break
         time.sleep(float(cfg.scorer_poll_interval_seconds))
     return 0
