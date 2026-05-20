@@ -239,3 +239,38 @@ walkaway_canonical_mid_term_spike_v1 = FeatureService(
     name="walkaway_canonical_mid_term_spike_v1",
     features=[mid_term_daily_spike_features],
 )
+
+# --- Canonical-grain long-term spike (see feast_long_term_spike.py) ---
+_SPIKE_LONG_TERM_PARQUET = (
+    _REPO_ROOT.parent / "artifacts" / "feast" / "long_term_spike_canonical.parquet"
+).resolve()
+_spike_long_term_source_path = str(_SPIKE_LONG_TERM_PARQUET)
+
+long_term_spike_canonical_source = FileSource(
+    name="long_term_spike_canonical_parquet",
+    path=_spike_long_term_source_path,
+    file_format=ParquetFormat(),
+    timestamp_field="event_timestamp",
+)
+
+long_term_slow_spike_features = FeatureView(
+    name="long_term_slow_spike_features",
+    entities=[canonical_patron],
+    ttl=timedelta(days=220),
+    schema=[
+        Field(name="patron__theo_win_sum__w180d_m1snap", dtype=Float64),
+        Field(name="patron__gaming_days_cnt__w180d_m1snap", dtype=Int64),
+        Field(name="patron__adt__w180d_m1snap", dtype=Float64),
+    ],
+    source=long_term_spike_canonical_source,
+    tags={
+        "owner": "trainer_hightier",
+        "cadence": "monthly_canonical_asof",
+        "spike": "feast_long_term_feasibility",
+    },
+)
+
+walkaway_canonical_long_term_spike_v1 = FeatureService(
+    name="walkaway_canonical_long_term_spike_v1",
+    features=[long_term_slow_spike_features],
+)
