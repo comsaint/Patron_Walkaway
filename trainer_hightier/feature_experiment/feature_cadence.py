@@ -36,6 +36,15 @@ _MID_TERM_COMPOSITE_SHORT_DEPS: Final[dict[str, tuple[str, ...]]] = {
     "fe__interarrival__last_gap_z__w7d": ("fe__time_since_last_bet_sec",),
 }
 
+MID_TERM_COMPOSITE_FEATURE_COLUMNS: Final[frozenset[str]] = frozenset(
+    {
+        "fe__wager_sum__w15m_over_w1d",
+        "fe__wager_cv_w7d",
+        "fe__payout_odds_z_prior_w30d",
+        "fe__interarrival__last_gap_z__w7d",
+    }
+)
+
 
 @dataclass(frozen=True)
 class ResolvedFeatureCadence:

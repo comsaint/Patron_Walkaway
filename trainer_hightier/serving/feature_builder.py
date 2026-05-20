@@ -504,6 +504,53 @@ SELECT
         con.close()
 
 
+def attach_mid_term_composite_columns(
+    bets: pd.DataFrame,
+    columns: tuple[str, ...],
+) -> pd.DataFrame:
+    """Derive bet-grain mid-term composite ``fe__*`` from Feast + short-term inputs."""
+    if bets.empty or not columns:
+        return bets
+    out = bets.copy()
+    col_set = set(columns)
+    if "fe__wager_sum__w15m_over_w1d" in col_set:
+        num = pd.to_numeric(out.get("fe__wager_sum__w15m"), errors="coerce")
+        den = pd.to_numeric(out.get("fe__wager_sum__w1d"), errors="coerce")
+        out["fe__wager_sum__w15m_over_w1d"] = np.where(
+            den > 1e-9,
+            num / den,
+            np.nan,
+        )
+    if "fe__wager_cv_w7d" in col_set:
+        avg_abs = pd.to_numeric(out.get("fe__avg_abs_wager_w7d"), errors="coerce")
+        std_w = pd.to_numeric(out.get("fe__std_wager_w7d"), errors="coerce")
+        out["fe__wager_cv_w7d"] = np.where(
+            avg_abs > 1e-12,
+            std_w / avg_abs,
+            np.nan,
+        )
+    if "fe__payout_odds_z_prior_w30d" in col_set:
+        prior_mean = pd.to_numeric(out.get("fe__prior_odds_mean_w30d"), errors="coerce")
+        prior_std = pd.to_numeric(out.get("fe__prior_odds_std_w30d"), errors="coerce")
+        odds = pd.to_numeric(out.get("payout_odds"), errors="coerce")
+        out["fe__payout_odds_z_prior_w30d"] = np.where(
+            prior_std.abs() > 1e-12,
+            (odds - prior_mean) / prior_std,
+            np.nan,
+        )
+    if "fe__interarrival__last_gap_z__w7d" in col_set:
+        gap = pd.to_numeric(out.get("fe__time_since_last_bet_sec"), errors="coerce")
+        avg_gap = pd.to_numeric(out.get("fe__interarrival_avg_w7d"), errors="coerce")
+        std_gap = pd.to_numeric(out.get("fe__interarrival_std_w7d"), errors="coerce")
+        out["fe__interarrival__last_gap_z__w7d"] = np.where(
+            std_gap > 1e-9,
+            (gap - avg_gap) / std_gap,
+            np.nan,
+        )
+    logger.info("[feature_builder] attached mid_term composite cols=%d", len(columns))
+    return out
+
+
 def _join_slow_patron_canonical_asof_snapshot(
     bets: pd.DataFrame,
     slow_parquet: Path,

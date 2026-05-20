@@ -27,8 +27,12 @@ from trainer_hightier.config import (
     SLOW_PATRON_GRAIN_CANONICAL_ASOF,
 )
 from trainer_hightier.feature_experiment.feature_cadence import (
+    MID_TERM_COMPOSITE_FEATURE_COLUMNS,
     classify_model_fe_features,
     short_term_enrich_columns_with_dependencies,
+)
+from trainer_hightier.feature_experiment.feast_mid_term_spike import (
+    SPIKE_MID_TERM_FEATURE_COLUMNS,
 )
 from trainer_hightier.feature_experiment.materialize_mid_term_daily_snapshot import (
     mid_term_snapshot_production_safe,
@@ -673,6 +677,9 @@ def load_frozen_registry_for_bundle(model_bundle_dir: Path) -> CandidateRegistry
     return load_candidate_registry(snap_p)
 
 
+_SPIKE_MID_TERM_COLUMN_SET: frozenset[str] = frozenset(SPIKE_MID_TERM_FEATURE_COLUMNS)
+
+
 @dataclass(frozen=True)
 class ScorerSupplierPlan:
     """Runtime supplier routing for one active model (scorer v2)."""
@@ -680,6 +687,7 @@ class ScorerSupplierPlan:
     baseline_cols: tuple[str, ...]
     feast_trial_cols: tuple[str, ...]
     feast_mid_cols: tuple[str, ...]
+    mid_composite_cols: tuple[str, ...]
     feast_slow_cols: tuple[str, ...]
     short_term_cols: tuple[str, ...]
     unknown_cols: tuple[str, ...]
@@ -698,6 +706,7 @@ def build_scorer_supplier_plan(
     baseline: list[str] = []
     trial: list[str] = []
     mid: list[str] = []
+    mid_composite: list[str] = []
     slow: list[str] = []
     short: list[str] = []
     unknown: list[str] = []
@@ -715,7 +724,12 @@ def build_scorer_supplier_plan(
             slow.append(feat)
         elif src == "fe_derived":
             if feat in mid_set:
-                mid.append(feat)
+                if feat in MID_TERM_COMPOSITE_FEATURE_COLUMNS:
+                    mid_composite.append(feat)
+                elif feat in _SPIKE_MID_TERM_COLUMN_SET:
+                    mid.append(feat)
+                else:
+                    unknown.append(feat)
             elif feat in short_set:
                 short.append(feat)
             else:
@@ -726,6 +740,7 @@ def build_scorer_supplier_plan(
         baseline_cols=tuple(baseline),
         feast_trial_cols=tuple(trial),
         feast_mid_cols=tuple(mid),
+        mid_composite_cols=tuple(mid_composite),
         feast_slow_cols=tuple(slow),
         short_term_cols=tuple(short),
         unknown_cols=tuple(unknown),
@@ -749,6 +764,7 @@ def scorer_supplier_route_counts(plan: ScorerSupplierPlan) -> dict[str, int]:
         "baseline_model": len(plan.baseline_cols),
         "feast_trial_1h": len(plan.feast_trial_cols),
         "feast_online_mid": len(plan.feast_mid_cols),
+        "mid_term_composite": len(plan.mid_composite_cols),
         "feast_online_slow": len(plan.feast_slow_cols),
         "fe_short_term_parquet": len(plan.short_term_cols),
     }

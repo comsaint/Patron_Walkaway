@@ -43,6 +43,7 @@ from trainer_hightier.feature_experiment.feature_cadence import (
 from trainer_hightier.serving.feature_builder import (
     assert_features_ready,
     attach_canonical_id,
+    attach_mid_term_composite_columns,
     attach_synthetic_etl_and_prediction_visible,
     attach_trial_bet_behavior_1h,
     coerce_categoricals,
@@ -520,11 +521,12 @@ def _log_scorer_readiness_summary(
     """Log scorer v2 supplier routes at startup."""
     routes = scorer_supplier_route_counts(supplier_plan)
     logger.info(
-        "[hightier_scorer] readiness model_version=%s routes=%s feast_mid=%d feast_slow=%d "
-        "short_term=%d feast_repo=%s entity_missing_fail_fraction=%s",
+        "[hightier_scorer] readiness model_version=%s routes=%s feast_mid=%d mid_composite=%d "
+        "feast_slow=%d short_term=%d feast_repo=%s entity_missing_fail_fraction=%s",
         bundle.model_version,
         routes,
         len(supplier_plan.feast_mid_cols),
+        len(supplier_plan.mid_composite_cols),
         len(supplier_plan.feast_slow_cols),
         len(supplier_plan.short_term_cols),
         default_feast_repo_path(),
@@ -687,9 +689,12 @@ def score_once(
     registry_snap = load_frozen_registry_for_bundle(Path(bundle.bundle_dir))
     supplier_plan = build_scorer_supplier_plan(registry_snap, bundle.feature_columns)
     assert_scorer_supplier_plan_or_raise(supplier_plan)
+    mid_term_for_deps = tuple(
+        dict.fromkeys([*supplier_plan.feast_mid_cols, *supplier_plan.mid_composite_cols])
+    )
     short_cols = short_term_enrich_columns_with_dependencies(
         supplier_plan.short_term_cols,
-        supplier_plan.feast_mid_cols,
+        mid_term_for_deps,
     )
     staged = _attach_short_term_supplier(staged, manifest, short_cols)
     n_before_feast = len(staged)
@@ -701,6 +706,7 @@ def score_once(
         slow_columns=supplier_plan.feast_slow_cols,
         fail_fraction=fail_frac,
     )
+    staged = attach_mid_term_composite_columns(staged, supplier_plan.mid_composite_cols)
     cycle_summary = build_cycle_readiness_summary(
         supplier_routes=scorer_supplier_route_counts(supplier_plan),
         feast_mid_columns=supplier_plan.feast_mid_cols,
@@ -736,12 +742,14 @@ def score_once(
         conn.commit()
         return 0
 
-    mid_cols = supplier_plan.feast_mid_cols
+    mid_cols = tuple(
+        dict.fromkeys([*supplier_plan.feast_mid_cols, *supplier_plan.mid_composite_cols])
+    )
     mid_path = manifest.mid_term_snapshot_parquet if manifest is not None else None
     mid_val = validate_mid_term_artifact(
         Path(mid_path) if mid_path is not None else None,
         manifest_grain=(manifest.raw.get("mid_term_grain") if manifest is not None else None),
-    ) if mid_cols else None
+    ) if supplier_plan.feast_mid_cols else None
     slow_val = (
         SnapshotValidationResult(
             layer="slow_patron",

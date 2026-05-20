@@ -33,6 +33,8 @@ from trainer_hightier.feature_experiment.feast_mid_term_spike import (
 from trainer_hightier.feature_experiment.feast_long_term_spike import (
     SPIKE_FEATURE_VIEW_NAME as LONG_SPIKE_FEATURE_VIEW_NAME,
 )
+from trainer_hightier.feature_experiment.feature_cadence import MID_TERM_COMPOSITE_FEATURE_COLUMNS
+from trainer_hightier.serving.feature_builder import attach_mid_term_composite_columns
 from trainer_hightier.serving.feature_supply import (
     assert_scorer_supplier_plan_or_raise,
     build_scorer_supplier_plan,
@@ -102,7 +104,12 @@ def _write_min_bundle(tmp_path: Path) -> Path:
     model.fit([[0.0], [1.0]], [0, 1])
     payload = {
         "model": model,
-        "feature_columns": list(plan.baseline_cols + plan.feast_mid_cols + plan.feast_slow_cols),
+        "feature_columns": list(
+            plan.baseline_cols
+            + plan.feast_mid_cols
+            + plan.mid_composite_cols
+            + plan.feast_slow_cols
+        ),
         "threshold": 0.99,
         "categorical_columns": [],
         "category_categories": {},
@@ -124,8 +131,73 @@ def test_build_scorer_supplier_plan_routes_mid_and_slow(tmp_path: Path) -> None:
     feats = ("wager", "fe__bets_cnt__w1d", "patron__adt__w180d_m1snap")
     plan = build_scorer_supplier_plan(snap, feats)
     assert plan.feast_mid_cols == ("fe__bets_cnt__w1d",)
+    assert plan.mid_composite_cols == ()
     assert plan.feast_slow_cols == ("patron__adt__w180d_m1snap",)
     assert_scorer_supplier_plan_or_raise(plan)
+
+
+def test_build_scorer_supplier_plan_splits_composite_mid_term(tmp_path: Path) -> None:
+    reg = tmp_path / "registry.yaml"
+    lines = ["registry_version: scorer-v2-test", "features:"]
+    for fid, horizon, lookback in (
+        ("fe__bets_cnt__w1d", "mid_term", "P1D"),
+        ("fe__wager_cv_w7d", "mid_term", "P7D"),
+        ("fe__wager_sum__w15m", "short_term", "PT15M"),
+    ):
+        lines.extend(
+            [
+                f"  - feature_id: {fid}",
+                "    group_id: g",
+                "    source: fe_derived",
+                "    status: active",
+                "    enabled_for: [baseline]",
+                f"    time_horizon: {horizon}",
+                f"    max_lookback: {lookback}",
+            ]
+        )
+    reg.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    snap = load_candidate_registry(reg)
+    plan = build_scorer_supplier_plan(
+        snap,
+        ("fe__bets_cnt__w1d", "fe__wager_cv_w7d", "fe__wager_sum__w15m"),
+    )
+    assert plan.feast_mid_cols == ("fe__bets_cnt__w1d",)
+    assert plan.mid_composite_cols == ("fe__wager_cv_w7d",)
+    assert plan.short_term_cols == ("fe__wager_sum__w15m",)
+    assert "fe__wager_cv_w7d" in MID_TERM_COMPOSITE_FEATURE_COLUMNS
+    counts = scorer_supplier_route_counts(plan)
+    assert counts["mid_term_composite"] == 1
+    assert counts["feast_online_mid"] == 1
+
+
+def test_attach_mid_term_composite_columns_from_feast_inputs() -> None:
+    staged = pd.DataFrame(
+        {
+            "fe__wager_sum__w15m": [30.0],
+            "fe__wager_sum__w1d": [100.0],
+            "fe__avg_abs_wager_w7d": [10.0],
+            "fe__std_wager_w7d": [4.0],
+            "fe__prior_odds_mean_w30d": [2.0],
+            "fe__prior_odds_std_w30d": [0.5],
+            "payout_odds": [2.5],
+            "fe__time_since_last_bet_sec": [20.0],
+            "fe__interarrival_avg_w7d": [10.0],
+            "fe__interarrival_std_w7d": [5.0],
+        }
+    )
+    got = attach_mid_term_composite_columns(
+        staged,
+        (
+            "fe__wager_sum__w15m_over_w1d",
+            "fe__wager_cv_w7d",
+            "fe__payout_odds_z_prior_w30d",
+            "fe__interarrival__last_gap_z__w7d",
+        ),
+    )
+    assert float(got.iloc[0]["fe__wager_sum__w15m_over_w1d"]) == pytest.approx(0.3)
+    assert float(got.iloc[0]["fe__wager_cv_w7d"]) == pytest.approx(0.4)
+    assert float(got.iloc[0]["fe__payout_odds_z_prior_w30d"]) == pytest.approx(1.0)
+    assert float(got.iloc[0]["fe__interarrival__last_gap_z__w7d"]) == pytest.approx(2.0)
 
 
 def test_entity_missing_policy_hard_fail_above_threshold() -> None:
