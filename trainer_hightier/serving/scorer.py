@@ -765,11 +765,26 @@ def score_once(
     mid_cols = tuple(
         dict.fromkeys([*supplier_plan.feast_mid_cols, *supplier_plan.mid_composite_cols])
     )
+    uses_feast_mid = bool(supplier_plan.feast_mid_cols or supplier_plan.mid_composite_cols)
     mid_path = manifest.mid_term_snapshot_parquet if manifest is not None else None
-    mid_val = validate_mid_term_artifact(
-        Path(mid_path) if mid_path is not None else None,
-        manifest_grain=(manifest.raw.get("mid_term_grain") if manifest is not None else None),
-    ) if supplier_plan.feast_mid_cols else None
+    mid_val = (
+        SnapshotValidationResult(
+            layer="mid_term",
+            ok=True,
+            hard_failure=False,
+            status="fresh",
+            message="feast online supplier",
+        )
+        if uses_feast_mid
+        else (
+            validate_mid_term_artifact(
+                Path(mid_path) if mid_path is not None else None,
+                manifest_grain=(manifest.raw.get("mid_term_grain") if manifest is not None else None),
+            )
+            if mid_cols
+            else None
+        )
+    )
     slow_val = (
         SnapshotValidationResult(
             layer="slow_patron",
@@ -794,16 +809,40 @@ def score_once(
             )
         )
     )
-    mid_anchor = read_mid_term_anchor_max(Path(mid_path) if mid_path else None, manifest.raw if manifest else None)
+    mid_anchor = (
+        None
+        if uses_feast_mid
+        else read_mid_term_anchor_max(Path(mid_path) if mid_path else None, manifest.raw if manifest else None)
+    )
     slow_anchor = read_slow_anchor_max(
         Path(manifest.slow_patron_parquet) if manifest is not None else None,
         manifest.raw if manifest else None,
     ) if not supplier_plan.feast_slow_cols else None
-    mid_fresh = evaluate_mid_term_freshness(
-        anchor_max=mid_anchor,
-        hard_cap_days=int(cfg.mid_term_stale_hard_cap_days),
-        close_hour=int(cfg.gaming_day_close_hour),
-    ) if mid_cols else LayerFreshnessResult(layer="mid_term", status="fresh", staleness_days=0, anchor_max=None, message="mid_term not required")
+    mid_fresh = (
+        LayerFreshnessResult(
+            layer="mid_term",
+            status="fresh",
+            staleness_days=0,
+            anchor_max=None,
+            message="feast online supplier",
+        )
+        if uses_feast_mid
+        else (
+            evaluate_mid_term_freshness(
+                anchor_max=mid_anchor,
+                hard_cap_days=int(cfg.mid_term_stale_hard_cap_days),
+                close_hour=int(cfg.gaming_day_close_hour),
+            )
+            if mid_cols
+            else LayerFreshnessResult(
+                layer="mid_term",
+                status="fresh",
+                staleness_days=0,
+                anchor_max=None,
+                message="mid_term not required",
+            )
+        )
+    )
     slow_fresh = (
         LayerFreshnessResult(
             layer="slow_patron",
