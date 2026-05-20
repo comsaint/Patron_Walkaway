@@ -71,3 +71,4 @@ Production stale snapshots are treated differently from all-null features. A sta
 
 - Extend health/status API beyond logs / `feature_state_meta` / prediction log for stale snapshot states (if product requires a single dashboard).
 - Optional: external orchestrator as alternative to in-process deploy supervisor for multi-instance (would need distributed lock first).
+- Feast allowlist feasibility (2026-05-20): see `Feast Production Feasibility Spike - DECISION_RECORD.md` — spike **marginal** on `prior_*` lookup nulls; production supplier remains Parquet until integration is approved.

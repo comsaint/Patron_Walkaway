@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import pickle
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Iterable
@@ -670,3 +671,84 @@ def load_frozen_registry_for_bundle(model_bundle_dir: Path) -> CandidateRegistry
             f"[feature-supply] missing {FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME} under {model_bundle_dir}"
         )
     return load_candidate_registry(snap_p)
+
+
+@dataclass(frozen=True)
+class ScorerSupplierPlan:
+    """Runtime supplier routing for one active model (scorer v2)."""
+
+    baseline_cols: tuple[str, ...]
+    feast_trial_cols: tuple[str, ...]
+    feast_mid_cols: tuple[str, ...]
+    feast_slow_cols: tuple[str, ...]
+    short_term_cols: tuple[str, ...]
+    unknown_cols: tuple[str, ...]
+
+
+def build_scorer_supplier_plan(
+    snap: CandidateRegistrySnapshot,
+    model_feats: tuple[str, ...],
+) -> ScorerSupplierPlan:
+    """Map ``model.pkl`` feature columns to scorer v2 runtime suppliers."""
+    by_id = {r.feature_id: r for r in snap.rows}
+    fe_split = classify_model_fe_features(snap, model_feats)
+    mid_set = set(fe_split["mid_term"])
+    short_set = set(fe_split["short_term"])
+    slow_set = set(DEFAULT_MODEL_SLOW_PATRON_COLUMNS)
+    baseline: list[str] = []
+    trial: list[str] = []
+    mid: list[str] = []
+    slow: list[str] = []
+    short: list[str] = []
+    unknown: list[str] = []
+    for feat in model_feats:
+        row = by_id.get(feat)
+        if row is None:
+            unknown.append(feat)
+            continue
+        src = row.source
+        if src == "baseline_model":
+            baseline.append(feat)
+        elif src == "feast_trial_1h":
+            trial.append(feat)
+        elif src == "feast_slow_180d" or feat in slow_set:
+            slow.append(feat)
+        elif src == "fe_derived":
+            if feat in mid_set:
+                mid.append(feat)
+            elif feat in short_set:
+                short.append(feat)
+            else:
+                unknown.append(feat)
+        else:
+            unknown.append(feat)
+    return ScorerSupplierPlan(
+        baseline_cols=tuple(baseline),
+        feast_trial_cols=tuple(trial),
+        feast_mid_cols=tuple(mid),
+        feast_slow_cols=tuple(slow),
+        short_term_cols=tuple(short),
+        unknown_cols=tuple(unknown),
+    )
+
+
+def assert_scorer_supplier_plan_or_raise(plan: ScorerSupplierPlan) -> None:
+    """Fail fast when scorer v2 cannot supply every model column."""
+    if plan.unknown_cols:
+        tip = ", ".join(plan.unknown_cols[:12])
+        ellipsis = "" if len(plan.unknown_cols) <= 12 else ", …"
+        raise ValueError(
+            "[feature-supply] scorer v2 supplier plan has unknown columns: "
+            f"[{tip}{ellipsis}]"
+        )
+
+
+def scorer_supplier_route_counts(plan: ScorerSupplierPlan) -> dict[str, int]:
+    """Count model columns routed to each scorer v2 runtime supplier."""
+    return {
+        "baseline_model": len(plan.baseline_cols),
+        "feast_trial_1h": len(plan.feast_trial_cols),
+        "feast_online_mid": len(plan.feast_mid_cols),
+        "feast_online_slow": len(plan.feast_slow_cols),
+        "fe_short_term_parquet": len(plan.short_term_cols),
+    }

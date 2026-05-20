@@ -11,7 +11,7 @@
 - 非範圍：
   - 模型訓練演算法、特徵發明與 ablation 策略本身。
   - orchestrator 平台實作細節（只定觸發契約，不綁具體產品）。
-  - online feature store 新建（本期不導入）。
+  - online feature store 新建（本期不導入；2026-05-20 allowlist Feast spike 見 `Feast Production Feasibility Spike - DECISION_RECORD.md`，尚未接入 scorer）。
 
 ## 已定決策（作為本計畫約束）
 

@@ -91,6 +91,10 @@ ALERT_HORIZON_MIN: Final[int] = 15
 LABEL_LOOKAHEAD_MIN: Final[int] = 45
 BET_AVAIL_DELAY_MIN: Final[int] = 1
 SCORER_POLL_INTERVAL_SECONDS: Final[int] = 45
+#: Hard-fail scoring cycle when Feast entity row missing rate exceeds this fraction.
+SCORER_FEAST_ENTITY_MISSING_FAIL_FRACTION: Final[float] = 0.10
+#: Run Feast registry / online schema smoke at scorer startup when mid/long Feast columns are required.
+SCORER_FEAST_SCHEMA_SMOKE_ENABLED: Final[bool] = True
 
 # Baseline MODEL columns: softer FQG (high PSI → WARN; unique-constant under sample → WARN; WARN auto-allowlist).
 _FQG_BASELINE_MODEL_SOFT_COLUMNS: tuple[str, ...] = (
@@ -499,6 +503,12 @@ class HightierServingConfig:
     production_bet_mirror_retention_days: int = PRODUCTION_BET_MIRROR_RETENTION_DAYS
     production_session_mirror_retention_days: int = PRODUCTION_SESSION_MIRROR_RETENTION_DAYS
     production_bet_mirror_rewrite_days: int = PRODUCTION_BET_MIRROR_REWRITE_DAYS
+    #: Batch hard-fail threshold for Feast entity row missing (see Scorer Runtime Contract SSOT).
+    scorer_feast_entity_missing_fail_fraction: float = SCORER_FEAST_ENTITY_MISSING_FAIL_FRACTION
+    #: Fail scorer startup when Feast registry / feature views / entity key do not match the model.
+    scorer_feast_schema_smoke_enabled: bool = SCORER_FEAST_SCHEMA_SMOKE_ENABLED
+    #: Probe ``canonical_id`` for startup online lookup smoke (may legitimately return empty features).
+    scorer_feast_schema_smoke_probe_canonical_id: str = "__feast_scorer_smoke_probe__"
 
 
 _DEFAULT_HIGHTIER_SERVING: HightierServingConfig = HightierServingConfig()

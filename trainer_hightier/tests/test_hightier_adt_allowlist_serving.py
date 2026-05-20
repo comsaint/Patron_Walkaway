@@ -46,6 +46,8 @@ def test_resolve_adt_allowlist_path_cli_over_manifest(tmp_path: Path) -> None:
         adt_allowlist_version=None,
         coverage_end_exclusive=None,
         training_cutoff_iso=None,
+        mid_term_snapshot_parquet=None,
+        fe_short_term_parquet=None,
         raw={},
     )
     got = resolve_adt_allowlist_path(cfg, manifest=m, cli_path=cli_p)
@@ -67,6 +69,8 @@ def test_resolve_adt_allowlist_path_manifest_before_cfg(tmp_path: Path) -> None:
         adt_allowlist_version="abc",
         coverage_end_exclusive=None,
         training_cutoff_iso=None,
+        mid_term_snapshot_parquet=None,
+        fe_short_term_parquet=None,
         raw={},
     )
     got = resolve_adt_allowlist_path(cfg, manifest=m, cli_path=None)
@@ -166,13 +170,15 @@ def test_score_once_allowlist_all_skipped_advances_watermark(monkeypatch: pytest
         model_version="mv",
         model=MagicMock(predict_proba=lambda x: np.zeros((len(x), 2))),
     )
+    from trainer_hightier.serving.feast_online_adapter import MockFeastOnlineAdapter
+
     conn = sqlite3.connect(db)
     try:
         before = get_last_processed_etl_insert(conn)
         n = scorer_mod.score_once(
             conn,
             bundle,
-            slow_parquet=tmp_path / "missing.parquet",
+            feast_adapter=MockFeastOnlineAdapter(features_by_canonical={}),
             high_adt_only=True,
             allowlist_ids=frozenset({1}),
         )

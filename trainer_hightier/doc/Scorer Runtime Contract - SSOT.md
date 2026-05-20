@@ -39,18 +39,44 @@ The scorer must never silently fill missing model features:
 - every `model.pkl.feature_columns` entry must exist before `predict_proba`.
 - required feature families must not be all null after joins.
 - wrong-grain or training-scoped mid-term snapshots are hard failures.
-- prediction logs should expose snapshot freshness/degraded state.
+- prediction logs should expose snapshot freshness/degraded state and missing-feature counts.
+
+### Scorer v2 Feast missing policy
+
+- **Cell-level NULL** (e.g. structural `prior_*` nulls within an otherwise present entity row): **allowed** for
+  `predict_proba`, but prediction log must record per-row missing counts / degraded status.
+- **Feast entity row missing** (entire mid-term or long-term family absent from online store for a patron): **skip
+  row + audit**; do not score as all-null features.
+- **Batch entity-missing rate > 10%**: **hard fail** the scoring cycle (configurable via
+  `scorer_feast_entity_missing_fail_fraction`) to surface refresh / key / mapping systemic issues.
 
 ## Supplier Rules
 
 - `baseline_model`: supplied from raw ClickHouse/scoring input fields.
 - `feast_trial_1h`: supplied online by the serving PIT builder; bundled trial parquet is diagnostic only.
-- short-term `fe__*`: supplied by `fe_short_term_parquet` or a declared online/micro-batch supplier.
-- mid-term `fe__*`: supplied by production-scoped `mid_term_snapshot_parquet` at deploy/scoring time.
-- `patron__*__w180d_m1snap`: supplied by canonical slow patron snapshot.
+- short-term `fe__*`: supplied by `fe_short_term_parquet` or a declared online/micro-batch supplier (not silent
+  fallback to legacy training Parquet).
+- mid-term `fe__*`: **scorer v2 adopted supplier** is Feast online lookup (production-scoped materialization +
+  refresh plane). Parquet manifest paths remain for refresh/deploy validation but are not the production runtime
+  fallback for scorer v2.
+- `patron__*__w180d_m1snap`: **scorer v2 adopted supplier** is Feast online lookup for canonical slow patron
+  features. Parquet slow snapshots remain for refresh/materialize but not as a silent runtime substitute when Feast
+  is configured.
+
+Production scorer v2 must **not** silently fallback to legacy `fe_derived_parquet` or training Parquet for mid/long
+features.
 
 ## Non-Goals
 
 - Development packaging does not require latest production data.
 - Training snapshots are not production readiness substitutes.
 - Packaging is not responsible for rebuilding production snapshots.
+- Short-term `fe__*` Feast online lookup is not required in scorer v2 first slice.
+
+## Related documents
+
+| Layer | Document |
+|-------|----------|
+| Feast spike decision | `Feast Production Feasibility Spike - DECISION_RECORD.md` |
+| Scorer v2 realization | `Scorer v2 Feast Runtime - IMPLEMENTATION_PLAN.md` |
+| Execution plan | `Scorer v2 Feast Runtime - WORKING_PLAN.md` |

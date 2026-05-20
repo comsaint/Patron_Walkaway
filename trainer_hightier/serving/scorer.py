@@ -38,7 +38,6 @@ from trainer_hightier.serving.contracts import (
     META_KEY_SNAPSHOT_SCORING_DEGRADED,
 )
 from trainer_hightier.feature_experiment.feature_cadence import (
-    classify_model_fe_features,
     short_term_enrich_columns_with_dependencies,
 )
 from trainer_hightier.serving.feature_builder import (
@@ -47,13 +46,30 @@ from trainer_hightier.serving.feature_builder import (
     attach_synthetic_etl_and_prediction_visible,
     attach_trial_bet_behavior_1h,
     coerce_categoricals,
-    join_fe_derived_snapshot,
     join_production_fe_suppliers,
-    join_slow_patron_snapshot,
 )
-from trainer_hightier.serving.feature_supply import load_frozen_registry_for_bundle
+from trainer_hightier.serving.feast_online_adapter import (
+    FeastLookupDiagnostics,
+    FeastLookupResult,
+    OnlineFeastAdapter,
+    apply_entity_missing_policy,
+    build_cycle_readiness_summary,
+    build_production_feast_adapter,
+    compute_row_missing_audits,
+    default_feast_repo_path,
+    join_feast_lookup,
+    run_feast_scorer_schema_smoke_check,
+)
+from trainer_hightier.serving.feature_supply import (
+    ScorerSupplierPlan,
+    assert_scorer_supplier_plan_or_raise,
+    build_scorer_supplier_plan,
+    load_frozen_registry_for_bundle,
+    scorer_supplier_route_counts,
+)
 from trainer_hightier.serving.snapshot_freshness import (
     LayerFreshnessResult,
+    SnapshotValidationResult,
     build_scoring_snapshot_gate,
     evaluate_mid_term_freshness,
     evaluate_slow_freshness,
@@ -65,7 +81,11 @@ from trainer_hightier.serving.snapshot_freshness import (
 )
 from trainer_hightier.serving.feature_state_store import ActiveSnapshotManifest, read_active_manifest
 from trainer_hightier.serving.model_bundle import HightierModelBundle, load_hightier_model_bundle
-from trainer_hightier.serving.prediction_log import append_hightier_prediction_log, init_prediction_log_db
+from trainer_hightier.serving.prediction_log import (
+    append_hightier_prediction_log,
+    append_skipped_entity_missing_log,
+    init_prediction_log_db,
+)
 from trainer_hightier.serving.runtime_config import HK_TZ
 from trainer_hightier.serving.state_db import (
     append_alerts,
@@ -468,12 +488,126 @@ def fetch_bet_pool_window(
     return bets
 
 
+def _attach_short_term_supplier(
+    staged: pd.DataFrame,
+    manifest: ActiveSnapshotManifest | None,
+    short_cols: tuple[str, ...],
+) -> pd.DataFrame:
+    """Join declared short-term ``fe__*`` parquet supplier (no legacy mid-term parquet)."""
+    if not short_cols or staged.empty:
+        return staged
+    fe_short_path = manifest.fe_short_term_parquet if manifest is not None else None
+    if fe_short_path is None or not Path(fe_short_path).is_file():
+        tip = ", ".join(short_cols[:8])
+        raise RuntimeError(
+            "[hightier_scorer] model requires short-term fe__* but fe_short_term_parquet missing; "
+            f"example columns: [{tip}]"
+        )
+    return join_production_fe_suppliers(
+        staged,
+        fe_short_term_parquet=Path(fe_short_path),
+        mid_term_snapshot_parquet=None,
+        short_term_columns=short_cols,
+        mid_term_columns=(),
+    )
+
+
+def _log_scorer_readiness_summary(
+    *,
+    bundle: HightierModelBundle,
+    supplier_plan: ScorerSupplierPlan,
+) -> None:
+    """Log scorer v2 supplier routes at startup."""
+    routes = scorer_supplier_route_counts(supplier_plan)
+    logger.info(
+        "[hightier_scorer] readiness model_version=%s routes=%s feast_mid=%d feast_slow=%d "
+        "short_term=%d feast_repo=%s entity_missing_fail_fraction=%s",
+        bundle.model_version,
+        routes,
+        len(supplier_plan.feast_mid_cols),
+        len(supplier_plan.feast_slow_cols),
+        len(supplier_plan.short_term_cols),
+        default_feast_repo_path(),
+        default_hightier_serving_config().scorer_feast_entity_missing_fail_fraction,
+    )
+
+
+def _attach_feast_mid_slow(
+    staged: pd.DataFrame,
+    adapter: OnlineFeastAdapter,
+    *,
+    mid_columns: tuple[str, ...],
+    slow_columns: tuple[str, ...],
+    fail_fraction: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, FeastLookupDiagnostics]:
+    """Feast online lookup for mid/long columns; returns (scorable, skipped, diagnostics)."""
+    feast_cols = tuple(dict.fromkeys([*mid_columns, *slow_columns]))
+    if staged.empty or not feast_cols:
+        empty_diag = FeastLookupDiagnostics(
+            lookup_latency_ms=0.0,
+            n_requested=len(staged),
+            n_mid_present=0,
+            n_slow_present=0,
+            n_entity_missing=0,
+        )
+        return staged.copy(), staged.iloc[0:0].copy(), empty_diag
+    cids = [str(x).strip() for x in staged["canonical_id"].tolist()]
+    t0 = time.perf_counter()
+    lookup_df = adapter.lookup_mid_slow(
+        cids,
+        mid_columns=mid_columns,
+        slow_columns=slow_columns,
+    )
+    lookup_latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+    lookup = join_feast_lookup(
+        staged,
+        lookup_df,
+        feature_columns=feast_cols,
+        mid_columns=mid_columns,
+        slow_columns=slow_columns,
+    )
+    lookup_diag = FeastLookupDiagnostics(
+        lookup_latency_ms=lookup_latency_ms,
+        n_requested=lookup.diagnostics.n_requested,
+        n_mid_present=lookup.diagnostics.n_mid_present,
+        n_slow_present=lookup.diagnostics.n_slow_present,
+        n_entity_missing=lookup.diagnostics.n_entity_missing,
+        cell_null_counts=dict(lookup.diagnostics.cell_null_counts),
+    )
+    lookup = FeastLookupResult(
+        feature_columns=lookup.feature_columns,
+        values=lookup.values,
+        entity_missing=lookup.entity_missing,
+        diagnostics=lookup_diag,
+    )
+    scorable, skipped, diag = apply_entity_missing_policy(
+        lookup.values,
+        lookup,
+        fail_fraction=fail_fraction,
+        mid_columns=mid_columns,
+        slow_columns=slow_columns,
+    )
+    return scorable, skipped, diag
+
+
+def _commit_scoring_cursor(
+    conn: sqlite3.Connection,
+    cursor: pd.Series,
+    row_indices: pd.Index,
+) -> None:
+    """Advance ETL watermark to the max cursor among *row_indices*."""
+    if row_indices.empty:
+        return
+    max_cursor = cursor.loc[row_indices].max()
+    if pd.notna(max_cursor):
+        set_last_processed_etl_insert(conn, max_cursor.to_pydatetime())
+
+
 def score_once(
     conn: sqlite3.Connection,
     bundle: HightierModelBundle,
     *,
-    slow_parquet: Path,
-    fe_parquet: Path | None = None,
+    feast_adapter: OnlineFeastAdapter,
     mapping_parquet: Path | None = None,
     manifest: ActiveSnapshotManifest | None = None,
     high_adt_only: bool,
@@ -549,53 +683,114 @@ def score_once(
     staged = attach_synthetic_etl_and_prediction_visible(bets)
     staged = attach_canonical_id(staged, mapping_parquet=mapping_parquet)
     staged = attach_trial_bet_behavior_1h(staged, pool2)
-    slow_grain = None
-    if manifest is not None and isinstance(manifest.raw, dict):
-        slow_grain = manifest.raw.get("slow_patron_grain")
-    staged = join_slow_patron_snapshot(staged, slow_parquet, slow_grain=slow_grain)
 
     registry_snap = load_frozen_registry_for_bundle(Path(bundle.bundle_dir))
-    fe_split = classify_model_fe_features(registry_snap, bundle.feature_columns)
+    supplier_plan = build_scorer_supplier_plan(registry_snap, bundle.feature_columns)
+    assert_scorer_supplier_plan_or_raise(supplier_plan)
     short_cols = short_term_enrich_columns_with_dependencies(
-        fe_split["short_term"],
-        fe_split["mid_term"],
+        supplier_plan.short_term_cols,
+        supplier_plan.feast_mid_cols,
     )
-    mid_cols = fe_split["mid_term"]
-    mid_path = manifest.mid_term_snapshot_parquet if manifest is not None else None
-    fe_short_path = manifest.fe_short_term_parquet if manifest is not None else None
-    has_mid_supplier = mid_path is not None and Path(mid_path).is_file() and bool(mid_cols)
-    has_short_supplier = fe_short_path is not None and Path(fe_short_path).is_file() and bool(short_cols)
-    if has_mid_supplier or has_short_supplier:
-        staged = join_production_fe_suppliers(
-            staged,
-            fe_short_term_parquet=Path(fe_short_path) if has_short_supplier else None,
-            mid_term_snapshot_parquet=Path(mid_path) if has_mid_supplier else None,
-            short_term_columns=short_cols,
-            mid_term_columns=mid_cols,
-        )
-    elif fe_parquet is not None and fe_parquet.is_file():
-        staged = join_fe_derived_snapshot(staged, fe_parquet)
+    staged = _attach_short_term_supplier(staged, manifest, short_cols)
+    n_before_feast = len(staged)
+    fail_frac = float(cfg.scorer_feast_entity_missing_fail_fraction)
+    staged, skipped, feast_diag = _attach_feast_mid_slow(
+        staged,
+        feast_adapter,
+        mid_columns=supplier_plan.feast_mid_cols,
+        slow_columns=supplier_plan.feast_slow_cols,
+        fail_fraction=fail_frac,
+    )
+    cycle_summary = build_cycle_readiness_summary(
+        supplier_routes=scorer_supplier_route_counts(supplier_plan),
+        feast_mid_columns=supplier_plan.feast_mid_cols,
+        feast_slow_columns=supplier_plan.feast_slow_cols,
+        short_term_columns=supplier_plan.short_term_cols,
+        n_requested=n_before_feast,
+        n_scored=len(staged),
+        n_skipped_entity_missing=len(skipped),
+        entity_missing_fail_fraction=fail_frac,
+        feast_diag=feast_diag,
+    )
+    logger.info("[hightier_scorer] cycle_readiness %s", cycle_summary.to_log_dict())
+    scored_at_iso = datetime.now(ZoneInfo(HK_TZ)).isoformat()
+    pl_path = cfg.prediction_log_db_path
+    if skipped.shape[0] and pl_path is not None and str(pl_path).strip():
+        try:
+            append_skipped_entity_missing_log(
+                pl_path,
+                scored_at=scored_at_iso,
+                model_version=str(bundle.model_version),
+                skipped=skipped,
+                feature_columns=bundle.feature_columns,
+                threshold=float(bundle.threshold),
+                feast_mid_cols=supplier_plan.feast_mid_cols,
+                feast_slow_cols=supplier_plan.feast_slow_cols,
+                short_term_cols=supplier_plan.short_term_cols,
+                snapshot_version=manifest.version if manifest is not None else None,
+            )
+        except Exception as exc:
+            logger.warning("[hightier_scorer] skipped prediction_log write failed: %s", exc)
+    if staged.empty:
+        _commit_scoring_cursor(conn, cursor, bets.index)
+        conn.commit()
+        return 0
 
+    mid_cols = supplier_plan.feast_mid_cols
+    mid_path = manifest.mid_term_snapshot_parquet if manifest is not None else None
     mid_val = validate_mid_term_artifact(
         Path(mid_path) if mid_path is not None else None,
         manifest_grain=(manifest.raw.get("mid_term_grain") if manifest is not None else None),
     ) if mid_cols else None
-    slow_val = validate_slow_artifact(
-        slow_parquet,
-        manifest_grain=slow_grain,
+    slow_val = (
+        SnapshotValidationResult(
+            layer="slow_patron",
+            ok=True,
+            hard_failure=False,
+            status="fresh",
+            message="feast online supplier",
+        )
+        if supplier_plan.feast_slow_cols
+        else (
+            validate_slow_artifact(
+                Path(manifest.slow_patron_parquet) if manifest is not None else None,
+                manifest_grain=(manifest.raw.get("slow_patron_grain") if manifest is not None else None),
+            )
+            if any(f.startswith("patron__") for f in bundle.feature_columns)
+            else SnapshotValidationResult(
+                layer="slow_patron",
+                ok=True,
+                hard_failure=False,
+                status="fresh",
+                message="slow not required",
+            )
+        )
     )
     mid_anchor = read_mid_term_anchor_max(Path(mid_path) if mid_path else None, manifest.raw if manifest else None)
-    slow_anchor = read_slow_anchor_max(slow_parquet, manifest.raw if manifest else None)
+    slow_anchor = read_slow_anchor_max(
+        Path(manifest.slow_patron_parquet) if manifest is not None else None,
+        manifest.raw if manifest else None,
+    ) if not supplier_plan.feast_slow_cols else None
     mid_fresh = evaluate_mid_term_freshness(
         anchor_max=mid_anchor,
         hard_cap_days=int(cfg.mid_term_stale_hard_cap_days),
         close_hour=int(cfg.gaming_day_close_hour),
     ) if mid_cols else LayerFreshnessResult(layer="mid_term", status="fresh", staleness_days=0, anchor_max=None, message="mid_term not required")
-    slow_fresh = evaluate_slow_freshness(
-        anchor_max=slow_anchor,
-        monthly_grace_days=int(cfg.slow_monthly_grace_days),
-        hard_cap_days=int(cfg.slow_stale_hard_cap_days),
-        close_hour=int(cfg.gaming_day_close_hour),
+    slow_fresh = (
+        LayerFreshnessResult(
+            layer="slow_patron",
+            status="fresh",
+            staleness_days=0,
+            anchor_max=None,
+            message="feast online supplier",
+        )
+        if supplier_plan.feast_slow_cols
+        else evaluate_slow_freshness(
+            anchor_max=slow_anchor,
+            monthly_grace_days=int(cfg.slow_monthly_grace_days),
+            hard_cap_days=int(cfg.slow_stale_hard_cap_days),
+            close_hour=int(cfg.gaming_day_close_hour),
+        )
     )
     gate = build_scoring_snapshot_gate(
         mid_term=mid_fresh,
@@ -641,8 +836,13 @@ def score_once(
     )
     prob = bundle.model.predict_proba(X)[:, 1]
     thr = float(bundle.threshold)
-    scored_at_iso = datetime.now(ZoneInfo(HK_TZ)).isoformat()
-    pl_path = cfg.prediction_log_db_path
+    row_audits = compute_row_missing_audits(
+        X,
+        bundle.feature_columns,
+        feast_mid_cols=supplier_plan.feast_mid_cols,
+        feast_slow_cols=supplier_plan.feast_slow_cols,
+        short_term_cols=supplier_plan.short_term_cols,
+    )
     if pl_path is not None and str(pl_path).strip():
         try:
             append_hightier_prediction_log(
@@ -654,6 +854,8 @@ def score_once(
                 threshold=thr,
                 features=X,
                 feature_columns=bundle.feature_columns,
+                row_audits=row_audits,
+                scoring_status="scored",
                 snapshot_version=manifest.version if manifest is not None else None,
                 mid_term_freshness_status=mid_fresh.status,
                 slow_freshness_status=slow_fresh.status,
@@ -664,10 +866,9 @@ def score_once(
 
     m = prob >= thr
     n = int(m.sum())
+    scored_indices = staged.index
     if n == 0:
-        max_cursor = cursor.max()
-        if pd.notna(max_cursor):
-            set_last_processed_etl_insert(conn, max_cursor.to_pydatetime())
+        _commit_scoring_cursor(conn, cursor, scored_indices)
         conn.commit()
         return 0
     out = staged.loc[m].copy()
@@ -712,10 +913,7 @@ def score_once(
         }
     )
     append_alerts(conn, alerts)
-    idx = out.index
-    max_cursor = cursor.loc[idx].max()
-    if pd.notna(max_cursor):
-        set_last_processed_etl_insert(conn, max_cursor.to_pydatetime())
+    _commit_scoring_cursor(conn, cursor, scored_indices)
     conn.commit()
     logger.info("[hightier_scorer] wrote %d alerts (threshold=%.6f)", n, thr)
     return n
@@ -726,7 +924,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     pr = argparse.ArgumentParser(description="trainer_hightier ClickHouse scorer daemon")
     pr.add_argument("--once", action="store_true", help="single cycle then exit")
     pr.add_argument("--bundle-dir", type=Path, default=None)
-    pr.add_argument("--slow-parquet", type=Path, default=None, help="override slow patron snapshot path")
+    pr.add_argument("--slow-parquet", type=Path, default=None, help="deprecated: mid/long use Feast online lookup")
     pr.add_argument("--canonical-mapping", type=Path, default=None)
     pr.add_argument(
         "--adt-allowlist",
@@ -744,26 +942,28 @@ def main(argv: Optional[list[str]] = None) -> int:
     init_state_db(Path(cfg.state_db_path))
     init_prediction_log_db(cfg.prediction_log_db_path)
     bundle = load_hightier_model_bundle(bundle_dir=args.bundle_dir)
-    slow_override = Path(args.slow_parquet).resolve() if args.slow_parquet else None
     map_path = Path(args.canonical_mapping).resolve() if args.canonical_mapping else None
     cli_al = Path(args.adt_allowlist).resolve() if args.adt_allowlist else None
     high_adt_only = bool(cfg.high_adt_only) and (not bool(args.no_high_adt_only))
+    feast_adapter = build_production_feast_adapter()
+    registry_snap = load_frozen_registry_for_bundle(Path(bundle.bundle_dir))
+    supplier_plan = build_scorer_supplier_plan(registry_snap, bundle.feature_columns)
+    assert_scorer_supplier_plan_or_raise(supplier_plan)
+    if args.slow_parquet is not None:
+        logger.warning("[hightier_scorer] --slow-parquet is ignored in scorer v2 (Feast mid/long supplier)")
+    if cfg.scorer_feast_schema_smoke_enabled and (
+        supplier_plan.feast_mid_cols or supplier_plan.feast_slow_cols
+    ):
+        smoke = run_feast_scorer_schema_smoke_check(
+            default_feast_repo_path(),
+            mid_columns=supplier_plan.feast_mid_cols,
+            slow_columns=supplier_plan.feast_slow_cols,
+            probe_canonical_id=str(cfg.scorer_feast_schema_smoke_probe_canonical_id),
+        )
+        logger.info("[hightier_scorer] feast_schema_smoke ok %s", smoke.to_log_dict())
+    _log_scorer_readiness_summary(bundle=bundle, supplier_plan=supplier_plan)
     al_cache: dict[str, Any] = {}
     boot_logged = False
-
-    def resolve_slow() -> Path:
-        if slow_override is not None:
-            return slow_override
-        man = read_active_manifest()
-        if man is None:
-            raise RuntimeError("No active snapshot manifest; run snapshot_updater or pass --slow-parquet")
-        return man.slow_patron_parquet
-
-    def resolve_fe(man: ActiveSnapshotManifest | None) -> Path | None:
-        if man is None:
-            return None
-        fp = man.fe_derived_parquet
-        return fp if fp is not None and str(fp).strip() else None
 
     while True:
         conn = connect_state_db(Path(cfg.state_db_path))
@@ -808,18 +1008,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                 )
                 boot_logged = True
 
-            sp = resolve_slow()
-            if not sp.is_file():
-                raise FileNotFoundError(f"slow patron parquet missing: {sp}")
-            fe_sp = resolve_fe(man)
             allow_ids = al_cache.get("ids", frozenset()) if high_adt_only else frozenset()
             if high_adt_only and not isinstance(allow_ids, frozenset):
                 allow_ids = frozenset(allow_ids)
             score_once(
                 conn,
                 bundle,
-                slow_parquet=sp,
-                fe_parquet=fe_sp,
+                feast_adapter=feast_adapter,
                 mapping_parquet=map_path,
                 manifest=man,
                 high_adt_only=high_adt_only,

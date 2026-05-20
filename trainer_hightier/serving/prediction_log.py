@@ -11,6 +11,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from trainer_hightier.serving.feast_online_adapter import RowMissingAudit
+
 logger = logging.getLogger(__name__)
 
 _PREDICTION_LOG_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -21,6 +23,9 @@ _PREDICTION_LOG_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("mid_term_freshness_status", "TEXT"),
     ("slow_freshness_status", "TEXT"),
     ("snapshot_scoring_degraded", "INTEGER"),
+    ("scoring_status", "TEXT"),
+    ("model_features_missing", "INTEGER"),
+    ("missing_family_json", "TEXT"),
 )
 
 
@@ -161,6 +166,8 @@ def append_hightier_prediction_log(
     threshold: float,
     features: pd.DataFrame | None = None,
     feature_columns: tuple[str, ...] | None = None,
+    row_audits: list[RowMissingAudit] | None = None,
+    scoring_status: str = "scored",
     snapshot_version: str | None = None,
     mid_term_freshness_status: str | None = None,
     slow_freshness_status: str | None = None,
@@ -169,7 +176,10 @@ def append_hightier_prediction_log(
     """Batch-insert one scoring cycle into ``prediction_log`` (no-op if path disabled or frame empty).
 
     When ``features`` and ``feature_columns`` are provided, each row stores a JSON object of
-    model input values in ``features_json`` plus ``fe_features_missing`` (count of null ``fe__*``).
+    model input values in ``features_json`` plus per-family missing counts in ``missing_family_json``.
+
+    ``scoring_status`` is ``scored`` for rows that entered ``predict_proba``, or
+    ``skipped_entity_missing`` when Feast entity rows were absent.
 
     ``is_alert`` here means ``margin >= 0`` and ``is_rated_obs == 1`` (audit flag; scorer
     ``state.db`` alerts use ``score >= threshold`` on all rows).
@@ -209,15 +219,26 @@ def append_hightier_prediction_log(
     is_alert = ((margin >= 0.0) & (is_rated_obs.to_numpy() == 1)).astype(int)
 
     staged_reset = staged.reset_index(drop=True)
+    status = str(scoring_status).strip() or "scored"
     rows: list[tuple[Any, ...]] = []
     for pos in range(len(staged_reset)):
         row = staged_reset.iloc[pos]
         feat_json: str | None = None
         fe_miss: int | None = None
+        model_miss: int | None = None
+        family_json: str | None = None
+        if row_audits is not None and pos < len(row_audits):
+            audit = row_audits[pos]
+            fe_miss = audit.fe_features_missing
+            model_miss = audit.model_features_missing
+            family_json = json.dumps(audit.family_summary(), separators=(",", ":"), ensure_ascii=False)
         if feat_frame is not None and feat_cols:
             feat_map = _feature_row_dict(feat_frame.iloc[pos], feat_cols)
             feat_json = json.dumps(feat_map, separators=(",", ":"), ensure_ascii=False)
-            fe_miss = _count_fe_features_missing(feat_map)
+            if fe_miss is None:
+                fe_miss = _count_fe_features_missing(feat_map)
+            if model_miss is None:
+                model_miss = sum(1 for c in feat_cols if feat_map.get(c) is None)
         rows.append(
             (
                 scored_at,
@@ -239,6 +260,9 @@ def append_hightier_prediction_log(
                 _str_or_none(mid_term_freshness_status),
                 _str_or_none(slow_freshness_status),
                 1 if snapshot_scoring_degraded else 0,
+                status,
+                model_miss,
+                family_json,
             )
         )
 
@@ -254,12 +278,56 @@ def append_hightier_prediction_log(
                 casino_player_id, table_id, model_version, score, margin,
                 is_alert, is_rated_obs, threshold, features_json, fe_features_missing,
                 snapshot_version, mid_term_freshness_status, slow_freshness_status,
-                snapshot_scoring_degraded
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                snapshot_scoring_degraded, scoring_status, model_features_missing,
+                missing_family_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
         conn.commit()
     finally:
         conn.close()
-    logger.debug("[prediction_log] appended %d row(s) to %s", len(rows), p)
+    logger.debug("[prediction_log] appended %d row(s) status=%s to %s", len(rows), status, p)
+
+
+def append_skipped_entity_missing_log(
+    db_path: Path | str | None,
+    *,
+    scored_at: str,
+    model_version: str,
+    skipped: pd.DataFrame,
+    feature_columns: tuple[str, ...],
+    threshold: float,
+    feast_mid_cols: tuple[str, ...] = (),
+    feast_slow_cols: tuple[str, ...] = (),
+    short_term_cols: tuple[str, ...] = (),
+    snapshot_version: str | None = None,
+) -> None:
+    """Audit Feast entity-missing rows that did not enter ``predict_proba``."""
+    if skipped is None or skipped.empty:
+        return
+    n_feat = len(feature_columns)
+    fe_n = sum(1 for c in feature_columns if str(c).startswith("fe__"))
+    short_n = len(short_term_cols)
+    audits = [
+        RowMissingAudit(
+            model_features_missing=n_feat,
+            fe_features_missing=fe_n,
+            feast_mid_missing=len(feast_mid_cols),
+            feast_slow_missing=len(feast_slow_cols),
+            short_term_missing=short_n,
+        )
+        for _ in range(len(skipped))
+    ]
+    append_hightier_prediction_log(
+        db_path,
+        scored_at=scored_at,
+        model_version=model_version,
+        staged=skipped,
+        prob=np.zeros(len(skipped), dtype=np.float64),
+        threshold=threshold,
+        feature_columns=feature_columns,
+        row_audits=audits,
+        scoring_status="skipped_entity_missing",
+        snapshot_version=snapshot_version,
+    )
