@@ -99,7 +99,8 @@ def test_clickhouse_session_export_chunks(tmp_path: Path) -> None:
         )
 
     assert meta["query_count"] == 3
-    assert "player_id IN (1,2)" in fake_client.queries[0]
+    assert "TRY_CAST(player_id AS Int64) IN (1,2)" in fake_client.queries[0]
+    assert "TRY_CAST(player_id AS Int64) IS NOT NULL" in fake_client.queries[0]
     assert "gaming_day" in fake_client.queries[0]
     assert "theo_win" in fake_client.queries[0]
 

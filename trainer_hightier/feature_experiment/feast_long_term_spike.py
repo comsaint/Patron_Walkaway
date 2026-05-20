@@ -122,18 +122,18 @@ def export_clickhouse_sessions_to_parquet(
         in_list = ",".join(str(int(x)) for x in chunk)
         q = f"""
             SELECT
-                CAST(player_id AS Int64) AS player_id,
+                TRY_CAST(player_id AS Int64) AS player_id,
                 CAST(gaming_day AS Date) AS gaming_day,
-                CAST(theo_win AS Float64) AS theo_win
+                TRY_CAST(theo_win AS Float64) AS theo_win
             FROM {cfg.source_db}.{cfg.tsession} FINAL
             WHERE gaming_day >= %(g_start)s
               AND gaming_day <= %(g_end)s
               AND gaming_day IS NOT NULL
-              AND player_id IS NOT NULL
-              AND player_id != {placeholder}
+              AND TRY_CAST(player_id AS Int64) IS NOT NULL
+              AND TRY_CAST(player_id AS Int64) != {placeholder}
               AND COALESCE(is_deleted, 0) = 0
               AND COALESCE(is_canceled, 0) = 0
-              AND player_id IN ({in_list})
+              AND TRY_CAST(player_id AS Int64) IN ({in_list})
         """
         frames.append(
             client.query_df(
