@@ -375,6 +375,17 @@ class FeastScorerSmokeResult:
         }
 
 
+def _extract_entity_join_keys(entity: Any) -> list[str]:
+    """Return join key column names from a Feast entity (0.63 uses ``join_key`` singular)."""
+    raw = getattr(entity, "join_keys", None)
+    if raw:
+        return [str(k).strip() for k in list(raw) if str(k).strip()]
+    single = getattr(entity, "join_key", None)
+    if single is not None and str(single).strip():
+        return [str(single).strip()]
+    return []
+
+
 def _check_feast_entity_key(store: Any) -> None:
     """Validate canonical patron entity name, join key, and STRING value type."""
     from feast.value_type import ValueType
@@ -385,7 +396,7 @@ def _check_feast_entity_key(store: Any) -> None:
         raise RuntimeError(
             f"[feast_smoke] entity {FEAST_CANONICAL_ENTITY_NAME!r} missing from Feast registry"
         ) from exc
-    join_keys = [str(k) for k in list(getattr(entity, "join_keys", []) or [])]
+    join_keys = _extract_entity_join_keys(entity)
     if FEAST_CANONICAL_JOIN_KEY not in join_keys:
         raise RuntimeError(
             "[feast_smoke] entity key mismatch: "

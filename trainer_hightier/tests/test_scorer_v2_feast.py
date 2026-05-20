@@ -19,6 +19,7 @@ from trainer_hightier.serving.feast_online_adapter import (
     FEAST_CANONICAL_ENTITY_NAME,
     FEAST_CANONICAL_JOIN_KEY,
     MockFeastOnlineAdapter,
+    _extract_entity_join_keys,
     apply_entity_missing_policy,
     compute_row_missing_audits,
     join_feast_lookup,
@@ -459,6 +460,65 @@ def test_feast_schema_smoke_requires_registry(tmp_path: Path) -> None:
         )
 
 
+def test_extract_entity_join_keys_feast_063_singular_join_key() -> None:
+    from unittest.mock import MagicMock
+
+    entity = MagicMock(spec=[])
+    entity.join_key = FEAST_CANONICAL_JOIN_KEY
+    assert _extract_entity_join_keys(entity) == [FEAST_CANONICAL_JOIN_KEY]
+
+
+def test_extract_entity_join_keys_plural_list() -> None:
+    from unittest.mock import MagicMock
+
+    entity = MagicMock(join_keys=[FEAST_CANONICAL_JOIN_KEY])
+    assert _extract_entity_join_keys(entity) == [FEAST_CANONICAL_JOIN_KEY]
+
+
+def test_feast_schema_smoke_accepts_singular_join_key(tmp_path: Path) -> None:
+    from feast.value_type import ValueType
+    from unittest.mock import MagicMock, patch
+
+    repo = tmp_path / "feast_repo"
+    (repo / "data").mkdir(parents=True)
+    (repo / "data" / "registry.db").write_bytes(b"x")
+    entity = MagicMock(spec=[])
+    entity.join_key = FEAST_CANONICAL_JOIN_KEY
+    entity.value_type = ValueType.STRING
+    mid_view = MagicMock(schema=[type("Field", (), {"name": "fe__bets_cnt__w1d"})()])
+
+    class _FakeStore:
+        def __init__(self, *, repo_path: str) -> None:
+            pass
+
+        def get_entity(self, name: str):
+            if name != FEAST_CANONICAL_ENTITY_NAME:
+                raise KeyError(name)
+            return entity
+
+        def get_feature_view(self, name: str):
+            if name == MID_SPIKE_FEATURE_VIEW_NAME:
+                return mid_view
+            raise KeyError(name)
+
+        def get_feature_service(self, name: str):
+            if name == MID_SPIKE_FEATURE_SERVICE_NAME:
+                return MagicMock()
+            raise KeyError(name)
+
+        def get_online_features(self, *, features, entity_rows):
+            return MagicMock(to_df=lambda: pd.DataFrame({FEAST_CANONICAL_JOIN_KEY: ["probe-c1"]}))
+
+    with patch("feast.FeatureStore", _FakeStore):
+        result = run_feast_scorer_schema_smoke_check(
+            repo,
+            mid_columns=("fe__bets_cnt__w1d",),
+            slow_columns=(),
+            probe_canonical_id="probe-c1",
+        )
+    assert result.online_probe_ok is True
+
+
 def test_feast_schema_smoke_validates_entity_and_views(tmp_path: Path) -> None:
     from feast.value_type import ValueType
     from unittest.mock import MagicMock, patch
@@ -511,7 +571,9 @@ def test_feast_schema_smoke_entity_key_mismatch(tmp_path: Path) -> None:
     repo = tmp_path / "feast_repo"
     (repo / "data").mkdir(parents=True)
     (repo / "data" / "registry.db").write_bytes(b"x")
-    bad_entity = MagicMock(join_keys=["player_id"], value_type=ValueType.INT64)
+    bad_entity = MagicMock(spec=[])
+    bad_entity.join_key = "player_id"
+    bad_entity.value_type = ValueType.INT64
 
     class _FakeStore:
         def __init__(self, *, repo_path: str) -> None:
