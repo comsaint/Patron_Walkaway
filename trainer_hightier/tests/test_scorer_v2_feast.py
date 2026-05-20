@@ -551,6 +551,33 @@ def test_mock_feast_adapter_cell_null_allowed() -> None:
     assert len(skipped) == 0
 
 
+def test_join_feast_lookup_dedupes_duplicate_canonical_rows() -> None:
+    """Feast SDK may return multiple rows per canonical_id; join must not explode bets."""
+    n_bets = 5
+    staged = pd.DataFrame(
+        {
+            "canonical_id": ["c1"] * n_bets,
+            "bet_id": [float(i) for i in range(n_bets)],
+        }
+    )
+    lookup_df = pd.DataFrame(
+        {
+            "canonical_id": ["c1", "c1", "c1"],
+            "fe__bets_cnt__w1d": [1.0, 2.0, 3.0],
+        }
+    )
+    lookup = join_feast_lookup(
+        staged,
+        lookup_df,
+        feature_columns=("fe__bets_cnt__w1d",),
+        mid_columns=("fe__bets_cnt__w1d",),
+        slow_columns=(),
+    )
+    assert len(lookup.values) == n_bets
+    assert lookup.values.index.tolist() == staged.index.tolist()
+    assert float(lookup.values.iloc[-1]["fe__bets_cnt__w1d"]) == pytest.approx(3.0)
+
+
 def test_entity_missing_rate_zero_passes() -> None:
     staged = pd.DataFrame({"canonical_id": ["a", "b"]})
     lookup_df = pd.DataFrame({"canonical_id": ["a", "b"], "fe__bets_cnt__w1d": [1.0, 2.0]})

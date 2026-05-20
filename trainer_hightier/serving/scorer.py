@@ -637,7 +637,9 @@ def _attach_feast_mid_slow(
             n_entity_missing=0,
         )
         return staged.copy(), staged.iloc[0:0].copy(), empty_diag
-    cids = [str(x).strip() for x in staged["canonical_id"].tolist()]
+    cids = sorted(
+        {str(x).strip() for x in staged["canonical_id"].tolist() if str(x).strip()}
+    )
     t0 = time.perf_counter()
     lookup_df = adapter.lookup_mid_slow(
         cids,

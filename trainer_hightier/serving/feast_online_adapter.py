@@ -303,7 +303,8 @@ class FeastSdkOnlineAdapter:
         if "canonical_id" not in out.columns:
             raise ValueError("[feast_adapter] Feast response missing canonical_id column")
         keep = ["canonical_id", *[c for c in wanted if c in out.columns]]
-        return out[keep].copy()
+        slim = out[keep].copy()
+        return _dedupe_lookup_by_canonical_id(slim)
 
 
 def default_feast_repo_path() -> Path:
@@ -527,6 +528,25 @@ def build_production_feast_adapter() -> OnlineFeastAdapter:
     return FeastSdkOnlineAdapter(feast_repo=default_feast_repo_path())
 
 
+def _dedupe_lookup_by_canonical_id(lookup_df: pd.DataFrame) -> pd.DataFrame:
+    """One row per ``canonical_id`` so left joins cannot many-to-many explode staged bets."""
+    if lookup_df is None or lookup_df.empty or "canonical_id" not in lookup_df.columns:
+        return lookup_df
+    lk = lookup_df.copy()
+    lk["canonical_id"] = lk["canonical_id"].astype(str).str.strip()
+    n_before = len(lk)
+    lk = lk.drop_duplicates(subset=["canonical_id"], keep="last")
+    n_dup = n_before - len(lk)
+    if n_dup:
+        logger.warning(
+            "[feast_adapter] dropped %d duplicate canonical_id rows from Feast lookup (before=%d after=%d)",
+            n_dup,
+            n_before,
+            len(lk),
+        )
+    return lk
+
+
 def join_feast_lookup(
     staged: pd.DataFrame,
     lookup_df: pd.DataFrame,
@@ -561,13 +581,24 @@ def join_feast_lookup(
         merged = out
         present_ids: set[str] = set()
     else:
-        lk = lookup_df.copy()
-        lk["canonical_id"] = lk["canonical_id"].astype(str).str.strip()
-        present_ids = set(lk["canonical_id"].tolist())
-        merged = out.merge(lk, on="canonical_id", how="left", suffixes=("", "_feast_dup"))
+        lk = _dedupe_lookup_by_canonical_id(lookup_df)
+        present_ids = set(lk["canonical_id"].astype(str).str.strip().tolist())
+        merged = out.merge(
+            lk,
+            on="canonical_id",
+            how="left",
+            suffixes=("", "_feast_dup"),
+            validate="m:1",
+        )
         for col in cols:
             if col not in merged.columns:
                 merged[col] = pd.NA
+    if len(merged) != len(staged):
+        raise RuntimeError(
+            "[feast_adapter] Feast join row count mismatch: "
+            f"staged={len(staged)} merged={len(merged)}; "
+            "lookup likely still has duplicate canonical_id rows"
+        )
     entity_missing = pd.Series(False, index=merged.index)
     n_mid_present = 0
     n_slow_present = 0

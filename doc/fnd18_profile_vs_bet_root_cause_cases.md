@@ -3,6 +3,8 @@
 日期：2026-05-13  
 範圍：`|profile_total_theo_win - bet_total_theo_win| >= 100,000` 的 42 位 canonical patrons。
 
+**可重現驗證（clone 後）**：`doc/FINDINGS.md` 附錄 **[FND-18]** 之 DuckDB SQL 使用 `doc/fixtures/fnd18/`（隨 repo 追蹤）；下表數字為當次全量掃描快照，與 fixture 重算之 `theo_gap` 可能因上游重跑而略有差異，但 42 位個案 ID 與 root-cause 分類仍為 SSOT。
+
 ## 欄位說明
 
 - `theo_gap`：`profile_total_theo_win - bet_total_theo_win`（負值代表 bet 端較大）。

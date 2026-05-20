@@ -690,22 +690,32 @@ WHERE bet_type = 'PLAYER';
 
 > 目的：對 `|profile_total_theo_win - bet_total_theo_win| >= 100k` 的高差異案例，區分是 `t_session` gate、raw source 覆蓋不一致，還是 matched-session 口徑差，避免把所有差異都歸咎為單一問題。
 
+**可重現資料（隨 repo 追蹤）**
+
+| 檔案 | 用途 |
+|------|------|
+| `doc/fixtures/fnd18/canonical_player_mapping.parquet` | `player_id` ↔ `canonical_id`（42 位高差異個案） |
+| `doc/fixtures/fnd18/canonical_patron_profile.csv` | patron 彙總（同上 42 位；欄位為附錄 SQL 所需子集） |
+| `doc/fixtures/fnd18/cleaned__gmwds_t_bet.parquet` | 對應 cleaned bet 列（同上 42 位） |
+
+**全量重跑（本機產物，不進 git）**：`trainer_hightier/artifacts/**` 由 `.gitignore` 排除；需先依 [`trainer_hightier/RUNBOOK.md`](../trainer_hightier/RUNBOOK.md) 跑 `python -m trainer_hightier.trainer` 產出 mapping／profile／`cleaned__gmwds_t_bet/`。全量掃描時 bet 請用 `read_parquet('trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet/**/*.parquet', hive_partitioning=true)`（Hive 分區目錄，非單一 `.parquet` 檔）。
+
 ```sql
--- 1) 先鎖定高差異 canonical_id（可調閾值）
+-- 1) 先鎖定高差異 canonical_id（可調閾值；路徑指向 repo 內 fixture，clone 後可直接跑）
 WITH mp AS (
   SELECT CAST(player_id AS BIGINT) AS player_id,
          CAST(canonical_id AS BIGINT) AS canonical_id
-  FROM read_parquet('trainer_hightier/artifacts/mapping/canonical_player_mapping.parquet')
+  FROM read_parquet('doc/fixtures/fnd18/canonical_player_mapping.parquet')
 ),
 p AS (
   SELECT CAST(canonical_id AS BIGINT) AS canonical_id,
          CAST(total_theo_win AS DOUBLE) AS p_theo
-  FROM read_csv_auto('trainer_hightier/artifacts/profile/canonical_patron_profile.csv', header=true)
+  FROM read_csv_auto('doc/fixtures/fnd18/canonical_patron_profile.csv', header=true)
 ),
 b AS (
   SELECT mp.canonical_id,
          SUM(COALESCE(CAST(bt.theo_win AS DOUBLE), 0.0)) AS b_theo
-  FROM read_parquet('trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet.parquet') bt
+  FROM read_parquet('doc/fixtures/fnd18/cleaned__gmwds_t_bet.parquet') bt
   JOIN mp ON CAST(bt.player_id AS BIGINT) = mp.player_id
   GROUP BY 1
 )
@@ -713,9 +723,10 @@ SELECT p.canonical_id, (p.p_theo - b.b_theo) AS theo_gap
 FROM p JOIN b USING (canonical_id)
 WHERE ABS(p.p_theo - b.b_theo) >= 100000
 ORDER BY ABS(p.p_theo - b.b_theo) DESC;
+-- 預期：回傳 42 列（與 doc/fnd18_profile_vs_bet_root_cause_cases.md 個案清單相同）
 
 -- 2) 依 canonical_id + session_id 做 FULL OUTER JOIN 拆成 matched / session_only / bet_only
 --    並把 bet_only 回接 raw t_session 的 dedup 後版本，判斷是 deleted/canceled 還是 raw session 缺失。
---    詳細逐案輸出請參考：
---    doc/fnd18_profile_vs_bet_root_cause_cases.md
+--    逐案分解表為 2026-05-13 全量掃描快照；數字與上式「當前 fixture 重算」可能因上游重跑而漂移。
+--    詳細逐案輸出請參考：doc/fnd18_profile_vs_bet_root_cause_cases.md
 ```
