@@ -15,6 +15,7 @@ from trainer_hightier.config import DuckDbRuntimeConfig, HightierServingConfig
 from trainer_hightier.feature_experiment.feast_long_term_spike import (
     SPIKE_LONG_TERM_FEATURE_COLUMNS,
     FeastLongTermSpikeConfig,
+    _sanitize_ch_session_export_df,
     _write_feast_spike_parquet,
     compute_long_term_spike_snapshot,
     export_clickhouse_sessions_to_parquet,
@@ -35,6 +36,19 @@ def _write_mapping(path: Path) -> None:
         pa.Table.from_pandas(pd.DataFrame({"player_id": [100], "canonical_id": ["c1"]})),
         path,
     )
+
+
+def test_sanitize_ch_session_export_drops_bad_player_id() -> None:
+    raw = pd.DataFrame(
+        {
+            "player_id": [1, None, "bad"],
+            "gaming_day": ["2024-01-05", "2024-01-06", "2024-01-07"],
+            "theo_win": [10.0, 20.0, 30.0],
+        }
+    )
+    got = _sanitize_ch_session_export_df(raw)
+    assert len(got) == 1
+    assert int(got.iloc[0]["player_id"]) == 1
 
 
 def test_write_feast_spike_parquet_collapses_latest_anchor(tmp_path: Path) -> None:
@@ -99,10 +113,9 @@ def test_clickhouse_session_export_chunks(tmp_path: Path) -> None:
         )
 
     assert meta["query_count"] == 3
-    assert "TRY_CAST(player_id AS Int64) IN (1,2)" in fake_client.queries[0]
-    assert "TRY_CAST(player_id AS Int64) IS NOT NULL" in fake_client.queries[0]
-    assert "gaming_day" in fake_client.queries[0]
-    assert "theo_win" in fake_client.queries[0]
+    assert "player_id IN (1,2)" in fake_client.queries[0]
+    assert "SELECT\n                player_id," in fake_client.queries[0]
+    assert meta["rows_dropped_on_sanitize"] == 0
 
 
 def test_compute_long_term_spike_snapshot_local(tmp_path: Path) -> None:

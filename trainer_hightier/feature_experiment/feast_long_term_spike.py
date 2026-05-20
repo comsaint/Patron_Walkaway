@@ -98,6 +98,23 @@ def _session_gaming_day_bounds(*, lookback_days: int) -> tuple[date, date]:
     return gaming_day_start, gaming_day_end
 
 
+def _sanitize_ch_session_export_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Coerce raw ClickHouse session rows for ``materialize_slow_patron_180d_canonical_asof``."""
+    required = ("player_id", "gaming_day", "theo_win")
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"session export missing columns {missing}; got {list(df.columns)[:20]}")
+    if df.empty:
+        return df
+    out = df.loc[:, list(required)].copy()
+    out["player_id"] = pd.to_numeric(out["player_id"], errors="coerce")
+    out["theo_win"] = pd.to_numeric(out["theo_win"], errors="coerce")
+    out["gaming_day"] = pd.to_datetime(out["gaming_day"], errors="coerce").dt.normalize()
+    out = out.loc[out["player_id"].notna() & out["gaming_day"].notna()].copy()
+    out["player_id"] = out["player_id"].astype("int64", copy=False)
+    return out
+
+
 def export_clickhouse_sessions_to_parquet(
     out_parquet: Path,
     *,
@@ -122,18 +139,18 @@ def export_clickhouse_sessions_to_parquet(
         in_list = ",".join(str(int(x)) for x in chunk)
         q = f"""
             SELECT
-                TRY_CAST(player_id AS Int64) AS player_id,
-                CAST(gaming_day AS Date) AS gaming_day,
-                TRY_CAST(theo_win AS Float64) AS theo_win
+                player_id,
+                gaming_day,
+                theo_win
             FROM {cfg.source_db}.{cfg.tsession} FINAL
             WHERE gaming_day >= %(g_start)s
               AND gaming_day <= %(g_end)s
               AND gaming_day IS NOT NULL
-              AND TRY_CAST(player_id AS Int64) IS NOT NULL
-              AND TRY_CAST(player_id AS Int64) != {placeholder}
+              AND player_id IS NOT NULL
+              AND player_id != {placeholder}
               AND COALESCE(is_deleted, 0) = 0
               AND COALESCE(is_canceled, 0) = 0
-              AND TRY_CAST(player_id AS Int64) IN ({in_list})
+              AND player_id IN ({in_list})
         """
         frames.append(
             client.query_df(
@@ -150,8 +167,10 @@ def export_clickhouse_sessions_to_parquet(
                     f"({rows_so_far} rows after chunk {i + 1}/{len(chunks)})"
                 )
     nonempty = [frame for frame in frames if frame is not None and not frame.empty]
-    df = pd.concat(nonempty, ignore_index=True) if nonempty else pd.DataFrame()
+    raw = pd.concat(nonempty, ignore_index=True) if nonempty else pd.DataFrame()
     elapsed = round(time.perf_counter() - t0, 3)
+    raw_rows = int(len(raw))
+    df = _sanitize_ch_session_export_df(raw)
     if df.empty:
         raise ValueError(
             f"ClickHouse session export returned 0 rows for gaming_day in "
@@ -161,6 +180,8 @@ def export_clickhouse_sessions_to_parquet(
     return {
         "source": "clickhouse",
         "rows_exported": int(len(df)),
+        "rows_raw_from_clickhouse": raw_rows,
+        "rows_dropped_on_sanitize": max(0, raw_rows - len(df)),
         "export_seconds": elapsed,
         "query_count": len(chunks),
         "player_id_chunk_count": len(chunks),
