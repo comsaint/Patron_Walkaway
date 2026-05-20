@@ -451,6 +451,9 @@ def run_spike(cfg: FeastLongTermSpikeConfig | None = None) -> dict[str, Any]:
     out_report.parent.mkdir(parents=True, exist_ok=True)
     out_report.write_text(json.dumps(report, indent=2, sort_keys=True, default=str), encoding="utf-8")
     report["report_path"] = str(out_report)
+    from trainer_hightier.serving.feast_readiness import update_readiness_layer_from_spike_report
+
+    update_readiness_layer_from_spike_report(report, layer="slow_patron", feast_repo=feast_repo)
     logger.info("[feast_long_term_spike] verdict=%s report=%s", report["verdict"], out_report)
     return report
 

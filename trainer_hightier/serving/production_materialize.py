@@ -251,14 +251,38 @@ def materialize_production_slow_canonical_asof(
         lookback_days=lb,
         duckdb_runtime=duckdb_runtime,
     )
+    anchor_max = None
+    pf = pq.ParquetFile(out)
+    if pf.metadata and pf.metadata.num_rows > 0 and "anchor_gaming_day" in pf.schema_arrow.names:
+        con = duckdb.connect(database=":memory:")
+        try:
+            esc = _path_esc(out)
+            raw = con.execute(
+                f"SELECT MAX(CAST(anchor_gaming_day AS DATE)) FROM read_parquet('{esc}')"
+            ).fetchone()[0]
+            if raw is not None:
+                anchor_max = pd.Timestamp(raw).date()
+        finally:
+            con.close()
     meta = {
         "artifact_kind": "slow_patron_canonical_asof",
         "slow_patron_grain": SLOW_PATRON_GRAIN_CANONICAL_ASOF,
+        "snapshot_scope": "production",
         "lookback_days": lb,
+        "slow_anchor_gaming_day_max": anchor_max.isoformat() if anchor_max else None,
         "sha256": _sha256_file(out),
         **parquet_row_stats(out, key_col="canonical_id"),
     }
     write_production_artifact_sidecar(out, meta)
+    try:
+        from trainer_hightier.serving.feast_readiness import (
+            layer_readiness_from_production_slow_meta,
+            publish_feast_layer_readiness,
+        )
+
+        publish_feast_layer_readiness(layer_readiness_from_production_slow_meta(meta))
+    except Exception as exc:
+        logger.warning("[production_materialize] feast readiness publish skipped: %s", exc)
     return out, meta
 
 
@@ -382,6 +406,15 @@ def materialize_production_mid_term_daily_snapshot(
         **parquet_row_stats(dst, key_col="canonical_id"),
     }
     write_production_artifact_sidecar(dst, meta)
+    try:
+        from trainer_hightier.serving.feast_readiness import (
+            layer_readiness_from_production_mid_meta,
+            publish_feast_layer_readiness,
+        )
+
+        publish_feast_layer_readiness(layer_readiness_from_production_mid_meta(meta))
+    except Exception as exc:
+        logger.warning("[production_materialize] feast readiness publish skipped: %s", exc)
     return dst, meta
 
 

@@ -586,6 +586,9 @@ def run_spike(cfg: FeastMidTermSpikeConfig | None = None) -> dict[str, Any]:
     out_report.parent.mkdir(parents=True, exist_ok=True)
     out_report.write_text(json.dumps(report, indent=2, sort_keys=True, default=str), encoding="utf-8")
     report["report_path"] = str(out_report)
+    from trainer_hightier.serving.feast_readiness import update_readiness_layer_from_spike_report
+
+    update_readiness_layer_from_spike_report(report, layer="mid_term", feast_repo=feast_repo)
     logger.info("[feast_mid_term_spike] verdict=%s report=%s", report["verdict"], out_report)
     return report
 

@@ -95,6 +95,13 @@ SCORER_POLL_INTERVAL_SECONDS: Final[int] = 45
 SCORER_FEAST_ENTITY_MISSING_FAIL_FRACTION: Final[float] = 0.10
 #: Run Feast registry / online schema smoke at scorer startup when mid/long Feast columns are required.
 SCORER_FEAST_SCHEMA_SMOKE_ENABLED: Final[bool] = True
+#: Combined mid/slow Feast online readiness JSON (written by spike / refresh jobs).
+FEAST_ONLINE_READINESS_BASENAME: Final[str] = "feast_online_readiness.json"
+FEAST_ONLINE_READINESS_SCHEMA_VERSION: Final[int] = 1
+#: Fail scorer startup when feast_online_readiness.json is missing or stale for required layers.
+SCORER_FEAST_READINESS_ENABLED: Final[bool] = True
+#: Allowlist canonical ids sampled for deploy-time Feast online lookup smoke.
+SCORER_FEAST_DEPLOY_LOOKUP_SMOKE_SAMPLE_SIZE: Final[int] = 20
 
 # Baseline MODEL columns: softer FQG (high PSI → WARN; unique-constant under sample → WARN; WARN auto-allowlist).
 _FQG_BASELINE_MODEL_SOFT_COLUMNS: tuple[str, ...] = (
@@ -509,6 +516,12 @@ class HightierServingConfig:
     scorer_feast_schema_smoke_enabled: bool = SCORER_FEAST_SCHEMA_SMOKE_ENABLED
     #: Probe ``canonical_id`` for startup online lookup smoke (may legitimately return empty features).
     scorer_feast_schema_smoke_probe_canonical_id: str = "__feast_scorer_smoke_probe__"
+    #: When True, require ``feast_online_readiness.json`` for Feast mid/long columns at scorer startup.
+    scorer_feast_readiness_enabled: bool = SCORER_FEAST_READINESS_ENABLED
+    #: Override path to combined Feast readiness JSON; ``None`` uses package default under artifacts/feast.
+    scorer_feast_readiness_path: Path | None = None
+    #: Deploy / dry-run allowlist sample size for Feast online lookup smoke.
+    scorer_feast_deploy_lookup_smoke_sample_size: int = SCORER_FEAST_DEPLOY_LOOKUP_SMOKE_SAMPLE_SIZE
 
 
 _DEFAULT_HIGHTIER_SERVING: HightierServingConfig = HightierServingConfig()

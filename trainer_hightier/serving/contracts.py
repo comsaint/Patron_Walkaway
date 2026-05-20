@@ -6,7 +6,7 @@ scorer, validator, and API without importing ``trainer.serving`` at runtime.
 
 from __future__ import annotations
 
-from typing import Final
+from typing import Any, Final
 
 #: New alert columns (Phase-1) — mirrors ``trainer.serving.scorer._NEW_ALERT_COLS``.
 NEW_ALERT_COLUMNS: Final[tuple[tuple[str, str], ...]] = (
@@ -32,6 +32,55 @@ VALIDATION_RESULTS_PHASE1_MIGRATION_COLUMNS: Final[tuple[tuple[str, str], ...]] 
     ("casino_player_id", "TEXT"),
     ("bet_ts", "TEXT"),
 )
+
+#: Columns scorer v2 must populate for ``validator.parse_alerts`` / ``validate_alert_row``.
+ALERTS_VALIDATOR_REQUIRED_COLUMNS: Final[tuple[str, ...]] = (
+    "bet_id",
+    "ts",
+    "bet_ts",
+    "player_id",
+    "table_id",
+    "position_idx",
+    "session_id",
+    "score",
+    "canonical_id",
+)
+
+#: ML API ``/alerts`` protocol keys produced by :func:`api_server._alerts_to_protocol_records`.
+ALERTS_API_PROTOCOL_COLUMNS: Final[tuple[str, ...]] = (
+    "bet_id",
+    "ts",
+    "bet_ts",
+    "player_id",
+    "casino_player_id",
+    "table_id",
+    "position_idx",
+    "session_id",
+    "visit_avg_bet",
+    "is_known_player",
+)
+
+
+def assert_alerts_dataframe_validator_ready(alerts: Any) -> None:
+    """Fail fast when scorer alert rows lack validator / API contract columns."""
+    import pandas as pd
+
+    if not isinstance(alerts, pd.DataFrame):
+        raise TypeError(f"alerts must be a DataFrame, got {type(alerts)!r}")
+    missing = [c for c in ALERTS_VALIDATOR_REQUIRED_COLUMNS if c not in alerts.columns]
+    if missing:
+        raise ValueError(
+            "[contracts] alerts missing validator-required columns: "
+            f"{missing}; got columns={list(alerts.columns)}"
+        )
+    if alerts.empty:
+        return
+    for col in ALERTS_VALIDATOR_REQUIRED_COLUMNS:
+        if alerts[col].isna().all():
+            raise ValueError(
+                f"[contracts] alerts column {col!r} is all-null; validator cannot process rows"
+            )
+
 
 VALIDATION_COLUMNS: Final[tuple[str, ...]] = (
     "alert_ts",

@@ -947,3 +947,261 @@ def test_feast_schema_smoke_missing_feature_service(tmp_path: Path) -> None:
                 slow_columns=(),
                 run_online_probe=False,
             )
+
+
+def test_feast_readiness_gate_fails_when_document_missing(tmp_path: Path) -> None:
+    from trainer_hightier.serving.feast_readiness import evaluate_feast_readiness_gate
+
+    path = tmp_path / "feast_online_readiness.json"
+    gate = evaluate_feast_readiness_gate(
+        None,
+        require_mid=True,
+        require_slow=True,
+        readiness_path=path,
+        close_hour=3,
+        mid_hard_cap_days=3,
+        slow_hard_cap_days=3,
+        slow_grace_days=1,
+    )
+    assert gate.ok is False
+    assert gate.hard_failure_reason is not None
+    assert "feast_online_readiness.json missing" in gate.hard_failure_reason
+
+
+def test_feast_readiness_roundtrip_and_fresh_gate(tmp_path: Path) -> None:
+    from datetime import date
+
+    from trainer_hightier.serving.feast_readiness import (
+        FeastLayerReadiness,
+        FeastOnlineReadiness,
+        evaluate_feast_readiness_gate,
+        layer_readiness_from_mid_spike_report,
+        load_feast_online_readiness,
+        write_feast_online_readiness,
+    )
+    from trainer_hightier.serving.snapshot_freshness import expected_mid_term_anchor, serving_gaming_day
+
+    hk = ZoneInfo("Asia/Hong_Kong")
+    anchor = expected_mid_term_anchor(serving_gaming_day(close_hour=3))
+    report = {
+        "snapshot_scope": "production",
+        "mid_term_anchor_gaming_day_max": anchor.isoformat(),
+        "feast_spike_rows": 100,
+        "lookup_batch_size": 10,
+        "lookup_ok_rows": 10,
+        "lookup_missing_by_feature": {},
+        "feature_columns": ["fe__bets_cnt__w1d"],
+    }
+    mid_layer = layer_readiness_from_mid_spike_report(report)
+    slow_layer = FeastLayerReadiness(
+        layer="slow_patron",
+        source_scope="adt_allowlist",
+        anchor_gaming_day_max=date(anchor.year, anchor.month, 1),
+        generated_at=mid_layer.generated_at,
+        row_count=50,
+        distinct_canonical_count=None,
+        cell_null_counts={},
+        lookup_sample_size=10,
+        lookup_entity_present_rate=1.0,
+        feature_columns=("patron__adt__w180d_m1snap",),
+        feast_feature_view="long_term_slow_spike_features",
+        materialize_source="test",
+    )
+    doc = FeastOnlineReadiness(
+        schema_version=1,
+        generated_at=mid_layer.generated_at,
+        feast_repo=str(tmp_path / "feast_repo"),
+        mid_term=mid_layer,
+        slow_patron=slow_layer,
+    )
+    out = tmp_path / "feast_online_readiness.json"
+    write_feast_online_readiness(doc, out)
+    loaded = load_feast_online_readiness(out)
+    assert loaded is not None
+    assert loaded.mid_term is not None
+    assert loaded.mid_term.anchor_gaming_day_max == anchor
+    gate = evaluate_feast_readiness_gate(
+        loaded,
+        require_mid=True,
+        require_slow=True,
+        readiness_path=out,
+        close_hour=3,
+        mid_hard_cap_days=3,
+        slow_hard_cap_days=3,
+        slow_grace_days=1,
+    )
+    assert gate.ok is True
+    assert gate.mid_fresh is not None
+    assert gate.mid_fresh.status == "fresh"
+
+
+def test_feast_readiness_rejects_training_scope_mid() -> None:
+    from trainer_hightier.serving.feast_readiness import (
+        FeastLayerReadiness,
+        FeastOnlineReadiness,
+        evaluate_feast_readiness_gate,
+    )
+
+    hk = ZoneInfo("Asia/Hong_Kong")
+    now = pd.Timestamp.now(tz=hk).to_pydatetime()
+    mid = FeastLayerReadiness(
+        layer="mid_term",
+        source_scope="training_step4_only",
+        anchor_gaming_day_max=pd.Timestamp("2026-05-19").date(),
+        generated_at=now,
+        row_count=1,
+        distinct_canonical_count=1,
+        cell_null_counts={},
+        lookup_sample_size=None,
+        lookup_entity_present_rate=None,
+        feature_columns=("fe__bets_cnt__w1d",),
+        feast_feature_view=None,
+        materialize_source="test",
+    )
+    doc = FeastOnlineReadiness(
+        schema_version=1,
+        generated_at=now,
+        feast_repo="/tmp/feast_repo",
+        mid_term=mid,
+        slow_patron=None,
+    )
+    gate = evaluate_feast_readiness_gate(
+        doc,
+        require_mid=True,
+        require_slow=False,
+        readiness_path=Path("/tmp/feast_online_readiness.json"),
+        close_hour=3,
+        mid_hard_cap_days=3,
+        slow_hard_cap_days=3,
+        slow_grace_days=1,
+    )
+    assert gate.ok is False
+    assert "training-scoped" in (gate.hard_failure_reason or "")
+
+
+def test_scorer_v2_alerts_validator_and_api_compatible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P6-4: scorer v2 alert rows satisfy validator columns and ML API protocol."""
+    from trainer_hightier.serving.api_server import _alerts_to_protocol_records
+    from trainer_hightier.serving.contracts import assert_alerts_dataframe_validator_ready
+    from trainer_hightier.serving import scorer as scorer_mod
+    from trainer_hightier.serving.model_bundle import load_hightier_model_bundle
+
+    bets, _ = _sample_bets_two_rows()
+    bets["payout_odds"] = [0.5, 0.5]
+    cmap = tmp_path / "map.parquet"
+    pd.DataFrame({"player_id": [10, 11], "canonical_id": ["c10", "c11"]}).to_parquet(cmap, index=False)
+    _patch_score_once_ch_io(monkeypatch, scorer_mod, bets=bets)
+    _patch_serving_prediction_log_path(monkeypatch, scorer_mod, tmp_path)
+    init_prediction_log_db(tmp_path / "prediction_log.db")
+
+    bundle = load_hightier_model_bundle(bundle_dir=_write_min_bundle(tmp_path))
+    adapter = MockFeastOnlineAdapter(
+        features_by_canonical={
+            "c10": {"fe__bets_cnt__w1d": 1.0, "patron__adt__w180d_m1snap": 5.0},
+            "c11": {"fe__bets_cnt__w1d": 2.0, "patron__adt__w180d_m1snap": 6.0},
+        }
+    )
+    state_db = tmp_path / "state.db"
+    init_state_db(state_db)
+    conn = sqlite3.connect(state_db)
+    try:
+        n_alerts = scorer_mod.score_once(
+            conn,
+            bundle,
+            feast_adapter=adapter,
+            mapping_parquet=cmap,
+            manifest=_manifest_v_test(tmp_path),
+            high_adt_only=False,
+            allowlist_ids=frozenset(),
+        )
+        alerts = pd.read_sql_query("SELECT * FROM alerts", conn)
+    finally:
+        conn.close()
+    assert n_alerts == 2
+    assert_alerts_dataframe_validator_ready(alerts)
+    alerts["ts_dt"] = pd.to_datetime(alerts["ts"], errors="coerce")
+    records = _alerts_to_protocol_records(alerts)
+    assert len(records) == 2
+    for rec in records:
+        assert rec["bet_id"] is not None
+        assert rec["player_id"] is not None
+        assert "canonical_id" not in rec
+
+
+def test_scorer_v2_integration_records_cycle_metrics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P6-2: mock CH + mock Feast + bundle reaches predict and records cycle metrics."""
+    from trainer_hightier.serving import scorer as scorer_mod
+    from trainer_hightier.serving.model_bundle import load_hightier_model_bundle
+
+    bets, _ = _sample_bets_two_rows()
+    cmap = tmp_path / "map.parquet"
+    pd.DataFrame({"player_id": [10, 11], "canonical_id": ["c10", "c11"]}).to_parquet(cmap, index=False)
+    _patch_score_once_ch_io(monkeypatch, scorer_mod, bets=bets)
+    _patch_serving_prediction_log_path(monkeypatch, scorer_mod, tmp_path)
+    init_prediction_log_db(tmp_path / "prediction_log.db")
+    bundle = load_hightier_model_bundle(bundle_dir=_write_min_bundle(tmp_path))
+    adapter = MockFeastOnlineAdapter(
+        features_by_canonical={
+            "c10": {"fe__bets_cnt__w1d": 1.0, "patron__adt__w180d_m1snap": 1.0},
+            "c11": {"fe__bets_cnt__w1d": 2.0, "patron__adt__w180d_m1snap": 2.0},
+        }
+    )
+    state_db = tmp_path / "state.db"
+    init_state_db(state_db)
+    conn = sqlite3.connect(state_db)
+    try:
+        scorer_mod.score_once(
+            conn,
+            bundle,
+            feast_adapter=adapter,
+            mapping_parquet=cmap,
+            manifest=_manifest_v_test(tmp_path),
+            high_adt_only=False,
+            allowlist_ids=frozenset(),
+        )
+    finally:
+        conn.close()
+    metrics = scorer_mod.get_last_scorer_cycle_metrics()
+    assert metrics is not None
+    assert metrics["n_alerts"] == 2
+    cr = metrics["cycle_readiness"]
+    assert cr["n_requested"] == cr["n_scored"] == 2
+
+
+def test_scorer_dry_run_report_row_alignment_verdict() -> None:
+    from trainer_hightier.serving.scorer_dry_run import build_dry_run_report_from_cycle
+
+    report = build_dry_run_report_from_cycle(
+        model_version="test-v2",
+        cycle_readiness={
+            "n_requested": 2000,
+            "n_scored": 2000,
+            "n_skipped_entity_missing": 0,
+            "entity_missing_rate": 0.0,
+            "entity_missing_fail_fraction": 0.1,
+            "lookup_latency_ms": 48.0,
+        },
+        n_alerts=1,
+    )
+    acc = report.acceptance_summary()
+    assert acc["verdict"] == "pass"
+    assert acc["row_count_aligned"] is True
+
+    bad = build_dry_run_report_from_cycle(
+        model_version="test-v2",
+        cycle_readiness={
+            "n_requested": 2000,
+            "n_scored": 177830,
+            "entity_missing_rate": 0.0,
+            "entity_missing_fail_fraction": 0.1,
+            "lookup_latency_ms": 48.0,
+        },
+        n_alerts=1,
+    )
+    assert bad.acceptance_summary()["verdict"] == "fail"
