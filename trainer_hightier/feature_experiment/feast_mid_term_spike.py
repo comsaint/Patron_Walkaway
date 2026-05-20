@@ -32,6 +32,7 @@ from trainer_hightier.config import (
     get_run_profile,
 )
 from trainer_hightier.feature_experiment.materialize_mid_term_daily_snapshot import (
+    MID_TERM_SNAPSHOT_OUTPUT_COLUMNS,
     materialize_mid_term_daily_snapshot,
 )
 from trainer_hightier.serving.adt_allowlist import load_adt_allowlist_ids, resolve_adt_allowlist_path
@@ -40,10 +41,10 @@ from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_p
 
 logger = logging.getLogger(__name__)
 
-SPIKE_MID_TERM_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
-    "fe__wager_sum__w7d",
-    "fe__wager_sum__w30d",
-    "fe__prior_wager_mean_w30d",
+SPIKE_MID_TERM_FEATURE_COLUMNS: Final[tuple[str, ...]] = tuple(
+    c
+    for c in MID_TERM_SNAPSHOT_OUTPUT_COLUMNS
+    if c not in ("canonical_id", "anchor_gaming_day")
 )
 SPIKE_FEATURE_VIEW_NAME: Final[str] = "mid_term_daily_spike_features"
 SPIKE_FEATURE_SERVICE_NAME: Final[str] = "walkaway_canonical_mid_term_spike_v1"
@@ -423,50 +424,42 @@ def run_online_lookup_smoke(
     canonical_ids: list[str],
     batch_size: int,
 ) -> dict[str, Any]:
-    """Measure ``get_online_features`` latency and missing rate."""
+    """Measure batched ``get_online_features`` latency and missing rate."""
     from feast import FeatureStore
 
     if not canonical_ids:
         raise ValueError("canonical_ids must be non-empty")
     store = FeatureStore(repo_path=str(Path(feast_repo).resolve()))
-    latencies_ms: list[float] = []
     missing_counts: dict[str, int] = {c: 0 for c in SPIKE_MID_TERM_FEATURE_COLUMNS}
-    n_ok = 0
     batch_ids = [str(x) for x in canonical_ids[: max(1, batch_size)]]
-    for cid in batch_ids:
-        t0 = time.perf_counter()
-        out = store.get_online_features(
-            features=list(SPIKE_ONLINE_FEATURE_REFS),
-            entity_rows=_feast_entity_rows([cid]),
-        ).to_df()
-        latencies_ms.append((time.perf_counter() - t0) * 1000.0)
-        if out.empty:
-            for col in SPIKE_MID_TERM_FEATURE_COLUMNS:
-                missing_counts[col] += 1
-            continue
-        row = out.iloc[0]
-        ok_row = True
+    t0 = time.perf_counter()
+    out = store.get_online_features(
+        features=list(SPIKE_ONLINE_FEATURE_REFS),
+        entity_rows=_feast_entity_rows(batch_ids),
+    ).to_df()
+    batch_latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+    n_ok = 0
+    if out.empty:
         for col in SPIKE_MID_TERM_FEATURE_COLUMNS:
-            if col not in row.index or pd.isna(row[col]):
-                missing_counts[col] += 1
-                ok_row = False
-        if ok_row:
-            n_ok += 1
-    lat_sorted = sorted(latencies_ms)
-    n = len(lat_sorted)
-
-    def _pct(p: float) -> float | None:
-        if n == 0:
-            return None
-        idx = min(n - 1, max(0, int(round(p * (n - 1)))))
-        return round(lat_sorted[idx], 3)
-
+            missing_counts[col] += len(batch_ids)
+    else:
+        for _, row in out.iterrows():
+            ok_row = True
+            for col in SPIKE_MID_TERM_FEATURE_COLUMNS:
+                if col not in row.index or pd.isna(row[col]):
+                    missing_counts[col] += 1
+                    ok_row = False
+            if ok_row:
+                n_ok += 1
+    per_entity_ms = round(batch_latency_ms / max(1, len(batch_ids)), 3)
     return {
-        "lookup_batch_size": min(len(canonical_ids), max(1, batch_size)),
+        "lookup_batch_size": len(batch_ids),
         "lookup_ok_rows": n_ok,
         "lookup_missing_by_feature": missing_counts,
-        "lookup_latency_ms_p50": _pct(0.50),
-        "lookup_latency_ms_p95": _pct(0.95),
+        "lookup_latency_ms_batch": batch_latency_ms,
+        "lookup_latency_ms_per_entity": per_entity_ms,
+        "lookup_latency_ms_p50": batch_latency_ms,
+        "lookup_latency_ms_p95": batch_latency_ms,
     }
 
 
@@ -615,6 +608,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--canonical-mapping", type=Path, default=None)
     parser.add_argument("--local-cleaned-bet", type=Path, default=None)
     parser.add_argument("--report-path", type=Path, default=None)
+    parser.add_argument(
+        "--lookup-batch-size",
+        type=int,
+        default=20,
+        help="Number of canonical_id values in one get_online_features batch (default 20)",
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     base = default_spike_config()
@@ -629,6 +628,7 @@ def main(argv: list[str] | None = None) -> int:
         bet_source=str(args.bet_source),
         local_cleaned_bet=args.local_cleaned_bet or base.local_cleaned_bet,
         sample_mode=str(args.sample_mode),
+        lookup_batch_size=max(1, int(args.lookup_batch_size)),
     )
     run_spike(cfg)
     return 0

@@ -47,17 +47,28 @@ def test_feast_entity_rows_dict_of_lists() -> None:
     assert not isinstance(rows["canonical_id"], pd.Series)
 
 
+def test_spike_mid_term_feature_columns_match_snapshot_materializer() -> None:
+    """Full-schema spike exposes all mid-term snapshot base columns."""
+    assert len(SPIKE_MID_TERM_FEATURE_COLUMNS) == 16
+    assert "fe__bets_cnt__w1d" in SPIKE_MID_TERM_FEATURE_COLUMNS
+    assert "fe__min_pcd_w7d" in SPIKE_MID_TERM_FEATURE_COLUMNS
+
+
 def test_online_lookup_uses_dict_entity_rows(tmp_path: Path) -> None:
-    """``get_online_features`` must receive dict entity_rows, not a DataFrame."""
+    """``get_online_features`` must receive dict entity_rows in one batch call."""
 
     captured: list[object] = []
 
     class _FakeResponse:
+        def __init__(self, canonical_ids: list[str]) -> None:
+            self._canonical_ids = canonical_ids
+
         def to_df(self) -> pd.DataFrame:
+            n = len(self._canonical_ids)
             return pd.DataFrame(
                 {
-                    "canonical_id": ["c1"],
-                    **{c: [1.0] for c in SPIKE_MID_TERM_FEATURE_COLUMNS},
+                    "canonical_id": self._canonical_ids,
+                    **{c: [1.0] * n for c in SPIKE_MID_TERM_FEATURE_COLUMNS},
                 }
             )
 
@@ -67,19 +78,21 @@ def test_online_lookup_uses_dict_entity_rows(tmp_path: Path) -> None:
 
         def get_online_features(self, *, features, entity_rows):
             captured.append(entity_rows)
-            return _FakeResponse()
+            return _FakeResponse(list(entity_rows["canonical_id"]))
 
     feast_repo = tmp_path / "feast_repo"
     feast_repo.mkdir()
     with patch("feast.FeatureStore", _FakeStore):
         result = run_online_lookup_smoke(
             feast_repo,
-            canonical_ids=["c1"],
-            batch_size=1,
+            canonical_ids=["c1", "c2", "c3"],
+            batch_size=2,
         )
 
-    assert result["lookup_ok_rows"] == 1
-    assert captured == [{"canonical_id": ["c1"]}]
+    assert result["lookup_ok_rows"] == 2
+    assert result["lookup_batch_size"] == 2
+    assert captured == [{"canonical_id": ["c1", "c2"]}]
+    assert result["lookup_latency_ms_batch"] == result["lookup_latency_ms_p50"]
 
 
 def test_clickhouse_export_chunks_player_filter(tmp_path: Path) -> None:
@@ -133,15 +146,13 @@ def test_clickhouse_export_chunks_player_filter(tmp_path: Path) -> None:
 
 def test_add_event_timestamp_collapses_to_latest_anchor(tmp_path: Path) -> None:
     full = tmp_path / "full.parquet"
-    pd.DataFrame(
-        {
-            "canonical_id": ["c1", "c1"],
-            "anchor_gaming_day": [pd.Timestamp("2026-05-17"), pd.Timestamp("2026-05-18")],
-            "fe__wager_sum__w7d": [10.0, 20.0],
-            "fe__wager_sum__w30d": [100.0, 200.0],
-            "fe__prior_wager_mean_w30d": [1.0, 2.0],
-        }
-    ).to_parquet(full, index=False)
+    row_old = {"canonical_id": "c1", "anchor_gaming_day": pd.Timestamp("2026-05-17")}
+    row_new = {"canonical_id": "c1", "anchor_gaming_day": pd.Timestamp("2026-05-18")}
+    for col in SPIKE_MID_TERM_FEATURE_COLUMNS:
+        row_old[col] = 10.0
+        row_new[col] = 20.0 if "w7d" in col or col.endswith("w1d") else 10.0
+    row_new["fe__wager_sum__w7d"] = 20.0
+    pd.DataFrame([row_old, row_new]).to_parquet(full, index=False)
     out = tmp_path / "feast.parquet"
     nrows = _add_event_timestamp_column(full, out)
     assert nrows == 1
@@ -244,11 +255,14 @@ def test_run_spike_end_to_end_local_mock_feast(tmp_path: Path) -> None:
         return 0.02
 
     def _fake_lookup(repo: Path, *, canonical_ids: list[str], batch_size: int) -> dict:
+        n = min(len(canonical_ids), batch_size)
         return {
-            "lookup_batch_size": min(len(canonical_ids), batch_size),
-            "lookup_ok_rows": len(canonical_ids),
+            "lookup_batch_size": n,
+            "lookup_ok_rows": n,
             "lookup_missing_by_feature": {c: 0 for c in SPIKE_MID_TERM_FEATURE_COLUMNS},
-            "lookup_latency_ms_p50": 1.0,
+            "lookup_latency_ms_batch": 2.0,
+            "lookup_latency_ms_per_entity": 2.0 / max(1, n),
+            "lookup_latency_ms_p50": 2.0,
             "lookup_latency_ms_p95": 2.0,
         }
 
