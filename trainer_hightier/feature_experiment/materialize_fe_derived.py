@@ -590,6 +590,7 @@ ordered AS (
 )
 SELECT
   bet_id,
+  CAST(interarrival_sec AS DOUBLE) AS fe__time_since_last_bet_sec,
   CAST(fe__bets_cnt__w15m_raw AS DOUBLE) AS fe__bets_cnt__w15m,
   CAST(fe__wager_sum__w15m_raw AS DOUBLE) AS fe__wager_sum__w15m,
   CAST(COALESCE(bets_today_so_far, 0) AS DOUBLE) AS fe__canonical__bets_cnt__today,

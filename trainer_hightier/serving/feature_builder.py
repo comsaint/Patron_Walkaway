@@ -27,12 +27,18 @@ from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
 
 logger = logging.getLogger(__name__)
 
+# Composite mid-term features may pull short-term PIT deps not listed in DEFAULT_MODEL_FE_DERIVED_COLUMNS.
+_SCORER_V2_SHORT_TERM_PIT_DEPS: Final[frozenset[str]] = frozenset({"fe__time_since_last_bet_sec"})
+
 # Active MVP short-term columns supported by scorer v2 bounded PIT (not Feast / not composite).
-SCORER_V2_SHORT_TERM_PIT_SUPPORTED: Final[frozenset[str]] = frozenset(
-    col
-    for col in DEFAULT_MODEL_FE_DERIVED_COLUMNS
-    if col not in SPIKE_MID_TERM_FEATURE_COLUMNS
-    and col not in MID_TERM_COMPOSITE_FEATURE_COLUMNS
+SCORER_V2_SHORT_TERM_PIT_SUPPORTED: Final[frozenset[str]] = (
+    frozenset(
+        col
+        for col in DEFAULT_MODEL_FE_DERIVED_COLUMNS
+        if col not in SPIKE_MID_TERM_FEATURE_COLUMNS
+        and col not in MID_TERM_COMPOSITE_FEATURE_COLUMNS
+    )
+    | _SCORER_V2_SHORT_TERM_PIT_DEPS
 )
 
 

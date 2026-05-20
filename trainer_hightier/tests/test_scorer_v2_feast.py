@@ -516,11 +516,12 @@ def test_attach_short_term_pit_features_from_bounded_pool() -> None:
         }
     )
     staged = pool.loc[[1]].copy()
-    cols = ("fe__wager_sum__w15m",)
+    cols = ("fe__wager_sum__w15m", "fe__time_since_last_bet_sec")
     assert_short_term_pit_columns_supported(cols)
     got = attach_short_term_pit_features(staged, pool, columns=cols)
     assert "fe__wager_sum__w15m" in got.columns
     assert pd.notna(got.iloc[0]["fe__wager_sum__w15m"])
+    assert float(got.iloc[0]["fe__time_since_last_bet_sec"]) == pytest.approx(300.0)
 
 
 def test_assert_short_term_pit_unsupported_column_raises() -> None:
