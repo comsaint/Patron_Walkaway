@@ -599,7 +599,7 @@ def attach_mid_term_composite_columns(
         prior_std = pd.to_numeric(out.get("fe__prior_odds_std_w30d"), errors="coerce")
         odds = pd.to_numeric(out.get("payout_odds"), errors="coerce")
         out["fe__payout_odds_z_prior_w30d"] = np.where(
-            prior_std.abs() > 1e-12,
+            np.abs(prior_std) > 1e-12,
             (odds - prior_mean) / prior_std,
             np.nan,
         )
