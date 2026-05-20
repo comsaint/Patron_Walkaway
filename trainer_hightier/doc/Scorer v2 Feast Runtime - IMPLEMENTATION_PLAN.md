@@ -14,14 +14,14 @@ Feast feasibility spike 已證明 allowlist 範圍內的 production compute path
 
 ## Adopted Decisions
 
-- Scorer v2 直接替換現有 `trainer_hightier.serving.scorer` 主流程，保留 CLI 與外部 runtime contract。
+- Scorer v2 直接替換現有 `trainer_hightier.serving.scorer` 主流程；只保留必要外部 contract（entrypoint / 支援中的 CLI 形狀 / `state.db` alerts 與 validation schema），不保留舊 feature supplier 相容路徑。
 - Scorer v2 第一版直接導入 Feast online lookup：
   - mid-term `fe__*` 由 Feast online store 供應。
   - long-term `patron__*__w180d_m1snap` 由 Feast online store 供應。
   - raw baseline 欄位仍由 ClickHouse scoring input 供應。
   - hot/event-level `feast_trial_1h` / `bet__*__w1h` 仍由 scorer 的 bounded PIT builder 供應。
-  - short-term `fe__*` 暫不強制走 Feast；先保留 declared online/micro-batch supplier boundary。
-- 不保留 scorer runtime fallback 到 legacy training Parquet。Feast readiness 不通過時，scorer 應 fail fast 或進入明確 debug mode，不可默默改用舊 supplier。
+  - short-term `fe__*` 由 scorer 的 bounded on-the-fly PIT builder 供應，第一版只支援目前部署模型需要的欄位；`fe_short_term_parquet` 不作為 production scorer v2 supplier。
+- 不保留 scorer runtime fallback 到 legacy training Parquet、`fe_derived_parquet` 或 `fe_short_term_parquet`。Feast readiness 或 short-term PIT supplier readiness 不通過時，scorer 應 fail fast；production code 不提供 runtime debug fallback。
 - Production scope 仍是 ADT allowlist only；`wider_sample` 不作為 production gate。
 
 ## Target Architecture
@@ -50,7 +50,7 @@ flowchart LR
     refreshJob --> feastOnline
 ```
 
-Scorer v2 的核心原則是把 heavy feature computation 移出 request-time scoring path。每日或排程 refresh job 負責 ClickHouse export、DuckDB materialization、Feast materialize；scorer 只針對本輪新 bet 做 bounded hot feature 計算與 Feast online lookup。
+Scorer v2 的核心原則是把 heavy mid/long feature computation 移出 request-time scoring path。每日或排程 refresh job 負責 ClickHouse export、DuckDB materialization、Feast materialize；scorer 只針對本輪新 bet 做 bounded hot / short-term PIT feature 計算與 Feast online lookup。
 
 ## Module Boundaries
 
@@ -62,7 +62,7 @@ Scorer v2 的核心原則是把 heavy feature computation 移出 request-time sc
 - 讀取 active allowlist 與 Feast readiness metadata。
 - 以 ETL cursor 從 ClickHouse 抓取下一批可見 bet。
 - 套用 high-ADT allowlist。
-- 建立 raw + hot event-level features。
+- 建立 raw + hot event-level + short-term `fe__*` PIT features。
 - 對 canonical ids 批次查詢 Feast mid/long features。
 - 執行 feature readiness gate。
 - `predict_proba` 後寫入 prediction log 與 alerts。
@@ -76,11 +76,12 @@ Scorer v2 的核心原則是把 heavy feature computation 移出 request-time sc
 |----------------|------------------|
 | `baseline_model` | ClickHouse scoring input |
 | `feast_trial_1h` / `bet__*__w1h` | scorer bounded PIT builder |
+| short-term `fe__*` | scorer bounded on-the-fly PIT builder |
 | mid-term `fe__*` | Feast online lookup |
 | long-term `patron__*__w180d_m1snap` | Feast online lookup |
-| short-term `fe__*` | declared online/micro-batch supplier; no silent fallback |
 
 Resolver 必須使用 frozen registry，不可只靠欄位前綴猜測。未分類、重複 supplier、或 supplier 缺失都應在 scorer readiness 階段 fail fast。
+`fe_short_term_parquet` 不可出現在 production scorer control flow。測試可透過 mock adapter / fixture injection 驗證資料形狀，但不可把 legacy Parquet fallback 寫成 production branch。
 
 ### 3. Feast Online Adapter
 
@@ -110,13 +111,14 @@ Refresh plane 負責把 production feature values 推進 Feast online store：
 保留現有 outward contract：
 
 - `state.db` 的 `alerts` / `validation_results` schema 相容。
-- `prediction_log.db` 繼續記錄全部 scored rows。
+- `prediction_log.db` 繼續記錄全部 scored rows，且必須記錄因 Feast entity row missing 被 skip 的 rows。
 - prediction log 必須增加或保留可觀測欄位：
   - Feast lookup status。
   - mid/long anchor。
   - freshness / degraded status。
   - feature missing counts。
   - supplier route summary。
+  - prediction status（例如 `scored`、`skipped_feast_entity_missing`）。
 
 Cursor 推進規則必須修正為：一批 rows 完成 feature gate、prediction、prediction log、alerts 寫入後，cursor 推進到該批成功 scored rows 的最大 ETL cursor；不得只以 alert rows 推進。
 
@@ -129,6 +131,7 @@ Production deploy 在啟動 scorer v2 前必須驗證：
 - model bundle、frozen registry、allowlist、canonical mapping 可讀。
 - Feast repo / feature service 已 apply，online store reachable。
 - required mid/long features 的 latest anchor 覆蓋 scoring policy。
+- short-term `fe__*` 全部由 bounded PIT builder 支援；不允許用 `fe_short_term_parquet` 作為 production readiness 替代。
 - source scope 為 production，不接受 training-scoped artifact。
 - null summary 符合已批准 policy。
 - allowlist sample 的 online lookup smoke test 通過。
@@ -141,6 +144,7 @@ Deploy-time gate 不通過時，不啟動正式 scorer。
 
 - 每個 `model.pkl.feature_columns` 都存在。
 - required feature family 不可整族 all-null。
+- short-term PIT builder 對目前部署模型的 required short-term `fe__*` 產出欄位；第一版不做通用 feature engine，unsupported columns fail fast。
 - Feast lookup row count 與 scoring batch 對齊。
 - wrong-grain、missing anchor、training-scoped metadata 都是 hard failure。
 - stale-but-allowed 只能在 hard cap 內 degraded run，且必須寫入 prediction log。
@@ -153,8 +157,8 @@ Feast spike 顯示 mid-term 主要風險是 `prior_*` NULL 與單日 active cove
 
 - 不做 silent fill。
 - 若模型訓練時允許 NULL 作為 signal，scorer 可保留 NULL 進模型，但必須在 prediction log 中標記。
-- 若 required feature family 對整批或高比例 rows 缺失，scoring-time gate 應 fail 或 degraded，依 SSOT 的 hard cap / waiver 決策執行。
-- allowlist patron 無 mid-term row 的語意必須由 SSOT 或 decision record 明確批准後才能放行。
+- 若 Feast entity row missing 比例超過 SSOT 門檻，scoring-time gate hard fail；低於門檻的 rows 只能 skip 並寫入 prediction log audit status。
+- allowlist patron 無 mid-term / long-term Feast entity row 不可被當作 all-null feature row scored。
 
 ## Workstreams / Phases
 
@@ -166,10 +170,13 @@ Feast spike 顯示 mid-term 主要風險是 `prior_*` NULL 與單日 active cove
 
 ### Phase 1: Scorer Core Rewrite
 
-- 重寫 `trainer_hightier.serving.scorer` 主流程，保留 CLI 相容。
+- 重寫 `trainer_hightier.serving.scorer` 主流程，只保留必要 entrypoint / CLI / outward DB contract。
 - 建立清楚的 cycle boundary：fetch -> feature build -> predict -> durable writes -> cursor advance。
 - 移除 legacy Parquet fallback 作為正式 scorer path。
+- 移除 `fe_short_term_parquet` 作為 production scorer v2 supplier；改由 bounded PIT builder 供應 short-term `fe__*`。
+- 將 short-term PIT builder scope 限定為目前 model feature set；缺支援欄位時列名 fail fast。
 - 將 alert subset 與 all-scored prediction log 明確分離。
+- 將 skipped rows audit 落在 prediction log，而不是只寫 process log 或 separate ad-hoc file。
 
 ### Phase 2: Feast Runtime Integration
 
@@ -216,6 +223,7 @@ Feast spike 顯示 mid-term 主要風險是 `prior_*` NULL 與單日 active cove
 
 - Unit tests：
   - supplier resolver 對 frozen registry 的分類。
+  - short-term PIT builder 對 required `fe__*` 的計算與 unsupported column fail-fast。
   - Feast adapter row alignment 與 missing feature handling。
   - cursor advance 對 alert / non-alert mixed batch。
   - `high_adt_only` allowlist filtering。
@@ -232,6 +240,6 @@ Feast spike 顯示 mid-term 主要風險是 `prior_*` NULL 與單日 active cove
 
 - Feast integration 已被採納為 scorer v2 mid/long supplier path。
 - Production scoring scope 仍為 high-ADT allowlist。
-- Short-term `fe__*` 不在第一版強制 Feast 化。
+- Short-term `fe__*` 不在第一版強制 Feast 化；production supply 由 scorer bounded on-the-fly PIT builder 負責。
 - Existing validator / API 仍依賴 `state.db` contract，因此 scorer v2 必須保留 outward DB compatibility。
 - 若 `Scorer Runtime Contract - SSOT.md` 與本文衝突，應先更新 SSOT，再進行 scorer v2 implementation。

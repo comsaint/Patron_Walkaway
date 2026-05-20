@@ -3,6 +3,8 @@
 > Historical reference. The current scorer packaging/runtime source of truth is
 > [`Scorer Runtime Contract - SSOT.md`](Scorer%20Runtime%20Contract%20-%20SSOT.md).
 > If this document conflicts with that SSOT, follow the SSOT.
+> This document describes the pre-scorer-v2 Parquet snapshot rollout. Scorer v2 production runtime must not use
+> `fe_short_term_parquet`, `fe_derived_parquet`, or slow/mid Parquet layers as feature fallback suppliers.
 
 Phase 0 inventory for `active_manifest.json` compatibility during production snapshot rollout.
 
@@ -12,7 +14,7 @@ Phase 0 inventory for `active_manifest.json` compatibility during production sna
 |-----|---------|
 | `version` | Manifest publish id |
 | `slow_patron_parquet` | Long-term slow patron artifact path |
-| `fe_derived_parquet` | Legacy monolithic `fe__*` artifact path; retained only as compatibility alias / debug fallback |
+| `fe_derived_parquet` | Historical monolithic `fe__*` artifact path; not a scorer v2 production supplier |
 | `trial_bet_behavior_parquet` | Optional diagnostic trial parquet |
 | `adt_allowlist_parquet` | High-ADT allowlist |
 | `adt_allowlist_version` | Allowlist sha256/version |
@@ -21,10 +23,10 @@ Phase 0 inventory for `active_manifest.json` compatibility during production sna
 | `fe_derived_source_kind` | `production_clickhouse` when Route B materialized production-compatible fe suppliers; `shipped_training_bundle` is not sufficient for production feature-supply readiness |
 | `slow_patron_grain` | `canonical_asof` for production slow patron |
 
-Legacy `fe_derived_parquet` must not be the only release gate for new models. Packaging and deploy preflight must split `source: fe_derived` by frozen registry cadence / `allowed_training_supplier`:
+Historical `fe_derived_parquet` must not be the release gate for scorer v2 models. The old Parquet rollout split `source: fe_derived` by frozen registry cadence / `allowed_training_supplier` as follows:
 
-- short-term `fe__*` → `fe_short_term_parquet` or serving online/micro-batch supplier.
-- mid-term `fe__*` → `mid_term_snapshot_parquet` with production scope, `canonical_daily_asof` grain, and freshness metadata.
+- short-term `fe__*` → old route: `fe_short_term_parquet` or serving online/micro-batch supplier; scorer v2 route: bounded on-the-fly PIT builder only.
+- mid-term `fe__*` → old route: `mid_term_snapshot_parquet`; scorer v2 route: Feast online lookup backed by production refresh/materialization.
 
 ## New per-layer keys
 
@@ -36,7 +38,7 @@ Legacy `fe_derived_parquet` must not be the only release gate for new models. Pa
 | `mid_term_coverage_end_exclusive` | Mid-term refresh publish timestamp |
 | `mid_term_generated_at` | Mid-term artifact generation timestamp |
 | `mid_term_stale_hard_cap_days` | Hard cap (default 3) |
-| `fe_short_term_parquet` | Explicit short-term bet-grain parquet alias |
+| `fe_short_term_parquet` | Historical short-term bet-grain parquet alias; not a scorer v2 production supplier |
 | `slow_anchor_gaming_day_max` | Latest slow monthly anchor |
 | `slow_generated_at` | Slow artifact generation timestamp |
 | `slow_monthly_grace_days` | Monthly grace (default 1) |
@@ -73,9 +75,9 @@ Legacy `fe_derived_parquet` must not be the only release gate for new models. Pa
 
 ## Compatibility aliases
 
-- When `fe_short_term_parquet` is absent, readers may fall back to `fe_derived_parquet` only for legacy/debug bundles. New production bundles should publish `fe_short_term_parquet` explicitly when short-term `fe__*` depends on parquet.
+- Scorer v2 readers must not fall back from missing `fe_short_term_parquet` to `fe_derived_parquet`; both are outside the production scorer v2 control flow.
 - When `mid_term_coverage_end_exclusive` is absent, readers fall back to `coverage_end_exclusive`.
-- When `mid_term_snapshot_parquet` is absent, production mid-term ASOF join is unavailable. Legacy bet-grain `fe_derived` mid-term columns may be used only in legacy/debug mode and must not satisfy the new cadence-aware production gate.
+- When `mid_term_snapshot_parquet` is absent, the old Parquet ASOF route is unavailable. Scorer v2 does not use legacy bet-grain `fe_derived` mid-term columns as fallback.
 - Training-scoped snapshots (`snapshot_scope=training_step4_only` or missing/unsafe scope metadata) must not be copied into production `active_manifest.json` as `mid_term_snapshot_parquet`.
 
 ## Supplier mapping
@@ -83,13 +85,13 @@ Legacy `fe_derived_parquet` must not be the only release gate for new models. Pa
 | Feature family | Production supplier | Grain |
 |----------------|--------------------|-------|
 | `bet__*__w1h` | Online PIT builder | bet / event |
-| Short-term `fe__*` | `fe_short_term_parquet` or serving online/micro-batch supplier; `fe_derived_parquet` only as legacy alias | bet_id |
-| Mid-term `fe__*` | `mid_term_snapshot_parquet` | canonical_id + anchor_gaming_day |
-| `patron__*__w180d_m1snap` | `slow_patron_parquet` | canonical ASOF |
+| Short-term `fe__*` | Historical route: `fe_short_term_parquet` or serving online/micro-batch supplier; scorer v2 route: bounded on-the-fly PIT builder | bet_id |
+| Mid-term `fe__*` | Historical route: `mid_term_snapshot_parquet`; scorer v2 route: Feast online lookup | canonical_id + anchor_gaming_day |
+| `patron__*__w180d_m1snap` | Historical route: `slow_patron_parquet`; scorer v2 route: Feast online lookup | canonical ASOF |
 
 ## Packaging / Deploy Preflight Rules
 
 - Build and deploy preflight must classify model features using the frozen registry, not just the manifest keys.
-- A model with only short-term `fe__*` may pass with `fe_short_term_parquet` and no `mid_term_snapshot_parquet`.
-- A model with any mid-term `fe__*` must fail if `mid_term_snapshot_parquet` is missing, stale, wrong grain, or not production-scoped.
-- A manifest with `fe_derived_source_kind=shipped_training_bundle` is not production-ready for Route B mid-term feature serving unless a valid production `mid_term_snapshot_parquet` is also present.
+- A scorer v2 model with short-term `fe__*` must pass via bounded PIT builder support; `fe_short_term_parquet` is not a production readiness substitute.
+- Historical Parquet route: a model with any mid-term `fe__*` must fail if `mid_term_snapshot_parquet` is missing, stale, wrong grain, or not production-scoped.
+- Scorer v2 route: a model with any mid-term `fe__*` must pass Feast online readiness; `mid_term_snapshot_parquet` cannot be used as runtime fallback.

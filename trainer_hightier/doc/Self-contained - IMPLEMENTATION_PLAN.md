@@ -3,6 +3,8 @@
 > Historical reference. The current scorer packaging/runtime source of truth is
 > [`Scorer Runtime Contract - SSOT.md`](Scorer%20Runtime%20Contract%20-%20SSOT.md).
 > If this document conflicts with that SSOT, follow the SSOT.
+> This plan predates scorer v2 Feast runtime adoption. Its `fe_short_term_parquet`, `mid_term_snapshot_parquet`, and
+> `slow_patron_parquet` supplier rules are historical and must not be used to justify scorer v2 production fallback.
 
 本文件屬於 **Implementation plan 層**，定義如何把 `trainer_hightier` 做成「**部署 runtime 自包含**」：打包後在 target 機只需 Python + 安裝 wheel/requirements + `.env`，即可啟動 scorer/api/validator。本文描述 realization strategy、模組邊界、里程碑、風險與驗證；不展開 ticket 級任務。
 
@@ -48,9 +50,9 @@
 - 讀取 frozen registry + `model.pkl.feature_columns`，驗證每個欄位在 self-contained runtime 中有對應 supplier：
   - baseline raw 欄位由 ClickHouse query 供應。
   - `feast_trial_1h` 由 serving online PIT builder 供應；trial parquet 僅為診斷 artifact。
-  - short-term `fe__*` 由 `fe_short_term_parquet` 或明確 online/micro-batch supplier 供應。
-  - mid-term `fe__*` 由 production-scoped `mid_term_snapshot_parquet` 供應，且必須通過 freshness / grain gate。
-  - long-term `patron__*` 由 `slow_patron_parquet` 供應。
+  - short-term `fe__*` 舊規劃可由 `fe_short_term_parquet` 或明確 online/micro-batch supplier 供應；scorer v2 改由 bounded on-the-fly PIT builder 供應目前模型欄位。
+  - mid-term `fe__*` 舊規劃可由 production-scoped `mid_term_snapshot_parquet` 供應；scorer v2 改由 Feast online lookup 供應。
+  - long-term `patron__*` 舊規劃可由 `slow_patron_parquet` 供應；scorer v2 改由 Feast online lookup 供應。
 
 ### 3) Runtime Entrypoint
 
@@ -62,11 +64,11 @@
 ### 4) Manifest Layer Contract
 
 - `active_manifest.json` 是 bundle 內 snapshot layer SSOT。
-- Required base layers：`slow_patron_parquet`, `adt_allowlist_parquet`。
+- Required base layers（historical Parquet route）：`slow_patron_parquet`, `adt_allowlist_parquet`。
 - Conditional feature layers：
-  - `fe_short_term_parquet`：模型含 short-term parquet-supplied `fe__*` 時必須存在。
-  - `mid_term_snapshot_parquet`：模型含 mid-term `fe__*` 時必須存在，且 `mid_term_grain` 必須為 `canonical_daily_asof`。
-  - `fe_derived_parquet`：legacy compatibility alias；不得作為新 cadence-aware production readiness 的唯一依據。
+  - `fe_short_term_parquet`：historical route only；scorer v2 production readiness 不接受此 layer。
+  - `mid_term_snapshot_parquet`：historical route only；scorer v2 runtime supplier 是 Feast online lookup。
+  - `fe_derived_parquet`：historical compatibility alias；不得作為 scorer v2 production readiness 或 fallback。
 - Training-scoped mid-term artifacts 不得進入 production manifest；若 manifest 缺 production-safe mid-term snapshot，self-contained bundle 必須 fail-fast 或先透過 refresh/bootstrap 發佈 production snapshot。
 
 ### 5) Config Contract
@@ -104,7 +106,7 @@
 - M2：bundle 具備完整啟動契約（`main.py`、`.env.example`、`requirements.txt`）。
 - M3：無 repo 目標機可啟動 scorer/api/validator。
 - M4：啟動與 runtime 可觀測 model/manifest/allowlist version/hash。
-- M5：self-contained preflight 可攔截缺失或過期的 `fe_short_term_parquet` / `mid_term_snapshot_parquet`，不依賴 legacy `fe_derived_parquet`。
+- M5：historical self-contained preflight 可攔截缺失或過期的 `fe_short_term_parquet` / `mid_term_snapshot_parquet`，不依賴 legacy `fe_derived_parquet`；scorer v2 以 Feast / bounded PIT readiness 為準。
 
 ## 風險與緩解
 
@@ -115,7 +117,7 @@
 - 風險：bundle 缺入口/設定模板，無法在 target 機一鍵啟動。
   - 緩解：將 `main.py`/`.env.example` 納入必帶契約與 release gate。
 - 風險：self-contained bundle 啟動成功，但模型欄位缺 cadence-aware supplier，第一輪 scoring 才失敗。
-  - 緩解：build/deploy preflight 必須讀 frozen registry 與 manifest，按 supplier matrix 驗證 `fe_short_term_parquet`、`mid_term_snapshot_parquet`、slow、online builders。
+  - 緩解：build/deploy preflight 必須讀 frozen registry 與 manifest，按當前 SSOT 驗證 Feast / bounded PIT / raw supplier readiness；本文件中的 Parquet supplier matrix 僅為 historical route。
 - 風險：為了通過 self-contained 打包而把 training-scoped mid-term snapshot 放進 production manifest。
   - 緩解：manifest layer contract 必須檢查 `snapshot_scope` / freshness / grain；unsafe artifact fail-fast，不做 silent fallback。
 
@@ -125,7 +127,7 @@
 
 - runtime 單元測試：bundle path、preflight、入口參數、manifest 驗證。
 - no-repo 整合測試：`pip install -r requirements.txt` 後直接啟動。
-- feature supplier smoke：使用 frozen registry + model columns 驗證 short-term / mid-term / slow suppliers 完整，並確認 legacy-only `fe_derived_parquet` 不會誤放行新 cadence-aware 模型。
+- feature supplier smoke：使用 frozen registry + model columns 驗證 short-term / mid-term / slow suppliers 完整；scorer v2 需驗證 bounded PIT + Feast readiness，並確認 legacy-only `fe_derived_parquet` 不會誤放行。
 - 非功能：啟動延遲、記憶體峰值不超出基線。
 
 ### Governance

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import pickle
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -13,7 +15,7 @@ import pytest
 from sklearn.dummy import DummyClassifier
 from zoneinfo import ZoneInfo
 
-from trainer_hightier.config import FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME
+from trainer_hightier.config import FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME, default_hightier_serving_config
 from trainer_hightier.feature_experiment.candidate_registry_loader import load_candidate_registry
 from trainer_hightier.serving.feast_online_adapter import (
     FEAST_CANONICAL_ENTITY_NAME,
@@ -34,7 +36,11 @@ from trainer_hightier.feature_experiment.feast_long_term_spike import (
     SPIKE_FEATURE_VIEW_NAME as LONG_SPIKE_FEATURE_VIEW_NAME,
 )
 from trainer_hightier.feature_experiment.feature_cadence import MID_TERM_COMPOSITE_FEATURE_COLUMNS
-from trainer_hightier.serving.feature_builder import attach_mid_term_composite_columns
+from trainer_hightier.serving.feature_builder import (
+    attach_mid_term_composite_columns,
+    attach_short_term_pit_features,
+    assert_short_term_pit_columns_supported,
+)
 from trainer_hightier.serving.feature_supply import (
     assert_scorer_supplier_plan_or_raise,
     build_scorer_supplier_plan,
@@ -124,6 +130,103 @@ def _write_min_bundle(tmp_path: Path) -> Path:
     return bundle_dir
 
 
+def _manifest_v_test(tmp_path: Path) -> Any:
+    from trainer_hightier.serving.feature_state_store import ActiveSnapshotManifest
+
+    return ActiveSnapshotManifest(
+        version="v-test",
+        slow_patron_parquet=tmp_path / "unused.parquet",
+        fe_derived_parquet=None,
+        trial_bet_behavior_parquet=None,
+        adt_allowlist_parquet=None,
+        adt_allowlist_version=None,
+        coverage_end_exclusive="2099-01-01T00:00:00+00:00",
+        training_cutoff_iso=None,
+        mid_term_snapshot_parquet=None,
+        fe_short_term_parquet=None,
+        raw={"mid_term_grain": "canonical_daily_asof"},
+    )
+
+
+def _patch_score_once_ch_io(
+    monkeypatch: pytest.MonkeyPatch,
+    scorer_mod: Any,
+    *,
+    bets: pd.DataFrame,
+    pool: pd.DataFrame | None = None,
+) -> None:
+    """Stub ClickHouse fetches and snapshot gates for mock Feast score_once tests."""
+    pool_df = bets.copy() if pool is None else pool
+    monkeypatch.setattr(scorer_mod, "fetch_bets_incremental_etl_probe", lambda *a, **k: bets.iloc[0:0])
+    monkeypatch.setattr(scorer_mod, "fetch_bets_incremental", lambda *a, **k: bets.copy())
+    monkeypatch.setattr(scorer_mod, "fetch_bet_pool_window", lambda *a, **k: pool_df.copy())
+    monkeypatch.setattr(
+        scorer_mod,
+        "attach_trial_bet_behavior_1h",
+        lambda staged, _pool: staged.assign(
+            bet__bets_cnt__w1h=1.0,
+            bet__wager_sum__w1h=1.0,
+            bet__back_bet_ratio__w1h=1.0,
+            bet__payout_odds_avg__w1h=1.0,
+        ),
+    )
+    monkeypatch.setattr(scorer_mod, "post_join_feature_smoke", lambda *a, **k: [])
+    monkeypatch.setattr(
+        scorer_mod,
+        "build_scoring_snapshot_gate",
+        lambda **k: MagicMock(allow_scoring=True, degraded=False, hard_failure_reason=None),
+    )
+    monkeypatch.setattr(scorer_mod, "validate_mid_term_artifact", lambda *a, **k: None)
+    monkeypatch.setattr(scorer_mod, "read_mid_term_anchor_max", lambda *a, **k: None)
+    monkeypatch.setattr(
+        scorer_mod,
+        "evaluate_mid_term_freshness",
+        lambda **k: MagicMock(status="fresh", staleness_days=0),
+    )
+
+
+def _patch_serving_prediction_log_path(
+    monkeypatch: pytest.MonkeyPatch,
+    scorer_mod: Any,
+    tmp_path: Path,
+) -> Path:
+    """Route prediction_log writes to a temp DB (P2 mock end-to-end)."""
+    pred_db = tmp_path / "prediction_log.db"
+    base = default_hightier_serving_config()
+    monkeypatch.setattr(
+        scorer_mod,
+        "default_hightier_serving_config",
+        lambda: replace(base, prediction_log_db_path=pred_db),
+    )
+    return pred_db
+
+
+def _sample_bets_two_rows() -> tuple[pd.DataFrame, pd.Timestamp]:
+    hk = ZoneInfo("Asia/Hong_Kong")
+    etl_early = pd.Timestamp("2025-06-01 10:00:00", tz=hk)
+    etl_late = pd.Timestamp("2025-06-01 10:05:00", tz=hk)
+    bets = pd.DataFrame(
+        {
+            "bet_id": [1.0, 2.0],
+            "is_back_bet": [1, 1],
+            "bet_type": ["x", "x"],
+            "type_of_bet": ["y", "y"],
+            "__etl_insert_Dtm": [etl_early, etl_late],
+            "payout_complete_dtm": [etl_early, etl_late],
+            "gaming_day": pd.to_datetime(["2025-06-01", "2025-06-01"]),
+            "session_id": ["s1", "s2"],
+            "player_id": [10, 11],
+            "table_id": [1, 1],
+            "position_idx": [1, 2],
+            "wager": [100.0, 200.0],
+            "casino_win": [0.0, 0.0],
+            "payout_odds": [1.0, 1.0],
+            "status": [1, 1],
+        }
+    )
+    return bets, etl_late
+
+
 def test_build_scorer_supplier_plan_routes_mid_and_slow(tmp_path: Path) -> None:
     reg = tmp_path / "registry.yaml"
     _write_min_registry(reg)
@@ -168,6 +271,41 @@ def test_build_scorer_supplier_plan_splits_composite_mid_term(tmp_path: Path) ->
     counts = scorer_supplier_route_counts(plan)
     assert counts["mid_term_composite"] == 1
     assert counts["feast_online_mid"] == 1
+    assert counts["short_term_pit_builder"] == 1
+
+
+def test_assert_scorer_supplier_plan_rejects_unknown_column(tmp_path: Path) -> None:
+    reg = tmp_path / "registry.yaml"
+    _write_min_registry(reg)
+    snap = load_candidate_registry(reg)
+    plan = build_scorer_supplier_plan(snap, ("wager", "fe__not_in_registry__w1d"))
+    assert plan.unknown_cols == ("fe__not_in_registry__w1d",)
+    with pytest.raises(ValueError, match=r"unknown columns"):
+        assert_scorer_supplier_plan_or_raise(plan)
+
+
+def test_assert_scorer_supplier_plan_rejects_unmapped_mid_fe(tmp_path: Path) -> None:
+    reg = tmp_path / "registry.yaml"
+    reg.write_text(
+        """
+registry_version: t
+features:
+  - feature_id: fe__custom_mid_only__w1d
+    group_id: g
+    source: fe_derived
+    status: active
+    enabled_for: [baseline]
+    time_horizon: mid_term
+    max_lookback: P1D
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    snap = load_candidate_registry(reg)
+    plan = build_scorer_supplier_plan(snap, ("fe__custom_mid_only__w1d",))
+    assert plan.unknown_cols == ("fe__custom_mid_only__w1d",)
+    with pytest.raises(ValueError, match=r"unknown columns"):
+        assert_scorer_supplier_plan_or_raise(plan)
 
 
 def test_attach_mid_term_composite_columns_from_feast_inputs() -> None:
@@ -240,66 +378,16 @@ def test_score_once_cursor_advances_all_scored_rows_not_only_alerts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from trainer_hightier.serving import scorer as scorer_mod
-    from trainer_hightier.serving.feature_state_store import ActiveSnapshotManifest
-
-    hk = ZoneInfo("Asia/Hong_Kong")
-    etl_early = pd.Timestamp("2025-06-01 10:00:00", tz=hk)
-    etl_late = pd.Timestamp("2025-06-01 10:05:00", tz=hk)
-    bets = pd.DataFrame(
-        {
-            "bet_id": [1.0, 2.0],
-            "is_back_bet": [1, 1],
-            "bet_type": ["x", "x"],
-            "type_of_bet": ["y", "y"],
-            "__etl_insert_Dtm": [etl_early, etl_late],
-            "payout_complete_dtm": [etl_early, etl_late],
-            "gaming_day": pd.to_datetime(["2025-06-01", "2025-06-01"]),
-            "session_id": ["s1", "s2"],
-            "player_id": [10, 11],
-            "table_id": [1, 1],
-            "position_idx": [1, 2],
-            "wager": [100.0, 200.0],
-            "casino_win": [0.0, 0.0],
-            "payout_odds": [1.0, 1.0],
-            "status": [1, 1],
-        }
-    )
-    pool = bets.copy()
-    cmap = tmp_path / "map.parquet"
-    pd.DataFrame({"player_id": [10, 11], "canonical_id": ["c10", "c11"]}).to_parquet(cmap, index=False)
-
-    monkeypatch.setattr(scorer_mod, "fetch_bets_incremental_etl_probe", lambda *a, **k: bets.iloc[0:0])
-    monkeypatch.setattr(scorer_mod, "fetch_bets_incremental", lambda *a, **k: bets.copy())
-    monkeypatch.setattr(scorer_mod, "fetch_bet_pool_window", lambda *a, **k: pool.copy())
-    monkeypatch.setattr(
-        scorer_mod,
-        "attach_trial_bet_behavior_1h",
-        lambda staged, _pool: staged.assign(
-            bet__bets_cnt__w1h=1.0,
-            bet__wager_sum__w1h=1.0,
-            bet__back_bet_ratio__w1h=1.0,
-            bet__payout_odds_avg__w1h=1.0,
-        ),
-    )
-    monkeypatch.setattr(scorer_mod, "post_join_feature_smoke", lambda *a, **k: [])
-    monkeypatch.setattr(
-        scorer_mod,
-        "build_scoring_snapshot_gate",
-        lambda **k: MagicMock(allow_scoring=True, degraded=False, hard_failure_reason=None),
-    )
-    monkeypatch.setattr(scorer_mod, "validate_mid_term_artifact", lambda *a, **k: None)
-    monkeypatch.setattr(scorer_mod, "read_mid_term_anchor_max", lambda *a, **k: None)
-    monkeypatch.setattr(
-        scorer_mod,
-        "evaluate_mid_term_freshness",
-        lambda **k: MagicMock(status="fresh", staleness_days=0),
-    )
-    monkeypatch.setattr(scorer_mod, "append_hightier_prediction_log", lambda *a, **k: None)
-
-    bundle_dir = _write_min_bundle(tmp_path)
     from trainer_hightier.serving.model_bundle import load_hightier_model_bundle
 
-    bundle = load_hightier_model_bundle(bundle_dir=bundle_dir)
+    bets, etl_late = _sample_bets_two_rows()
+    cmap = tmp_path / "map.parquet"
+    pd.DataFrame({"player_id": [10, 11], "canonical_id": ["c10", "c11"]}).to_parquet(cmap, index=False)
+    _patch_score_once_ch_io(monkeypatch, scorer_mod, bets=bets)
+    _patch_serving_prediction_log_path(monkeypatch, scorer_mod, tmp_path)
+    init_prediction_log_db(tmp_path / "prediction_log.db")
+
+    bundle = load_hightier_model_bundle(bundle_dir=_write_min_bundle(tmp_path))
     adapter = MockFeastOnlineAdapter(
         features_by_canonical={
             "c10": {"fe__bets_cnt__w1d": 1.0, "patron__adt__w180d_m1snap": 5.0},
@@ -315,28 +403,129 @@ def test_score_once_cursor_advances_all_scored_rows_not_only_alerts(
             bundle,
             feast_adapter=adapter,
             mapping_parquet=cmap,
-            manifest=ActiveSnapshotManifest(
-                version="v-test",
-                slow_patron_parquet=tmp_path / "unused.parquet",
-                fe_derived_parquet=None,
-                trial_bet_behavior_parquet=None,
-                adt_allowlist_parquet=None,
-                adt_allowlist_version=None,
-                coverage_end_exclusive="2099-01-01T00:00:00+00:00",
-                training_cutoff_iso=None,
-                mid_term_snapshot_parquet=None,
-                fe_short_term_parquet=None,
-                raw={"mid_term_grain": "canonical_daily_asof"},
-            ),
+            manifest=_manifest_v_test(tmp_path),
             high_adt_only=False,
             allowlist_ids=frozenset(),
         )
         after = get_last_processed_etl_insert(conn)
+        pred_rows = sqlite3.connect(tmp_path / "prediction_log.db").execute(
+            "SELECT COUNT(*) FROM prediction_log WHERE scoring_status = 'scored'"
+        ).fetchone()[0]
+        alert_rows = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
     finally:
         conn.close()
     assert n == 2
     assert after is not None
     assert pd.Timestamp(after).as_unit("ns") == etl_late.as_unit("ns")
+    assert pred_rows == 2
+    assert alert_rows == 2
+
+
+def test_score_once_mock_e2e_entity_missing_writes_skipped_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2-4: one entity-missing row below batch threshold still advances scorable cursor."""
+    from trainer_hightier.serving import scorer as scorer_mod
+    from trainer_hightier.serving.model_bundle import load_hightier_model_bundle
+
+    hk = ZoneInfo("Asia/Hong_Kong")
+    etl = pd.Timestamp("2025-06-01 10:00:00", tz=hk)
+    n_rows = 10
+    bets = pd.DataFrame(
+        {
+            "bet_id": [float(i + 1) for i in range(n_rows)],
+            "is_back_bet": [1] * n_rows,
+            "bet_type": ["x"] * n_rows,
+            "type_of_bet": ["y"] * n_rows,
+            "__etl_insert_Dtm": [etl] * n_rows,
+            "payout_complete_dtm": [etl] * n_rows,
+            "gaming_day": pd.to_datetime(["2025-06-01"] * n_rows),
+            "session_id": [f"s{i}" for i in range(n_rows)],
+            "player_id": list(range(10, 10 + n_rows)),
+            "table_id": [1] * n_rows,
+            "position_idx": list(range(1, n_rows + 1)),
+            "wager": [100.0] * n_rows,
+            "casino_win": [0.0] * n_rows,
+            "payout_odds": [1.0] * n_rows,
+            "status": [1] * n_rows,
+        }
+    )
+    cmap = tmp_path / "map.parquet"
+    pd.DataFrame(
+        {
+            "player_id": list(range(10, 10 + n_rows)),
+            "canonical_id": [f"c{i}" for i in range(n_rows)],
+        }
+    ).to_parquet(cmap, index=False)
+    _patch_score_once_ch_io(monkeypatch, scorer_mod, bets=bets)
+    pred_db = _patch_serving_prediction_log_path(monkeypatch, scorer_mod, tmp_path)
+    init_prediction_log_db(pred_db)
+
+    bundle = load_hightier_model_bundle(bundle_dir=_write_min_bundle(tmp_path))
+    adapter = MockFeastOnlineAdapter(
+        features_by_canonical={f"c{i}": {"fe__bets_cnt__w1d": float(i), "patron__adt__w180d_m1snap": 1.0} for i in range(9)},
+        absent_canonical=frozenset({"c9"}),
+    )
+    state_db = tmp_path / "state.db"
+    init_state_db(state_db)
+    conn = sqlite3.connect(state_db)
+    try:
+        n_alerts = scorer_mod.score_once(
+            conn,
+            bundle,
+            feast_adapter=adapter,
+            mapping_parquet=cmap,
+            manifest=_manifest_v_test(tmp_path),
+            high_adt_only=False,
+            allowlist_ids=frozenset(),
+        )
+        pred_conn = sqlite3.connect(pred_db)
+        try:
+            scored_n, skipped_n = pred_conn.execute(
+                "SELECT "
+                "SUM(CASE WHEN scoring_status = 'scored' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN scoring_status = 'skipped_entity_missing' THEN 1 ELSE 0 END) "
+                "FROM prediction_log"
+            ).fetchone()
+        finally:
+            pred_conn.close()
+    finally:
+        conn.close()
+    assert n_alerts == 9
+    assert scored_n == 9
+    assert skipped_n == 1
+
+
+def test_attach_short_term_pit_features_from_bounded_pool() -> None:
+    """P2-5: short-term fe__* from in-memory pool without Parquet supplier."""
+    hk = ZoneInfo("Asia/Hong_Kong")
+    t0 = pd.Timestamp("2025-06-01 10:00:00", tz=hk)
+    pool = pd.DataFrame(
+        {
+            "bet_id": [1.0, 2.0],
+            "player_id": [10, 10],
+            "canonical_id": ["c10", "c10"],
+            "session_id": [1, 1],
+            "table_id": [1, 1],
+            "gaming_day": pd.to_datetime(["2025-06-01", "2025-06-01"]),
+            "payout_complete_dtm": [t0, t0 + pd.Timedelta(minutes=5)],
+            "wager": [50.0, 100.0],
+            "payout_odds": [2.0, 2.0],
+            "casino_win": [0.0, 0.0],
+        }
+    )
+    staged = pool.loc[[1]].copy()
+    cols = ("fe__wager_sum__w15m",)
+    assert_short_term_pit_columns_supported(cols)
+    got = attach_short_term_pit_features(staged, pool, columns=cols)
+    assert "fe__wager_sum__w15m" in got.columns
+    assert pd.notna(got.iloc[0]["fe__wager_sum__w15m"])
+
+
+def test_assert_short_term_pit_unsupported_column_raises() -> None:
+    with pytest.raises(ValueError, match=r"bounded PIT does not support"):
+        assert_short_term_pit_columns_supported(("fe__totally_new_feature__w1h",))
 
 
 def test_mock_feast_adapter_cell_null_allowed() -> None:

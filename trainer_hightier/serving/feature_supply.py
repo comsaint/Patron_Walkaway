@@ -766,5 +766,5 @@ def scorer_supplier_route_counts(plan: ScorerSupplierPlan) -> dict[str, int]:
         "feast_online_mid": len(plan.feast_mid_cols),
         "mid_term_composite": len(plan.mid_composite_cols),
         "feast_online_slow": len(plan.feast_slow_cols),
-        "fe_short_term_parquet": len(plan.short_term_cols),
+        "short_term_pit_builder": len(plan.short_term_cols),
     }

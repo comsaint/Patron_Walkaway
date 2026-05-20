@@ -3,6 +3,8 @@
 > Historical reference. The current scorer packaging/runtime source of truth is
 > [`Scorer Runtime Contract - SSOT.md`](Scorer%20Runtime%20Contract%20-%20SSOT.md).
 > If this document conflicts with that SSOT, follow the SSOT.
+> Scorer v2 uses Feast online lookup for mid-term runtime supply. This snapshot plan remains useful for refresh /
+> materialization context, but not as a production scorer v2 fallback path.
 
 本文件是 **Implementation Plan 層**，針對 `trainer_hightier` training pipeline 與 production scorer 的 feature cadence / snapshot 供應提出修正方案。目標是讓訓練與 production 都遵守同一套語意：short-term features 由 event-level PIT / online builder 供應；mid-term features 以 `gaming_day` daily snapshot 供應；long-term features 以 monthly canonical ASOF snapshot 供應。
 

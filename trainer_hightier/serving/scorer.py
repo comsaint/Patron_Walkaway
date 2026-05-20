@@ -6,6 +6,7 @@ import argparse
 import logging
 import sqlite3
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -44,10 +45,10 @@ from trainer_hightier.serving.feature_builder import (
     assert_features_ready,
     attach_canonical_id,
     attach_mid_term_composite_columns,
+    attach_short_term_pit_features,
     attach_synthetic_etl_and_prediction_visible,
     attach_trial_bet_behavior_1h,
     coerce_categoricals,
-    join_production_fe_suppliers,
 )
 from trainer_hightier.serving.feast_online_adapter import (
     FeastLookupDiagnostics,
@@ -489,28 +490,111 @@ def fetch_bet_pool_window(
     return bets
 
 
-def _attach_short_term_supplier(
-    staged: pd.DataFrame,
-    manifest: ActiveSnapshotManifest | None,
-    short_cols: tuple[str, ...],
-) -> pd.DataFrame:
-    """Join declared short-term ``fe__*`` parquet supplier (no legacy mid-term parquet)."""
-    if not short_cols or staged.empty:
-        return staged
-    fe_short_path = manifest.fe_short_term_parquet if manifest is not None else None
-    if fe_short_path is None or not Path(fe_short_path).is_file():
-        tip = ", ".join(short_cols[:8])
-        raise RuntimeError(
-            "[hightier_scorer] model requires short-term fe__* but fe_short_term_parquet missing; "
-            f"example columns: [{tip}]"
+@dataclass(frozen=True)
+class _ScoringBatch:
+    """Bounded incremental batch ready for feature build."""
+
+    bets: pd.DataFrame
+    cursor: pd.Series
+    pool: pd.DataFrame
+
+
+def _fetch_scoring_batch(
+    conn: sqlite3.Connection,
+    *,
+    high_adt_only: bool,
+    allowlist_ids: frozenset[int],
+) -> _ScoringBatch | None:
+    """Phase 1: fetch incremental bets and bounded hot-feature pool."""
+
+    cfg = default_hightier_serving_config()
+    last = get_last_processed_etl_insert(conn)
+    lookback = float(cfg.scorer_dynamic_lookback_cap_hours)
+    lim = int(cfg.hightier_scorer_max_bets_per_cycle)
+    cursor_all: Optional[pd.Series] = None
+
+    if high_adt_only:
+        probe = fetch_bets_incremental_etl_probe(last, lookback_hours=lookback, limit_rows=lim)
+        if probe.empty:
+            return None
+        cursor_pre_probe = _effective_etl_cursor(probe)
+        if last is not None:
+            probe = probe[cursor_pre_probe > last].copy()
+        if probe.empty:
+            return None
+        cursor_all = _effective_etl_cursor(probe)
+        bets = fetch_bets_incremental(
+            last,
+            lookback_hours=lookback,
+            limit_rows=lim,
+            allowlist_player_ids=allowlist_ids,
         )
-    return join_production_fe_suppliers(
-        staged,
-        fe_short_term_parquet=Path(fe_short_path),
-        mid_term_snapshot_parquet=None,
-        short_term_columns=short_cols,
-        mid_term_columns=(),
+        if bets.empty:
+            max_c = cursor_all.max()
+            if pd.notna(max_c):
+                set_last_processed_etl_insert(conn, max_c.to_pydatetime())
+            conn.commit()
+            return None
+    else:
+        bets = fetch_bets_incremental(
+            last,
+            lookback_hours=lookback,
+            limit_rows=lim,
+            allowlist_player_ids=None,
+        )
+        if bets.empty:
+            return None
+
+    cursor_pre = _effective_etl_cursor(bets)
+    if last is not None:
+        bets = bets[cursor_pre > last].copy()
+    if bets.empty:
+        if high_adt_only and cursor_all is not None:
+            max_c = cursor_all.max()
+            if pd.notna(max_c):
+                set_last_processed_etl_insert(conn, max_c.to_pydatetime())
+            conn.commit()
+        return None
+
+    cursor = _effective_etl_cursor(bets)
+    p_min = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce").min()
+    p_max = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce").max()
+    pool_start = (p_min - timedelta(hours=int(cfg.hot_feature_pool_lookback_hours))).to_pydatetime()
+    pool_end = p_max.to_pydatetime()
+    pids = sorted({int(x) for x in bets["player_id"].dropna().unique().tolist()})
+    fan_cap = int(cfg.hightier_scorer_pool_player_fanout_cap)
+    if len(pids) > fan_cap:
+        logger.warning(
+            "[hightier_scorer] large player fanout (%d); truncating window pool to cap OOM risk (%d)",
+            len(pids),
+            fan_cap,
+        )
+        pids = pids[:fan_cap]
+    pool = fetch_bet_pool_window(player_ids=pids, window_start=pool_start, window_end=pool_end)
+    pool = attach_synthetic_etl_and_prediction_visible(pool)
+    return _ScoringBatch(bets=bets, cursor=cursor, pool=pool)
+
+
+def _build_staged_features(
+    batch: _ScoringBatch,
+    *,
+    mapping_parquet: Path | None,
+    supplier_plan: ScorerSupplierPlan,
+) -> pd.DataFrame:
+    """Phase 2: hot PIT + short-term bounded PIT on the scoring batch."""
+
+    pool = attach_canonical_id(batch.pool, mapping_parquet=mapping_parquet)
+    staged = attach_synthetic_etl_and_prediction_visible(batch.bets)
+    staged = attach_canonical_id(staged, mapping_parquet=mapping_parquet)
+    staged = attach_trial_bet_behavior_1h(staged, pool)
+    mid_term_for_deps = tuple(
+        dict.fromkeys([*supplier_plan.feast_mid_cols, *supplier_plan.mid_composite_cols])
     )
+    short_cols = short_term_enrich_columns_with_dependencies(
+        supplier_plan.short_term_cols,
+        mid_term_for_deps,
+    )
+    return attach_short_term_pit_features(staged, pool, columns=short_cols)
 
 
 def _log_scorer_readiness_summary(
@@ -617,86 +701,22 @@ def score_once(
 ) -> int:
     """One incremental scoring cycle; returns number of alerts written."""
     cfg = default_hightier_serving_config()
-    last = get_last_processed_etl_insert(conn)
-    lookback = float(cfg.scorer_dynamic_lookback_cap_hours)
-    lim = int(cfg.hightier_scorer_max_bets_per_cycle)
-
-    cursor_all: Optional[pd.Series] = None
-    if high_adt_only:
-        probe = fetch_bets_incremental_etl_probe(last, lookback_hours=lookback, limit_rows=lim)
-        if probe.empty:
-            return 0
-        cursor_pre_probe = _effective_etl_cursor(probe)
-        if last is not None:
-            probe = probe[cursor_pre_probe > last].copy()
-        if probe.empty:
-            return 0
-        cursor_all = _effective_etl_cursor(probe)
-        bets = fetch_bets_incremental(
-            last,
-            lookback_hours=lookback,
-            limit_rows=lim,
-            allowlist_player_ids=allowlist_ids,
-        )
-        if bets.empty:
-            max_c = cursor_all.max()
-            if pd.notna(max_c):
-                set_last_processed_etl_insert(conn, max_c.to_pydatetime())
-            conn.commit()
-            return 0
-    else:
-        bets = fetch_bets_incremental(
-            last,
-            lookback_hours=lookback,
-            limit_rows=lim,
-            allowlist_player_ids=None,
-        )
-        if bets.empty:
-            return 0
-
-    cursor_pre = _effective_etl_cursor(bets)
-    if last is not None:
-        bets = bets[cursor_pre > last].copy()
-    if bets.empty:
-        if high_adt_only and cursor_all is not None:
-            max_c = cursor_all.max()
-            if pd.notna(max_c):
-                set_last_processed_etl_insert(conn, max_c.to_pydatetime())
-            conn.commit()
+    batch = _fetch_scoring_batch(
+        conn,
+        high_adt_only=high_adt_only,
+        allowlist_ids=allowlist_ids,
+    )
+    if batch is None:
         return 0
-
-    cursor = _effective_etl_cursor(bets)
-    p_min = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce").min()
-    p_max = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce").max()
-    pool_start = (p_min - timedelta(hours=int(cfg.hot_feature_pool_lookback_hours))).to_pydatetime()
-    pool_end = p_max.to_pydatetime()
-    pids = sorted({int(x) for x in bets["player_id"].dropna().unique().tolist()})
-    fan_cap = int(cfg.hightier_scorer_pool_player_fanout_cap)
-    if len(pids) > fan_cap:
-        logger.warning(
-            "[hightier_scorer] large player fanout (%d); truncating window pool to cap OOM risk (%d)",
-            len(pids),
-            fan_cap,
-        )
-        pids = pids[:fan_cap]
-    pool = fetch_bet_pool_window(player_ids=pids, window_start=pool_start, window_end=pool_end)
-    pool2 = attach_synthetic_etl_and_prediction_visible(pool)
-    pool2 = attach_canonical_id(pool2, mapping_parquet=mapping_parquet)
-    staged = attach_synthetic_etl_and_prediction_visible(bets)
-    staged = attach_canonical_id(staged, mapping_parquet=mapping_parquet)
-    staged = attach_trial_bet_behavior_1h(staged, pool2)
 
     registry_snap = load_frozen_registry_for_bundle(Path(bundle.bundle_dir))
     supplier_plan = build_scorer_supplier_plan(registry_snap, bundle.feature_columns)
     assert_scorer_supplier_plan_or_raise(supplier_plan)
-    mid_term_for_deps = tuple(
-        dict.fromkeys([*supplier_plan.feast_mid_cols, *supplier_plan.mid_composite_cols])
+    staged = _build_staged_features(
+        batch,
+        mapping_parquet=mapping_parquet,
+        supplier_plan=supplier_plan,
     )
-    short_cols = short_term_enrich_columns_with_dependencies(
-        supplier_plan.short_term_cols,
-        mid_term_for_deps,
-    )
-    staged = _attach_short_term_supplier(staged, manifest, short_cols)
     n_before_feast = len(staged)
     fail_frac = float(cfg.scorer_feast_entity_missing_fail_fraction)
     staged, skipped, feast_diag = _attach_feast_mid_slow(
@@ -738,7 +758,7 @@ def score_once(
         except Exception as exc:
             logger.warning("[hightier_scorer] skipped prediction_log write failed: %s", exc)
     if staged.empty:
-        _commit_scoring_cursor(conn, cursor, bets.index)
+        _commit_scoring_cursor(conn, batch.cursor, batch.bets.index)
         conn.commit()
         return 0
 
@@ -876,7 +896,7 @@ def score_once(
     n = int(m.sum())
     scored_indices = staged.index
     if n == 0:
-        _commit_scoring_cursor(conn, cursor, scored_indices)
+        _commit_scoring_cursor(conn, batch.cursor, scored_indices)
         conn.commit()
         return 0
     out = staged.loc[m].copy()
@@ -921,7 +941,7 @@ def score_once(
         }
     )
     append_alerts(conn, alerts)
-    _commit_scoring_cursor(conn, cursor, scored_indices)
+    _commit_scoring_cursor(conn, batch.cursor, scored_indices)
     conn.commit()
     logger.info("[hightier_scorer] wrote %d alerts (threshold=%.6f)", n, thr)
     return n

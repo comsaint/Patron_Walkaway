@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Iterable
+from typing import Final, Iterable
 
 import duckdb  # type: ignore[import-untyped]
 import pyarrow.parquet as pq
@@ -17,11 +17,23 @@ from trainer_hightier.config import (
     DuckDbRuntimeConfig,
     default_hightier_serving_config,
 )
+from trainer_hightier.feature_experiment.feature_cadence import MID_TERM_COMPOSITE_FEATURE_COLUMNS
+from trainer_hightier.feature_experiment.feast_mid_term_spike import SPIKE_MID_TERM_FEATURE_COLUMNS
+from trainer_hightier.feature_experiment.materialize_fe_derived import compute_fe_derived_features_from_pool
+from trainer_hightier.serving.production_materialize import DEFAULT_MODEL_FE_DERIVED_COLUMNS
 from trainer_hightier.utils.bet_l0_preprocess import _bet_feast_prediction_visible_alignment_params
 from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_parquet_path
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
 
 logger = logging.getLogger(__name__)
+
+# Active MVP short-term columns supported by scorer v2 bounded PIT (not Feast / not composite).
+SCORER_V2_SHORT_TERM_PIT_SUPPORTED: Final[frozenset[str]] = frozenset(
+    col
+    for col in DEFAULT_MODEL_FE_DERIVED_COLUMNS
+    if col not in SPIKE_MID_TERM_FEATURE_COLUMNS
+    and col not in MID_TERM_COMPOSITE_FEATURE_COLUMNS
+)
 
 
 def attach_synthetic_etl_and_prediction_visible(bets: pd.DataFrame) -> pd.DataFrame:
@@ -502,6 +514,53 @@ SELECT
         return out
     finally:
         con.close()
+
+
+def assert_short_term_pit_columns_supported(columns: tuple[str, ...]) -> None:
+    """Fail fast when the model requests unsupported short-term ``fe__*`` columns."""
+
+    unsupported = [c for c in columns if c not in SCORER_V2_SHORT_TERM_PIT_SUPPORTED]
+    if unsupported:
+        tip = ", ".join(unsupported[:12])
+        ellipsis = "" if len(unsupported) <= 12 else ", …"
+        raise ValueError(
+            "[feature_builder] scorer v2 bounded PIT does not support short-term columns: "
+            f"[{tip}{ellipsis}]"
+        )
+
+
+def attach_short_term_pit_features(
+    staged: pd.DataFrame,
+    pool: pd.DataFrame,
+    *,
+    columns: tuple[str, ...],
+) -> pd.DataFrame:
+    """Attach short-term ``fe__*`` via bounded on-the-fly PIT over the scoring pool."""
+
+    if not columns or staged.empty:
+        return staged
+    assert_short_term_pit_columns_supported(columns)
+    feats = compute_fe_derived_features_from_pool(pool, staged["bet_id"])
+    if feats.empty:
+        raise RuntimeError(
+            "[feature_builder] short-term PIT produced no rows for staged bet_ids; "
+            f"requested columns={[c for c in columns[:8]]}"
+        )
+    keep = ["bet_id", *[c for c in columns if c in feats.columns]]
+    missing = [c for c in columns if c not in feats.columns]
+    if missing:
+        raise RuntimeError(
+            "[feature_builder] short-term PIT missing computed columns: "
+            f"{missing[:12]}"
+        )
+    merged = staged.merge(feats.loc[:, keep], on="bet_id", how="left")
+    logger.info(
+        "[feature_builder] attached short_term PIT cols=%d pool_rows=%d staged_rows=%d",
+        len(columns),
+        len(pool),
+        len(staged),
+    )
+    return merged
 
 
 def attach_mid_term_composite_columns(

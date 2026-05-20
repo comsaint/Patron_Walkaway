@@ -1,5 +1,10 @@
 # Production Snapshot Serving — Runbook
 
+> Historical runbook for the pre-scorer-v2 Parquet snapshot serving route. The current scorer v2 runtime source of
+> truth is [`Scorer Runtime Contract - SSOT.md`](Scorer%20Runtime%20Contract%20-%20SSOT.md). Scorer v2 production
+> runtime must not use `fe_short_term_parquet`, `fe_derived_parquet`, or snapshot Parquet layers as feature fallback
+> suppliers.
+
 Operational procedures for production snapshot bootstrap, refresh, and degraded scoring.
 
 ## Bundle layout (production mirror + snapshots)
@@ -20,9 +25,9 @@ Mirror paths and retention defaults are defined in `trainer_hightier.config` (`p
 ## First deploy
 
 1. Train model bundle with cadence-aware Step 3.5 (short-term + mid-term snapshots in `deploy_inputs/`).
-2. Build deploy bundle; confirm `snapshots/active_manifest.json` includes:
+2. For the historical Parquet route, build deploy bundle and confirm `snapshots/active_manifest.json` includes:
    - `mid_term_snapshot_parquet`
-   - `fe_short_term_parquet` (or legacy `fe_derived_parquet`)
+   - `fe_short_term_parquet` (or legacy `fe_derived_parquet`) only for the old Parquet route; not for scorer v2 production readiness
    - `slow_patron_parquet` with `slow_patron_grain=canonical_asof`
 3. **Seed `source_mirror/`** with cleaned bet partitions and `cleaned_session.parquet` meeting schema + coverage (see `trainer_hightier/serving/production_source_mirror.py` and `MANIFEST_INVENTORY.md`).
 4. Run deploy (`trainer_hightier.deploy.main`); preflight validates frozen artifacts. In `all` / `scorer` modes, the **refresh supervisor** starts by default and runs **startup hard-failure repair** (missing/invalid/hard-cap) synchronously; **`stale_allowed` does not block startup**.
@@ -66,7 +71,7 @@ When `mid_term_freshness_status` or `slow_freshness_status` is `hard_cap_breache
 
 1. Scorer stops with actionable error (no silent zero/median fallback).
 2. **MVP:** there is **no** manual manifest override flag — operator must fix mirror coverage / ClickHouse export, run targeted refresh successfully, or ship a new bundle.
-3. Do not repoint manifest to training bet-grain artifacts.
+3. Do not repoint manifest to training bet-grain artifacts. For scorer v2, do not route around Feast/PIT readiness by enabling legacy Parquet fallback.
 
 ## Missing / all-null feature family
 

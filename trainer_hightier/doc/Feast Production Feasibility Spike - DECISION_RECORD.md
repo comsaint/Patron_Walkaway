@@ -24,10 +24,12 @@ Archived copies used for this record: repo-root `batch2000.json` (mid-term), `lo
 1. **Adopt Feast online lookup for scorer v2 mid/long suppliers** per `Scorer Runtime Contract - SSOT.md` and
    `Scorer v2 Feast Runtime - WORKING_PLAN.md`. Refresh/materialize still uses CH → DuckDB → Feast; scorer runtime
    does not recompute mid/long features.
-2. **Short-term `fe__*` Feast online lookup is out of scope for scorer v2 first slice**; continue PIT builder or
-   declared short-term parquet supplier when required by the model.
+2. **Short-term `fe__*` Feast online lookup is out of scope for scorer v2 first slice**; production scorer v2 uses
+   the bounded PIT builder for the currently deployed model feature set only. Legacy short-term Parquet is not a
+   production runtime supplier or fallback.
 3. **NULL policy for production scoring:** cell-level NULL (including structural `prior_*`) is allowed with audit;
-   Feast entity row missing skips the row; batch entity-missing rate **> 10%** hard-fails the cycle.
+   Feast entity row missing skips the row and writes prediction-log audit status; batch entity-missing rate **> 10%**
+   hard-fails the cycle.
 4. **Do not** use frozen training Parquet bundles or `wider_sample` as the production gate; production scope stays
    **ADT allowlist only**.
 

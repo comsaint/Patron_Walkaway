@@ -3,6 +3,9 @@
 > Historical reference. The current scorer packaging/runtime source of truth is
 > [`Scorer Runtime Contract - SSOT.md`](Scorer%20Runtime%20Contract%20-%20SSOT.md).
 > If this document conflicts with that SSOT, follow the SSOT.
+> This plan predates scorer v2 Feast runtime adoption. Any references to `fe_short_term_parquet`,
+> `mid_term_snapshot_parquet`, `slow_patron_parquet`, or `fe_derived_parquet` as production scorer suppliers are
+> historical unless explicitly restated by the scorer runtime SSOT.
 
 本文件屬於 **Implementation plan 層**，定義 `trainer_hightier` 打包如何落地成「**Standalone production bundle**」：目標機器只有 Python interpreter 與交付包，也能啟動服務。本文描述 realization strategy、模組邊界、階段、里程碑、風險與驗證策略；不展開 ticket 級任務。
 
@@ -122,8 +125,8 @@
 |----------|------|-------------------|------|
 | `baseline_model` | （非窗特徵） | raw | 不套用 term 窗規則 |
 | `feast_trial_1h` | short-term | **online-only primary**（`attach_trial_bet_behavior_1h`） | `trial_bet_behavior_parquet` 僅診斷/回歸用 artifact，**不是** production 主供應路徑；scorer 不讀 trial parquet 供分 |
-| `fe_derived` | short-term / mid-term（依 registry cadence） | **cadence-aware suppliers**：short-term → `fe_short_term_parquet`；mid-term → `mid_term_snapshot_parquet` | 不再以 `source` 單獨推斷 supplier；legacy `fe_derived_parquet` 僅為相容 alias / debug fallback |
-| `feast_slow_180d` | long-term | **snapshot_parquet**（`slow_patron_parquet`） | `snapshot_updater` 可日更/重物化 slow；月更語意 |
+| `fe_derived` | short-term / mid-term（依 registry cadence） | Historical route：short-term → `fe_short_term_parquet`；mid-term → `mid_term_snapshot_parquet`。Scorer v2 route：short-term → bounded PIT builder；mid-term → Feast online lookup | 不再以 `source` 單獨推斷 supplier；legacy `fe_derived_parquet` 不可作 scorer v2 production fallback |
+| `feast_slow_180d` | long-term | Historical route：`slow_patron_parquet`。Scorer v2 route：Feast online lookup | `snapshot_updater` / materialization 可供 refresh plane 使用；不是 scorer v2 silent runtime substitute |
 
 詳細 registry 治理欄位（`time_horizon`、`max_lookback`，ISO-8601）見 [`Feature Candidate Registry - IMPLEMENTATION_PLAN.md`](Feature%20Candidate%20Registry%20-%20IMPLEMENTATION_PLAN.md)。
 
@@ -131,7 +134,7 @@
 
 若模型含任一 `time_horizon=mid_term` 欄位（registry 必填欄位，見 Feature Candidate Registry plan），建包與 deploy preflight **必須**同時滿足：
 
-1. **Supplier 存在**：`active_manifest.json` 宣告 `mid_term_snapshot_parquet`，且檔案存在並含模型所需 mid-term source columns / derived support columns；short-term `fe__*` 另由 `fe_short_term_parquet` 或 serving online/micro-batch supplier 供應。
+1. **Supplier 存在**：historical Parquet route 要求 `active_manifest.json` 宣告 `mid_term_snapshot_parquet`，且檔案存在並含模型所需 mid-term source columns / derived support columns；scorer v2 則要求 Feast mid/long readiness 與 bounded PIT short-term support，不接受 `fe_short_term_parquet` 作 production readiness。
 2. **Freshness 達標**：優先使用 `mid_term_coverage_end_exclusive` / `mid_term_anchor_gaming_day_max`（manifest 內 ISO-8601 / gaming-day anchor）；舊 manifest 僅可 fallback 到 `coverage_end_exclusive`。  
    Freshness 須滿足 `mid_term_coverage_end_exclusive >= now_utc - mid_term_freshness_sla`（建議預設 **PT36H**，日更 SLA 加排程容忍），且 anchor 必須 cover scoring 所需 prior gaming day。
 
@@ -154,8 +157,8 @@
 - D-007（更新）：Production bundle 的完成條件包含 **feature supplyability**，不僅是檔案完整與 `/health` 成功。建包器必須以 frozen registry 將 `model.pkl.feature_columns` 分派到 runtime suppliers：
   - `baseline_model`：由 scorer ClickHouse `t_bet` 查詢直接供應。
   - `feast_trial_1h`：由 serving **online-only primary**（`attach_trial_bet_behavior_1h`）；bundled trial parquet **不計入** production 主供應判定。
-  - `feast_slow_180d`：由 bundled slow parquet 供應。
-  - `fe_derived`：依 registry cadence 分派；short-term 欄位由 `fe_short_term_parquet` / online / micro-batch supplier 供應，mid-term 欄位由 `mid_term_snapshot_parquet` 供應；legacy `fe_derived_parquet` 不再是 production 完成條件。
+  - `feast_slow_180d`：historical route 由 bundled slow parquet 供應；scorer v2 由 Feast online lookup 供應。
+  - `fe_derived`：依 registry cadence 分派；historical route 使用 `fe_short_term_parquet` / `mid_term_snapshot_parquet`，scorer v2 使用 bounded PIT builder / Feast online lookup；legacy `fe_derived_parquet` 不再是 production 完成條件或 fallback。
   - 影響：`GET /health` 不再足以作 production readiness；release gate 必須跑至少一條 scorer feature readiness smoke。
 - D-008（已定）：**Time-horizon（term）** 與 **supplier** 分離治理（見上節「時間視野分類」）。
   - short-term = lookback `< 24h`；mid-term = `24h–30d`；long-term = `> 30d`；複合特徵以最大 lookback 定 term。
@@ -166,9 +169,9 @@
   - Primary：**online**（`attach_trial_bet_behavior_1h`）。
   - `trial_bet_behavior_parquet`：僅診斷/回歸/可選 schema gate，**不得**作為 scorer 主路徑供應或 release 通過條件。
   - 影響：建包 gate 不再因「有 trial parquet」誤判 trial 特徵已可供 production scoring。
-- D-010（更新）：**Mid-term freshness 硬 gate**（見上節「Mid-term freshness 硬 gate」）。
-  - 含 `mid_term` 欄位的模型：`mid_term_snapshot_parquet` 存在、欄位齊、`mid_term_grain=canonical_daily_asof`，且 `mid_term_coverage_end_exclusive` / `mid_term_anchor_gaming_day_max` 在 SLA 內。
-  - 影響：避免訓練截點 fe 快照在 production 長期陳舊卻通過建包。
+- D-010（historical）：**Mid-term freshness 硬 gate**（見上節「Mid-term freshness 硬 gate」）。
+  - Historical Parquet route：含 `mid_term` 欄位的模型需有 `mid_term_snapshot_parquet`、欄位齊、`mid_term_grain=canonical_daily_asof`，且 `mid_term_coverage_end_exclusive` / `mid_term_anchor_gaming_day_max` 在 SLA 內。
+  - Scorer v2 route：mid-term production readiness 以 Feast online feature service、latest anchor、source scope、coverage / missing policy gate 為準。
 
 ## 目標架構（Standalone）
 
@@ -238,13 +241,13 @@ flowchart LR
   - **Micro-batch parquet supplier**：週期性物化 parquet，scorer merge；可用於 short-term 或 mid-term（term 不變）。
   - **Snapshot parquet supplier**：訓練凍結或低頻快照 merge；mid-term（`mid_term_snapshot_parquet`）與 long-term（`slow_patron_parquet`）。
 - 依 term 的 release 預期（現況 vs 目標）：
-  - **short-term**：**online-only primary**（`attach_trial_bet_behavior_1h`）；允許 micro-batch parquet 作為未來擴展，非現況主路徑。
-  - **mid-term**：bundled `mid_term_snapshot_parquet` + **freshness 硬 gate**（`mid_term_coverage_end_exclusive` / anchor SLA）；不可僅依訓練截點快照長期 serving。
-  - **long-term**：`slow_patron_parquet` + `snapshot_updater`（或 `--rematerialize-slow`）；月更語意。
+  - **short-term**：scorer v2 由 bounded on-the-fly PIT builder 供應目前模型欄位；historical route 的 `fe_short_term_parquet` 不再作 production scorer supplier。
+  - **mid-term**：scorer v2 由 Feast online lookup 供應；historical route 的 bundled `mid_term_snapshot_parquet` 只保留為 refresh/materialize 或舊路徑參考。
+  - **long-term**：scorer v2 由 Feast online lookup 供應；historical route 的 `slow_patron_parquet` 只保留為 refresh/materialize 或舊路徑參考。
 - Gate 原則：
   - dynamic schema gate 僅能放行「實際已有 supplier」的欄位。
   - `feast_trial_1h`：僅 **online** 計入 production 供應判定；`trial_bet_behavior_parquet` 不計入（D-009）。
-  - `fe_derived`：必須先按 cadence split；short-term 檢查 `fe_short_term_parquet` / online supplier，mid-term 檢查 `mid_term_snapshot_parquet` + freshness SLA（D-010）。
+  - `fe_derived`：必須先按 cadence split；scorer v2 short-term 檢查 bounded PIT builder support，mid-term 檢查 Feast online readiness。Historical Parquet checks 不可作 scorer v2 production fallback。
   - `source` 不能被當成供應保證，也不能單獨代表 term（`fe_derived` ≠ slow；`feast_trial_1h` ≠ 全部 short 以外特徵）。
   - 若 registry 新增 feature，但 serving / artifact 未同步，建包應失敗，而不是讓 scorer runtime 失敗。
   - preflight / `bundle_info` 建議輸出：按 term 與 supplier 的欄位計數摘要（便於區分「mid-term fe 缺失/過期」vs「long-term slow 缺失」）。
@@ -261,8 +264,8 @@ flowchart LR
 - `snapshots/active_manifest.json`
 - `snapshots/artifacts/slow_patron_*.parquet`（required）
 - `snapshots/artifacts/adt_allowed_players_*.parquet`（required）
-- `snapshots/artifacts/fe_short_term_*.parquet`（required only when model uses short-term `fe__*` that is not supplied online）
-- `snapshots/artifacts/mid_term_daily_snapshot*.parquet`（required when model uses mid-term `fe__*`）
+- `snapshots/artifacts/fe_short_term_*.parquet`（historical route only；scorer v2 production readiness 不接受此 artifact）
+- `snapshots/artifacts/mid_term_daily_snapshot*.parquet`（historical route / refresh materialization support；scorer v2 runtime supplier 是 Feast）
 - `mapping/`（canonical mapping parquet）
 - `local_state/`（至少保留可建立 `state.db`、`prediction_log.db` 的路徑）
 - `README_DEPLOY.md`
@@ -272,7 +275,7 @@ flowchart LR
 可選內容：
 
 - `snapshots/artifacts/trial_bet_behavior_*.parquet`
-- `snapshots/artifacts/fe_derived_*.parquet`（legacy alias / debug fallback only；不得作為新 cadence-aware release gate 的唯一依據）
+- `snapshots/artifacts/fe_derived_*.parquet`（historical alias only；不得作為 scorer v2 release gate 或 runtime fallback）
 - `feature_state.db`（如需審計歷史）
 - `prediction_log.db`（若交付時預先建立；未預建亦須保證 runtime 可自動初始化）
 
@@ -321,12 +324,12 @@ Feature supplyability contract：
   - 讀取 frozen registry snapshot（含 `time_horizon` / `max_lookback`）。
   - 建立 supplier matrix，確認每個模型欄位有 runtime 供應來源。
   - `feast_trial_1h`：僅 online 路徑計入通過；trial parquet 可選打包但不計入。
-  - `fe_derived`：依 frozen registry 的 cadence / `allowed_training_supplier` split；short-term 驗證 `fe_short_term_parquet` 或 online supplier，mid-term 驗證 `mid_term_snapshot_parquet`、grain、欄位與 freshness。
+  - `fe_derived`：依 frozen registry 的 cadence / `allowed_training_supplier` split；scorer v2 short-term 驗證 bounded PIT builder support，mid-term 驗證 Feast readiness；historical Parquet supplier checks 不可放行 scorer v2。
 - Runtime 階段：
   - deploy preflight 或 scorer `--once` smoke 必須跑到 `assert_features_ready` 前後，確認模型欄位完整。
-  - 若模型需要 `fe_derived`，須有 cadence-aware supplier matrix；不得因缺少 legacy `fe_derived_parquet` 直接失敗，也不得因只有 short-term parquet 就放行 mid-term 欄位。
+  - 若模型需要 `fe_derived`，須有 cadence-aware supplier matrix；scorer v2 不得因缺少 legacy `fe_derived_parquet` 直接失敗，也不得因有 historical short-term parquet 就放行 mid-term 欄位。
 - Release 文件：
-  - `RUNBOOK.md` 補上 missing features 的排查：raw、online（trial）、slow parquet、`fe_short_term_parquet` / `mid_term_snapshot_parquet` 缺失或 **stale**（勿將 trial parquet 或 legacy `fe_derived_parquet` 當 production 主路徑）。
+  - `RUNBOOK.md` 補上 missing features 的排查：raw、online（trial）、bounded PIT、Feast mid/long readiness；舊 Parquet artifact 僅作 historical route 排查，勿當 scorer v2 production 主路徑。
 
 ## 里程碑
 
@@ -354,8 +357,8 @@ Feature supplyability contract：
   - 緩解：hash parity fail-fast + `bundle_info` 版本稽核。
 - 風險：prediction log 長時累積導致磁碟壓力或查詢退化。
   - 緩解：建立 retention/summary 策略與必要索引；runbook 加入容量監控與清理步驟。
-- 風險：模型包含訓練端可產生、但 serving bundle 不可產生的欄位（例如 cadence split 後的 `fe_derived`）。
-  - 緩解：feature supplyability gate + mid-term freshness 硬 gate；若缺 `fe_short_term_parquet` / `mid_term_snapshot_parquet` 或 SLA 過期，建包/preflight fail-fast。重訓重打包後須確保 fe refresh job 與 manifest 時間戳一併更新。
+- 風險：模型包含訓練端可產生、但 scorer v2 不可供應的欄位（例如目前 bounded PIT builder 尚未支援的 short-term `fe__*`）。
+  - 緩解：feature supplyability gate + Feast readiness gate；若缺 bounded PIT support 或 Feast mid/long readiness，建包/preflight fail-fast。不得用 `fe_short_term_parquet`、`mid_term_snapshot_parquet` 或 `fe_derived_parquet` 解鎖 scorer v2 production。
 - 風險：將 `trial_bet_behavior_parquet` 誤當 production 主供應。
   - 緩解：D-009 明確 online-only primary；gate 不以 trial parquet 作為 trial 特徵通過條件。
 - 風險：只驗 `/health` 導致部署成功但 scorer 首輪失敗。

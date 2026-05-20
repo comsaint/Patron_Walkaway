@@ -17,10 +17,13 @@ Time-zone convention (verified against cleaned bet Parquet):
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Final
 
 import duckdb
+import numpy as np
+import pandas as pd
 
-from trainer_hightier.config import DuckDbRuntimeConfig
+from trainer_hightier.config import DuckDbRuntimeConfig, default_hightier_serving_config
 from trainer_hightier.utils.bet_l0_preprocess import (
     cleaned_bet_dataset_has_any_parquet,
     resolved_cleaned_bet_read_parquet_sql,
@@ -528,3 +531,192 @@ def materialize_fe_derived_short_term_parquet(
         con.close()
     tmp.unlink(missing_ok=True)
     return dst
+
+
+# Shared window pipeline (starts after ``src`` CTE is defined).
+_FE_DERIVED_PIPELINE_AFTER_SRC: Final[str] = """
+src_lagged AS (
+  SELECT s.*,
+    LAG(pcd) OVER w_canonical AS lag1_pcd,
+    LAG(pcd, 2) OVER w_canonical AS lag2_pcd,
+    LAG(table_id) OVER w_canonical AS lag1_table_id,
+    LAG(payout_odds) OVER w_canonical AS lag1_payout_odds,
+    LAG(wager) OVER w_canonical AS lag1_wager,
+    COUNT(*) OVER w_canon_day_prior AS bets_today_so_far,
+    SUM(wager) OVER w_canon_day_prior AS wager_today_so_far,
+    MIN(pcd) OVER w_canon_day_inclusive AS first_pcd_today
+  FROM src AS s
+  WINDOW
+    w_canonical AS (PARTITION BY canonical_id ORDER BY pcd),
+    w_canon_day_prior AS (
+      PARTITION BY canonical_id, gaming_day ORDER BY pcd
+      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+    ),
+    w_canon_day_inclusive AS (
+      PARTITION BY canonical_id, gaming_day ORDER BY pcd
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    )
+),
+src_with_iv AS (
+  SELECT s.*,
+    EXTRACT(epoch FROM (pcd - lag1_pcd)) AS interarrival_sec
+  FROM src_lagged AS s
+),
+ordered AS (
+  SELECT s.*,
+    COUNT(*) OVER w15 AS fe__bets_cnt__w15m_raw,
+    COALESCE(SUM(wager) OVER w15, 0.0) AS fe__wager_sum__w15m_raw,
+    AVG(payout_odds) OVER w1h AS payout_odds_avg_w1h,
+    STDDEV_POP(payout_odds) OVER w1h AS payout_odds_std_w1h,
+    AVG(interarrival_sec) OVER w1h AS interarrival_avg_w1h,
+    STDDEV_POP(interarrival_sec) OVER w1h AS interarrival_std_w1h,
+    AVG(payout_odds) OVER w7d AS payout_odds_avg_w7d,
+    STDDEV_POP(payout_odds) OVER w7d AS payout_odds_std_w7d,
+    MAX(payout_odds) OVER w1h AS max_payout_odds_w1h
+  FROM src_with_iv AS s
+  WINDOW
+    w15 AS (
+      PARTITION BY canonical_id ORDER BY pcd
+      RANGE BETWEEN INTERVAL '15 MINUTE' PRECEDING AND INTERVAL '1 MICROSECOND' PRECEDING
+    ),
+    w1h AS (
+      PARTITION BY canonical_id ORDER BY pcd
+      RANGE BETWEEN INTERVAL '1 HOUR' PRECEDING AND INTERVAL '1 MICROSECOND' PRECEDING
+    ),
+    w7d AS (
+      PARTITION BY canonical_id ORDER BY pcd
+      RANGE BETWEEN INTERVAL '7 DAY' PRECEDING AND INTERVAL '1 MICROSECOND' PRECEDING
+    )
+)
+SELECT
+  bet_id,
+  CAST(fe__bets_cnt__w15m_raw AS DOUBLE) AS fe__bets_cnt__w15m,
+  CAST(fe__wager_sum__w15m_raw AS DOUBLE) AS fe__wager_sum__w15m,
+  CAST(COALESCE(bets_today_so_far, 0) AS DOUBLE) AS fe__canonical__bets_cnt__today,
+  CAST(COALESCE(wager_today_so_far, 0.0) AS DOUBLE) AS fe__canonical__wager_sum__today,
+  CASE
+    WHEN bets_today_so_far IS NOT NULL AND bets_today_so_far > 0 AND wager_today_so_far IS NOT NULL
+    THEN CAST(wager_today_so_far / bets_today_so_far AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__canonical__avg_wager__today,
+  CAST(EXTRACT(epoch FROM (pcd - first_pcd_today)) AS DOUBLE)
+    AS fe__canonical__elapsed_sec_since_first_bet__today,
+  CAST(EXTRACT(epoch FROM (lag1_pcd - lag2_pcd)) AS DOUBLE) AS fe__interarrival__lag2_sec,
+  CASE
+    WHEN interarrival_avg_w1h IS NOT NULL AND interarrival_avg_w1h > 1e-9
+       AND interarrival_sec IS NOT NULL
+    THEN CAST(interarrival_sec / interarrival_avg_w1h AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__interarrival__last_gap_to_recent_mean_ratio__w1h,
+  CASE
+    WHEN interarrival_avg_w1h IS NOT NULL AND interarrival_avg_w1h > 1e-9
+       AND interarrival_std_w1h IS NOT NULL
+    THEN CAST(interarrival_std_w1h / interarrival_avg_w1h AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__interarrival__cv__w1h,
+  CASE
+    WHEN payout_odds_std_w1h IS NOT NULL AND payout_odds_std_w1h > 1e-12
+       AND payout_odds_avg_w1h IS NOT NULL AND payout_odds IS NOT NULL
+    THEN CAST((payout_odds - payout_odds_avg_w1h) / payout_odds_std_w1h AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__odds__payout_odds_z__w1h,
+  CASE
+    WHEN payout_odds_std_w7d IS NOT NULL AND payout_odds_std_w7d > 1e-12
+       AND payout_odds_avg_w7d IS NOT NULL AND payout_odds IS NOT NULL
+    THEN CAST((payout_odds - payout_odds_avg_w7d) / payout_odds_std_w7d AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__odds__payout_odds_z__w7d,
+  CASE
+    WHEN max_payout_odds_w1h IS NOT NULL AND max_payout_odds_w1h > 1e-9 AND payout_odds IS NOT NULL
+    THEN CAST(payout_odds / max_payout_odds_w1h AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__odds__payout_odds_to_recent_max_ratio__w1h,
+  CASE
+    WHEN lag1_payout_odds IS NOT NULL AND lag1_payout_odds > 1e-9 AND payout_odds IS NOT NULL
+    THEN CAST(payout_odds / lag1_payout_odds AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__odds__payout_odds_step_ratio
+FROM ordered
+WHERE bet_id IN (SELECT bet_id FROM tid)
+""".strip()
+
+
+def _prepare_pool_for_fe_derived(pool: pd.DataFrame) -> pd.DataFrame:
+    """Normalize bounded bet pool columns for in-memory fe derived PIT."""
+
+    need = (
+        "bet_id",
+        "player_id",
+        "canonical_id",
+        "session_id",
+        "table_id",
+        "gaming_day",
+        "payout_complete_dtm",
+        "wager",
+        "payout_odds",
+        "casino_win",
+    )
+    missing = [c for c in need if c not in pool.columns]
+    if missing:
+        raise ValueError(
+            f"pool missing columns required for short-term PIT: {missing}; "
+            f"have={list(pool.columns)}"
+        )
+    work = pool.loc[:, list(need)].copy()
+    for opt in ("theo_win", "base_ha"):
+        if opt not in work.columns:
+            work[opt] = np.nan
+    return work
+
+
+def compute_fe_derived_features_from_pool(
+    pool: pd.DataFrame,
+    target_bet_ids: pd.Series,
+    *,
+    duckdb_runtime: DuckDbRuntimeConfig | None = None,
+) -> pd.DataFrame:
+    """Compute bet-grain short-term ``fe__*`` for ``target_bet_ids`` from a bounded pool."""
+
+    if pool.empty or target_bet_ids.empty:
+        return pd.DataFrame(columns=["bet_id"])
+    work_pool = _prepare_pool_for_fe_derived(pool)
+    tid = pd.DataFrame({"bet_id": pd.to_numeric(target_bet_ids, errors="coerce")}).dropna()
+    if tid.empty:
+        return pd.DataFrame(columns=["bet_id"])
+    runtime = duckdb_runtime or DuckDbRuntimeConfig()
+    sql = f"""
+WITH tid AS (
+  SELECT DISTINCT TRY_CAST(bet_id AS DOUBLE) AS bet_id
+  FROM staged_tid
+  WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
+),
+src AS (
+  SELECT
+    TRY_CAST(b."bet_id" AS DOUBLE) AS bet_id,
+    TRY_CAST(b."player_id" AS BIGINT) AS player_id,
+    TRIM(CAST(b."canonical_id" AS VARCHAR)) AS canonical_id,
+    TRY_CAST(b."session_id" AS BIGINT) AS session_id,
+    TRY_CAST(b."table_id" AS BIGINT) AS table_id,
+    TRY_CAST(b."gaming_day" AS DATE) AS gaming_day,
+    CAST(b."payout_complete_dtm" AS TIMESTAMPTZ) AS pcd,
+    TRY_CAST(b."wager" AS DOUBLE) AS wager,
+    TRY_CAST(b."payout_odds" AS DOUBLE) AS payout_odds,
+    TRY_CAST(b."casino_win" AS DOUBLE) AS casino_win,
+    TRY_CAST(b."theo_win" AS DOUBLE) AS theo_win,
+    TRY_CAST(b."base_ha" AS DOUBLE) AS base_ha
+  FROM pool_src AS b
+  WHERE TRY_CAST(b."bet_id" AS DOUBLE) IS NOT NULL
+    AND TRY_CAST(b."player_id" AS BIGINT) IS NOT NULL
+    AND b."payout_complete_dtm" IS NOT NULL
+    AND TRIM(CAST(b."canonical_id" AS VARCHAR)) <> ''
+),
+{_FE_DERIVED_PIPELINE_AFTER_SRC}
+""".strip()
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, runtime)
+        con.register("pool_src", work_pool)
+        con.register("staged_tid", tid)
+        return con.execute(sql).df()
+    finally:
+        con.close()
