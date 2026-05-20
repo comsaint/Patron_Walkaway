@@ -224,8 +224,8 @@ mid_term_daily_spike_features = FeatureView(
         Field(name="fe__avg_abs_wager_w7d", dtype=Float64),
         Field(name="fe__interarrival_avg_w7d", dtype=Float64),
         Field(name="fe__interarrival_std_w7d", dtype=Float64),
-        Field(name="fe__max_pcd_w7d", dtype=Float64),
-        Field(name="fe__min_pcd_w7d", dtype=Float64),
+        Field(name="fe__max_pcd_w7d", dtype=UnixTimestamp),
+        Field(name="fe__min_pcd_w7d", dtype=UnixTimestamp),
     ],
     source=mid_term_spike_canonical_source,
     tags={
