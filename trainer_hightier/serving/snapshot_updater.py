@@ -111,7 +111,16 @@ def run_mid_term_refresh(
     run_id = _utc_run_id()
     log_job_start(run_id, detail="mid_term_refresh")
     try:
-        ensure_production_mirrors_ready(for_mid_term=True, for_slow=False)
+        bet_src = cleaned_bet
+        if bet_src is None:
+            from trainer_hightier.serving.production_materialize import default_production_cleaned_bet_path
+
+            bet_src = default_production_cleaned_bet_path()
+        ensure_production_mirrors_ready(
+            for_mid_term=True,
+            for_slow=False,
+            cleaned_bet=Path(bet_src),
+        )
         manifest_dir = Path(cfg.snapshot_manifest_dir).resolve()
         manifest_dir.mkdir(parents=True, exist_ok=True)
         cmap = resolve_production_canonical_mapping(canonical_mapping)
@@ -121,12 +130,6 @@ def run_mid_term_refresh(
             al_src = default_adt_allowed_players_parquet_path(float(cfg.adt_allowlist_quantile)).resolve()
         if not al_src.is_file():
             raise FileNotFoundError(f"adt allowlist missing: {al_src}")
-
-        bet_src = cleaned_bet
-        if bet_src is None:
-            from trainer_hightier.serving.production_materialize import default_production_cleaned_bet_path
-
-            bet_src = default_production_cleaned_bet_path()
 
         serving_day = serving_gaming_day(close_hour=int(cfg.gaming_day_close_hour))
         anchor_end = serving_day - timedelta(days=1)
@@ -278,12 +281,22 @@ def run_snapshot_updater(
         cmap = resolve_production_canonical_mapping(canonical_mapping)
 
         if production:
-            ensure_production_mirrors_ready(for_mid_term=True, for_slow=True)
             sess_src = cleaned_session
             if sess_src is None:
                 from trainer_hightier.serving.production_materialize import default_production_cleaned_session_path
 
                 sess_src = default_production_cleaned_session_path()
+            bet_src_for_validation = cleaned_bet
+            if bet_src_for_validation is None:
+                from trainer_hightier.serving.production_materialize import default_production_cleaned_bet_path
+
+                bet_src_for_validation = default_production_cleaned_bet_path()
+            ensure_production_mirrors_ready(
+                for_mid_term=True,
+                for_slow=True,
+                cleaned_bet=Path(bet_src_for_validation),
+                cleaned_session=Path(sess_src),
+            )
             staging_slow, slow_meta = materialize_production_slow_canonical_asof(
                 cleaned_session_parquet=Path(sess_src),
                 canonical_mapping_parquet=cmap,

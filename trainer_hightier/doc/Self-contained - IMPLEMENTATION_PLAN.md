@@ -1,5 +1,9 @@
 # trainer_hightier - Self-contained Implementation Plan
 
+> Historical reference. The current scorer packaging/runtime source of truth is
+> [`Scorer Runtime Contract - SSOT.md`](Scorer%20Runtime%20Contract%20-%20SSOT.md).
+> If this document conflicts with that SSOT, follow the SSOT.
+
 本文件屬於 **Implementation plan 層**，定義如何把 `trainer_hightier` 做成「**部署 runtime 自包含**」：打包後在 target 機只需 Python + 安裝 wheel/requirements + `.env`，即可啟動 scorer/api/validator。本文描述 realization strategy、模組邊界、里程碑、風險與驗證；不展開 ticket 級任務。
 
 ## 目標與邊界
@@ -7,6 +11,7 @@
 - 目標：`trainer_hightier` **部署 runtime 路徑**（`serving/*`、`deploy/*`、打包輸出）不依賴 `trainer.*`。
 - 目標：輸出可部署的 Runtime Bundle（入口、設定模板、模型與快照 artifacts、安裝契約）。
 - 目標：target 機流程收斂為：`pip install`（PyPI + 本地 wheel）→ 設定 `.env` → `python main.py`。
+- 目標：self-contained bundle 的 preflight 必須驗證模型欄位的 cadence-aware runtime suppliers；不能只驗 `model.pkl` / manifest 檔案存在。
 - 非範圍：訓練/特徵實驗路徑完全去除第三方專案依賴（例如 `pipelines.layered_data_assets`）。
 
 ## 依賴策略（只針對 runtime）
@@ -40,14 +45,31 @@
 - 產出 runtime 契約檔（`deploy_bundle_paths.json`, `bundle_info.json`, `README_DEPLOY.md`）。
 - 產出安裝契約（`requirements.txt`，可連 PyPI；可選 `wheels/` 備援）。
 - strict 檢查 manifest/hash/path 完整性。
+- 讀取 frozen registry + `model.pkl.feature_columns`，驗證每個欄位在 self-contained runtime 中有對應 supplier：
+  - baseline raw 欄位由 ClickHouse query 供應。
+  - `feast_trial_1h` 由 serving online PIT builder 供應；trial parquet 僅為診斷 artifact。
+  - short-term `fe__*` 由 `fe_short_term_parquet` 或明確 online/micro-batch supplier 供應。
+  - mid-term `fe__*` 由 production-scoped `mid_term_snapshot_parquet` 供應，且必須通過 freshness / grain gate。
+  - long-term `patron__*` 由 `slow_patron_parquet` 供應。
 
 ### 3) Runtime Entrypoint
 
 - bundle 內存在 `main.py`（或等效入口）。
 - 入口可直接啟動 scorer/api/validator（all/api/scorer/validator mode）。
 - 啟動前檢查 `model.pkl`, `active_manifest.json`, required parquet, mapping。
+- 啟動前 feature preflight 必須與 packaging 使用同一套 supplier contract，避免 API alive 但 scorer 第一輪缺欄。
 
-### 4) Config Contract
+### 4) Manifest Layer Contract
+
+- `active_manifest.json` 是 bundle 內 snapshot layer SSOT。
+- Required base layers：`slow_patron_parquet`, `adt_allowlist_parquet`。
+- Conditional feature layers：
+  - `fe_short_term_parquet`：模型含 short-term parquet-supplied `fe__*` 時必須存在。
+  - `mid_term_snapshot_parquet`：模型含 mid-term `fe__*` 時必須存在，且 `mid_term_grain` 必須為 `canonical_daily_asof`。
+  - `fe_derived_parquet`：legacy compatibility alias；不得作為新 cadence-aware production readiness 的唯一依據。
+- Training-scoped mid-term artifacts 不得進入 production manifest；若 manifest 缺 production-safe mid-term snapshot，self-contained bundle 必須 fail-fast 或先透過 refresh/bootstrap 發佈 production snapshot。
+
+### 5) Config Contract
 
 - `.env.example` 定義必填設定（含 CH 連線）。
 - `.env` 僅承載 secrets 與 operator 參數，禁止依賴 repo 本地路徑。
@@ -69,6 +91,7 @@
 - 封裝 `trainer_hightier` runtime code 為 wheel 並納入部署流程。
 - bundle 交付 `main.py`、`.env.example`、`requirements.txt`（PyPI + 本地 wheel）。
 - README/RUNBOOK 收斂為單一路徑啟動指令。
+- bundle 交付 cadence-aware `active_manifest.json` layer contract，並在 build / boot preflight 驗證 feature supplier matrix。
 
 ### Phase 3：Deployment Validation
 
@@ -81,6 +104,7 @@
 - M2：bundle 具備完整啟動契約（`main.py`、`.env.example`、`requirements.txt`）。
 - M3：無 repo 目標機可啟動 scorer/api/validator。
 - M4：啟動與 runtime 可觀測 model/manifest/allowlist version/hash。
+- M5：self-contained preflight 可攔截缺失或過期的 `fe_short_term_parquet` / `mid_term_snapshot_parquet`，不依賴 legacy `fe_derived_parquet`。
 
 ## 風險與緩解
 
@@ -90,6 +114,10 @@
   - 緩解：前置檢查 + `--snapshot-manifest-source` 明確覆寫。
 - 風險：bundle 缺入口/設定模板，無法在 target 機一鍵啟動。
   - 緩解：將 `main.py`/`.env.example` 納入必帶契約與 release gate。
+- 風險：self-contained bundle 啟動成功，但模型欄位缺 cadence-aware supplier，第一輪 scoring 才失敗。
+  - 緩解：build/deploy preflight 必須讀 frozen registry 與 manifest，按 supplier matrix 驗證 `fe_short_term_parquet`、`mid_term_snapshot_parquet`、slow、online builders。
+- 風險：為了通過 self-contained 打包而把 training-scoped mid-term snapshot 放進 production manifest。
+  - 緩解：manifest layer contract 必須檢查 `snapshot_scope` / freshness / grain；unsafe artifact fail-fast，不做 silent fallback。
 
 ## 驗證與治理
 
@@ -97,6 +125,7 @@
 
 - runtime 單元測試：bundle path、preflight、入口參數、manifest 驗證。
 - no-repo 整合測試：`pip install -r requirements.txt` 後直接啟動。
+- feature supplier smoke：使用 frozen registry + model columns 驗證 short-term / mid-term / slow suppliers 完整，並確認 legacy-only `fe_derived_parquet` 不會誤放行新 cadence-aware 模型。
 - 非功能：啟動延遲、記憶體峰值不超出基線。
 
 ### Governance

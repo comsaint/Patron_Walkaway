@@ -1,5 +1,9 @@
 # Mid-Term Feature Snapshot - Training and Production Implementation Plan
 
+> Historical reference. The current scorer packaging/runtime source of truth is
+> [`Scorer Runtime Contract - SSOT.md`](Scorer%20Runtime%20Contract%20-%20SSOT.md).
+> If this document conflicts with that SSOT, follow the SSOT.
+
 本文件是 **Implementation Plan 層**，針對 `trainer_hightier` training pipeline 與 production scorer 的 feature cadence / snapshot 供應提出修正方案。目標是讓訓練與 production 都遵守同一套語意：short-term features 由 event-level PIT / online builder 供應；mid-term features 以 `gaming_day` daily snapshot 供應；long-term features 以 monthly canonical ASOF snapshot 供應。
 
 本計畫涵蓋 training 語意修正、production snapshot bootstrap / refresh、manifest freshness gate、scorer runtime join 與過期處理。Production **source mirror** 契約、deploy supervisor 啟動語意與 `feature_state_meta` 鍵值見 [`Production Snapshot Serving - MANIFEST_INVENTORY.md`](Production%20Snapshot%20Serving%20-%20MANIFEST_INVENTORY.md) 與 [`Production Snapshot Serving - RUNBOOK.md`](Production%20Snapshot%20Serving%20-%20RUNBOOK.md)。Production alert threshold / policy 不在本計畫內。

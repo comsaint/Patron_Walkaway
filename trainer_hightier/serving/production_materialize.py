@@ -16,6 +16,8 @@ import pyarrow.parquet as pq
 from trainer_hightier.config import (
     DuckDbRuntimeConfig,
     FE_DERIVED_SOURCE_KIND_PRODUCTION,
+    PRODUCTION_BET_MIRROR_DIRNAME,
+    PRODUCTION_SESSION_MIRROR_FILENAME,
     SLOW_PATRON_GRAIN_CANONICAL_ASOF,
     default_hightier_serving_config,
 )
@@ -60,6 +62,7 @@ DEFAULT_MODEL_SLOW_PATRON_COLUMNS: tuple[str, ...] = (
 
 _TRAINING_FE_ARTIFACT_MARKERS: tuple[str, ...] = (
     "_main_trainer_fe_derived",
+    "_main_trainer_fe_short_term",
     "/training_data/",
     "\\training_data\\",
 )
@@ -445,17 +448,27 @@ def is_training_fe_derived_artifact(path: Path | str | None) -> bool:
 def default_production_cleaned_bet_path() -> Path:
     """Default cleaned bet mirror root for production refresh."""
 
-    from trainer_hightier.serving.production_source_mirror import resolve_production_bet_mirror_dir
-
-    return resolve_production_bet_mirror_dir()
+    cfg = default_hightier_serving_config()
+    if cfg.production_cleaned_bet_mirror_dir is not None:
+        return Path(cfg.production_cleaned_bet_mirror_dir).resolve()
+    return (
+        Path(cfg.snapshot_manifest_dir).resolve().parent
+        / "source_mirror"
+        / PRODUCTION_BET_MIRROR_DIRNAME
+    )
 
 
 def default_production_cleaned_session_path() -> Path:
     """Default cleaned session mirror parquet for production refresh."""
 
-    from trainer_hightier.serving.production_source_mirror import resolve_production_session_mirror_path
-
-    return resolve_production_session_mirror_path()
+    cfg = default_hightier_serving_config()
+    if cfg.production_cleaned_session_mirror_parquet is not None:
+        return Path(cfg.production_cleaned_session_mirror_parquet).resolve()
+    return (
+        Path(cfg.snapshot_manifest_dir).resolve().parent
+        / "source_mirror"
+        / PRODUCTION_SESSION_MIRROR_FILENAME
+    )
 
 
 def resolve_production_canonical_mapping(path: Path | None = None) -> Path:

@@ -1,5 +1,9 @@
 # trainer_hightier - Packaging Implementation Plan
 
+> Historical reference. The current scorer packaging/runtime source of truth is
+> [`Scorer Runtime Contract - SSOT.md`](Scorer%20Runtime%20Contract%20-%20SSOT.md).
+> If this document conflicts with that SSOT, follow the SSOT.
+
 本文件屬於 **Implementation plan 層**，定義 `trainer_hightier` 打包如何落地成「**Standalone production bundle**」：目標機器只有 Python interpreter 與交付包，也能啟動服務。本文描述 realization strategy、模組邊界、階段、里程碑、風險與驗證策略；不展開 ticket 級任務。
 
 ## 目標聲明（硬性）
@@ -37,7 +41,8 @@
 - 建包或 deploy preflight 必須驗證 **model feature supplyability**：
   - `model.pkl` 內每個 `feature_columns` 欄位都必須有且只有一個 runtime supplier。
   - supplier 可以是 ClickHouse 原始欄位、serving 即時計算器、或 bundled parquet（`feast_trial_1h` 僅計 **online** 為 production 主路徑，見 D-009）。
-  - 若模型含 `fe_derived` 類欄位，但 bundle / wheel / runtime 沒有對應供應路徑，或 mid-term **freshness** 未達 SLA，必須 fail-fast，不可等到 scorer 第一輪才由 `assert_features_ready` 爆錯。
+  - `source: fe_derived` 必須依 frozen registry 的 cadence / `allowed_training_supplier` 分派，不可再要求單一 legacy `fe_derived_parquet` 同時供應 short-term 與 mid-term。
+  - 若模型含 `fe_derived` 類欄位，但 bundle / wheel / runtime 沒有對應 cadence-aware 供應路徑，或 mid-term **freshness** 未達 SLA，必須 fail-fast，不可等到 scorer 第一輪才由 `assert_features_ready` 爆錯。
 - 同一 `model_version` 連續建包輸出可重現（manifest / allowlist / mapping / fingerprint 一致）。
 - folder 與 zip 兩種交付形式具一致啟動結果。
 - runtime 可持續寫入 `prediction_log.db`，至少覆蓋每輪全量 scored rows（不只 alert rows），以支援「全部預測」查詢與審計。
@@ -85,7 +90,8 @@
 - 複合特徵（ratio、zscore、多窗）以**依賴的最長窗口**定 term。例：`fe__wager_sum__w15m_over_w1d` 依賴 1d → **mid-term**，不可因名稱含 `w15m` 判為 short-term。
 - 現況欄位對照（治理用，非 exhaustive）：
   - `bet__*__w1h`（`feast_trial_1h`）→ short-term
-  - `fe__*` 中 1d–30d 衍生欄（`fe_derived`）→ mid-term
+  - `fe__*` 中 `<24h` / event-level 欄位（`fe_derived` + `allowed_training_supplier=short_term_pit_builder`）→ short-term
+  - `fe__*` 中 1d–30d snapshot / composite 欄位（`fe_derived` + `allowed_training_supplier=mid_term_daily_snapshot`）→ mid-term
   - `patron__*__w180d_m1snap`（`feast_slow_180d`）→ long-term
 
 **與 `1h ~ <24h` 灰區**
@@ -101,7 +107,7 @@
 | **raw** | ClickHouse `t_bet` 原始欄 | 任意（多為 baseline） |
 | **online** | scorer 每輪即時計算（如 `attach_trial_bet_behavior_1h`） | short-term（預設首選） |
 | **micro_batch_parquet** | 固定 cadence 物化 parquet，scorer 僅 merge | short-term / mid-term |
-| **snapshot_parquet** | 訓練凍結或低頻全量/增量快照（如 slow 180d、fe_derived bundle） | mid-term / long-term |
+| **snapshot_parquet** | 訓練凍結或低頻全量/增量快照（如 mid-term daily snapshot、slow 180d） | mid-term / long-term |
 
 **範例：short-term 用 micro-batch parquet（非 online）**
 
@@ -116,7 +122,7 @@
 |----------|------|-------------------|------|
 | `baseline_model` | （非窗特徵） | raw | 不套用 term 窗規則 |
 | `feast_trial_1h` | short-term | **online-only primary**（`attach_trial_bet_behavior_1h`） | `trial_bet_behavior_parquet` 僅診斷/回歸用 artifact，**不是** production 主供應路徑；scorer 不讀 trial parquet 供分 |
-| `fe_derived` | mid-term | **snapshot_parquet**（`fe_derived_parquet`） | 訓練由 `materialize_fe_derived`；production 須週期更新（見下節 freshness gate） |
+| `fe_derived` | short-term / mid-term（依 registry cadence） | **cadence-aware suppliers**：short-term → `fe_short_term_parquet`；mid-term → `mid_term_snapshot_parquet` | 不再以 `source` 單獨推斷 supplier；legacy `fe_derived_parquet` 僅為相容 alias / debug fallback |
 | `feast_slow_180d` | long-term | **snapshot_parquet**（`slow_patron_parquet`） | `snapshot_updater` 可日更/重物化 slow；月更語意 |
 
 詳細 registry 治理欄位（`time_horizon`、`max_lookback`，ISO-8601）見 [`Feature Candidate Registry - IMPLEMENTATION_PLAN.md`](Feature%20Candidate%20Registry%20-%20IMPLEMENTATION_PLAN.md)。
@@ -125,9 +131,9 @@
 
 若模型含任一 `time_horizon=mid_term` 欄位（registry 必填欄位，見 Feature Candidate Registry plan），建包與 deploy preflight **必須**同時滿足：
 
-1. **Supplier 存在**：`active_manifest.json` 宣告 `fe_derived_parquet`，且檔案存在並含模型所需欄位（既有 feature supplyability gate）。
-2. **Freshness 達標**：`coverage_end_exclusive`（manifest 內 ISO-8601）須滿足  
-   `coverage_end_exclusive >= now_utc - mid_term_freshness_sla`（建議預設 **PT36H**，日更 SLA 加排程容忍）。
+1. **Supplier 存在**：`active_manifest.json` 宣告 `mid_term_snapshot_parquet`，且檔案存在並含模型所需 mid-term source columns / derived support columns；short-term `fe__*` 另由 `fe_short_term_parquet` 或 serving online/micro-batch supplier 供應。
+2. **Freshness 達標**：優先使用 `mid_term_coverage_end_exclusive` / `mid_term_anchor_gaming_day_max`（manifest 內 ISO-8601 / gaming-day anchor）；舊 manifest 僅可 fallback 到 `coverage_end_exclusive`。  
+   Freshness 須滿足 `mid_term_coverage_end_exclusive >= now_utc - mid_term_freshness_sla`（建議預設 **PT36H**，日更 SLA 加排程容忍），且 anchor 必須 cover scoring 所需 prior gaming day。
 
 未達標時 fail-fast，錯誤須標 `[feature-supply]` 或 `[pack-schema]` 並列出過期欄位數與 manifest 時間戳。
 
@@ -145,23 +151,23 @@
 - D-005（新增）：`prediction_log.db` 採獨立 SQLite（不混入 `state.db`），寫入點位於 scorer 每輪 `predict_proba` 後、alert 篩選前，對齊 `archive/trainer` 行為。
   - 影響：可觀測到全量 predictions；不得僅依 alerts 反推。
 - D-006（新增）：Step 5 完成後自動產出 `<model-bundle>/deploy_inputs/`（frozen `active_manifest.json` + 對應 parquet 副本，`adt_allowlist_version`/`adt_allowlist_sha256` 與 allowlist 一致）；`build_deploy_package` **優先**自此目錄解析 manifest／canonical mapping。**僅需 `--model-version`** 即可建包——前提為訓練已寫完整 `deploy_inputs`；仍可透過 `--snapshot-manifest-source`／`--mapping-source` override。建包複製 parquet 時，manifest 若以**非絕對路徑**載明檔案，來源為 **`active_manifest.json` 之父目錄**。
-- D-007（新增）：Production bundle 的完成條件包含 **feature supplyability**，不僅是檔案完整與 `/health` 成功。建包器必須以 frozen registry 將 `model.pkl.feature_columns` 分派到 runtime suppliers：
+- D-007（更新）：Production bundle 的完成條件包含 **feature supplyability**，不僅是檔案完整與 `/health` 成功。建包器必須以 frozen registry 將 `model.pkl.feature_columns` 分派到 runtime suppliers：
   - `baseline_model`：由 scorer ClickHouse `t_bet` 查詢直接供應。
   - `feast_trial_1h`：由 serving **online-only primary**（`attach_trial_bet_behavior_1h`）；bundled trial parquet **不計入** production 主供應判定。
   - `feast_slow_180d`：由 bundled slow parquet 供應。
-  - `fe_derived`：必須由 bundled `fe_derived_parquet` 供應（serving-safe online 為後續選項）；若兩者皆無，建包或 deploy preflight 必須 fail-fast。
+  - `fe_derived`：依 registry cadence 分派；short-term 欄位由 `fe_short_term_parquet` / online / micro-batch supplier 供應，mid-term 欄位由 `mid_term_snapshot_parquet` 供應；legacy `fe_derived_parquet` 不再是 production 完成條件。
   - 影響：`GET /health` 不再足以作 production readiness；release gate 必須跑至少一條 scorer feature readiness smoke。
 - D-008（已定）：**Time-horizon（term）** 與 **supplier** 分離治理（見上節「時間視野分類」）。
   - short-term = lookback `< 24h`；mid-term = `24h–30d`；long-term = `> 30d`；複合特徵以最大 lookback 定 term。
-  - `feast_slow_180d` 為 **long-term**，**不是** mid-term；`fe_derived`（1d–30d）為 **mid-term**。
+  - `feast_slow_180d` 為 **long-term**，**不是** mid-term；`fe_derived` 必須依 cadence split，不能整個 family 一律視為 mid-term。
   - supplier 可為 online / micro_batch_parquet / snapshot_parquet，不得由 `source` 單獨推斷 term。
   - 影響：release gate / supplier summary 應能按 term 彙總；mid-term 缺 supplier 與 long-term 缺 slow 分開排查。
 - D-009（已定）：**`feast_trial_1h` production supplier 定版**。
   - Primary：**online**（`attach_trial_bet_behavior_1h`）。
   - `trial_bet_behavior_parquet`：僅診斷/回歸/可選 schema gate，**不得**作為 scorer 主路徑供應或 release 通過條件。
   - 影響：建包 gate 不再因「有 trial parquet」誤判 trial 特徵已可供 production scoring。
-- D-010（已定）：**Mid-term freshness 硬 gate**（見上節「Mid-term freshness 硬 gate」）。
-  - 含 `mid_term` 欄位的模型：`fe_derived_parquet` 存在、欄位齊、且 `coverage_end_exclusive` 在 SLA 內。
+- D-010（更新）：**Mid-term freshness 硬 gate**（見上節「Mid-term freshness 硬 gate」）。
+  - 含 `mid_term` 欄位的模型：`mid_term_snapshot_parquet` 存在、欄位齊、`mid_term_grain=canonical_daily_asof`，且 `mid_term_coverage_end_exclusive` / `mid_term_anchor_gaming_day_max` 在 SLA 內。
   - 影響：避免訓練截點 fe 快照在 production 長期陳舊卻通過建包。
 
 ## 目標架構（Standalone）
@@ -230,15 +236,15 @@ flowchart LR
   - **Raw supplier**：`baseline_model` 欄位由 scorer ClickHouse 查詢提供。
   - **Online supplier**：每輪 scoring 即時計算（例：`attach_trial_bet_behavior_1h`）；適合 short-term、低延遲需求。
   - **Micro-batch parquet supplier**：週期性物化 parquet，scorer merge；可用於 short-term 或 mid-term（term 不變）。
-  - **Snapshot parquet supplier**：訓練凍結或低頻快照 merge；mid-term（`fe_derived_parquet`）與 long-term（`slow_patron_parquet`）。
+  - **Snapshot parquet supplier**：訓練凍結或低頻快照 merge；mid-term（`mid_term_snapshot_parquet`）與 long-term（`slow_patron_parquet`）。
 - 依 term 的 release 預期（現況 vs 目標）：
   - **short-term**：**online-only primary**（`attach_trial_bet_behavior_1h`）；允許 micro-batch parquet 作為未來擴展，非現況主路徑。
-  - **mid-term**：bundled `fe_derived_parquet` + **freshness 硬 gate**（`coverage_end_exclusive` SLA）；不可僅依訓練截點快照長期 serving。
+  - **mid-term**：bundled `mid_term_snapshot_parquet` + **freshness 硬 gate**（`mid_term_coverage_end_exclusive` / anchor SLA）；不可僅依訓練截點快照長期 serving。
   - **long-term**：`slow_patron_parquet` + `snapshot_updater`（或 `--rematerialize-slow`）；月更語意。
 - Gate 原則：
   - dynamic schema gate 僅能放行「實際已有 supplier」的欄位。
   - `feast_trial_1h`：僅 **online** 計入 production 供應判定；`trial_bet_behavior_parquet` 不計入（D-009）。
-  - `fe_derived`（mid-term）：除欄位存在外，須通過 `coverage_end_exclusive` freshness SLA（D-010）。
+  - `fe_derived`：必須先按 cadence split；short-term 檢查 `fe_short_term_parquet` / online supplier，mid-term 檢查 `mid_term_snapshot_parquet` + freshness SLA（D-010）。
   - `source` 不能被當成供應保證，也不能單獨代表 term（`fe_derived` ≠ slow；`feast_trial_1h` ≠ 全部 short 以外特徵）。
   - 若 registry 新增 feature，但 serving / artifact 未同步，建包應失敗，而不是讓 scorer runtime 失敗。
   - preflight / `bundle_info` 建議輸出：按 term 與 supplier 的欄位計數摘要（便於區分「mid-term fe 缺失/過期」vs「long-term slow 缺失」）。
@@ -255,8 +261,9 @@ flowchart LR
 - `snapshots/active_manifest.json`
 - `snapshots/artifacts/slow_patron_*.parquet`（required）
 - `snapshots/artifacts/adt_allowed_players_*.parquet`（required）
+- `snapshots/artifacts/fe_short_term_*.parquet`（required only when model uses short-term `fe__*` that is not supplied online）
+- `snapshots/artifacts/mid_term_daily_snapshot*.parquet`（required when model uses mid-term `fe__*`）
 - `mapping/`（canonical mapping parquet）
-- `local_state/`（可空）
 - `local_state/`（至少保留可建立 `state.db`、`prediction_log.db` 的路徑）
 - `README_DEPLOY.md`
 - `bundle_info.json`
@@ -265,7 +272,7 @@ flowchart LR
 可選內容：
 
 - `snapshots/artifacts/trial_bet_behavior_*.parquet`
-- `snapshots/artifacts/fe_derived_*.parquet`（若 production 模型含 `source: fe_derived` 且選擇預物化供應策略）
+- `snapshots/artifacts/fe_derived_*.parquet`（legacy alias / debug fallback only；不得作為新 cadence-aware release gate 的唯一依據）
 - `feature_state.db`（如需審計歷史）
 - `prediction_log.db`（若交付時預先建立；未預建亦須保證 runtime 可自動初始化）
 
@@ -314,12 +321,12 @@ Feature supplyability contract：
   - 讀取 frozen registry snapshot（含 `time_horizon` / `max_lookback`）。
   - 建立 supplier matrix，確認每個模型欄位有 runtime 供應來源。
   - `feast_trial_1h`：僅 online 路徑計入通過；trial parquet 可選打包但不計入。
-  - `fe_derived`：驗證 `fe_derived_parquet` 存在、欄位齊、且 `coverage_end_exclusive` 在 SLA 內。
+  - `fe_derived`：依 frozen registry 的 cadence / `allowed_training_supplier` split；short-term 驗證 `fe_short_term_parquet` 或 online supplier，mid-term 驗證 `mid_term_snapshot_parquet`、grain、欄位與 freshness。
 - Runtime 階段：
   - deploy preflight 或 scorer `--once` smoke 必須跑到 `assert_features_ready` 前後，確認模型欄位完整。
-  - 若模型需要 `fe_derived`，須有 bundled `fe_derived_parquet` 且 manifest 新鮮度達標（serving-safe online 為後續選項）。
+  - 若模型需要 `fe_derived`，須有 cadence-aware supplier matrix；不得因缺少 legacy `fe_derived_parquet` 直接失敗，也不得因只有 short-term parquet 就放行 mid-term 欄位。
 - Release 文件：
-  - `RUNBOOK.md` 補上 missing features 的排查：raw、online（trial）、slow parquet、`fe_derived` 缺失或 **stale**（勿將 trial parquet 當 production 主路徑）。
+  - `RUNBOOK.md` 補上 missing features 的排查：raw、online（trial）、slow parquet、`fe_short_term_parquet` / `mid_term_snapshot_parquet` 缺失或 **stale**（勿將 trial parquet 或 legacy `fe_derived_parquet` 當 production 主路徑）。
 
 ## 里程碑
 
@@ -330,7 +337,7 @@ Feature supplyability contract：
 - M5：同一 `model_version` 可重現建包。
 - M6：zip 交付與回滾 runbook 可操作。
 - M7：`prediction_log.db` 在 target 機可自動建立並可查詢全量 predictions。
-- M8：feature supplyability gate 生效；含 `fe_derived` 的模型若無 supplier 或 mid-term freshness 過期，會在建包/preflight 階段失敗，而非 scorer 第一輪失敗。
+- M8：feature supplyability gate 生效；含 `fe_derived` 的模型若缺 cadence-aware supplier 或 mid-term freshness 過期，會在建包/preflight 階段失敗，而非 scorer 第一輪失敗。
 - M9：`feast_trial_1h` 僅以 online supplier 判定通過；trial parquet 存在不影響 release gate。
 
 ## 主要風險與緩解
@@ -347,8 +354,8 @@ Feature supplyability contract：
   - 緩解：hash parity fail-fast + `bundle_info` 版本稽核。
 - 風險：prediction log 長時累積導致磁碟壓力或查詢退化。
   - 緩解：建立 retention/summary 策略與必要索引；runbook 加入容量監控與清理步驟。
-- 風險：模型包含訓練端可產生、但 serving bundle 不可產生的欄位（例如 `fe_derived`）。
-  - 緩解：feature supplyability gate + mid-term freshness 硬 gate；若無 `fe_derived_parquet` 或 SLA 過期，建包/preflight fail-fast。重訓重打包後須確保 fe refresh job 與 manifest 時間戳一併更新。
+- 風險：模型包含訓練端可產生、但 serving bundle 不可產生的欄位（例如 cadence split 後的 `fe_derived`）。
+  - 緩解：feature supplyability gate + mid-term freshness 硬 gate；若缺 `fe_short_term_parquet` / `mid_term_snapshot_parquet` 或 SLA 過期，建包/preflight fail-fast。重訓重打包後須確保 fe refresh job 與 manifest 時間戳一併更新。
 - 風險：將 `trial_bet_behavior_parquet` 誤當 production 主供應。
   - 緩解：D-009 明確 online-only primary；gate 不以 trial parquet 作為 trial 特徵通過條件。
 - 風險：只驗 `/health` 導致部署成功但 scorer 首輪失敗。

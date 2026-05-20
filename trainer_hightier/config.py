@@ -38,6 +38,9 @@ FE_DERIVED_DEPLOY_PARQUET_BASENAME: Final[str] = "fe_derived_features.parquet"
 MID_TERM_FRESHNESS_SLA_ISO8601: Final[str] = "PT36H"
 # Max gaming-day lookback when building mid-term daily snapshots (w30d + buffer).
 MID_TERM_SNAPSHOT_MAX_LOOKBACK_DAYS: Final[int] = 32
+# Mid-term snapshot artifact scope labels (sidecar metadata + cache keys).
+MID_TERM_SNAPSHOT_SCOPE_TRAINING: Final[str] = "training_step4_only"
+MID_TERM_SNAPSHOT_SCOPE_PRODUCTION: Final[str] = "production"
 # Training audit columns written by mid-term ASOF enrich.
 MID_TERM_ANCHOR_AUDIT_COLUMN: Final[str] = "mid_term_anchor_gaming_day"
 MID_TERM_SNAPSHOT_AGE_AUDIT_COLUMN: Final[str] = "mid_term_snapshot_age_days"
@@ -382,7 +385,7 @@ class Step5TrainConfig:
     #: When ``True``, use :data:`baseline_*` hyperparameters only (no Optuna).
     skip_optuna: bool = False
     #: ``study.optimize(..., timeout=...)`` wall-clock cap in seconds.
-    optuna_timeout_sec: float = 60.0 * 60 * 1  # 1 hour = 60*60
+    optuna_timeout_sec: float = 60.0 * 60 * 3  # 1 hour = 60*60
     early_stopping_rounds: int = 50
     #: Upper bound on boosting rounds (early stopping usually stops sooner).
     lgb_n_estimators_cap: int = 2000

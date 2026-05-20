@@ -10,9 +10,15 @@ from pathlib import Path
 import duckdb
 import pyarrow.parquet as pq
 
-from trainer_hightier.config import DuckDbRuntimeConfig, default_hightier_serving_config
+from trainer_hightier.config import (
+    DuckDbRuntimeConfig,
+    PRODUCTION_BET_MIRROR_DIRNAME,
+    PRODUCTION_SESSION_MIRROR_FILENAME,
+    default_hightier_serving_config,
+)
 from trainer_hightier.utils.bet_l0_preprocess import (
     cleaned_bet_dataset_has_any_parquet,
+    first_parquet_under_for_schema,
     resolved_cleaned_bet_read_parquet_sql,
 )
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
@@ -51,9 +57,11 @@ def resolve_production_bet_mirror_dir() -> Path:
     cfg = default_hightier_serving_config()
     if cfg.production_cleaned_bet_mirror_dir is not None:
         return Path(cfg.production_cleaned_bet_mirror_dir).resolve()
-    from trainer_hightier.serving.production_materialize import default_production_cleaned_bet_path
-
-    return default_production_cleaned_bet_path().resolve()
+    return (
+        Path(cfg.snapshot_manifest_dir).resolve().parent
+        / "source_mirror"
+        / PRODUCTION_BET_MIRROR_DIRNAME
+    )
 
 
 def resolve_production_session_mirror_path() -> Path:
@@ -62,9 +70,11 @@ def resolve_production_session_mirror_path() -> Path:
     cfg = default_hightier_serving_config()
     if cfg.production_cleaned_session_mirror_parquet is not None:
         return Path(cfg.production_cleaned_session_mirror_parquet).resolve()
-    from trainer_hightier.serving.production_materialize import default_production_cleaned_session_path
-
-    return default_production_cleaned_session_path().resolve()
+    return (
+        Path(cfg.snapshot_manifest_dir).resolve().parent
+        / "source_mirror"
+        / PRODUCTION_SESSION_MIRROR_FILENAME
+    )
 
 
 def _missing_columns(path: Path, required: tuple[str, ...]) -> list[str]:
@@ -121,7 +131,7 @@ def validate_production_bet_mirror(
             ok=False,
             message=f"cleaned bet mirror has no parquet under {root}",
         )
-    sample = next(root.rglob("*.parquet"))
+    sample = first_parquet_under_for_schema(root)
     miss = _missing_columns(sample, PRODUCTION_BET_MIRROR_REQUIRED_COLUMNS)
     if miss:
         return MirrorValidationResult(
@@ -245,17 +255,23 @@ WHERE gaming_day IS NOT NULL
     )
 
 
-def ensure_production_mirrors_ready(*, for_mid_term: bool, for_slow: bool) -> dict[str, MirrorValidationResult]:
+def ensure_production_mirrors_ready(
+    *,
+    for_mid_term: bool,
+    for_slow: bool,
+    cleaned_bet: Path | None = None,
+    cleaned_session: Path | None = None,
+) -> dict[str, MirrorValidationResult]:
     """Validate required production mirrors before refresh; raise on failure."""
 
     out: dict[str, MirrorValidationResult] = {}
     if for_mid_term:
-        bet = validate_production_bet_mirror()
+        bet = validate_production_bet_mirror(mirror_dir=cleaned_bet)
         out["bet_mirror"] = bet
         if not bet.ok:
             raise ValueError(f"[source_mirror] {bet.message}")
     if for_slow:
-        sess = validate_production_session_mirror()
+        sess = validate_production_session_mirror(mirror_path=cleaned_session)
         out["session_mirror"] = sess
         if not sess.ok:
             raise ValueError(f"[source_mirror] {sess.message}")

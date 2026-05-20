@@ -184,3 +184,45 @@ walkaway_bet_slow_snap_v1 = FeatureService(
     name="walkaway_bet_slow_snap_v1",
     features=[slow_patron_180d_monthly_features],
 )
+
+# --- Canonical-grain mid-term spike (production feasibility; see feast_mid_term_spike.py) ---
+_SPIKE_MID_TERM_PARQUET = (
+    _REPO_ROOT.parent / "artifacts" / "feast" / "mid_term_spike_canonical.parquet"
+).resolve()
+_spike_mid_term_source_path = str(_SPIKE_MID_TERM_PARQUET)
+
+canonical_patron = Entity(
+    name="canonical_patron",
+    join_keys=["canonical_id"],
+    value_type=ValueType.STRING,
+    description="Patron grain for mid-term daily snapshots (canonical_id).",
+)
+
+mid_term_spike_canonical_source = FileSource(
+    name="mid_term_spike_canonical_parquet",
+    path=_spike_mid_term_source_path,
+    file_format=ParquetFormat(),
+    timestamp_field="event_timestamp",
+)
+
+mid_term_daily_spike_features = FeatureView(
+    name="mid_term_daily_spike_features",
+    entities=[canonical_patron],
+    ttl=timedelta(days=40),
+    schema=[
+        Field(name="fe__wager_sum__w7d", dtype=Float64),
+        Field(name="fe__wager_sum__w30d", dtype=Float64),
+        Field(name="fe__prior_wager_mean_w30d", dtype=Float64),
+    ],
+    source=mid_term_spike_canonical_source,
+    tags={
+        "owner": "trainer_hightier",
+        "cadence": "canonical_daily_asof",
+        "spike": "feast_mid_term_feasibility",
+    },
+)
+
+walkaway_canonical_mid_term_spike_v1 = FeatureService(
+    name="walkaway_canonical_mid_term_spike_v1",
+    features=[mid_term_daily_spike_features],
+)

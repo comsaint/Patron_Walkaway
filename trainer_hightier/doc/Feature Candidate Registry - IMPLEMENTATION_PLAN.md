@@ -1,5 +1,9 @@
 # trainer_hightier - Feature Candidate Registry Implementation Plan
 
+> Historical reference. The current scorer packaging/runtime source of truth is
+> [`Scorer Runtime Contract - SSOT.md`](Scorer%20Runtime%20Contract%20-%20SSOT.md).
+> If this document conflicts with that SSOT, follow the SSOT.
+
 本文件屬於 **Implementation Plan 層**，定義如何在 `trainer_hightier` 導入一份可治理的候選特徵 YAML 台帳，並讓 feature experiment pipeline 以該台帳作為「啟用特徵」來源。  
 本文件聚焦實作策略與里程碑，不展開 ticket 級工作拆解（該部分應由後續 Working Plan 承接）。
 

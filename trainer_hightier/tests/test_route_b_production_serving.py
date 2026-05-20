@@ -41,8 +41,8 @@ features:
     source: fe_derived
     status: active
     enabled_for: [baseline]
-    time_horizon: mid_term
-    max_lookback: P1D
+    time_horizon: short_term
+    max_lookback: PT1H
   - feature_id: patron__adt__w180d_m1snap
     group_id: g
     source: feast_slow_180d
@@ -63,7 +63,7 @@ features:
     out = audit_feature_supplier_routes(snap, feats, fe_bundled=True, manifest=man)
     by_id = {r["feature_id"]: r["supplier"] for r in out["features"]}
     assert by_id["wager"] == "clickhouse_raw"
-    assert by_id["fe__wager_sum__w15m"] == "production_fe_derived_parquet"
+    assert by_id["fe__wager_sum__w15m"] == "fe_short_term_parquet"
     assert "canonical_asof" in by_id["patron__adt__w180d_m1snap"]
 
 
@@ -112,8 +112,8 @@ features:
     source: fe_derived
     status: active
     enabled_for: [baseline]
-    time_horizon: mid_term
-    max_lookback: P1D
+    time_horizon: short_term
+    max_lookback: PT1H
 """.strip()
         + "\n",
         encoding="utf-8",
@@ -133,5 +133,6 @@ features:
             slow_pack_path=None,
             trial_pack_path=None,
             fe_pack_path=fe_p,
+            fe_short_term_pack_path=fe_p,
             manifest=man,
         )

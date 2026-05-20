@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import pickle
 from datetime import datetime, timezone, timedelta
@@ -13,12 +14,23 @@ import pyarrow.parquet as pq
 
 from trainer_hightier.config import (
     FE_DERIVED_SOURCE_KIND_PRODUCTION,
+    FE_DERIVED_SOURCE_KIND_SHIPPED,
     FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME,
     MANIFEST_KEY_FE_DERIVED_SOURCE_KIND,
+    MANIFEST_KEY_FE_SHORT_TERM,
+    MANIFEST_KEY_MID_TERM_GRAIN,
     MANIFEST_KEY_MID_TERM_SNAPSHOT,
     MANIFEST_KEY_SLOW_PATRON_GRAIN,
     MID_TERM_FRESHNESS_SLA_ISO8601,
+    MID_TERM_GRAIN_CANONICAL_DAILY_ASOF,
     SLOW_PATRON_GRAIN_CANONICAL_ASOF,
+)
+from trainer_hightier.feature_experiment.feature_cadence import (
+    classify_model_fe_features,
+    short_term_enrich_columns_with_dependencies,
+)
+from trainer_hightier.feature_experiment.materialize_mid_term_daily_snapshot import (
+    mid_term_snapshot_production_safe,
 )
 from trainer_hightier.serving.candidate_registry_loader import (
     CandidateRegistrySnapshot,
@@ -33,6 +45,69 @@ from trainer_hightier.serving.production_materialize import (
 logger = logging.getLogger(__name__)
 
 MANIFEST_KEY_FE_DERIVED: str = "fe_derived_parquet"
+
+
+def _read_json_sidecar(path: Path) -> dict[str, Any] | None:
+    """Load JSON sidecar when present; return None on missing or parse errors."""
+
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _read_fe_production_sidecar(parquet_path: Path) -> dict[str, Any] | None:
+    sidecar = parquet_path.resolve().parent / f"{parquet_path.stem}.production_meta.json"
+    return _read_json_sidecar(sidecar)
+
+
+def _read_mid_term_snapshot_meta(parquet_path: Path) -> dict[str, Any] | None:
+    sidecar = parquet_path.resolve().parent / f"{parquet_path.stem}.meta.json"
+    return _read_json_sidecar(sidecar)
+
+
+def _manifest_layer_base_dir(
+    *,
+    fe_short_term_pack_path: Path | None,
+    mid_term_pack_path: Path | None,
+    fe_pack_path: Path | None,
+    slow_pack_path: Path | None,
+) -> Path | None:
+    for candidate in (fe_short_term_pack_path, mid_term_pack_path, fe_pack_path, slow_pack_path):
+        if candidate is not None and candidate.is_file():
+            return candidate.parent
+    return None
+
+
+def _resolve_manifest_layer_path(
+    manifest: dict[str, Any] | None,
+    *,
+    base_dir: Path | None,
+    manifest_key: str,
+) -> Path | None:
+    if manifest is None or base_dir is None:
+        return None
+    rel = manifest.get(manifest_key)
+    if not isinstance(rel, str) or not rel.strip():
+        return None
+    candidate = (base_dir / rel).resolve()
+    return candidate if candidate.is_file() else None
+
+
+def _fe_source_kind_production(manifest: dict[str, Any] | None, parquet_path: Path | None) -> bool:
+    man = manifest or {}
+    kind = str(man.get(MANIFEST_KEY_FE_DERIVED_SOURCE_KIND, "") or "").strip()
+    if kind == FE_DERIVED_SOURCE_KIND_PRODUCTION:
+        return True
+    if parquet_path is None:
+        return False
+    sidecar = _read_fe_production_sidecar(parquet_path)
+    sidecar_kind = str((sidecar or {}).get("fe_derived_source_kind", "") or "").strip()
+    return sidecar_kind == FE_DERIVED_SOURCE_KIND_PRODUCTION
+
 
 _KNOWN_SOURCES: frozenset[str] = frozenset(
     {
@@ -175,12 +250,15 @@ def audit_feature_supplier_routes(
             grain = (manifest or {}).get(MANIFEST_KEY_SLOW_PATRON_GRAIN, SLOW_PATRON_GRAIN_CANONICAL_ASOF)
             supplier = f"slow_parquet_{grain}"
         elif src == "fe_derived":
-            kind = (manifest or {}).get(MANIFEST_KEY_FE_DERIVED_SOURCE_KIND, "")
-            supplier = (
-                "production_fe_derived_parquet"
-                if kind == FE_DERIVED_SOURCE_KIND_PRODUCTION and fe_bundled
-                else ("bundled_fe_derived_parquet" if fe_bundled else "missing")
-            )
+            fe_split = classify_model_fe_features(snap, (feat,))
+            if fe_split["mid_term"]:
+                supplier = "mid_term_snapshot_parquet"
+            elif fe_split["short_term"]:
+                supplier = "fe_short_term_parquet"
+            elif fe_bundled:
+                supplier = "legacy_fe_derived_parquet"
+            else:
+                supplier = "missing"
         else:
             supplier = "unknown"
         rows.append(
@@ -207,38 +285,89 @@ def audit_feature_supplier_routes(
 def assert_production_feature_artifacts_or_raise(
     model_feats: tuple[str, ...],
     *,
+    snap: CandidateRegistrySnapshot,
+    fe_short_term_pack_path: Path | None,
+    mid_term_pack_path: Path | None,
     fe_pack_path: Path | None,
     slow_pack_path: Path | None,
     manifest: dict[str, Any] | None,
-    fe_derived_columns: tuple[str, ...] | None = None,
+    require_fe_artifacts: bool = True,
 ) -> None:
     """Reject training-bundle suppliers and require production manifest metadata."""
 
     man = manifest or {}
-    fe_needed = [f for f in model_feats if f.startswith("fe__")]
+    fe_split = classify_model_fe_features(snap, model_feats)
+    short_cols = fe_split["short_term"]
+    mid_cols = fe_split["mid_term"]
     slow_needed = [f for f in model_feats if f in DEFAULT_MODEL_SLOW_PATRON_COLUMNS]
-    if fe_needed:
+
+    if short_cols:
+        short_path = fe_short_term_pack_path
+        if short_path is None or not short_path.is_file():
+            if fe_pack_path is not None and fe_pack_path.is_file() and not mid_cols:
+                short_path = fe_pack_path
+        if short_path is None or not short_path.is_file():
+            if not require_fe_artifacts:
+                short_path = None
+            else:
+                raise FileNotFoundError(
+                    "[feature-supply] production fe_short_term_parquet missing for short-term fe__*"
+                )
+        if short_path is None:
+            pass
+        elif not require_fe_artifacts:
+            pass
+        elif is_training_fe_derived_artifact(short_path):
+            raise ValueError(
+                f"[feature-supply] fe_short_term path looks like training artifact: {short_path}. "
+                "Publish production short-term materialization via snapshot_updater --production."
+            )
+        elif not _fe_source_kind_production(man, short_path):
+            kind = str(man.get(MANIFEST_KEY_FE_DERIVED_SOURCE_KIND, "") or "").strip()
+            raise ValueError(
+                "[feature-supply] short-term fe__* requires production supplier metadata "
+                f"({MANIFEST_KEY_FE_DERIVED_SOURCE_KIND}={FE_DERIVED_SOURCE_KIND_PRODUCTION!r} "
+                f"or production sidecar); got manifest kind={kind!r}"
+            )
+        else:
+            smoke_feature_coverage_or_raise(
+                short_path,
+                columns=short_term_enrich_columns_with_dependencies(short_cols, mid_cols),
+                label="fe_short_term",
+                max_null_fraction=0.95,
+            )
+
+    if mid_cols:
+        if mid_term_pack_path is None or not mid_term_pack_path.is_file():
+            if require_fe_artifacts:
+                raise FileNotFoundError(
+                    "[feature-supply] production mid_term_snapshot_parquet missing for mid-term fe__*"
+                )
+            mid_term_pack_path = None
+        if mid_term_pack_path is not None:
+            meta = _read_mid_term_snapshot_meta(mid_term_pack_path)
+            if not mid_term_snapshot_production_safe(meta):
+                scope = str((meta or {}).get("snapshot_scope", "") or "").strip()
+                raise ValueError(
+                    "[feature-supply] mid_term_snapshot_parquet is not production-safe "
+                    f"(snapshot_scope={scope!r}, expected production). "
+                    "Training-scoped snapshots cannot satisfy production packaging."
+                )
+        if mid_term_pack_path is None and not require_fe_artifacts:
+            pass
         kind = str(man.get(MANIFEST_KEY_FE_DERIVED_SOURCE_KIND, "") or "").strip()
-        if kind != FE_DERIVED_SOURCE_KIND_PRODUCTION:
+        if (
+            mid_term_pack_path is not None
+            and kind == FE_DERIVED_SOURCE_KIND_SHIPPED
+            and not _fe_source_kind_production(man, fe_short_term_pack_path)
+        ):
             raise ValueError(
-                "[feature-supply] model requires production fe_derived but manifest "
-                f"{MANIFEST_KEY_FE_DERIVED_SOURCE_KIND}!={FE_DERIVED_SOURCE_KIND_PRODUCTION!r} "
-                f"(got {kind!r}). Run snapshot_updater with --production."
+                "[feature-supply] manifest fe_derived_source_kind=shipped_training_bundle cannot "
+                "satisfy production mid-term fe__* serving without production short-term supplier metadata"
             )
-        if fe_pack_path is None or not fe_pack_path.is_file():
-            raise FileNotFoundError("[feature-supply] production fe_derived_parquet missing")
-        if is_training_fe_derived_artifact(fe_pack_path):
-            raise ValueError(
-                f"[feature-supply] fe_derived path looks like training artifact: {fe_pack_path}. "
-                "Publish production materialization via snapshot_updater --production."
-            )
-        cols = fe_derived_columns or tuple(f for f in fe_needed if f in DEFAULT_MODEL_FE_DERIVED_COLUMNS)
-        smoke_feature_coverage_or_raise(
-            fe_pack_path,
-            columns=cols or tuple(fe_needed),
-            label="fe_derived",
-            max_null_fraction=0.95,
-        )
+
+    if slow_needed and not require_fe_artifacts:
+        return
     if slow_needed:
         grain = str(man.get(MANIFEST_KEY_SLOW_PATRON_GRAIN, "") or "").strip()
         if grain != SLOW_PATRON_GRAIN_CANONICAL_ASOF:
@@ -339,10 +468,18 @@ def assert_feature_supplyability_or_raise(
     slow_pack_path: Path | None,
     trial_pack_path: Path | None,
     fe_pack_path: Path | None,
+    fe_short_term_pack_path: Path | None = None,
+    mid_term_pack_path: Path | None = None,
     manifest: dict[str, Any] | None = None,
     mid_term_freshness_sla_iso: str | None = None,
+    validation_stage: str = "deploy",
 ) -> dict[str, Any]:
     """Fail fast when any model column cannot be supplied in production serving."""
+
+    if validation_stage not in {"package", "deploy"}:
+        raise ValueError(f"validation_stage must be 'package' or 'deploy', got {validation_stage!r}")
+    require_runtime_artifacts = validation_stage == "deploy"
+    refresh_required_layers: list[str] = []
 
     by_id = {r.feature_id: r for r in snap.rows}
     fe_needed: list[str] = []
@@ -377,50 +514,106 @@ def assert_feature_supplyability_or_raise(
             + ", ".join(unknown)
         )
 
-    mid_term_needed = model_feats_requiring_mid_term_snapshot(snap, model_feats)
+    fe_split = classify_model_fe_features(snap, tuple(fe_needed) if fe_needed else model_feats)
+    short_cols = fe_split["short_term"]
+    mid_cols = fe_split["mid_term"]
+    other_fe_cols = fe_split["other"]
+    if other_fe_cols:
+        tip = ", ".join(other_fe_cols[:12])
+        ellipsis = "" if len(other_fe_cols) <= 12 else ", …"
+        raise ValueError(
+            "[feature-supply] model fe__* columns lack a supported cadence supplier: "
+            f"[{tip}{ellipsis}]. Update frozen registry allowed_training_supplier."
+        )
+
+    base_dir = _manifest_layer_base_dir(
+        fe_short_term_pack_path=fe_short_term_pack_path,
+        mid_term_pack_path=mid_term_pack_path,
+        fe_pack_path=fe_pack_path,
+        slow_pack_path=slow_pack_path,
+    )
+    if fe_short_term_pack_path is None or not fe_short_term_pack_path.is_file():
+        fe_short_term_pack_path = _resolve_manifest_layer_path(
+            manifest, base_dir=base_dir, manifest_key=MANIFEST_KEY_FE_SHORT_TERM
+        )
+    if mid_term_pack_path is None or not mid_term_pack_path.is_file():
+        mid_term_pack_path = _resolve_manifest_layer_path(
+            manifest, base_dir=base_dir, manifest_key=MANIFEST_KEY_MID_TERM_SNAPSHOT
+        )
+
+    mid_term_registry = model_feats_requiring_mid_term_snapshot(snap, model_feats)
+    mid_term_needed = tuple(dict.fromkeys([*mid_term_registry, *mid_cols]))
     sla = mid_term_freshness_sla_iso or MID_TERM_FRESHNESS_SLA_ISO8601
 
-    if fe_needed:
-        if fe_pack_path is None or not fe_pack_path.is_file():
-            tip = ", ".join(fe_needed[:24])
-            ellipsis = "" if len(fe_needed) <= 24 else ", …"
-            raise ValueError(
-                "[feature-supply] model requires fe_derived features but bundle has no "
-                f"{MANIFEST_KEY_FE_DERIVED} (or file missing). "
-                f"Missing example columns: [{tip}{ellipsis}]. "
-                "Retrain with fe__* in baseline, ensure Step 5 copies fe_derived_features.parquet "
-                "into deploy_inputs, then rebuild the deploy bundle."
-            )
-        _ensure_parquet_columns(fe_pack_path, role="fe_derived", required=tuple(fe_needed))
-
-    if mid_term_needed and manifest is not None:
-        mid_rel = manifest.get(MANIFEST_KEY_MID_TERM_SNAPSHOT)
-        if mid_rel:
-            from trainer_hightier.serving.snapshot_freshness import (
-                evaluate_mid_term_freshness,
-                read_mid_term_anchor_max,
-                validate_mid_term_artifact,
-            )
-
-            base_dir = None
-            if fe_pack_path is not None:
-                base_dir = fe_pack_path.parent
-            elif slow_pack_path is not None:
-                base_dir = slow_pack_path.parent
-            mid_path = (base_dir / str(mid_rel)).resolve() if base_dir is not None else None
-            if mid_path is None or not mid_path.is_file():
-                raise FileNotFoundError(
-                    "[feature-supply] model uses mid_term features but "
-                    f"{MANIFEST_KEY_MID_TERM_SNAPSHOT} missing under manifest dir"
+    if short_cols:
+        short_path = fe_short_term_pack_path
+        if short_path is None or not short_path.is_file():
+            if fe_pack_path is not None and fe_pack_path.is_file():
+                short_path = fe_pack_path
+        if short_path is None or not short_path.is_file():
+            tip = ", ".join(short_cols[:24])
+            ellipsis = "" if len(short_cols) <= 24 else ", …"
+            refresh_required_layers.append(MANIFEST_KEY_FE_SHORT_TERM)
+            if require_runtime_artifacts:
+                raise ValueError(
+                    "[feature-supply] model requires short-term fe__* but bundle has no "
+                    f"{MANIFEST_KEY_FE_SHORT_TERM} (legacy {MANIFEST_KEY_FE_DERIVED} is debug-only for "
+                    "mid-term). "
+                    f"Missing example columns: [{tip}{ellipsis}]. "
+                    "Publish production fe_short_term_parquet via snapshot_updater --production."
                 )
-            mid_val = validate_mid_term_artifact(mid_path, manifest_grain=manifest.get("mid_term_grain"))
-            if mid_val.hard_failure:
-                raise ValueError(f"[feature-supply] mid_term artifact invalid: {mid_val.message}")
-            mid_anchor = read_mid_term_anchor_max(mid_path, manifest)
-            mid_fresh = evaluate_mid_term_freshness(anchor_max=mid_anchor)
-            if mid_fresh.status == "hard_cap_breached":
-                raise ValueError(f"[feature-supply] mid-term hard cap breached: {mid_fresh.message}")
         else:
+            short_required = short_term_enrich_columns_with_dependencies(short_cols, mid_cols)
+            _ensure_parquet_columns(short_path, role="fe_short_term", required=short_required)
+
+    if mid_term_needed:
+        if mid_term_pack_path is None or not mid_term_pack_path.is_file():
+            tip = ", ".join(mid_cols[:24] or mid_term_needed[:24])
+            ellipsis = "" if len(mid_cols or mid_term_needed) <= 24 else ", …"
+            refresh_required_layers.append(MANIFEST_KEY_MID_TERM_SNAPSHOT)
+            if require_runtime_artifacts:
+                raise ValueError(
+                    "[feature-supply] model requires mid-term fe__* but bundle has no "
+                    f"{MANIFEST_KEY_MID_TERM_SNAPSHOT} (legacy {MANIFEST_KEY_FE_DERIVED} does not satisfy "
+                    "mid-term production gate). "
+                    f"Missing example columns: [{tip}{ellipsis}]. "
+                    "Publish production mid_term_snapshot_parquet with snapshot_scope=production."
+                )
+        if mid_cols and fe_pack_path is not None and fe_pack_path.is_file() and (
+            fe_short_term_pack_path is None or not fe_short_term_pack_path.is_file()
+        ):
+            refresh_required_layers.append(MANIFEST_KEY_FE_SHORT_TERM)
+            if require_runtime_artifacts:
+                raise ValueError(
+                    "[feature-supply] legacy fe_derived_parquet alone cannot satisfy mid-term fe__*; "
+                    f"require {MANIFEST_KEY_MID_TERM_SNAPSHOT} and {MANIFEST_KEY_FE_SHORT_TERM}."
+                )
+
+    if mid_term_needed and manifest is not None and mid_term_pack_path is not None:
+        from trainer_hightier.serving.snapshot_freshness import (
+            evaluate_mid_term_freshness,
+            read_mid_term_anchor_max,
+            validate_mid_term_artifact,
+        )
+
+        grain = str(manifest.get(MANIFEST_KEY_MID_TERM_GRAIN, "") or "").strip()
+        if grain and grain != MID_TERM_GRAIN_CANONICAL_DAILY_ASOF:
+            raise ValueError(
+                "[feature-supply] mid_term_grain must be "
+                f"{MID_TERM_GRAIN_CANONICAL_DAILY_ASOF!r} (got {grain!r})"
+            )
+        mid_val = validate_mid_term_artifact(
+            mid_term_pack_path,
+            manifest_grain=manifest.get(MANIFEST_KEY_MID_TERM_GRAIN),
+        )
+        if mid_val.hard_failure:
+            raise ValueError(f"[feature-supply] mid_term artifact invalid: {mid_val.message}")
+        mid_anchor = read_mid_term_anchor_max(mid_term_pack_path, manifest)
+        mid_fresh = evaluate_mid_term_freshness(anchor_max=mid_anchor)
+        if require_runtime_artifacts and mid_fresh.status == "hard_cap_breached":
+            raise ValueError(f"[feature-supply] mid-term hard cap breached: {mid_fresh.message}")
+    elif mid_term_needed and manifest is not None and mid_term_pack_path is None:
+        if require_runtime_artifacts:
             assert_mid_term_freshness_or_raise(
                 manifest,
                 mid_term_feature_count=len(mid_term_needed),
@@ -433,26 +626,37 @@ def assert_feature_supplyability_or_raise(
             f"mid_term columns example: {', '.join(mid_term_needed[:12])}",
         )
 
-    fe_bundled = fe_pack_path is not None and fe_pack_path.is_file()
+    fe_bundled = (fe_short_term_pack_path is not None and fe_short_term_pack_path.is_file()) or (
+        fe_pack_path is not None and fe_pack_path.is_file()
+    )
     if fe_needed or any(f in model_feats for f in DEFAULT_MODEL_SLOW_PATRON_COLUMNS):
         assert_production_feature_artifacts_or_raise(
             model_feats,
+            snap=snap,
+            fe_short_term_pack_path=fe_short_term_pack_path,
+            mid_term_pack_path=mid_term_pack_path,
             fe_pack_path=fe_pack_path,
             slow_pack_path=slow_pack_path,
             manifest=manifest,
+            require_fe_artifacts=require_runtime_artifacts,
         )
     summary = audit_feature_supplier_routes(
         snap, model_feats, fe_bundled=fe_bundled, manifest=manifest
     )
+    summary["fe_short_term_column_count"] = len(short_cols)
+    summary["fe_mid_term_column_count"] = len(mid_cols)
     summary["mid_term_model_feature_count"] = len(mid_term_needed)
+    summary["validation_stage"] = validation_stage
+    summary["refresh_required_layers"] = sorted(set(refresh_required_layers))
     if manifest is not None:
         summary["coverage_end_exclusive"] = manifest.get("coverage_end_exclusive")
     logger.info(
-        "[feature-supply] ok model_features=%d fe_derived=%d bundled_fe=%s mid_term_in_model=%d",
+        "[feature-supply] ok model_features=%d fe_derived=%d short_fe=%d mid_fe=%d bundled_fe=%s",
         len(model_feats),
         len(fe_needed),
+        len(short_cols),
+        len(mid_cols),
         fe_bundled,
-        len(mid_term_needed),
     )
     return summary
 

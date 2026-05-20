@@ -6,7 +6,7 @@ import importlib
 import json
 import pickle
 import zipfile
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -83,8 +83,8 @@ features:
     source: "fe_derived"
     status: "active"
     enabled_for: ["baseline"]
-    time_horizon: mid_term
-    max_lookback: P1D
+    time_horizon: short_term
+    max_lookback: PT15M
 """
 
 
@@ -111,17 +111,57 @@ def _write_fe_derived_fixture(path: Path, *, include_registry_feat: bool = True)
     pd.DataFrame(data).to_parquet(path, index=False)
 
 
-def _manifest_abc_layers(*, slow: Path, allow: Path, fe: Path | None, version: str = "mv") -> dict:
+def _manifest_abc_layers(
+    *,
+    slow: Path,
+    allow: Path,
+    fe: Path | None,
+    fe_short: Path | None = None,
+    mid_term: Path | None = None,
+    version: str = "mv",
+) -> dict:
     man = {
         "version": version,
         "slow_patron_parquet": str(slow.resolve()),
         "adt_allowlist_parquet": str(allow.resolve()),
         "coverage_end_exclusive": datetime.now(timezone.utc).isoformat(),
     }
+    short_path = fe_short if fe_short is not None else fe
+    if short_path is not None:
+        man["fe_short_term_parquet"] = str(short_path.resolve())
+        man["fe_derived_source_kind"] = "production_clickhouse"
     if fe is not None:
         man["fe_derived_parquet"] = str(fe.resolve())
-        man["fe_derived_source_kind"] = "production_clickhouse"
+        man.setdefault("fe_derived_source_kind", "production_clickhouse")
+    if mid_term is not None:
+        from trainer_hightier.config import MID_TERM_GRAIN_CANONICAL_DAILY_ASOF
+
+        man["mid_term_snapshot_parquet"] = str(mid_term.resolve())
+        man["mid_term_grain"] = MID_TERM_GRAIN_CANONICAL_DAILY_ASOF
     return man
+
+
+def _write_mid_term_production_fixture(path: Path, *, anchor: date | None = None) -> None:
+    from trainer_hightier.config import MID_TERM_SNAPSHOT_SCOPE_PRODUCTION
+    from trainer_hightier.feature_experiment.materialize_mid_term_daily_snapshot import (
+        MID_TERM_SNAPSHOT_OUTPUT_COLUMNS,
+    )
+    from trainer_hightier.serving.snapshot_freshness import expected_mid_term_anchor
+
+    anchor_day = anchor or expected_mid_term_anchor(date.today())
+    row: dict[str, object] = {
+        "canonical_id": ["c1"],
+        "anchor_gaming_day": [anchor_day.isoformat()],
+    }
+    for col in MID_TERM_SNAPSHOT_OUTPUT_COLUMNS:
+        if col.startswith("fe__"):
+            row[col] = [1.0]
+    pd.DataFrame(row).to_parquet(path, index=False)
+    meta = path.parent / f"{path.stem}.meta.json"
+    meta.write_text(
+        json.dumps({"snapshot_scope": MID_TERM_SNAPSHOT_SCOPE_PRODUCTION}),
+        encoding="utf-8",
+    )
 
 
 def _write_slow_bet_fixture(path: Path, *, include_registry_slow_feat: bool = True) -> None:
@@ -421,8 +461,8 @@ def test_static_allowlist_missing_player_id_fails(tmp_path: Path) -> None:
         )
 
 
-def test_feature_supplyability_missing_fe_derived_fails(tmp_path: Path) -> None:
-    """Models with fe_derived columns must bundle fe_derived_parquet (strict)."""
+def test_package_allows_refresh_required_fe_suppliers(tmp_path: Path) -> None:
+    """Package-time gate permits production-refreshable fe suppliers to be absent."""
 
     model_src = tmp_path / "model_fe_miss"
     snap_src = tmp_path / "snap_fe_miss"
@@ -439,19 +479,77 @@ def test_feature_supplyability_missing_fe_derived_fails(tmp_path: Path) -> None:
     mapping = tmp_path / "map-fe-miss.parquet"
     _write_parquet(mapping)
     out = tmp_path / "fe-supply-miss"
-    with pytest.raises(ValueError, match=r"feature-supply.*fe_derived"):
-        build_deploy_package(
-            [
-                "--model-source",
-                str(model_src),
-                "--snapshot-manifest-source",
-                str(snap_src),
-                "--mapping-source",
-                str(mapping),
-                "--output-dir",
-                str(out),
-            ]
-        )
+    build_deploy_package(
+        [
+            "--model-source",
+            str(model_src),
+            "--snapshot-manifest-source",
+            str(snap_src),
+            "--mapping-source",
+            str(mapping),
+            "--output-dir",
+            str(out),
+        ]
+    )
+    assert (out / "snapshots" / "active_manifest.json").is_file()
+
+
+def test_pack_copies_fe_short_term_and_mid_term_layers(tmp_path: Path) -> None:
+    """Cadence-aware manifest keys are copied into snapshots/artifacts with rewritten paths."""
+
+    model_src = tmp_path / "model_cadence_layers"
+    snap_src = tmp_path / "snap_cadence_layers"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    fe_short = art / "fe_short.parquet"
+    mid = art / "mid.parquet"
+    _write_slow_bet_fixture(slow)
+    _write_parquet(allow)
+    _write_fe_derived_fixture(fe_short)
+    _write_mid_term_production_fixture(mid)
+    _write_minimal_model_bundle(model_src)
+    reg = Path(model_src) / FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME
+    reg.write_text(
+        _REGISTRY_SNAPSHOT_BODY_WITH_FE.replace("short_term", "mid_term", 1)
+        .replace("PT15M", "P1D", 1)
+        .strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (model_src / "training_metrics.json").write_text(
+        json.dumps({"feature_candidate_registry_sha256": sha256_file(reg)}),
+        encoding="utf-8",
+    )
+    man = _manifest_abc_layers(
+        slow=slow,
+        allow=allow,
+        fe=None,
+        fe_short=fe_short,
+        mid_term=mid,
+    )
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-cadence-layers.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "cadence-layers-pack"
+    build_deploy_package(
+        [
+            "--model-source",
+            str(model_src),
+            "--snapshot-manifest-source",
+            str(snap_src),
+            "--mapping-source",
+            str(mapping),
+            "--output-dir",
+            str(out),
+        ]
+    )
+    man_out = json.loads((out / "snapshots" / "active_manifest.json").read_text(encoding="utf-8"))
+    assert man_out["fe_short_term_parquet"].startswith("artifacts/")
+    assert man_out["mid_term_snapshot_parquet"].startswith("artifacts/")
+    assert (out / "snapshots" / man_out["fe_short_term_parquet"]).is_file()
+    assert (out / "snapshots" / man_out["mid_term_snapshot_parquet"]).is_file()
 
 
 def test_feature_supplyability_bundled_fe_parquet_succeeds(tmp_path: Path) -> None:
@@ -467,7 +565,7 @@ def test_feature_supplyability_bundled_fe_parquet_succeeds(tmp_path: Path) -> No
     _write_fe_derived_fixture(fe)
     _write_minimal_model_bundle(model_src)
     _write_frozen_registry_abc_fixture(model_src, with_fe_derived=True)
-    man = _manifest_abc_layers(slow=slow, allow=allow, fe=fe)
+    man = _manifest_abc_layers(slow=slow, allow=allow, fe=fe, fe_short=fe)
     (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
     mapping = tmp_path / "map-fe-ok.parquet"
     _write_parquet(mapping)
@@ -485,8 +583,8 @@ def test_feature_supplyability_bundled_fe_parquet_succeeds(tmp_path: Path) -> No
         ]
     )
     man_out = json.loads((out / "snapshots" / "active_manifest.json").read_text(encoding="utf-8"))
-    assert "fe_derived_parquet" in man_out
-    fe_rel = man_out["fe_derived_parquet"]
+    assert "fe_short_term_parquet" in man_out
+    fe_rel = man_out["fe_short_term_parquet"]
     assert (out / "snapshots" / fe_rel).is_file()
 
 
@@ -926,29 +1024,48 @@ def test_deploy_inputs_autodiscovery_model_source_only(tmp_path: Path) -> None:
 
 
 def test_deploy_inputs_mid_term_manifest_freshness_passes(tmp_path: Path) -> None:
-    """Self-contained deploy_inputs must carry freshness metadata for mid-term fe_derived models."""
+    """Production mid_term_snapshot_parquet is copied and validated for mid-term fe_derived models."""
+
+    from trainer_hightier.config import MID_TERM_GRAIN_CANONICAL_DAILY_ASOF
 
     model_src = tmp_path / "self_contained_fe_bundle"
     di = model_src / "deploy_inputs"
     di.mkdir(parents=True)
     slow_name = "slow_patron_180d_monthly.parquet"
     allow_name = "adt_allowed_players_q0p99.parquet"
-    fe_name = "fe_derived_features.parquet"
+    fe_name = "fe_short_term_features.parquet"
+    mid_name = "mid_term_daily_snapshot.parquet"
     slow = di / slow_name
     allow_f = di / allow_name
     fe = di / fe_name
+    mid = di / mid_name
     _write_slow_bet_fixture(slow)
     _write_parquet(allow_f)
     _write_fe_derived_fixture(fe)
+    _write_mid_term_production_fixture(mid)
     cmap = di / "canonical_player_mapping.parquet"
     _write_parquet(cmap)
     _write_minimal_model_bundle(model_src)
-    _write_frozen_registry_abc_fixture(model_src, with_fe_derived=True)
+    reg_body = (
+        _REGISTRY_SNAPSHOT_BODY_WITH_FE.replace("short_term", "mid_term", 1)
+        .replace("PT15M", "P1D", 1)
+        .strip()
+        + "\n"
+    )
+    snap_reg = model_src / FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME
+    snap_reg.write_text(reg_body, encoding="utf-8")
+    (di / FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME).write_text(reg_body, encoding="utf-8")
+    (model_src / "training_metrics.json").write_text(
+        json.dumps({"feature_candidate_registry_sha256": sha256_file(snap_reg)}),
+        encoding="utf-8",
+    )
     man = {
         "version": "frozen-di-fe",
         "slow_patron_parquet": slow_name,
-        "fe_derived_parquet": fe_name,
+        "fe_short_term_parquet": fe_name,
         "fe_derived_source_kind": "production_clickhouse",
+        "mid_term_snapshot_parquet": mid_name,
+        "mid_term_grain": MID_TERM_GRAIN_CANONICAL_DAILY_ASOF,
         "adt_allowlist_parquet": allow_name,
         "adt_allowlist_version": "x",
         "coverage_end_exclusive": datetime.now(timezone.utc).isoformat(),
@@ -961,8 +1078,10 @@ def test_deploy_inputs_mid_term_manifest_freshness_passes(tmp_path: Path) -> Non
     build_deploy_package(["--model-source", str(model_src), "--output-dir", str(out)])
     payload = json.loads((out / "snapshots" / "active_manifest.json").read_text(encoding="utf-8"))
     assert payload["coverage_end_exclusive"] == man["coverage_end_exclusive"]
-    assert payload["fe_derived_parquet"]
-    assert (out / "snapshots" / payload["fe_derived_parquet"]).is_file()
+    assert payload["fe_short_term_parquet"]
+    assert payload["mid_term_snapshot_parquet"]
+    assert (out / "snapshots" / payload["fe_short_term_parquet"]).is_file()
+    assert (out / "snapshots" / payload["mid_term_snapshot_parquet"]).is_file()
 
 
 def test_deploy_inputs_fallback_when_absent(monkeypatch, tmp_path: Path) -> None:

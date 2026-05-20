@@ -157,11 +157,13 @@ def classify_model_fe_features(
     mid_cols: list[str] = []
     other_cols: list[str] = []
     for feat in model_features:
-        if not str(feat).startswith("fe__"):
-            continue
         row = by_id.get(feat)
         if row is None:
-            other_cols.append(feat)
+            if str(feat).startswith("fe__"):
+                other_cols.append(feat)
+            continue
+        is_fe_derived = row.source == "fe_derived" or str(feat).startswith("fe__")
+        if not is_fe_derived:
             continue
         resolved = resolve_feature_cadence(row, raw_by_id.get(feat))
         if resolved.allowed_training_supplier == SUPPLIER_MID_TERM_DAILY:

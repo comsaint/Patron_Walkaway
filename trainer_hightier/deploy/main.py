@@ -203,6 +203,8 @@ def _preflight_feature_supplyability(bundle_root: Path, rel: dict[str, Any]) -> 
         slow_pack_path=_layer_path("slow_patron_parquet"),
         trial_pack_path=_layer_path("trial_bet_behavior_parquet"),
         fe_pack_path=_layer_path("fe_derived_parquet"),
+        fe_short_term_pack_path=_layer_path("fe_short_term_parquet"),
+        mid_term_pack_path=_layer_path("mid_term_snapshot_parquet"),
         manifest=man if isinstance(man, dict) else None,
     )
 

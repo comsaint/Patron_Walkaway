@@ -30,6 +30,8 @@ from trainer_hightier.serving.feature_state_store import (
     init_feature_state_db,
 )
 from trainer_hightier.serving.production_source_mirror import (
+    resolve_production_bet_mirror_dir,
+    resolve_production_session_mirror_path,
     validate_production_bet_mirror,
     validate_production_session_mirror,
 )
@@ -217,6 +219,24 @@ def _publish_test_manifest(
     if slow_anchor is not None:
         payload["slow_anchor_gaming_day_max"] = slow_anchor.isoformat()
     (snap_dir / "active_manifest.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_default_production_mirror_paths_do_not_recurse(tmp_path: Path) -> None:
+    """Default mirror resolution should derive sibling source_mirror paths."""
+
+    snap_dir = tmp_path / "snapshots"
+    cfg = replace(
+        HightierServingConfig(),
+        snapshot_manifest_dir=snap_dir,
+        production_cleaned_bet_mirror_dir=None,
+        production_cleaned_session_mirror_parquet=None,
+    )
+    set_hightier_serving_deploy_override(cfg)
+    try:
+        assert resolve_production_bet_mirror_dir() == tmp_path / "source_mirror" / "cleaned_bet"
+        assert resolve_production_session_mirror_path() == tmp_path / "source_mirror" / "cleaned_session.parquet"
+    finally:
+        set_hightier_serving_deploy_override(None)
 
 
 def test_expected_slow_month_end_anchor() -> None:

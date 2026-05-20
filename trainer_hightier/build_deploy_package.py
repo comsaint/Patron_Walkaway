@@ -37,6 +37,8 @@ from trainer_hightier.core.model_bundle_paths import resolve_model_bundle_dir
 from trainer_hightier import config as th_config
 from trainer_hightier.config import (
     FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME,
+    MANIFEST_KEY_FE_SHORT_TERM,
+    MANIFEST_KEY_MID_TERM_SNAPSHOT,
     default_hightier_serving_config,
 )
 from trainer_hightier.serving.candidate_registry_loader import (
@@ -217,6 +219,15 @@ def _copy_parquet_map(
     return _rel_posix(manifest_parent, dest)
 
 
+def _copy_parquet_sidecars(src: Path, *, dest_artifacts_dir: Path) -> None:
+    """Copy optional metadata sidecars next to a packaged parquet artifact."""
+
+    for suffix in (".meta.json", ".production_meta.json"):
+        side = src.parent / f"{src.stem}{suffix}"
+        if side.is_file():
+            shutil.copy2(side, dest_artifacts_dir / side.name)
+
+
 def _maybe_copy_layer(
     key: str,
     raw_path: Any,
@@ -244,6 +255,8 @@ def _maybe_copy_layer(
         logger.warning("[pack] skip missing optional %s=%s", key, src)
         return None, None
     rel = _copy_parquet_map(src, dest_artifacts_dir=dest_artifacts_dir, manifest_parent=manifest_parent)
+    if key in (MANIFEST_KEY_FE_SHORT_TERM, MANIFEST_KEY_MID_TERM_SNAPSHOT, MANIFEST_KEY_FE_DERIVED):
+        _copy_parquet_sidecars(src, dest_artifacts_dir=dest_artifacts_dir)
     return rel, src
 
 
@@ -752,6 +765,8 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
         "trial_bet_behavior_parquet",
         "adt_allowlist_parquet",
         MANIFEST_KEY_FE_DERIVED,
+        MANIFEST_KEY_FE_SHORT_TERM,
+        MANIFEST_KEY_MID_TERM_SNAPSHOT,
     ):
         rel, _src = _maybe_copy_layer(
             key,
@@ -807,6 +822,20 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
         if fp.is_file():
             fe_pack_path = fp
 
+    fe_short_pack_path: Path | None = None
+    fe_short_rel = new_man.get(MANIFEST_KEY_FE_SHORT_TERM)
+    if isinstance(fe_short_rel, str) and fe_short_rel:
+        fsp = (snap_dir / fe_short_rel).resolve()
+        if fsp.is_file():
+            fe_short_pack_path = fsp
+
+    mid_term_pack_path: Path | None = None
+    mid_rel = new_man.get(MANIFEST_KEY_MID_TERM_SNAPSHOT)
+    if isinstance(mid_rel, str) and mid_rel:
+        mp = (snap_dir / mid_rel).resolve()
+        if mp.is_file():
+            mid_term_pack_path = mp
+
     model_cols = _model_feature_columns_from_pickle(models_dir)
     _static_parquet_minimum_contracts(
         strict=strict,
@@ -828,7 +857,10 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
             slow_pack_path=slow_pack_path,
             trial_pack_path=trial_pack_path,
             fe_pack_path=fe_pack_path,
+            fe_short_term_pack_path=fe_short_pack_path,
+            mid_term_pack_path=mid_term_pack_path,
             manifest=dict(new_man) if isinstance(new_man, dict) else None,
+            validation_stage="package",
         )
 
     out_manifest = snap_dir / "active_manifest.json"
