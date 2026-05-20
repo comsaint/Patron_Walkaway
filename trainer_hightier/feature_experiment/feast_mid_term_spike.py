@@ -410,6 +410,13 @@ def _pick_probe_bet(
     }
 
 
+def _feast_entity_rows(canonical_ids: list[str]) -> dict[str, list[str]]:
+    """Build ``entity_rows`` for Feast 0.63 (dict-of-lists, not a pandas DataFrame)."""
+    if not canonical_ids:
+        raise ValueError("canonical_ids must be non-empty")
+    return {"canonical_id": [str(x) for x in canonical_ids]}
+
+
 def run_online_lookup_smoke(
     feast_repo: Path,
     *,
@@ -425,12 +432,12 @@ def run_online_lookup_smoke(
     latencies_ms: list[float] = []
     missing_counts: dict[str, int] = {c: 0 for c in SPIKE_MID_TERM_FEATURE_COLUMNS}
     n_ok = 0
-    for cid in canonical_ids[: max(1, batch_size)]:
-        entity_rows = pd.DataFrame({"canonical_id": [cid]})
+    batch_ids = [str(x) for x in canonical_ids[: max(1, batch_size)]]
+    for cid in batch_ids:
         t0 = time.perf_counter()
         out = store.get_online_features(
             features=list(SPIKE_ONLINE_FEATURE_REFS),
-            entity_rows=entity_rows,
+            entity_rows=_feast_entity_rows([cid]),
         ).to_df()
         latencies_ms.append((time.perf_counter() - t0) * 1000.0)
         if out.empty:

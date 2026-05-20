@@ -15,9 +15,11 @@ from trainer_hightier.feature_experiment.feast_mid_term_spike import (
     SPIKE_MID_TERM_FEATURE_COLUMNS,
     FeastMidTermSpikeConfig,
     _add_event_timestamp_column,
+    _feast_entity_rows,
     _split_player_id_chunks,
     compute_mid_term_spike_snapshot,
     export_clickhouse_bets_to_parquet,
+    run_online_lookup_smoke,
     run_spike,
 )
 
@@ -36,6 +38,48 @@ def test_split_player_id_chunks_stable_sorted() -> None:
     """Allowlist chunks must be bounded and deterministic."""
 
     assert _split_player_id_chunks(frozenset({5, 1, 3, 2, 4}), 2) == [[1, 2], [3, 4], [5]]
+
+
+def test_feast_entity_rows_dict_of_lists() -> None:
+    """Feast 0.63 rejects pandas Series columns (no ``.val``); use dict-of-lists."""
+    rows = _feast_entity_rows(["c1", "c2"])
+    assert rows == {"canonical_id": ["c1", "c2"]}
+    assert not isinstance(rows["canonical_id"], pd.Series)
+
+
+def test_online_lookup_uses_dict_entity_rows(tmp_path: Path) -> None:
+    """``get_online_features`` must receive dict entity_rows, not a DataFrame."""
+
+    captured: list[object] = []
+
+    class _FakeResponse:
+        def to_df(self) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "canonical_id": ["c1"],
+                    **{c: [1.0] for c in SPIKE_MID_TERM_FEATURE_COLUMNS},
+                }
+            )
+
+    class _FakeStore:
+        def __init__(self, *, repo_path: str) -> None:
+            self.repo_path = repo_path
+
+        def get_online_features(self, *, features, entity_rows):
+            captured.append(entity_rows)
+            return _FakeResponse()
+
+    feast_repo = tmp_path / "feast_repo"
+    feast_repo.mkdir()
+    with patch("feast.FeatureStore", _FakeStore):
+        result = run_online_lookup_smoke(
+            feast_repo,
+            canonical_ids=["c1"],
+            batch_size=1,
+        )
+
+    assert result["lookup_ok_rows"] == 1
+    assert captured == [{"canonical_id": ["c1"]}]
 
 
 def test_clickhouse_export_chunks_player_filter(tmp_path: Path) -> None:
