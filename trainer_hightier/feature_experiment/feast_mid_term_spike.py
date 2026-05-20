@@ -52,6 +52,16 @@ SPIKE_ONLINE_FEATURE_REFS: Final[tuple[str, ...]] = tuple(
 )
 
 
+def _split_player_id_chunks(ids: frozenset[int], chunk_size: int) -> list[list[int]]:
+    """Return stable sorted ``player_id`` chunks for bounded ClickHouse ``IN`` lists."""
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be >= 1, got {chunk_size!r}")
+    if not ids:
+        return []
+    sorted_ids = sorted(int(x) for x in ids)
+    return [sorted_ids[i : i + chunk_size] for i in range(0, len(sorted_ids), chunk_size)]
+
+
 @dataclass(frozen=True)
 class FeastMidTermSpikeConfig:
     """Spike runner settings (edit here; no environment-variable SSOT)."""
@@ -115,13 +125,9 @@ def export_clickhouse_bets_to_parquet(
     placeholder = int(cfg.placeholder_player_id)
     out_parquet = Path(out_parquet).resolve()
     out_parquet.parent.mkdir(parents=True, exist_ok=True)
-    player_filter = ""
-    if player_ids is not None:
-        if not player_ids:
-            raise ValueError("player_ids is empty; cannot export ClickHouse bets")
-        in_list = ",".join(str(int(x)) for x in sorted(player_ids))
-        player_filter = f"AND player_id IN ({in_list})"
-    q = f"""
+
+    def _query(player_filter: str) -> pd.DataFrame:
+        q = f"""
         SELECT
             CAST(player_id AS Int64) AS player_id,
             CAST(gaming_day AS Date) AS gaming_day,
@@ -138,14 +144,42 @@ def export_clickhouse_bets_to_parquet(
           AND player_id != {placeholder}
           {player_filter}
     """
+        return client.query_df(
+            q,
+            parameters={
+                "g_start": bets_gaming_day_start,
+                "g_end": bets_gaming_day_end,
+            },
+        )
+
     t0 = time.perf_counter()
-    df = client.query_df(
-        q,
-        parameters={
-            "g_start": bets_gaming_day_start,
-            "g_end": bets_gaming_day_end,
-        },
-    )
+    chunk_count = 0
+    chunk_size = 0
+    query_count = 1
+    if player_ids is None:
+        df = _query("")
+    else:
+        if not player_ids:
+            raise ValueError("player_ids is empty; cannot export ClickHouse bets")
+        chunk_size = int(cfg.hightier_scorer_player_id_chunk_size)
+        chunks = _split_player_id_chunks(player_ids, chunk_size)
+        chunk_count = len(chunks)
+        query_count = chunk_count
+        frames: list[pd.DataFrame] = []
+        row_cap = int(cfg.hightier_scorer_chunk_merge_row_cap)
+        for i, chunk in enumerate(chunks):
+            in_list = ",".join(str(int(x)) for x in chunk)
+            frames.append(_query(f"AND player_id IN ({in_list})"))
+            if row_cap > 0:
+                rows_so_far = sum(len(frame) for frame in frames)
+                if rows_so_far > row_cap:
+                    raise RuntimeError(
+                        "feast mid-term spike ClickHouse export exceeds "
+                        f"hightier_scorer_chunk_merge_row_cap={row_cap} "
+                        f"({rows_so_far} rows after chunk {i + 1}/{chunk_count})"
+                    )
+        nonempty = [frame for frame in frames if frame is not None and not frame.empty]
+        df = pd.concat(nonempty, ignore_index=True) if nonempty else pd.DataFrame()
     elapsed = round(time.perf_counter() - t0, 3)
     if df.empty:
         raise ValueError(
@@ -157,6 +191,9 @@ def export_clickhouse_bets_to_parquet(
         "source": "clickhouse",
         "rows_exported": int(len(df)),
         "export_seconds": elapsed,
+        "query_count": int(query_count),
+        "player_id_chunk_count": int(chunk_count),
+        "player_id_chunk_size": int(chunk_size),
         "path": str(out_parquet),
         "gaming_day_start": bets_gaming_day_start.isoformat(),
         "gaming_day_end": bets_gaming_day_end.isoformat(),

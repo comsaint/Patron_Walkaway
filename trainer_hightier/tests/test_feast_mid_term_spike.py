@@ -10,12 +10,14 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
-from trainer_hightier.config import DuckDbRuntimeConfig
+from trainer_hightier.config import DuckDbRuntimeConfig, HightierServingConfig
 from trainer_hightier.feature_experiment.feast_mid_term_spike import (
     SPIKE_MID_TERM_FEATURE_COLUMNS,
     FeastMidTermSpikeConfig,
     _add_event_timestamp_column,
+    _split_player_id_chunks,
     compute_mid_term_spike_snapshot,
+    export_clickhouse_bets_to_parquet,
     run_spike,
 )
 
@@ -28,6 +30,61 @@ def _write_cleaned_bet(root: Path, rows: list[dict[str, object]]) -> None:
 
 def _write_mapping(path: Path) -> None:
     pd.DataFrame({"player_id": [1, 2], "canonical_id": ["c1", "c2"]}).to_parquet(path, index=False)
+
+
+def test_split_player_id_chunks_stable_sorted() -> None:
+    """Allowlist chunks must be bounded and deterministic."""
+
+    assert _split_player_id_chunks(frozenset({5, 1, 3, 2, 4}), 2) == [[1, 2], [3, 4], [5]]
+
+
+def test_clickhouse_export_chunks_player_filter(tmp_path: Path) -> None:
+    """Small-sample export must not build one giant ClickHouse IN-list."""
+
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        def query_df(self, query: str, parameters: dict) -> pd.DataFrame:
+            self.queries.append(query)
+            assert parameters["g_start"] == date(2026, 5, 1)
+            assert parameters["g_end"] == date(2026, 5, 3)
+            return pd.DataFrame(
+                {
+                    "player_id": [1],
+                    "gaming_day": [pd.Timestamp("2026-05-01")],
+                    "payout_complete_dtm": [pd.Timestamp("2026-05-01T10:00:00Z")],
+                    "wager": [100.0],
+                    "payout_odds": [2.0],
+                }
+            )
+
+    fake_client = _FakeClient()
+    cfg = HightierServingConfig(hightier_scorer_player_id_chunk_size=2)
+    with (
+        patch(
+            "trainer_hightier.feature_experiment.feast_mid_term_spike.default_hightier_serving_config",
+            return_value=cfg,
+        ),
+        patch(
+            "trainer_hightier.feature_experiment.feast_mid_term_spike.get_clickhouse_client",
+            return_value=fake_client,
+        ),
+    ):
+        meta = export_clickhouse_bets_to_parquet(
+            tmp_path / "out.parquet",
+            bets_gaming_day_start=date(2026, 5, 1),
+            bets_gaming_day_end=date(2026, 5, 3),
+            player_ids=frozenset({1, 2, 3, 4, 5}),
+        )
+
+    assert meta["query_count"] == 3
+    assert meta["player_id_chunk_count"] == 3
+    assert meta["player_id_chunk_size"] == 2
+    assert len(fake_client.queries) == 3
+    assert "player_id IN (1,2)" in fake_client.queries[0]
+    assert "player_id IN (3,4)" in fake_client.queries[1]
+    assert "player_id IN (5)" in fake_client.queries[2]
 
 
 def test_add_event_timestamp_collapses_to_latest_anchor(tmp_path: Path) -> None:
