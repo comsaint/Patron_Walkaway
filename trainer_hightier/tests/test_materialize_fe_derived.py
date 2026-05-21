@@ -8,8 +8,15 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from decimal import Decimal
+
+import pytest
+
 from trainer_hightier.config import DuckDbRuntimeConfig
-from trainer_hightier.feature_experiment.materialize_fe_derived import materialize_fe_derived_parquet
+from trainer_hightier.feature_experiment.materialize_fe_derived import (
+    compute_fe_derived_features_from_pool,
+    materialize_fe_derived_parquet,
+)
 
 
 def test_materialize_fe_derived_prior_15m_includes_sibling_player_id(tmp_path: Path) -> None:
@@ -77,3 +84,27 @@ def test_materialize_fe_derived_prior_15m_includes_sibling_player_id(tmp_path: P
     assert int(r["fe__bets_cnt__w15m"]) == 1
     assert abs(float(r["fe__wager_sum__w15m"]) - 100.0) < 1e-6
     assert float(r["fe__session__bet_idx_in_session"]) == 1.0
+
+
+def test_compute_fe_derived_from_pool_schema_max_payout_odds() -> None:
+    """``t_bet.payout_odds`` is Decimal(19,4) with metadata max 100.0000 (schema §4)."""
+    hk = "Asia/Hong_Kong"
+    t0 = pd.Timestamp("2025-06-01 10:00:00", tz=hk)
+    pool = pd.DataFrame(
+        {
+            "bet_id": [1.0, 2.0],
+            "player_id": [10, 10],
+            "canonical_id": ["c10", "c10"],
+            "session_id": [1, 1],
+            "table_id": [1, 1],
+            "gaming_day": pd.to_datetime(["2025-06-01", "2025-06-01"]),
+            "payout_complete_dtm": [t0, t0 + pd.Timedelta(minutes=5)],
+            "wager": [Decimal("50.0000"), Decimal("100.0000")],
+            "payout_odds": [Decimal("2.0000"), Decimal("100.0000")],
+            "casino_win": [Decimal("0.0000"), Decimal("0.0000")],
+        }
+    )
+    got = compute_fe_derived_features_from_pool(pool, pool.loc[[1], "bet_id"])
+    assert not got.empty
+    ratio = float(got.iloc[0]["fe__odds__payout_odds_to_recent_max_ratio__w1h"])
+    assert ratio == pytest.approx(50.0)
