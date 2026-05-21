@@ -105,6 +105,8 @@ Refresh plane 負責把 production feature values 推進 Feast online store：
 - 寫入 readiness metadata：latest anchor、generated_at、coverage、row count、null summary、source scope。
 
 這個 plane 可重用現有 spike materializer 與 production materialize 模組，但不應放進 scorer scoring loop。
+詳細 orchestration realization 見 `Feast Online Refresh - IMPLEMENTATION_PLAN.md`；production 預設 source 是
+ClickHouse export，local cleaned inputs 僅作 debug / fixture override。
 
 ### 5. State and Logging
 

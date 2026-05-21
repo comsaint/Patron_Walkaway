@@ -239,6 +239,7 @@ def materialize_production_slow_canonical_asof(
     out_parquet: Path,
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
     lookback_days: int | None = None,
+    publish_readiness: bool = True,
 ) -> tuple[Path, dict[str, Any]]:
     """Materialize canonical/player ASOF slow 180d snapshot for production serving."""
 
@@ -274,15 +275,16 @@ def materialize_production_slow_canonical_asof(
         **parquet_row_stats(out, key_col="canonical_id"),
     }
     write_production_artifact_sidecar(out, meta)
-    try:
-        from trainer_hightier.serving.feast_readiness import (
-            layer_readiness_from_production_slow_meta,
-            publish_feast_layer_readiness,
-        )
+    if publish_readiness:
+        try:
+            from trainer_hightier.serving.feast_readiness import (
+                layer_readiness_from_production_slow_meta,
+                publish_feast_layer_readiness,
+            )
 
-        publish_feast_layer_readiness(layer_readiness_from_production_slow_meta(meta))
-    except Exception as exc:
-        logger.warning("[production_materialize] feast readiness publish skipped: %s", exc)
+            publish_feast_layer_readiness(layer_readiness_from_production_slow_meta(meta))
+        except Exception as exc:
+            logger.warning("[production_materialize] feast readiness publish skipped: %s", exc)
     return out, meta
 
 
@@ -341,6 +343,7 @@ def materialize_production_mid_term_daily_snapshot(
     anchor_gaming_day_end: date | None = None,
     lookback_days: int | None = None,
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
+    publish_readiness: bool = True,
 ) -> tuple[Path, dict[str, Any]]:
     """Materialize canonical mid-term daily snapshot for high-ADT production universe."""
 
@@ -406,15 +409,16 @@ def materialize_production_mid_term_daily_snapshot(
         **parquet_row_stats(dst, key_col="canonical_id"),
     }
     write_production_artifact_sidecar(dst, meta)
-    try:
-        from trainer_hightier.serving.feast_readiness import (
-            layer_readiness_from_production_mid_meta,
-            publish_feast_layer_readiness,
-        )
+    if publish_readiness:
+        try:
+            from trainer_hightier.serving.feast_readiness import (
+                layer_readiness_from_production_mid_meta,
+                publish_feast_layer_readiness,
+            )
 
-        publish_feast_layer_readiness(layer_readiness_from_production_mid_meta(meta))
-    except Exception as exc:
-        logger.warning("[production_materialize] feast readiness publish skipped: %s", exc)
+            publish_feast_layer_readiness(layer_readiness_from_production_mid_meta(meta))
+        except Exception as exc:
+            logger.warning("[production_materialize] feast readiness publish skipped: %s", exc)
     return dst, meta
 
 

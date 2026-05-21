@@ -132,6 +132,46 @@ def init_feature_state_db(path: Optional[Path] = None) -> Path:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feast_refresh_run (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL UNIQUE,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL,
+                source TEXT NOT NULL,
+                layers TEXT NOT NULL,
+                feast_repo TEXT,
+                readiness_path TEXT,
+                apply_seconds REAL,
+                materialize_seconds REAL,
+                summary_json TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feast_refresh_layer (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                layer TEXT NOT NULL,
+                artifact_path TEXT,
+                row_count INTEGER,
+                anchor_gaming_day_max TEXT,
+                source_scope TEXT,
+                feature_view TEXT,
+                export_rows INTEGER,
+                export_seconds REAL,
+                compute_seconds REAL,
+                smoke_sample_size INTEGER,
+                smoke_entity_present_rate REAL,
+                status TEXT NOT NULL,
+                detail_json TEXT,
+                UNIQUE(run_id, layer)
+            )
+            """
+        )
         conn.commit()
     return db_path
 
@@ -276,6 +316,131 @@ def update_watermark(layer: str, coverage_end_exclusive: str, *, path: Optional[
                 updated_at=excluded.updated_at
             """,
             (layer, coverage_end_exclusive, _hk_now_iso()),
+        )
+        conn.commit()
+
+
+def feast_refresh_run_start(
+    run_id: str,
+    *,
+    source: str,
+    layers: str,
+    feast_repo: str | None = None,
+    readiness_path: str | None = None,
+    path: Optional[Path] = None,
+) -> None:
+    """Insert a ``feast_refresh_run`` row with ``status=running``."""
+    init_feature_state_db(path)
+    db_path = Path(path or default_hightier_serving_config().feature_state_db_path).resolve()
+    with sqlite3.connect(db_path) as conn:
+        apply_feature_state_pragmas(conn)
+        conn.execute(
+            """
+            INSERT INTO feast_refresh_run(
+                run_id, started_at, finished_at, status, source, layers,
+                feast_repo, readiness_path, apply_seconds, materialize_seconds, summary_json
+            )
+            VALUES (?, ?, NULL, 'running', ?, ?, ?, ?, NULL, NULL, NULL)
+            """,
+            (run_id, _hk_now_iso(), source, layers, feast_repo, readiness_path),
+        )
+        conn.commit()
+
+
+def feast_refresh_run_finish(
+    run_id: str,
+    *,
+    status: str,
+    apply_seconds: float | None = None,
+    materialize_seconds: float | None = None,
+    summary_json: str | None = None,
+    path: Optional[Path] = None,
+) -> None:
+    """Mark a Feast refresh run finished."""
+    init_feature_state_db(path)
+    db_path = Path(path or default_hightier_serving_config().feature_state_db_path).resolve()
+    with sqlite3.connect(db_path) as conn:
+        apply_feature_state_pragmas(conn)
+        conn.execute(
+            """
+            UPDATE feast_refresh_run
+            SET finished_at = ?, status = ?, apply_seconds = ?,
+                materialize_seconds = ?, summary_json = ?
+            WHERE run_id = ?
+            """,
+            (
+                _hk_now_iso(),
+                status,
+                apply_seconds,
+                materialize_seconds,
+                (summary_json or "")[:8000] if summary_json else None,
+                run_id,
+            ),
+        )
+        conn.commit()
+
+
+def upsert_feast_refresh_layer(
+    run_id: str,
+    *,
+    layer: str,
+    status: str,
+    artifact_path: str | None = None,
+    row_count: int | None = None,
+    anchor_gaming_day_max: str | None = None,
+    source_scope: str | None = None,
+    feature_view: str | None = None,
+    export_rows: int | None = None,
+    export_seconds: float | None = None,
+    compute_seconds: float | None = None,
+    smoke_sample_size: int | None = None,
+    smoke_entity_present_rate: float | None = None,
+    detail_json: str | None = None,
+    path: Optional[Path] = None,
+) -> None:
+    """Upsert one layer outcome for a Feast refresh run."""
+    init_feature_state_db(path)
+    db_path = Path(path or default_hightier_serving_config().feature_state_db_path).resolve()
+    with sqlite3.connect(db_path) as conn:
+        apply_feature_state_pragmas(conn)
+        conn.execute(
+            """
+            INSERT INTO feast_refresh_layer(
+                run_id, layer, artifact_path, row_count, anchor_gaming_day_max,
+                source_scope, feature_view, export_rows, export_seconds, compute_seconds,
+                smoke_sample_size, smoke_entity_present_rate, status, detail_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id, layer) DO UPDATE SET
+                artifact_path=excluded.artifact_path,
+                row_count=excluded.row_count,
+                anchor_gaming_day_max=excluded.anchor_gaming_day_max,
+                source_scope=excluded.source_scope,
+                feature_view=excluded.feature_view,
+                export_rows=excluded.export_rows,
+                export_seconds=excluded.export_seconds,
+                compute_seconds=excluded.compute_seconds,
+                smoke_sample_size=excluded.smoke_sample_size,
+                smoke_entity_present_rate=excluded.smoke_entity_present_rate,
+                status=excluded.status,
+                detail_json=excluded.detail_json
+            """,
+            (
+                run_id,
+                layer,
+                artifact_path,
+                row_count,
+                anchor_gaming_day_max,
+                source_scope,
+                feature_view,
+                export_rows,
+                export_seconds,
+                compute_seconds,
+                smoke_sample_size,
+                smoke_entity_present_rate,
+                status,
+                (detail_json or "")[:8000] if detail_json else None,
+            ),
         )
         conn.commit()
 

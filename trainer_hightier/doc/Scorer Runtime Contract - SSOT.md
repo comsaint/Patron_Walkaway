@@ -97,4 +97,5 @@ Parquet for model features, silently or explicitly.
 |-------|----------|
 | Feast spike decision | `Feast Production Feasibility Spike - DECISION_RECORD.md` |
 | Scorer v2 realization | `Scorer v2 Feast Runtime - IMPLEMENTATION_PLAN.md` |
+| Feast online refresh realization | `Feast Online Refresh - IMPLEMENTATION_PLAN.md` |
 | Execution plan | `Scorer v2 Feast Runtime - WORKING_PLAN.md` |
