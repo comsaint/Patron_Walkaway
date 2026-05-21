@@ -20,6 +20,8 @@ dependencies = [
     "clickhouse-connect==0.13.0",
     "duckdb==1.4.4",
     "pyarrow==23.0.1",
+    "feast==0.63.0",
+    "ibis-framework[duckdb]>=11.0.0,<12",
 ]
 
 [project.optional-dependencies]
@@ -37,8 +39,6 @@ include-package-data = false
 where = [".."]
 include = ["trainer_hightier*"]
 exclude = [
-    "trainer_hightier.feature_experiment",
-    "trainer_hightier.feature_experiment.*",
     "trainer_hightier.tests",
     "trainer_hightier.tests.*",
     "trainer_hightier.feast_repo",

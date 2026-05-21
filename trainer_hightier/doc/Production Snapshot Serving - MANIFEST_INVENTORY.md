@@ -5,6 +5,8 @@
 > If this document conflicts with that SSOT, follow the SSOT.
 > This document describes the pre-scorer-v2 Parquet snapshot rollout. Scorer v2 production runtime must not use
 > `fe_short_term_parquet`, `fe_derived_parquet`, or slow/mid Parquet layers as feature fallback suppliers.
+>
+> For scorer v2 Feast production, mid/long features come from **Feast online store** (refresh via `feast_online_refresh` / deploy startup refresh), not from manifest Parquet joins at score time.
 
 Phase 0 inventory for `active_manifest.json` compatibility during production snapshot rollout.
 
@@ -45,9 +47,11 @@ Historical `fe_derived_parquet` must not be the release gate for scorer v2 model
 | `slow_stale_hard_cap_days` | Hard cap (default 3) |
 | `sha256_by_layer` | Optional per-layer content hashes |
 
-## Deploy Refresh Supervisor
+## Deploy Refresh Supervisor (legacy Parquet snapshot plane)
 
-- `trainer_hightier.deploy.main` starts a refresh supervisor by default in scorer-capable modes (`all` and `scorer`).
+- `trainer_hightier.deploy.main` historically starts a **Parquet snapshot** refresh supervisor in scorer-capable modes (`all` and `scorer`).
+- **Scorer v2 production** must **not** treat this as the mid/long feature supplier; use Feast online startup refresh instead (see SSOT and `Feast Online Refresh - IMPLEMENTATION_PLAN.md`).
+- **Future must-do:** post-startup scheduled/daemon Feast refresh (startup-only is insufficient for long-running production).
 - **Startup (blocking):** only **hard failures** trigger synchronous repair before scorer startup: missing/invalid artifacts, or staleness past hard cap. If targeted refresh fails, scorer-capable deploy fails fast.
 - **Startup (non-blocking):** `stale_allowed` does not block startup; the background supervisor retries immediately and on each poll.
 - **Background loop** (default poll 300s):

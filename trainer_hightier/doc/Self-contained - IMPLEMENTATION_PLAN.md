@@ -43,9 +43,9 @@
 
 ### 2) Packaging Compiler（`build_deploy_package.py`）
 
-- 產出 deploy bundle（`models/`, `snapshots/`, `mapping/`, `local_state/`）。
+- 產出 deploy bundle（`models/`, `snapshots/`, `mapping/`, `feast_repo/`, `artifacts/feast/`, `local_state/`）。
 - 產出 runtime 契約檔（`deploy_bundle_paths.json`, `bundle_info.json`, `README_DEPLOY.md`）。
-- 產出安裝契約（`requirements.txt`，可連 PyPI；可選 `wheels/` 備援）。
+- 產出安裝契約（`requirements.txt`，可連 PyPI / internal index；`wheels/` 第一版只需 local package wheel，third-party wheelhouse 為備援）。
 - strict 檢查 manifest/hash/path 完整性。
 - 讀取 frozen registry + `model.pkl.feature_columns`，驗證每個欄位在 self-contained runtime 中有對應 supplier：
   - baseline raw 欄位由 ClickHouse query 供應。
@@ -75,6 +75,8 @@
 
 - `.env.example` 定義必填設定（含 CH 連線）。
 - `.env` 僅承載 secrets 與 operator 參數，禁止依賴 repo 本地路徑。
+- Scorer v2 Feast path 必須 bundle-local：`feast_repo/`、`artifacts/feast/`、`local_state/feature_state.db`。
+- Feast `feature_store.yaml`、registry、online store path 不可保留 dev-machine absolute path；deploy startup 必須 resolve / rewrite。
 
 ## Workstreams / Phases
 
@@ -91,7 +93,8 @@
 ### Phase 2：Package And Bootstrap Contract
 
 - 封裝 `trainer_hightier` runtime code 為 wheel 並納入部署流程。
-- bundle 交付 `main.py`、`.env.example`、`requirements.txt`（PyPI + 本地 wheel）。
+- bundle 交付 `main.py`、`.env.example`、`requirements.txt`（PyPI / internal index + 本地 wheel）。
+- bundle 交付 scorer v2 Feast runtime path contract（`feast_repo/`、`artifacts/feast/`、`local_state/feature_state.db`）。
 - README/RUNBOOK 收斂為單一路徑啟動指令。
 - bundle 交付 cadence-aware `active_manifest.json` layer contract，並在 build / boot preflight 驗證 feature supplier matrix。
 
@@ -107,6 +110,7 @@
 - M3：無 repo 目標機可啟動 scorer/api/validator。
 - M4：啟動與 runtime 可觀測 model/manifest/allowlist version/hash。
 - M5：historical self-contained preflight 可攔截缺失或過期的 `fe_short_term_parquet` / `mid_term_snapshot_parquet`，不依賴 legacy `fe_derived_parquet`；scorer v2 以 Feast / bounded PIT readiness 為準。
+- M6（future must-do）：post-startup scheduled/daemon Feast online refresh（startup auto-refresh 不足以支撐跨 gaming day 無重啟）。
 
 ## 風險與緩解
 

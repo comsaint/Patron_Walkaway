@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -22,14 +23,10 @@ from trainer_hightier.config import (
     TRAINER_HIGHTIER_PACKAGE_DIR,
     default_hightier_serving_config,
 )
-from trainer_hightier.feature_experiment.feast_long_term_spike import (
-    SPIKE_LONG_TERM_FEATURE_COLUMNS,
-    default_long_term_spike_config,
-)
-from trainer_hightier.feature_experiment.feast_mid_term_spike import (
-    SPIKE_MID_TERM_FEATURE_COLUMNS,
-    _feast_entity_rows,
-    default_spike_config,
+from trainer_hightier.serving.feast_production_constants import (
+    PRODUCTION_LONG_TERM_FEATURE_COLUMNS,
+    PRODUCTION_MID_TERM_FEATURE_COLUMNS,
+    feast_entity_rows,
 )
 from trainer_hightier.serving.feast_online_adapter import (
     FEAST_CANONICAL_JOIN_KEY,
@@ -254,7 +251,7 @@ def layer_readiness_from_mid_spike_report(report: dict[str, Any]) -> FeastLayerR
         if report.get("lookup_batch_size") is not None
         else None,
         lookup_entity_present_rate=_lookup_entity_present_rate(report),
-        feature_columns=tuple(str(c) for c in (report.get("feature_columns") or SPIKE_MID_TERM_FEATURE_COLUMNS)),
+        feature_columns=tuple(str(c) for c in (report.get("feature_columns") or PRODUCTION_MID_TERM_FEATURE_COLUMNS)),
         feast_feature_view=str(report.get("feast_feature_view") or "mid_term_daily_spike_features"),
         materialize_source="feast_mid_term_spike",
     )
@@ -274,7 +271,7 @@ def layer_readiness_from_production_mid_meta(meta: dict[str, Any]) -> FeastLayer
         cell_null_counts={},
         lookup_sample_size=None,
         lookup_entity_present_rate=None,
-        feature_columns=SPIKE_MID_TERM_FEATURE_COLUMNS,
+        feature_columns=PRODUCTION_MID_TERM_FEATURE_COLUMNS,
         feast_feature_view="mid_term_daily_spike_features",
         materialize_source="production_materialize",
     )
@@ -294,7 +291,7 @@ def layer_readiness_from_production_slow_meta(meta: dict[str, Any]) -> FeastLaye
         cell_null_counts={},
         lookup_sample_size=None,
         lookup_entity_present_rate=None,
-        feature_columns=SPIKE_LONG_TERM_FEATURE_COLUMNS,
+        feature_columns=PRODUCTION_LONG_TERM_FEATURE_COLUMNS,
         feast_feature_view="long_term_slow_spike_features",
         materialize_source="production_materialize",
     )
@@ -331,7 +328,7 @@ def write_minimal_test_feast_readiness(
         cell_null_counts={},
         lookup_sample_size=1,
         lookup_entity_present_rate=1.0,
-        feature_columns=SPIKE_MID_TERM_FEATURE_COLUMNS,
+        feature_columns=PRODUCTION_MID_TERM_FEATURE_COLUMNS,
         feast_feature_view="mid_term_daily_spike_features",
         materialize_source="test_fixture",
     )
@@ -345,7 +342,7 @@ def write_minimal_test_feast_readiness(
         cell_null_counts={},
         lookup_sample_size=1,
         lookup_entity_present_rate=1.0,
-        feature_columns=SPIKE_LONG_TERM_FEATURE_COLUMNS,
+        feature_columns=PRODUCTION_LONG_TERM_FEATURE_COLUMNS,
         feast_feature_view="long_term_slow_spike_features",
         materialize_source="test_fixture",
     )
@@ -377,7 +374,7 @@ def layer_readiness_from_long_spike_report(report: dict[str, Any]) -> FeastLayer
         else None,
         lookup_entity_present_rate=_lookup_entity_present_rate(report),
         feature_columns=tuple(
-            str(c) for c in (report.get("feature_columns") or SPIKE_LONG_TERM_FEATURE_COLUMNS)
+            str(c) for c in (report.get("feature_columns") or PRODUCTION_LONG_TERM_FEATURE_COLUMNS)
         ),
         feast_feature_view=str(report.get("feast_feature_view") or "long_term_slow_spike_features"),
         materialize_source="feast_long_term_spike",
@@ -396,10 +393,18 @@ def load_feast_online_readiness(path: Path | None = None) -> FeastOnlineReadines
 
 
 def write_feast_online_readiness(readiness: FeastOnlineReadiness, path: Path | None = None) -> Path:
-    """Persist combined readiness JSON."""
+    """Persist combined readiness JSON via temp+replace."""
     p = Path(path).resolve() if path is not None else resolve_feast_readiness_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(readiness.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+    body = json.dumps(readiness.to_dict(), indent=2, sort_keys=True)
+    fd, tmp = tempfile.mkstemp(prefix="feast_readiness_", suffix=".json", dir=str(p.parent))
+    try:
+        with open(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        Path(tmp).replace(p)
+    except Exception:
+        Path(tmp).unlink(missing_ok=True)
+        raise
     logger.info("[feast_readiness] wrote %s", p)
     return p
 
@@ -454,6 +459,9 @@ def refresh_readiness_from_spike_reports(
     feast_repo: Path | None = None,
 ) -> FeastOnlineReadiness:
     """Rebuild combined readiness from existing spike report JSON files."""
+    from trainer_hightier.feature_experiment.feast_long_term_spike import default_long_term_spike_config
+    from trainer_hightier.feature_experiment.feast_mid_term_spike import default_spike_config
+
     mid_p = Path(
         mid_report_path or default_spike_config().report_path,
     ).resolve()
@@ -625,7 +633,7 @@ def run_allowlist_feast_lookup_smoke(
     t0 = time.perf_counter()
     out = store.get_online_features(
         features=refs,
-        entity_rows=_feast_entity_rows(cids),
+        entity_rows=feast_entity_rows(cids),
     ).to_df()
     latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
     wanted = tuple(dict.fromkeys([*mid_columns, *slow_columns]))
@@ -753,8 +761,8 @@ def main(argv: list[str] | None = None) -> int:
             require_slow=bool(args.require_slow),
             allowlist_parquet=Path(args.allowlist_parquet).resolve(),
             canonical_mapping_parquet=Path(args.canonical_mapping).resolve(),
-            mid_columns=SPIKE_MID_TERM_FEATURE_COLUMNS[:1],
-            slow_columns=SPIKE_LONG_TERM_FEATURE_COLUMNS,
+            mid_columns=PRODUCTION_MID_TERM_FEATURE_COLUMNS[:1],
+            slow_columns=PRODUCTION_LONG_TERM_FEATURE_COLUMNS,
             run_lookup_smoke=True,
         )
         logger.info("[feast_readiness] deploy_check %s", gate.to_log_dict())

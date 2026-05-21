@@ -11,7 +11,10 @@ import pytest
 
 from trainer_hightier.config import default_hightier_serving_config
 from trainer_hightier.serving import feast_online_refresh as refresh_mod
-from trainer_hightier.serving.feature_state_store import init_feature_state_db
+from trainer_hightier.serving.feature_state_store import (
+    feature_state_meta_get,
+    init_feature_state_db,
+)
 
 
 def test_parse_refresh_layers_rejects_unknown() -> None:
@@ -204,6 +207,10 @@ def test_mocked_refresh_publishes_readiness_after_smoke(tmp_path: Path, monkeypa
     finally:
         conn.close()
     assert layers == [("mid", "ok"), ("slow", "ok")]
+    assert feature_state_meta_get("feast_online_readiness_latest_run_id", path=db_path) == report["run_id"]
+    stored = feature_state_meta_get("feast_online_readiness_latest_json", path=db_path)
+    assert stored is not None
+    assert json.loads(stored)["mid_term"]["materialize_source"] == "feast_online_refresh"
 
 
 def test_smoke_failure_does_not_publish_readiness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

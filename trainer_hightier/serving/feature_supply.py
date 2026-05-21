@@ -31,9 +31,7 @@ from trainer_hightier.feature_experiment.feature_cadence import (
     classify_model_fe_features,
     short_term_enrich_columns_with_dependencies,
 )
-from trainer_hightier.feature_experiment.feast_mid_term_spike import (
-    SPIKE_MID_TERM_FEATURE_COLUMNS,
-)
+from trainer_hightier.serving.feast_production_constants import PRODUCTION_MID_TERM_FEATURE_COLUMNS
 from trainer_hightier.feature_experiment.materialize_mid_term_daily_snapshot import (
     mid_term_snapshot_production_safe,
 )
@@ -478,6 +476,7 @@ def assert_feature_supplyability_or_raise(
     manifest: dict[str, Any] | None = None,
     mid_term_freshness_sla_iso: str | None = None,
     validation_stage: str = "deploy",
+    scorer_v2_feast_mode: bool = False,
 ) -> dict[str, Any]:
     """Fail fast when any model column cannot be supplied in production serving."""
 
@@ -502,7 +501,7 @@ def assert_feature_supplyability_or_raise(
             unknown.append(f"{feat}({src})")
             continue
         if src == "feast_slow_180d":
-            if slow_pack_path is None or not slow_pack_path.is_file():
+            if not scorer_v2_feast_mode and (slow_pack_path is None or not slow_pack_path.is_file()):
                 raise FileNotFoundError(
                     f"[feature-supply] model expects {feat!r} (feast_slow_180d) but slow parquet missing"
                 )
@@ -550,7 +549,7 @@ def assert_feature_supplyability_or_raise(
     mid_term_needed = tuple(dict.fromkeys([*mid_term_registry, *mid_cols]))
     sla = mid_term_freshness_sla_iso or MID_TERM_FRESHNESS_SLA_ISO8601
 
-    if short_cols:
+    if short_cols and not scorer_v2_feast_mode:
         short_path = fe_short_term_pack_path
         if short_path is None or not short_path.is_file():
             if fe_pack_path is not None and fe_pack_path.is_file():
@@ -571,7 +570,7 @@ def assert_feature_supplyability_or_raise(
             short_required = short_term_enrich_columns_with_dependencies(short_cols, mid_cols)
             _ensure_parquet_columns(short_path, role="fe_short_term", required=short_required)
 
-    if mid_term_needed:
+    if mid_term_needed and not scorer_v2_feast_mode:
         if mid_term_pack_path is None or not mid_term_pack_path.is_file():
             tip = ", ".join(mid_cols[:24] or mid_term_needed[:24])
             ellipsis = "" if len(mid_cols or mid_term_needed) <= 24 else ", …"
@@ -594,7 +593,7 @@ def assert_feature_supplyability_or_raise(
                     f"require {MANIFEST_KEY_MID_TERM_SNAPSHOT} and {MANIFEST_KEY_FE_SHORT_TERM}."
                 )
 
-    if mid_term_needed and manifest is not None and mid_term_pack_path is not None:
+    if mid_term_needed and not scorer_v2_feast_mode and manifest is not None and mid_term_pack_path is not None:
         from trainer_hightier.serving.snapshot_freshness import (
             evaluate_mid_term_freshness,
             read_mid_term_anchor_max,
@@ -617,14 +616,14 @@ def assert_feature_supplyability_or_raise(
         mid_fresh = evaluate_mid_term_freshness(anchor_max=mid_anchor)
         if require_runtime_artifacts and mid_fresh.status == "hard_cap_breached":
             raise ValueError(f"[feature-supply] mid-term hard cap breached: {mid_fresh.message}")
-    elif mid_term_needed and manifest is not None and mid_term_pack_path is None:
+    elif mid_term_needed and not scorer_v2_feast_mode and manifest is not None and mid_term_pack_path is None:
         if require_runtime_artifacts:
             assert_mid_term_freshness_or_raise(
                 manifest,
                 mid_term_feature_count=len(mid_term_needed),
                 sla_iso=sla,
             )
-    elif mid_term_needed and manifest is None:
+    elif mid_term_needed and not scorer_v2_feast_mode and manifest is None:
         raise ValueError(
             "[feature-supply] model uses mid_term registry features but no manifest was provided "
             "for freshness gate; pass active_manifest dict (coverage_end_exclusive). "
@@ -634,7 +633,7 @@ def assert_feature_supplyability_or_raise(
     fe_bundled = (fe_short_term_pack_path is not None and fe_short_term_pack_path.is_file()) or (
         fe_pack_path is not None and fe_pack_path.is_file()
     )
-    if fe_needed or any(f in model_feats for f in DEFAULT_MODEL_SLOW_PATRON_COLUMNS):
+    if (fe_needed or any(f in model_feats for f in DEFAULT_MODEL_SLOW_PATRON_COLUMNS)) and not scorer_v2_feast_mode:
         assert_production_feature_artifacts_or_raise(
             model_feats,
             snap=snap,
@@ -677,7 +676,7 @@ def load_frozen_registry_for_bundle(model_bundle_dir: Path) -> CandidateRegistry
     return load_candidate_registry(snap_p)
 
 
-_SPIKE_MID_TERM_COLUMN_SET: frozenset[str] = frozenset(SPIKE_MID_TERM_FEATURE_COLUMNS)
+_SPIKE_MID_TERM_COLUMN_SET: frozenset[str] = frozenset(PRODUCTION_MID_TERM_FEATURE_COLUMNS)
 
 
 @dataclass(frozen=True)

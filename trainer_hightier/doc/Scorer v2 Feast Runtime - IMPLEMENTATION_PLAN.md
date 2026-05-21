@@ -103,10 +103,56 @@ Refresh plane 負責把 production feature values 推進 Feast online store：
 - long-term：ClickHouse cleaned session source + DuckDB canonical slow snapshot。
 - apply / materialize Feast definitions。
 - 寫入 readiness metadata：latest anchor、generated_at、coverage、row count、null summary、source scope。
+- 成功 refresh 後同時保存 latest readiness payload / hash 到 `feature_state.db`，保留 `feast_online_readiness.json`
+  作為 deploy/scorer gate 的 latest snapshot。
 
 這個 plane 可重用現有 spike materializer 與 production materialize 模組，但不應放進 scorer scoring loop。
 詳細 orchestration realization 見 `Feast Online Refresh - IMPLEMENTATION_PLAN.md`；production 預設 source 是
 ClickHouse export，local cleaned inputs 僅作 debug / fixture override。
+
+## Deploy bundle and startup (no-repo production)
+
+Production 目標是不依賴 repo checkout：只 ship wheel + bundle 內容 + `.env` ClickHouse credentials，然後 `python main.py --mode all` 即可工作。
+
+### Dependency install strategy (adopted)
+
+Production host 可用 `pip install -r requirements.txt` 從 PyPI 或 internal package index 安裝 Feast 與其 transitive
+dependencies。`wheels/` 第一版只必須包含 `trainer_hightier` local wheel；完整 third-party wheelhouse / offline vendor
+是備援 SOP，不是 go-live blocker，因 production machine OS / architecture 尚未固定。
+
+### Bundle-local Feast path contract
+
+Scorer v2 bundle 必須包含或產生下列 bundle-local 路徑；不得把 dev machine absolute path 寫進 production
+`feature_store.yaml`、readiness metadata、或 deploy overrides：
+
+- `feast_repo/`：Feast definitions / feature store config。
+- `artifacts/feast/`：Feast materialization artifacts、refresh reports、`feast_online_readiness.json`。
+- `local_state/feature_state.db`：refresh audit DB 與 latest readiness payload/hash。
+- `mapping/adt_allowed_players_q0p99.parquet`：ADT allowlist bundle default。
+
+若 Feast repo 內含 online store / registry path，deploy startup 必須 resolve 或 rewrite 成 bundle-local path。
+
+### Deploy startup auto-refresh (adopted)
+
+`mode=all` 與 `mode=scorer`（預設開啟，可用 `--no-feast-startup-refresh` 關閉）：
+
+1. 載入 bundle-local config 與 `.env` ClickHouse credentials。
+2. Preflight model、mapping、allowlist、**bundle-local `feast_repo/`**。
+3. 判斷 freshness 時只讀 config / readiness metadata，不在 `deploy.main` 寫死 stale threshold。
+4. 若 `feast_online_readiness.json` 缺失、stale，或 `--force-feast-refresh`：取得 bundle-local Feast refresh lock
+   （短 timeout，超時 fail-fast），再執行 `feast_online_refresh`（CH export + materialize + smoke）。
+5. Refresh publish 順序固定為：final readiness doc → DB latest payload/hash → atomic write
+   `feast_online_readiness.json` → deploy readiness gate + allowlist online smoke。
+6. 成功後才啟動 API thread、validator thread、scorer foreground。
+7. refresh、publish、或 smoke 失敗則 **fail-fast**，不啟動 scorer。
+
+### Deploy must not use legacy snapshot supervisor for scorer v2
+
+歷史 `trainer_hightier.deploy.main` Parquet snapshot refresh supervisor（`run_mid_term_refresh` / `run_slow_refresh`）**不是** scorer v2 mid/long supplier path。Scorer v2 deploy 應停用該 supervisor，改以 Feast online readiness 為準。
+
+### Future must-do: refresh cadence after startup
+
+Startup auto-refresh 只解決首次啟動；**不足以**支撐跨 gaming day 長期運行。後續 slice 必須加入 **排程或 daemon Feast online refresh**（cron、外部 orchestrator、或 deploy background loop）。在此之前，營運需手動重跑 `feast_online_refresh` 或重啟 deploy。
 
 ### 5. State and Logging
 
@@ -128,17 +174,22 @@ Cursor 推進規則必須修正為：一批 rows 完成 feature gate、predictio
 
 ### Deploy-Time Gate
 
-Production deploy 在啟動 scorer v2 前必須驗證：
+Production deploy（`mode=all` / `mode=scorer`）在啟動 scorer v2 前必須：
 
-- model bundle、frozen registry、allowlist、canonical mapping 可讀。
-- Feast repo / feature service 已 apply，online store reachable。
-- required mid/long features 的 latest anchor 覆蓋 scoring policy。
-- short-term `fe__*` 全部由 bounded PIT builder 支援；不允許用 `fe_short_term_parquet` 作為 production readiness 替代。
-- source scope 為 production，不接受 training-scoped artifact。
-- null summary 符合已批准 policy。
-- allowlist sample 的 online lookup smoke test 通過。
+- 驗證 model bundle、frozen registry、allowlist、canonical mapping 可讀。
+- 在 readiness 缺失 / stale / `--force-feast-refresh` 時執行 **startup Feast online refresh**（ClickHouse → materialize → smoke）。
+- 取得 bundle-local Feast refresh lock；只等待短 timeout，超時、refresh、publish、或 smoke 失敗皆 **fail-fast**。
+- 驗證 Feast repo / feature service 已 apply，online store reachable。
+- 驗證 required mid/long features 的 latest anchor 覆蓋 scoring policy；stale 判斷只來自 config / readiness metadata。
+- 驗證 short-term `fe__*` 全部由 bounded PIT builder 支援；不允許用 `fe_short_term_parquet` 作為 production readiness 替代。
+- 驗證 source scope 為 production，不接受 training-scoped artifact。
+- 執行 allowlist sample 的 online lookup smoke test。
+
+`mode=api` / `mode=validator` 不觸發 Feast refresh；須在 scorer-capable startup 成功後才啟動。
 
 Deploy-time gate 不通過時，不啟動正式 scorer。
+
+**Future must-do：** post-startup 排程 Feast refresh（見上文 Deploy bundle 小節）。
 
 ### Scoring-Time Gate
 
@@ -192,6 +243,10 @@ Feast spike 顯示 mid-term 主要風險是 `prior_*` NULL 與單日 active cove
 - 將 spike 中驗證過的 ClickHouse -> DuckDB -> Feast materialize path 接入 production refresh ownership。
 - 使 refresh job 寫入 scorer 可讀的 readiness metadata。
 - 保留 shared / incremental export 的擴充方向，降低每日 full pull 對 ClickHouse 與本機 RAM 的壓力。
+
+### Phase 3b: Post-startup refresh cadence (future must-do)
+
+**不在第一版 deploy slice。** Startup auto-refresh 之後，production 仍需要 **排程或 daemon Feast online refresh**，避免 mid/long anchor 過期卻只能重啟 process。此為 **future must-do**，不是可選優化。
 
 ### Phase 4: Validation and Rollout
 

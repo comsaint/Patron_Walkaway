@@ -102,6 +102,7 @@ FEAST_ONLINE_READINESS_SCHEMA_VERSION: Final[int] = 1
 SCORER_FEAST_READINESS_ENABLED: Final[bool] = True
 #: Allowlist canonical ids sampled for deploy-time Feast online lookup smoke.
 SCORER_FEAST_DEPLOY_LOOKUP_SMOKE_SAMPLE_SIZE: Final[int] = 20
+FEAST_STARTUP_REFRESH_LOCK_WAIT_SECONDS: Final[int] = 30
 
 # Baseline MODEL columns: softer FQG (high PSI → WARN; unique-constant under sample → WARN; WARN auto-allowlist).
 _FQG_BASELINE_MODEL_SOFT_COLUMNS: tuple[str, ...] = (
@@ -520,6 +521,10 @@ class HightierServingConfig:
     scorer_feast_readiness_enabled: bool = SCORER_FEAST_READINESS_ENABLED
     #: Override path to combined Feast readiness JSON; ``None`` uses package default under artifacts/feast.
     scorer_feast_readiness_path: Path | None = None
+    #: Bundle-local Feast repo path; ``None`` uses package default ``trainer_hightier/feast_repo``.
+    scorer_feast_repo_path: Path | None = None
+    #: Max seconds to wait for bundle-local Feast refresh lock before fail-fast.
+    feast_startup_refresh_lock_wait_seconds: int = FEAST_STARTUP_REFRESH_LOCK_WAIT_SECONDS
     #: Deploy / dry-run allowlist sample size for Feast online lookup smoke.
     scorer_feast_deploy_lookup_smoke_sample_size: int = SCORER_FEAST_DEPLOY_LOOKUP_SMOKE_SAMPLE_SIZE
 

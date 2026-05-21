@@ -32,9 +32,10 @@ Excluded:
   through the bounded PIT builder and fail-fast rejects unsupported short-term columns.
 - No scoring-loop refresh. `trainer_hightier.serving.scorer` consumes readiness metadata and Feast online values; it
   must not compute or materialize mid/long features.
-- No deploy-time auto repair. Deploy may check readiness and smoke status, but should not silently run a refresh.
 - No production dependency on local cleaned Parquet tables. Local cleaned inputs may exist only as explicit debug or
   fixture overrides.
+- Scheduled or daemon Feast refresh after startup is **out of scope for the first deploy slice** but is a **future must-do**
+  (see `Scorer v2 Feast Runtime - IMPLEMENTATION_PLAN.md` and deploy bundle docs).
 
 ## Decisions
 
@@ -49,6 +50,9 @@ Excluded:
 - Smoke missing entity rate follows scorer policy: over `scorer_feast_entity_missing_fail_fraction` hard-fails.
 - Refresh observability is stored in `feature_state.db`; JSON summary can remain as a latest human-readable artifact
   but is not the operational source of truth.
+- Production deploy runs **startup Feast online refresh** for scorer-capable modes when readiness is missing, stale, or
+  forced; refresh or smoke failure is fail-fast.
+- **Post-startup scheduled/daemon refresh** is a future must-do; the first slice does not implement it.
 
 ## Module Boundaries
 
@@ -88,6 +92,10 @@ avoid depending on scorer runtime state.
 Operational metadata DB owner. It should be extended with Feast refresh audit tables rather than creating a separate
 DB or writing refresh metadata into `prediction_log.db`.
 
+The DB is the audit / operational history source of truth. `feast_online_readiness.json` remains the latest
+deploy/scorer gate snapshot. Successful refresh should persist the latest readiness JSON payload, sha256, run id, and
+generated timestamp in `feature_state.db` before atomically publishing the JSON file.
+
 ## Production Flow
 
 ### 1. Resolve Runtime Inputs
@@ -98,11 +106,13 @@ Resolve from config and explicit CLI overrides:
 - Feast readiness path.
 - Feature-state DB path.
 - Canonical mapping Parquet.
-- ADT allowlist Parquet.
+- ADT allowlist Parquet (bundle default: `mapping/adt_allowed_players_q0p99.parquet`).
 - ClickHouse source table names / connection config.
 - Output staging directory under the existing Feast artifacts area.
 
 CLI path overrides are allowed for testability, but production defaults should not rely on environment variables.
+Production defaults must be bundle-local for `feast_repo/`, `artifacts/feast/`, and `local_state/feature_state.db`;
+`feature_store.yaml` / Feast registry / online-store paths must not retain dev-machine absolute paths.
 
 ### 2. Select Layers
 
@@ -178,7 +188,7 @@ Smoke must verify:
 Default sample size should be conservative, for example 100 canonical IDs, with CLI override for larger release-gate
 runs.
 
-### 7. Publish Readiness
+### 7. Persist Audit and Publish Readiness
 
 Publish `feast_online_readiness.json` only after selected layers pass materialization and smoke.
 
@@ -197,7 +207,17 @@ Readiness should include:
 
 The scorer startup gate and deploy preflight continue to read this readiness document.
 
-### 8. Persist Feature-State Audit
+Publish order is part of the contract:
+
+1. Build final readiness doc.
+2. Persist refresh audit plus latest readiness payload / sha256 / run id / generated timestamp in `feature_state.db`.
+3. Atomically write `feast_online_readiness.json`.
+4. Let deploy/scorer gate read the published JSON and run final smoke.
+
+If either DB persistence or JSON atomic publish fails, the refresh is failed; deploy must not start scorer from a
+partially published state.
+
+### 8. Feature-State Audit Shape
 
 Persist refresh metadata in `feature_state.db`, not `prediction_log.db`.
 
@@ -236,6 +256,15 @@ Proposed tables:
 | `status` | Layer result |
 | `detail_json` | Layer-specific diagnostic payload |
 
+Latest readiness metadata:
+
+| Key / Column | Purpose |
+|--------------|---------|
+| `feast_online_readiness_latest_json` | Full final readiness document used for the latest gate snapshot |
+| `feast_online_readiness_latest_sha256` | Hash of the latest readiness payload |
+| `feast_online_readiness_latest_run_id` | Refresh run that produced the latest readiness payload |
+| `feast_online_readiness_latest_generated_at` | Readiness document timestamp |
+
 Optional later table:
 
 `feast_refresh_smoke`
@@ -249,10 +278,7 @@ Recommended first CLI:
 ```bash
 python -m trainer_hightier.serving.feast_online_refresh \
   --layers mid,slow \
-  --source clickhouse \
-  --apply \
-  --materialize \
-  --smoke
+  --source clickhouse
 ```
 
 Suggested options:
@@ -287,6 +313,8 @@ Fail fast on:
 - Feast apply failure.
 - Feast materialize failure.
 - Online smoke failure.
+- Feature-state DB latest-readiness persistence failure.
+- Readiness JSON atomic publish failure.
 - Readiness gate failure.
 - Source scope not production.
 
@@ -316,10 +344,20 @@ Run Feast apply and selected-layer online materialization using artifact-derived
 
 Run allowlist online smoke, publish final `feast_online_readiness.json`, and record final DB audit rows.
 
-### Phase 6: Deploy Alignment
+### Phase 6: Deploy Alignment (scorer v2)
 
-Keep deploy behavior as check-only: deploy validates readiness and optional smoke status, but does not run refresh
-implicitly.
+Production deploy (`trainer_hightier.deploy.main`) for scorer-capable modes (`all`, `scorer`) must:
+
+- run **startup Feast online refresh** when readiness is missing, stale, or forced;
+- acquire a bundle-local Feast refresh lock before refresh; use a short timeout and fail-fast on contention;
+- evaluate freshness only from config / readiness metadata, not hard-coded deploy thresholds;
+- run deploy Feast readiness + allowlist online smoke after refresh;
+- **fail-fast** if refresh, latest-readiness DB persistence, JSON publish, or smoke fails (do not start API / validator / scorer);
+- **not** start the legacy Parquet snapshot refresh supervisor as the scorer v2 mid/long supplier path.
+
+`mode=api` and `mode=validator` must not trigger Feast refresh. API and validator start only after scorer-capable startup succeeds.
+
+See also: `Scorer Runtime Contract - SSOT.md` (Deploy-Time Contract), `Scorer v2 Feast Runtime - IMPLEMENTATION_PLAN.md` (Deploy bundle), bundle `README_DEPLOY.md`, and task-level breakdown in `Scorer v2 Feast Runtime - WORKING_PLAN.md` (Slice S1–S6).
 
 ## Risks and Mitigations
 
@@ -338,6 +376,7 @@ implicitly.
 
 ## Open Questions
 
+- Implementation timing for **post-startup scheduled/daemon Feast refresh** (future must-do; not in first deploy slice).
 - Whether production Feast feature views should be renamed before the first scheduled refresh rollout, or whether the
   existing spike names remain accepted for scorer v2 first slice.
 - Whether `feature_state.db` should keep only latest summary rows plus full detail JSON, or retain all historical

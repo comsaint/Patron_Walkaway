@@ -4,8 +4,11 @@
 > truth is [`Scorer Runtime Contract - SSOT.md`](Scorer%20Runtime%20Contract%20-%20SSOT.md). Scorer v2 production
 > runtime must not use `fe_short_term_parquet`, `fe_derived_parquet`, or snapshot Parquet layers as feature fallback
 > suppliers.
+>
+> Scorer v2 deploy uses **Feast online startup refresh** (`Feast Online Refresh - IMPLEMENTATION_PLAN.md`, bundle
+> `README_DEPLOY.md`). **Future must-do:** scheduled/daemon Feast refresh after startup.
 
-Operational procedures for production snapshot bootstrap, refresh, and degraded scoring.
+Operational procedures for legacy Parquet snapshot bootstrap, refresh, and degraded scoring.
 
 ## Bundle layout (production mirror + snapshots)
 

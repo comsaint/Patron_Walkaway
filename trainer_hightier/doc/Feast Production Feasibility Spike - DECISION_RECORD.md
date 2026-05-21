@@ -127,6 +127,9 @@ Archived copies used for this record: repo-root `batch2000.json` (mid-term), `lo
 3. Shared or incremental CH export for bets + sessions to avoid ~10 min sequential full pulls (refresh plane).
 4. Optional: full allowlist Feast lookup benchmark (e.g. batch size 23,696 or multi-batch p95).
 5. Scorer v2 working plan tracks mock → real Feast adapter, cursor fix, and dry-run validation.
+6. **Future must-do:** post-startup scheduled/daemon Feast refresh (deploy startup refresh is not enough for daily production).
+7. Deploy integration must use bundle-local Feast paths and persist latest readiness payload/hash to `feature_state.db`;
+   `feast_online_readiness.json` remains the latest gate snapshot.
 
 ## Implementation artifacts
 

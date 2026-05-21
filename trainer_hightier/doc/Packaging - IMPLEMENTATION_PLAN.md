@@ -140,7 +140,9 @@
 
 未達標時 fail-fast，錯誤須標 `[feature-supply]` 或 `[pack-schema]` 並列出過期欄位數與 manifest 時間戳。
 
-**實作備註（已更新）**：`trainer_hightier.serving.snapshot_updater` 支援 `--production` 全層 publish、`--refresh-mid-term`、`--refresh-slow`；production 物化前會驗證 bundle 內 `source_mirror` 之 cleaned bet / session mirror。日常 cadence 預設由 **`trainer_hightier.deploy.main` 內建 refresh supervisor**（`all` / `scorer` 模式）驅動；外部 orchestrator 仍可作為備援或 `--no-refresh-supervisor` 時的唯一排程來源。
+**實作備註（已更新）**：`trainer_hightier.serving.snapshot_updater` 支援 `--production` 全層 publish、`--refresh-mid-term`、`--refresh-slow`；production 物化前會驗證 bundle 內 `source_mirror` 之 cleaned bet / session mirror。
+
+**Scorer v2 注意**：Parquet snapshot refresh supervisor（`deploy.main` 預設）是 **legacy snapshot-plane** 行為，不是 scorer v2 的 mid/long supplier。Scorer v2 production deploy 應以 **Feast online startup refresh + readiness smoke** 為準（見 `Feast Online Refresh - IMPLEMENTATION_PLAN.md`、`Scorer v2 Feast Runtime - IMPLEMENTATION_PLAN.md`）。**Post-startup 排程 Feast refresh** 為後續必做，非本 slice 範圍。
 
 ## Decision Log
 
@@ -172,6 +174,14 @@
 - D-010（historical）：**Mid-term freshness 硬 gate**（見上節「Mid-term freshness 硬 gate」）。
   - Historical Parquet route：含 `mid_term` 欄位的模型需有 `mid_term_snapshot_parquet`、欄位齊、`mid_term_grain=canonical_daily_asof`，且 `mid_term_coverage_end_exclusive` / `mid_term_anchor_gaming_day_max` 在 SLA 內。
   - Scorer v2 route：mid-term production readiness 以 Feast online feature service、latest anchor、source scope、coverage / missing policy gate 為準。
+- D-011（已定）：Scorer v2 Feast deploy bundle 採 **PyPI / internal index install** 作為第一版依賴策略。
+  - `wheels/` 必須包含 `trainer_hightier` local wheel；不要求 vendor Feast / transitive third-party wheels。
+  - 完整 wheelhouse 可作離線或 locked-platform 備援，但不是 go-live blocker，因 production OS / architecture 尚未固定。
+- D-012（已定）：Scorer v2 Feast runtime 路徑必須 bundle-local。
+  - `feast_repo/`、`artifacts/feast/`、`local_state/feature_state.db`、`mapping/adt_allowed_players_q0p99.parquet` 是 bundle contract。
+  - `feature_store.yaml` / Feast registry / online store path 不可保留 dev-machine absolute path。
+- D-013（已定）：Startup Feast refresh publish 順序為 final readiness doc → `feature_state.db` latest payload/hash → atomic `feast_online_readiness.json` → deploy gate smoke。
+  - 任一步失敗即 fail-fast，不啟動 scorer。
 
 ## 目標架構（Standalone）
 
@@ -257,8 +267,8 @@ flowchart LR
 必帶內容（production 完成態）：
 
 - `main.py`（或等效 standalone entrypoint）
-- `requirements.txt`（於 **bundle 根目錄** 執行 `pip install -r`；首行為相對該目錄之 `wheels/trainer_hightier-*.whl`，其餘相依由 PyPI 解析）
-- `wheels/`（**預設**：内含 `trainer_hightier-*.whl`，由建包機 `pip wheel --no-deps` 產生；亦保留作離線備援擴充）
+- `requirements.txt`（於 **bundle 根目錄** 執行 `pip install -r`；首行為相對該目錄之 `wheels/trainer_hightier-*.whl`，其餘相依由 PyPI / internal index 解析）
+- `wheels/`（**預設**：內含 `trainer_hightier-*.whl`，由建包機 `pip wheel --no-deps` 產生；third-party wheels 僅作離線備援擴充）
 - `.env.example`
 - `models/`（至少 `model.pkl`、`training_metrics.json`、`model_version`）
 - `snapshots/active_manifest.json`
@@ -267,7 +277,10 @@ flowchart LR
 - `snapshots/artifacts/fe_short_term_*.parquet`（historical route only；scorer v2 production readiness 不接受此 artifact）
 - `snapshots/artifacts/mid_term_daily_snapshot*.parquet`（historical route / refresh materialization support；scorer v2 runtime supplier 是 Feast）
 - `mapping/`（canonical mapping parquet）
-- `local_state/`（至少保留可建立 `state.db`、`prediction_log.db` 的路徑）
+- `mapping/adt_allowed_players_q0p99.parquet`（scorer v2 ADT allowlist bundle default）
+- `feast_repo/`（scorer v2 Feast definitions；`feature_store.yaml` 不可帶 dev-machine absolute path）
+- `artifacts/feast/`（scorer v2 Feast readiness / refresh reports / materialization artifacts）
+- `local_state/`（至少保留可建立 `state.db`、`prediction_log.db`、`feature_state.db` 的路徑）
 - `README_DEPLOY.md`
 - `bundle_info.json`
 - `deploy_bundle_paths.json`

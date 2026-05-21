@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -13,11 +14,17 @@ from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from trainer_hightier.config import (
+    HK_TZ,
     MANIFEST_KEY_FE_SHORT_TERM,
     MANIFEST_KEY_MID_TERM_SNAPSHOT,
     default_hightier_serving_config,
 )
-from trainer_hightier.serving.runtime_config import HK_TZ
+from trainer_hightier.serving.contracts import (
+    META_KEY_FEAST_READINESS_LATEST_GENERATED_AT,
+    META_KEY_FEAST_READINESS_LATEST_JSON,
+    META_KEY_FEAST_READINESS_LATEST_RUN_ID,
+    META_KEY_FEAST_READINESS_LATEST_SHA256,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -443,6 +450,23 @@ def upsert_feast_refresh_layer(
             ),
         )
         conn.commit()
+
+
+def persist_feast_online_readiness_latest(
+    run_id: str,
+    readiness_payload: dict[str, Any],
+    *,
+    path: Optional[Path] = None,
+) -> str:
+    """Persist latest Feast readiness document and sha256 in ``feature_state_meta``."""
+    body = json.dumps(readiness_payload, sort_keys=True, default=str)
+    sha256_hex = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    generated_at = str(readiness_payload.get("generated_at") or "")
+    feature_state_meta_set(META_KEY_FEAST_READINESS_LATEST_JSON, body, path=path)
+    feature_state_meta_set(META_KEY_FEAST_READINESS_LATEST_SHA256, sha256_hex, path=path)
+    feature_state_meta_set(META_KEY_FEAST_READINESS_LATEST_RUN_ID, str(run_id), path=path)
+    feature_state_meta_set(META_KEY_FEAST_READINESS_LATEST_GENERATED_AT, generated_at, path=path)
+    return sha256_hex
 
 
 def upsert_adt_allowlist_meta(

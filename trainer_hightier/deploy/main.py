@@ -46,7 +46,17 @@ def _parse_deploy_args(argv: list[str] | None) -> argparse.Namespace:
     pr.add_argument(
         "--no-refresh-supervisor",
         action="store_true",
-        help="Disable deploy-managed snapshot refresh loop (debug / externally scheduled refresh only).",
+        help="Disable legacy Parquet snapshot refresh supervisor (debug only).",
+    )
+    pr.add_argument(
+        "--no-feast-startup-refresh",
+        action="store_true",
+        help="Skip startup Feast online refresh (debug only; scorer likely fails readiness).",
+    )
+    pr.add_argument(
+        "--force-feast-refresh",
+        action="store_true",
+        help="Force Feast online refresh even when readiness looks fresh.",
     )
     return pr.parse_args(argv)
 
@@ -64,6 +74,8 @@ def _load_rel_paths(bundle_root: Path) -> dict[str, Any]:
 def _serving_config_for_bundle(bundle_root: Path, rel: dict[str, Any]) -> HightierServingConfig:
     br = bundle_root.resolve()
     ls = rel.get("local_state_dir", "local_state")
+    feast_art = rel.get("feast_artifacts_dir", "artifacts/feast")
+    feast_repo = rel.get("feast_repo_dir", "feast_repo")
     base = HightierServingConfig()
     return replace(
         base,
@@ -74,6 +86,13 @@ def _serving_config_for_bundle(bundle_root: Path, rel: dict[str, Any]) -> Highti
         validator_out_dir=br / ls / "validator_out",
         production_cleaned_bet_mirror_dir=br / "source_mirror" / "cleaned_bet",
         production_cleaned_session_mirror_parquet=br / "source_mirror" / "cleaned_session.parquet",
+        scorer_feast_repo_path=(br / feast_repo).resolve(),
+        scorer_feast_readiness_path=(br / rel.get(
+            "feast_readiness_path", f"{feast_art}/feast_online_readiness.json"
+        )).resolve(),
+        adt_allowed_players_parquet=(br / rel.get(
+            "adt_allowlist_parquet", "mapping/adt_allowed_players_q0p99.parquet"
+        )).resolve(),
     )
 
 
@@ -128,34 +147,20 @@ def _preflight_frozen_artifacts(bundle_root: Path, rel: dict[str, Any]) -> None:
     mapping = bundle_root / rel["canonical_mapping_parquet"]
     if not mapping.is_file():
         raise FileNotFoundError(f"bundle mapping missing: {mapping}")
+    feast_repo = bundle_root / rel.get("feast_repo_dir", "feast_repo")
+    if not feast_repo.is_dir():
+        raise FileNotFoundError(f"bundle feast_repo missing: {feast_repo}")
+    allowlist = bundle_root / rel.get("adt_allowlist_parquet", "mapping/adt_allowed_players_q0p99.parquet")
+    if not allowlist.is_file():
+        raise FileNotFoundError(f"bundle ADT allowlist missing: {allowlist}")
     snap_root = bundle_root / str(rel.get("snapshot_manifest_dir", "snapshots"))
     man_path = snap_root / "active_manifest.json"
     if not man_path.is_file():
-        raise FileNotFoundError(f"active_manifest.json missing under {snap_root}")
+        logging.warning("[deploy] active_manifest.json missing under %s (Feast bundle ok)", snap_root)
+        return
     man = json.loads(man_path.read_text(encoding="utf-8"))
     if not isinstance(man, dict):
         raise ValueError("active_manifest.json root must be a JSON object")
-    for key in ("slow_patron_parquet", "adt_allowlist_parquet"):
-        rel_p = man.get(key)
-        if not rel_p:
-            raise ValueError(f"active_manifest.json missing required key {key!r}")
-        fp = (snap_root / str(rel_p)).resolve()
-        if not fp.is_file():
-            raise FileNotFoundError(
-                f"manifest {key}={rel_p!r} resolves to missing file {fp} (under {snap_root})"
-            )
-    from trainer_hightier.config import MANIFEST_KEY_MID_TERM_SNAPSHOT
-    from trainer_hightier.serving.snapshot_bootstrap import preflight_validate_shipped_snapshots
-
-    if man.get(MANIFEST_KEY_MID_TERM_SNAPSHOT):
-        try:
-            summary = preflight_validate_shipped_snapshots(man, manifest_dir=snap_root)
-            logging.info("[deploy] snapshot preflight ok: %s", summary)
-        except ValueError as exc:
-            logging.warning(
-                "[deploy] shipped snapshot preflight failed; refresh supervisor will attempt repair: %s",
-                exc,
-            )
     trial = man.get("trial_bet_behavior_parquet")
     if trial:
         tp = (snap_root / str(trial)).resolve()
@@ -206,6 +211,7 @@ def _preflight_feature_supplyability(bundle_root: Path, rel: dict[str, Any]) -> 
         fe_short_term_pack_path=_layer_path("fe_short_term_parquet"),
         mid_term_pack_path=_layer_path("mid_term_snapshot_parquet"),
         manifest=man if isinstance(man, dict) else None,
+        scorer_v2_feast_mode=True,
     )
 
 
@@ -519,6 +525,218 @@ def _start_refresh_supervisor(model_bundle: Path, mapping: Path, cfg: HightierSe
     )
 
 
+def _feast_refresh_lock_path(cfg: HightierServingConfig) -> Path:
+    """Return bundle-local Feast refresh lock under feast artifacts."""
+    readiness = Path(cfg.scorer_feast_readiness_path or (Path(cfg.feature_state_db_path).parent / "feast_readiness.json"))
+    lock_dir = readiness.parent
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    return lock_dir / ".feast_online_refresh.lock"
+
+
+def _try_acquire_feast_refresh_lock(cfg: HightierServingConfig) -> int | None:
+    """Acquire Feast refresh lock with short timeout; return fd or None."""
+    lock = _feast_refresh_lock_path(cfg)
+    wait_s = max(1, int(cfg.feast_startup_refresh_lock_wait_seconds))
+    deadline = time.monotonic() + wait_s
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    while True:
+        try:
+            fd = os.open(str(lock), flags)
+            os.write(
+                fd,
+                f"pid={os.getpid()} ts={datetime.now(timezone.utc).isoformat()}\n".encode("utf-8"),
+            )
+            return fd
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.25)
+
+
+def _release_feast_refresh_lock(cfg: HightierServingConfig, fd: int) -> None:
+    """Release bundle-local Feast refresh lock."""
+    os.close(fd)
+    try:
+        _feast_refresh_lock_path(cfg).unlink(missing_ok=True)
+    except OSError:
+        logging.warning("[deploy] failed to remove Feast refresh lock", exc_info=True)
+
+
+def _bundle_allowlist_path(bundle_root: Path, rel: dict[str, Any]) -> Path:
+    return (bundle_root / rel.get("adt_allowlist_parquet", "mapping/adt_allowed_players_q0p99.parquet")).resolve()
+
+
+def _needs_feast_startup_refresh(
+    cfg: HightierServingConfig,
+    *,
+    force: bool,
+    require_mid: bool,
+    require_slow: bool,
+) -> tuple[bool, str]:
+    """Return whether deploy should run startup Feast refresh."""
+    from trainer_hightier.serving.feast_readiness import (
+        evaluate_feast_readiness_gate,
+        load_feast_online_readiness,
+        resolve_feast_readiness_path,
+    )
+
+    if force:
+        return True, "forced by --force-feast-refresh"
+    path = resolve_feast_readiness_path(cfg)
+    readiness = load_feast_online_readiness(path)
+    gate = evaluate_feast_readiness_gate(
+        readiness,
+        require_mid=require_mid,
+        require_slow=require_slow,
+        readiness_path=path,
+        close_hour=int(cfg.gaming_day_close_hour),
+        mid_hard_cap_days=int(cfg.mid_term_stale_hard_cap_days),
+        slow_hard_cap_days=int(cfg.slow_stale_hard_cap_days),
+        slow_grace_days=int(cfg.slow_monthly_grace_days),
+    )
+    if gate.ok:
+        return False, "readiness fresh"
+    return True, gate.hard_failure_reason or "readiness gate not ok"
+
+
+def _run_deploy_feast_smoke_or_raise(
+    cfg: HightierServingConfig,
+    *,
+    mapping: Path,
+    allowlist: Path,
+    require_mid: bool,
+    require_slow: bool,
+) -> None:
+    """Run deploy Feast readiness + allowlist lookup smoke."""
+    from trainer_hightier.serving.feast_production_constants import (
+        PRODUCTION_LONG_TERM_FEATURE_COLUMNS,
+        PRODUCTION_MID_TERM_FEATURE_COLUMNS,
+    )
+    from trainer_hightier.serving.feast_readiness import run_deploy_feast_readiness_check
+
+    gate = run_deploy_feast_readiness_check(
+        require_mid=require_mid,
+        require_slow=require_slow,
+        allowlist_parquet=allowlist,
+        canonical_mapping_parquet=mapping,
+        mid_columns=PRODUCTION_MID_TERM_FEATURE_COLUMNS if require_mid else (),
+        slow_columns=PRODUCTION_LONG_TERM_FEATURE_COLUMNS if require_slow else (),
+        run_lookup_smoke=True,
+    )
+    if not gate.ok:
+        raise RuntimeError(gate.hard_failure_reason or "[deploy] Feast readiness smoke failed")
+    logging.info("[deploy] feast readiness smoke ok %s", gate.to_log_dict())
+
+
+def _startup_feast_refresh_or_raise(
+    bundle_root: Path,
+    rel: dict[str, Any],
+    cfg: HightierServingConfig,
+    *,
+    mapping: Path,
+    force: bool,
+    skip_refresh: bool,
+) -> None:
+    """Run startup Feast refresh + smoke for scorer-capable deploy modes."""
+    from trainer_hightier.serving import feast_online_refresh as refresh_mod
+    from trainer_hightier.serving.feature_supply import (
+        build_scorer_supplier_plan,
+        load_frozen_registry_for_bundle,
+        model_feature_columns_from_pickle,
+    )
+
+    model_bundle = bundle_root / str(rel.get("model_bundle_dir", "models"))
+    allowlist = _bundle_allowlist_path(bundle_root, rel)
+    feast_repo = Path(cfg.scorer_feast_repo_path or (bundle_root / "feast_repo")).resolve()
+    if not feast_repo.is_dir():
+        raise FileNotFoundError(f"[deploy] feast_repo missing: {feast_repo}")
+
+    snap = load_frozen_registry_for_bundle(model_bundle)
+    model_feats = model_feature_columns_from_pickle(model_bundle)
+    plan = build_scorer_supplier_plan(snap, model_feats)
+    require_mid = bool(plan.feast_mid_cols or plan.mid_composite_cols)
+    require_slow = bool(plan.feast_slow_cols)
+
+    if skip_refresh:
+        logging.warning("[deploy] --no-feast-startup-refresh: skipping refresh (smoke still runs)")
+        _run_deploy_feast_smoke_or_raise(
+            cfg,
+            mapping=mapping,
+            allowlist=allowlist,
+            require_mid=require_mid,
+            require_slow=require_slow,
+        )
+        return
+
+    need_refresh, reason = _needs_feast_startup_refresh(
+        cfg,
+        force=force,
+        require_mid=require_mid,
+        require_slow=require_slow,
+    )
+    if need_refresh:
+        logging.warning("[deploy] startup Feast refresh required: %s", reason)
+        fd = _try_acquire_feast_refresh_lock(cfg)
+        if fd is None:
+            raise RuntimeError(
+                "[deploy] startup Feast refresh blocked: another process holds the refresh lock"
+            )
+        layers: list[str] = []
+        if require_mid:
+            layers.append("mid")
+        if require_slow:
+            layers.append("slow")
+        if not layers:
+            layers = ["mid", "slow"]
+        try:
+            opts = refresh_mod._resolve_refresh_options(
+                layers=",".join(layers),
+                source="clickhouse",
+                skip_apply=False,
+                skip_materialize=False,
+                smoke_only=False,
+                dry_run=False,
+                feast_repo=feast_repo,
+                readiness_path=cfg.scorer_feast_readiness_path,
+                canonical_mapping=mapping,
+                adt_allowlist=allowlist,
+                local_cleaned_bet=None,
+                local_cleaned_session=None,
+                max_smoke_entities=int(cfg.scorer_feast_deploy_lookup_smoke_sample_size),
+                summary_path=(Path(cfg.scorer_feast_readiness_path).parent / "feast_online_refresh_report.json"),
+            )
+            refresh_mod.run_feast_online_refresh(opts)
+        finally:
+            _release_feast_refresh_lock(cfg, fd)
+    else:
+        logging.info("[deploy] startup Feast refresh skipped: %s", reason)
+
+    _run_deploy_feast_smoke_or_raise(
+        cfg,
+        mapping=mapping,
+        allowlist=allowlist,
+        require_mid=require_mid,
+        require_slow=require_slow,
+    )
+
+
+def _scorer_argv(
+    *,
+    model_bundle: Path,
+    mapping: Path,
+    allowlist: Path,
+) -> list[str]:
+    """Build scorer CLI argv for deploy foreground."""
+    return [
+        "--bundle-dir",
+        str(model_bundle),
+        "--canonical-mapping",
+        str(mapping),
+        "--adt-allowlist",
+        str(allowlist),
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     """Configure paths from bundle, log versions, then run selected mode."""
     args = _parse_deploy_args(argv)
@@ -536,11 +754,24 @@ def main(argv: list[str] | None = None) -> int:
 
     model_bundle = br / rel.get("model_bundle_dir", "models")
     mapping = br / rel["canonical_mapping_parquet"]
+    allowlist = _bundle_allowlist_path(br, rel)
     mode = str(args.mode)
 
     _preflight_frozen_artifacts(br, rel)
-    if mode in ("all", "scorer") and not bool(args.no_refresh_supervisor):
-        _start_refresh_supervisor(model_bundle, mapping, cfg)
+    if mode in ("all", "scorer"):
+        _startup_feast_refresh_or_raise(
+            br,
+            rel,
+            cfg,
+            mapping=mapping,
+            force=bool(args.force_feast_refresh),
+            skip_refresh=bool(args.no_feast_startup_refresh),
+        )
+    elif mode in ("api", "validator") and not bool(args.no_feast_startup_refresh):
+        logging.warning(
+            "[deploy] mode=%s does not run Feast startup refresh; use mode=all or mode=scorer first",
+            mode,
+        )
     _preflight_feature_supplyability(br, rel)
     _emit_deploy_boot_info(br, cfg, rel)
 
@@ -560,12 +791,11 @@ def main(argv: list[str] | None = None) -> int:
         logging.info("[deploy] scorer foreground (mode=scorer)")
         return int(
             scorer.main(
-                [
-                    "--bundle-dir",
-                    str(model_bundle),
-                    "--canonical-mapping",
-                    str(mapping),
-                ]
+                _scorer_argv(
+                    model_bundle=model_bundle,
+                    mapping=mapping,
+                    allowlist=allowlist,
+                )
             )
         )
 
@@ -587,12 +817,11 @@ def main(argv: list[str] | None = None) -> int:
     logging.info("[deploy] scorer foreground (mode=all)")
     return int(
         scorer.main(
-            [
-                "--bundle-dir",
-                str(model_bundle),
-                "--canonical-mapping",
-                str(mapping),
-            ]
+            _scorer_argv(
+                model_bundle=model_bundle,
+                mapping=mapping,
+                allowlist=allowlist,
+            )
         )
     )
 

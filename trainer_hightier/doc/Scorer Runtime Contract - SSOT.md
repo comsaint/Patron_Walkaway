@@ -26,6 +26,8 @@ mirrors are available.
 `build_deploy_package` must verify that the bundle is structurally usable:
 
 - model files, frozen registry, wheel, mapping, allowlist, and manifest are present and readable.
+- `requirements.txt` supports production install from PyPI or an internal package index; full third-party wheel
+  vendoring is optional backup SOP, not the first-slice completion condition.
 - model feature columns can be classified into known suppliers using the frozen registry.
 - training-scoped artifacts must not be accepted as production-safe snapshots.
 - optional seed snapshots may be packaged when present.
@@ -37,15 +39,25 @@ Package-time output may therefore represent a refresh-required bundle.
 
 ## Deploy-Time Contract
 
-Production deploy owns readiness:
+Production deploy (`trainer_hightier.deploy.main`) for scorer-capable modes (`all`, `scorer`) owns Feast readiness before scoring starts:
 
-- load the packaged model and manifest.
-- validate source mirrors or ClickHouse access needed to refresh missing/stale layers.
-- if required snapshots are missing, invalid, or beyond hard cap, run targeted refresh before scoring.
-- if the model contains short-term `fe__*`, verify the scorer's bounded on-the-fly PIT supplier supports every
-  required short-term column.
-- fail deploy/scorer readiness if refresh fails.
-- stale-but-allowed snapshots may run degraded only within the configured hard cap.
+- load the packaged model, frozen registry, canonical mapping, ADT allowlist, and bundle-local Feast repo.
+- validate ClickHouse credentials (via bundle `.env` / environment overrides).
+- ensure Feast repo / registry / online-store paths resolve bundle-locally and do not retain dev-machine absolute paths.
+- **startup Feast online refresh** when readiness is missing, stale, or explicitly forced (`--force-feast-refresh`);
+- acquire a bundle-local Feast refresh lock; wait only a short timeout, then fail-fast if another deploy process holds the lock;
+- evaluate mid/slow freshness only from config and readiness metadata, not hard-coded deploy thresholds;
+- persist the final readiness payload/hash/run id/generated timestamp in `feature_state.db` before atomically publishing
+  `feast_online_readiness.json`;
+- run deploy Feast readiness gate and allowlist online lookup smoke after refresh;
+- **fail-fast** if refresh, readiness DB persistence, JSON publish, or smoke fails — do not start API, validator, or scorer;
+- if the model contains short-term `fe__*`, verify the scorer's bounded on-the-fly PIT supplier supports every required short-term column.
+- do **not** use legacy Parquet snapshot refresh as the scorer v2 mid/long supplier path;
+- stale-but-allowed readiness (within hard cap) may allow degraded scoring with prediction-log audit.
+
+`mode=api` and `mode=validator` alone must not run Feast refresh; they start only after scorer-capable startup succeeds.
+
+**Future must-do:** scheduled or daemon Feast online refresh after startup (see `Feast Online Refresh - IMPLEMENTATION_PLAN.md` and `Scorer v2 Feast Runtime - IMPLEMENTATION_PLAN.md`). Startup refresh alone is not sufficient for long-running production without manual re-refresh or restart.
 
 ## Scoring-Time Contract
 

@@ -4,7 +4,7 @@ Layout (resolved ``--output-dir``, default ``trainer_hightier.config.DEFAULT_DEP
 
 - ``main.py`` — standalone entrypoint (``python main.py`` after ``pip install -r requirements.txt``)
 - ``wheels/trainer_hightier-*.whl`` — serving package wheel (``pip wheel --no-deps`` from ``trainer_hightier/pyproject.toml``)
-- ``requirements.txt`` — local wheel line (transitive deps from PyPI per wheel metadata)
+- ``requirements.txt`` — local wheel line (transitive deps from PyPI / internal index per wheel metadata)
 - ``.env.example`` — optional ClickHouse / log overrides for :mod:`trainer_hightier.deploy.main`
 - ``models/`` — ``model.pkl``, ``training_metrics.json``, ``feature_candidate_registry.snapshot.yaml`` (frozen feature registry YAML from Step 5), ``model_version``, …
 - ``snapshots/active_manifest.json`` — paths rewritten to bundle-relative
@@ -55,6 +55,8 @@ from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_p
 logger = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+_FEAST_REPO_SRC = _REPO_ROOT / "trainer_hightier" / "feast_repo"
+_ADT_ALLOWLIST_BUNDLE_BASENAME = "adt_allowed_players_q0p99.parquet"
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -385,6 +387,7 @@ def _static_parquet_minimum_contracts(
     slow_pack_path: Path | None,
     map_dest_path: Path,
     allow_pack_path: Path | None,
+    feast_bundle: bool = False,
 ) -> None:
     """Structural gates independent of frozen registry (keys + slow anchor)."""
 
@@ -393,10 +396,40 @@ def _static_parquet_minimum_contracts(
     if allow_pack_path is not None and allow_pack_path.is_file():
         _ensure_parquet_columns(allow_pack_path, role="adt_allowlist", required=("player_id",))
     if slow_pack_path is None or not slow_pack_path.is_file():
-        if strict:
+        if strict and not feast_bundle:
             raise FileNotFoundError("[pack-schema] slow patron parquet unresolved for static gate")
         return
     _static_slow_minimum_contract_pack(slow_pack_path)
+
+
+def _rewrite_feast_feature_store_yaml(feast_repo: Path) -> None:
+    """Point Feast offline staging at bundle-local ``artifacts/feast``."""
+    yaml_path = feast_repo / "feature_store.yaml"
+    if not yaml_path.is_file():
+        return
+    text = yaml_path.read_text(encoding="utf-8")
+    text = text.replace(
+        "staging_location: ../tmp/feast_duckdb_staging",
+        "staging_location: ../artifacts/feast/duckdb_staging",
+    )
+    yaml_path.write_text(text, encoding="utf-8")
+
+
+def _copy_feast_repo_to_bundle(bundle_root: Path) -> Path:
+    """Copy ``trainer_hightier/feast_repo`` into deploy bundle."""
+    if not _FEAST_REPO_SRC.is_dir():
+        raise FileNotFoundError(f"Feast repo missing at {_FEAST_REPO_SRC}")
+    dest = bundle_root / "feast_repo"
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(
+        _FEAST_REPO_SRC,
+        dest,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    (dest / "data").mkdir(parents=True, exist_ok=True)
+    _rewrite_feast_feature_store_yaml(dest)
+    return dest
 
 
 def _load_and_verify_frozen_registry(
@@ -520,37 +553,44 @@ def _write_deploy_paths(
     path: Path,
     *,
     mapping_name: str,
+    adt_allowlist_basename: str = _ADT_ALLOWLIST_BUNDLE_BASENAME,
 ) -> None:
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "model_bundle_dir": "models",
         "snapshot_manifest_dir": "snapshots",
         "canonical_mapping_parquet": f"mapping/{mapping_name}",
         "local_state_dir": "local_state",
+        "feast_repo_dir": "feast_repo",
+        "feast_artifacts_dir": "artifacts/feast",
+        "feast_readiness_path": "artifacts/feast/feast_online_readiness.json",
+        "adt_allowlist_parquet": f"mapping/{adt_allowlist_basename}",
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def _write_readme(path: Path) -> None:
-    body = """# trainer_hightier deploy bundle (standalone)
+    body = """# trainer_hightier deploy bundle (standalone, scorer v2 Feast)
 
-## Layout
+## Layout (no repo checkout required)
 
-- `main.py` — primary entrypoint (run from this directory)
-- `wheels/` — `trainer_hightier` wheel built at package time
-- `requirements.txt` — install the local wheel; dependencies resolve from PyPI
-- `.env.example` — copy to `.env` and set ClickHouse credentials (optional overrides)
-- `models/` — `model.pkl`, `training_metrics.json`, `model_version`
-- `snapshots/active_manifest.json` — layer paths are relative to the `snapshots/` directory
-- `snapshots/artifacts/` — Parquet layers referenced by the manifest
+- `main.py` — unified entrypoint (`python main.py --mode all`)
+- `wheels/` — `trainer_hightier` wheel (install from this directory)
+- `requirements.txt` — local wheel + PyPI / internal-index deps (must install `feast` for refresh)
+- `.env.example` — copy to `.env`; set ClickHouse credentials
+- `models/` — `model.pkl`, `training_metrics.json`, frozen registry snapshot, `model_version`
 - `mapping/` — canonical mapping Parquet
-- `local_state/` — runtime SQLite (`state.db`, `feature_state.db`)
+- `snapshots/` — optional seed Parquet layers + `active_manifest.json` (legacy snapshot plane; **not** scorer v2 mid/long supplier)
+- `feast_repo/` — Feast definitions + bundle-local online store / registry paths (required for scorer v2)
+- `artifacts/feast/` — writable Feast readiness + refresh reports (bundle-local paths)
+- `local_state/` — `state.db`, `feature_state.db`, `prediction_log.db`
 
 ## Prerequisites
 
-- Python 3.9+ on the target host
-- Network access to PyPI (or an internal index configured for `pip`), unless you
-  pre-populate `wheels/` with all transitive wheels (not generated by default)
+- Python 3.9+
+- ClickHouse reachable from the production host (credentials in `.env`)
+- `pip install -r requirements.txt` using PyPI or an internal package index
+- `feast` CLI on PATH (used by startup refresh)
 
 ## Install
 
@@ -560,31 +600,57 @@ python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\\Scripts\\activate
 pip install -r requirements.txt
 cp .env.example .env
-# Edit .env: set CH_USER / CH_PASS (or CH_PASSWORD) at minimum
+# Set at minimum: CH_USER, CH_PASS (or CH_PASSWORD)
 ```
 
-## Run (unified)
+Offline / fully vendored third-party wheels are optional backup SOP. The first production slice assumes the host can
+install transitive dependencies from PyPI or an internal index because the final production OS / architecture may vary.
 
-From **this bundle root** (the directory that contains `main.py`)::
+## Run (scorer v2 production)
 
-  python main.py --mode all
+From **this bundle root**:
 
-Modes: `all` (default), `api`, `scorer`, `validator`. Optional `--host`, `--port` apply to API thread.
+```bash
+python main.py --mode all
+```
 
-Equivalent (after install)::
+Default behavior for `mode=all` / `mode=scorer`:
 
-  python -m trainer_hightier.deploy.main --bundle-dir /path/to/this/folder --mode all
+1. Preflight model, mapping, allowlist, `feast_repo`
+2. Resolve Feast repo / registry / online-store paths bundle-locally
+3. If Feast readiness missing/stale (or `--force-feast-refresh`): acquire a short-timeout lock and run **startup Feast online refresh** from ClickHouse
+4. Persist latest readiness payload/hash in `feature_state.db`, then atomically publish `artifacts/feast/feast_online_readiness.json`
+5. Run deploy Feast readiness + allowlist online smoke
+6. Start API (background), validator (background), scorer (foreground)
 
-## Offline / no PyPI
+If lock acquisition, refresh, readiness persistence/publish, or smoke fails, startup **aborts** (no partial scorer).
 
-Mirror the pinned versions from the wheel metadata, or vendor wheels into `wheels/` and
-use `pip install -r requirements.txt --no-index -f wheels/` (organizational SOP).
+Flags:
+
+- `--no-feast-startup-refresh` — skip startup refresh (debug only; scorer will likely fail readiness gate)
+- `--force-feast-refresh` — force refresh even if readiness looks fresh
+- `--host` / `--port` — API bind address
+
+Manual refresh (ops):
+
+```bash
+python -m trainer_hightier.serving.feast_online_refresh \\
+  --source clickhouse --layers mid,slow \\
+  --adt-allowlist mapping/adt_allowed_players_q0p99.parquet \\
+  --canonical-mapping mapping/canonical_player_mapping.parquet
+```
+
+## Future must-do (not in first bundle slice)
+
+**Scheduled or daemon Feast online refresh** after startup is required for long-running production without daily process restarts. Until implemented, re-run `feast_online_refresh` or restart deploy when gaming-day anchors go stale.
+
+## Legacy note
+
+Older docs may describe Parquet snapshot refresh supervisor as the primary refresh path. Scorer v2 adopted path is **Feast online**, not manifest Parquet fallback at score time.
 
 ## Rollback
 
-Keep the previous bundle directory or zip. Stop processes, swap folder or symlink,
-restart with the same `python main.py` command; verify `bundle_info.json`,
-`/health`, and boot logs (`model_version`, `manifest_version`, `allowlist_sha256`).
+Keep previous bundle; stop processes; swap directory; restart `python main.py --mode all`.
 """
     path.write_text(body, encoding="utf-8")
 
@@ -683,7 +749,7 @@ def _write_standalone_requirements(dest: Path, *, wheel_filename: str) -> None:
     """Write ``requirements.txt`` with a relative wheel path and comment header."""
     wheel_line = f"wheels/{wheel_filename}"
     dest.write_text(
-        "# trainer_hightier standalone: local wheel; transitive deps from PyPI (wheel metadata).\n"
+        "# trainer_hightier standalone: local wheel; transitive deps from PyPI/internal index (wheel metadata).\n"
         "# Run from THIS directory (bundle root): pip install -r requirements.txt\n"
         f"{wheel_line}\n",
         encoding="utf-8",
@@ -741,6 +807,7 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
     if root.exists() and any(root.iterdir()):
         raise FileExistsError(f"output dir must be empty or absent: {root}")
     root.mkdir(parents=True, exist_ok=True)
+    _copy_feast_repo_to_bundle(root)
     wheels_dir = root / "wheels"
     wheel_name = _build_trainer_hightier_wheel(wheels_dir=wheels_dir)
     _write_bundle_main_py(root / "main.py")
@@ -751,7 +818,8 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
     art_dir = snap_dir / "artifacts"
     map_dir = root / "mapping"
     local_dir = root / "local_state"
-    for d in (art_dir, map_dir, local_dir):
+    feast_art_dir = root / "artifacts" / "feast"
+    for d in (art_dir, map_dir, local_dir, feast_art_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     mver = _ensure_model_bundle(model_bundle, models_dir, strict=strict)
@@ -783,10 +851,10 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
 
     slow_rel = new_man.get("slow_patron_parquet")
     if strict and (not slow_rel or not (snap_dir / slow_rel).is_file()):
-        raise FileNotFoundError(
-            f"strict pack requires slow_patron_parquet present in bundle; got {slow_rel!r}"
+        logger.warning(
+            "[pack] slow_patron_parquet missing; scorer v2 bundle uses Feast online for mid/long"
         )
-    if isinstance(slow_rel, str) and slow_rel:
+    if isinstance(slow_rel, str) and slow_rel and (snap_dir / slow_rel).is_file():
         slow_pack_path = (snap_dir / slow_rel).resolve()
 
     if strict and man.get("trial_bet_behavior_parquet") and not new_man.get("trial_bet_behavior_parquet"):
@@ -801,12 +869,23 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
             f"manifest keys={sorted(new_man.keys())}"
         )
     al_rel = new_man.get("adt_allowlist_parquet")
-    if isinstance(al_rel, str) and al_rel:
+    if isinstance(al_rel, str) and al_rel and (snap_dir / al_rel).is_file():
         allow_pack_path = (snap_dir / al_rel).resolve()
 
     map_name = map_src.name
     map_dest_path = map_dir / map_name
     shutil.copy2(map_src, map_dest_path)
+
+    fixed_allow_path = map_dir / _ADT_ALLOWLIST_BUNDLE_BASENAME
+    if allow_pack_path is not None and allow_pack_path.is_file():
+        if allow_pack_path.resolve() != fixed_allow_path.resolve():
+            shutil.copy2(allow_pack_path, fixed_allow_path)
+        allow_pack_path = fixed_allow_path
+    elif strict:
+        raise ValueError(
+            "strict pack requires ADT allowlist parquet for Feast scorer v2 bundle; "
+            f"manifest keys={sorted(new_man.keys())}"
+        )
 
     trial_pack_path: Path | None = None
     tr_rel = new_man.get("trial_bet_behavior_parquet")
@@ -842,6 +921,7 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
         slow_pack_path=slow_pack_path,
         map_dest_path=map_dest_path,
         allow_pack_path=allow_pack_path,
+        feast_bundle=True,
     )
     frozen_snap = _load_and_verify_frozen_registry(models_dir=models_dir, metrics=metrics, strict=strict)
     if frozen_snap is not None:
@@ -861,6 +941,7 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
             mid_term_pack_path=mid_term_pack_path,
             manifest=dict(new_man) if isinstance(new_man, dict) else None,
             validation_stage="package",
+            scorer_v2_feast_mode=True,
         )
 
     out_manifest = snap_dir / "active_manifest.json"

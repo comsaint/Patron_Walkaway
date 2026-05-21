@@ -21,13 +21,11 @@ from trainer_hightier.config import (
     TRAINER_HIGHTIER_PACKAGE_DIR,
     default_hightier_serving_config,
 )
-from trainer_hightier.feature_experiment.feast_long_term_spike import (
-    SPIKE_FEATURE_VIEW_NAME as LONG_SPIKE_FEATURE_VIEW_NAME,
-    SPIKE_LONG_TERM_FEATURE_COLUMNS,
-)
-from trainer_hightier.feature_experiment.feast_mid_term_spike import (
-    SPIKE_FEATURE_VIEW_NAME as MID_SPIKE_FEATURE_VIEW_NAME,
-    SPIKE_MID_TERM_FEATURE_COLUMNS,
+from trainer_hightier.serving.feast_production_constants import (
+    LONG_SPIKE_FEATURE_VIEW_NAME,
+    MID_SPIKE_FEATURE_VIEW_NAME,
+    PRODUCTION_LONG_TERM_FEATURE_COLUMNS,
+    PRODUCTION_MID_TERM_FEATURE_COLUMNS,
 )
 from trainer_hightier.serving.adt_allowlist import load_adt_allowlist_ids, resolve_adt_allowlist_path
 from trainer_hightier.serving.ch_adapter import get_clickhouse_client
@@ -48,6 +46,7 @@ from trainer_hightier.serving.feature_state_store import (
     feast_refresh_run_finish,
     feast_refresh_run_start,
     init_feature_state_db,
+    persist_feast_online_readiness_latest,
     upsert_feast_refresh_layer,
 )
 from trainer_hightier.serving.production_materialize import (
@@ -292,7 +291,7 @@ def write_mid_feast_parquet(full_snap: Path, feast_out: Path) -> int:
     dst = Path(feast_out).resolve()
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst_esc = str(dst).replace("\\", "/").replace("'", "''")
-    feat_cols = ", ".join(f'"{c}"' for c in SPIKE_MID_TERM_FEATURE_COLUMNS)
+    feat_cols = ", ".join(f'"{c}"' for c in PRODUCTION_MID_TERM_FEATURE_COLUMNS)
     sql = f"""
 COPY (
   SELECT canonical_id, {feat_cols},
@@ -324,7 +323,7 @@ def write_slow_feast_parquet(full_snap: Path, feast_out: Path) -> int:
     dst = Path(feast_out).resolve()
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst_esc = str(dst).replace("\\", "/").replace("'", "''")
-    feat_cols = ", ".join(f'"{c}"' for c in SPIKE_LONG_TERM_FEATURE_COLUMNS)
+    feat_cols = ", ".join(f'"{c}"' for c in PRODUCTION_LONG_TERM_FEATURE_COLUMNS)
     sql = f"""
 COPY (
   SELECT canonical_id, {feat_cols},
@@ -637,8 +636,8 @@ def run_feast_online_refresh(opts: RefreshOptions) -> dict[str, Any]:
                     feature_views=tuple(views),
                     feast_parquets=tuple(parquets),
                 )
-        mid_cols = SPIKE_MID_TERM_FEATURE_COLUMNS if "mid" in opts.layers else ()
-        slow_cols = SPIKE_LONG_TERM_FEATURE_COLUMNS if "slow" in opts.layers else ()
+        mid_cols = PRODUCTION_MID_TERM_FEATURE_COLUMNS if "mid" in opts.layers else ()
+        slow_cols = PRODUCTION_LONG_TERM_FEATURE_COLUMNS if "slow" in opts.layers else ()
         smoke = run_allowlist_feast_lookup_smoke(
             feast_repo=opts.feast_repo,
             allowlist_parquet=opts.adt_allowlist,
@@ -680,6 +679,11 @@ def run_feast_online_refresh(opts: RefreshOptions) -> dict[str, Any]:
                 detail_json=json.dumps(outcome.detail),
             )
         if readiness_doc is not None:
+            persist_feast_online_readiness_latest(
+                run_id,
+                readiness_doc.to_dict(),
+                path=Path(cfg.feature_state_db_path).resolve(),
+            )
             write_feast_online_readiness(readiness_doc, opts.readiness_path)
         summary.update(
             {

@@ -711,6 +711,16 @@ def test_build_bundle_rewrites_manifest_relative_paths(tmp_path: Path) -> None:
     assert (out / "main.py").is_file()
     assert (out / ".env.example").is_file()
     assert (out / "requirements.txt").is_file()
+    assert (out / "feast_repo" / "feature_store.yaml").is_file()
+    assert (out / "artifacts" / "feast").is_dir()
+    deploy_paths = json.loads((out / "deploy_bundle_paths.json").read_text(encoding="utf-8"))
+    assert deploy_paths.get("schema_version") == 2
+    assert deploy_paths.get("feast_repo_dir") == "feast_repo"
+    assert deploy_paths.get("feast_readiness_path") == "artifacts/feast/feast_online_readiness.json"
+    assert deploy_paths.get("adt_allowlist_parquet") == "mapping/adt_allowed_players_q0p99.parquet"
+    assert (out / "mapping" / "adt_allowed_players_q0p99.parquet").is_file()
+    feast_yaml = (out / "feast_repo" / "feature_store.yaml").read_text(encoding="utf-8")
+    assert "artifacts/feast/duckdb_staging" in feast_yaml
     whls = list((out / "wheels").glob("trainer_hightier-*.whl"))
     assert whls, "expected trainer_hightier wheel under bundle wheels/"
     req_txt = (out / "requirements.txt").read_text(encoding="utf-8")
@@ -1221,7 +1231,7 @@ def test_phase_b_wheel_excludes_junk_and_includes_serving(tmp_path: Path) -> Non
     with zipfile.ZipFile(whls[0]) as zf:
         names = zf.namelist()
     assert not any("/build/lib/" in n for n in names), names[:20]
-    assert not any(n.startswith("trainer_hightier/feature_experiment/") for n in names)
+    assert any(n.startswith("trainer_hightier/feature_experiment/") for n in names)
     assert not any(n.startswith("trainer_hightier/tests/") for n in names)
     assert not any(n.startswith("trainer_hightier/feast_repo/") for n in names)
     assert any(n.endswith("trainer_hightier/utils/__init__.py") for n in names)

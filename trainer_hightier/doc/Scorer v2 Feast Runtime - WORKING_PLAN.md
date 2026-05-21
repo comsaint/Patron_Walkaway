@@ -19,6 +19,12 @@
 - Feast entity row missing 不等同正常 NULL：第一版採 **skip missing rows + prediction-log audit status**。
 - Feast entity row missing 比例 **> 10%** 時，整批 hard fail，避免 refresh / key / mapping 系統性問題被靜默吞掉。
 - 不允許 production scorer runtime fallback 到 legacy training Parquet、`fe_derived_parquet` 或 `fe_short_term_parquet`，不提供 production debug fallback。
+- Scorer-capable deploy (`all` / `scorer`) 採 **startup Feast online refresh**；`api` / `validator` 不觸發 refresh。
+- Production dependency install 第一版接受 `pip install -r requirements.txt` 從 PyPI / internal index 安裝；`wheels/` 必須有 local package wheel，third-party wheelhouse 僅作備援。
+- Feast runtime paths 必須 bundle-local：`feast_repo/`、`artifacts/feast/`、`local_state/feature_state.db`、`mapping/adt_allowed_players_q0p99.parquet`。
+- Startup refresh lock 採短 timeout + fail-fast；freshness 判斷只讀 config / readiness metadata。
+- `feature_state.db` 保存 latest readiness payload/hash/run id/generated_at；`feast_online_readiness.json` 保留為 latest deploy/scorer gate snapshot。
+- Post-startup scheduled / daemon Feast refresh 是 future must-do，不混入 startup auto-refresh 第一版。
 
 ## 執行護欄
 
@@ -28,7 +34,262 @@
 - 不把 ClickHouse credentials、Feast online store credentials 或環境差異塞進環境變數控制行為；runtime 行為設定應收斂在既有 config / Python config。
 - 不新增多餘架構層。第一輪只允許為 scorer v2 必要邊界新增小型 adapter / helper。
 
-## 建議執行順序
+## 本輪聚焦 slice（優先執行）
+
+**Next Slice: Startup Auto-refresh + No-repo Feast Bundle**
+
+本輪只處理 deploy / package / refresh integration，使 production 可在 **無 repo checkout** 下以
+`python main.py --mode all` 啟動 scorer v2。**不**混入 post-startup scheduled / daemon Feast refresh（future must-do）。
+
+```mermaid
+flowchart TD
+    bundleBuild["Build deploy bundle"] --> installDeps["pip install requirements"]
+    installDeps --> deployStart["python main.py --mode all"]
+    deployStart --> preflight["Preflight model mapping allowlist feast_repo"]
+    preflight --> readinessCheck["Read config and readiness metadata"]
+    readinessCheck --> needsRefresh{"Needs refresh?"}
+    needsRefresh -->|"No"| smoke["Deploy Feast smoke"]
+    needsRefresh -->|"Yes"| lock["Acquire short-timeout lock"]
+    lock --> refresh["feast_online_refresh"]
+    refresh --> persistDb["Persist latest readiness in feature_state.db"]
+    persistDb --> publishJson["Atomic readiness JSON publish"]
+    publishJson --> smoke
+    smoke --> startRuntime["Start API validator scorer"]
+```
+
+### Slice 建議執行順序
+
+```mermaid
+flowchart TD
+    s1["S1 Package and Bundle Layout"]
+    s2["S2 Bundle-local Feast Paths"]
+    s3["S3 Readiness Persistence"]
+    s4["S4 Deploy Startup Auto-refresh"]
+    s5["S5 Disable Legacy Snapshot Supervisor"]
+    s6["S6 Tests and No-repo Smoke"]
+
+    s1 --> s2
+    s2 --> s3
+    s3 --> s4
+    s4 --> s5
+    s5 --> s6
+```
+
+## Slice S1: Package Dependency and Bundle Layout
+
+目的：產出 scorer v2 可用的 no-repo deploy bundle；依賴由 PyPI / internal index 安裝，不要求 vendor third-party wheels。
+
+- ID: `S1-1`
+  - Task: 在 `pyproject.toml` 加入 `feast` runtime dependency（版本鎖定），使 `pip install -r requirements.txt` 可安裝 refresh / scorer 所需 Feast SDK。
+  - Owner: agent
+  - Files: `trainer_hightier/pyproject.toml`, bundle `requirements.txt`
+  - Dependencies: 已定前置決策
+  - Definition of Done: 乾淨 venv 執行 `pip install -r requirements.txt` 後 `import feast` 成功；wheel 仍只 vendor `trainer_hightier` local wheel。
+
+- ID: `S1-2`
+  - Task: `build_deploy_package.py` 打包 `feast_repo/` 到 bundle root；建立可寫入的 `artifacts/feast/`、`local_state/` 目錄。
+  - Owner: agent
+  - Files: `trainer_hightier/build_deploy_package.py`
+  - Dependencies: `S1-1`
+  - Definition of Done: bundle 含 `feast_repo/`、`artifacts/feast/`、`local_state/`；`deploy_bundle_paths.json` 記錄 bundle-local Feast / readiness / feature_state 路徑。
+
+- ID: `S1-3`
+  - Task: 固定 ADT allowlist bundle 位置為 `mapping/adt_allowed_players_q0p99.parquet`（或 manifest / `deploy_bundle_paths.json` 明確指向）；deploy 與 refresh 從 bundle 解析並傳入 `--adt-allowlist`。
+  - Owner: agent
+  - Files: `trainer_hightier/build_deploy_package.py`, `trainer_hightier/deploy/main.py`
+  - Dependencies: `S1-2`
+  - Definition of Done: 無 repo 時 deploy / refresh 不需隱含 dev path 即可找到 allowlist。
+
+- ID: `S1-4`
+  - Task: 更新 bundle preflight / strict pack gate：scorer v2 不再以 `slow_patron_parquet` / `mid_term_snapshot_parquet` 缺失作為 production blocker；改驗證 Feast repo、mapping、allowlist、model bundle 結構。
+  - Owner: agent
+  - Files: `trainer_hightier/build_deploy_package.py`, `trainer_hightier/deploy/main.py`
+  - Dependencies: `S1-2`, `S1-3`
+  - Definition of Done: Feast-capable bundle 可在缺 legacy snapshot parquet 時建包；legacy-only gate 不阻擋 scorer v2 path。
+
+- ID: `S1-5`
+  - Task: 移除或隔離 serving runtime 對 `trainer_hightier.feature_experiment` 的 import（wheel 已 exclude 該 package）；consolidate spike constants 到 production module，避免 no-repo `ModuleNotFoundError`。
+  - Owner: agent
+  - Files: `trainer_hightier/serving/feast_readiness.py`, `trainer_hightier/serving/feast_online_refresh.py`, 等
+  - Dependencies: `S1-1`
+  - Definition of Done: 安裝 wheel 後 scorer / refresh 可 import，不依賴 repo checkout 或 `feature_experiment`。
+
+## Slice S2: Bundle-local Feast Path Contract
+
+目的：Feast repo / online store / readiness 路徑在 production 全部 bundle-local，不含 dev machine absolute path。
+
+- ID: `S2-1`
+  - Task: 擴充 `HightierServingConfig` / deploy override：bundle-local `scorer_feast_repo_path`、`scorer_feast_readiness_path`、`feature_state_db_path` 預設指向 bundle 內 `feast_repo/`、`artifacts/feast/feast_online_readiness.json`、`local_state/feature_state.db`。
+  - Owner: agent
+  - Files: `trainer_hightier/config.py`, `trainer_hightier/deploy/main.py`
+  - Dependencies: `S1-2`
+  - Definition of Done: `_serving_config_for_bundle` 設定 Feast 路徑；scorer / refresh 在 bundle 內不需手動 override。
+
+- ID: `S2-2`
+  - Task: 建包或 deploy startup 時 rewrite `feast_repo/feature_store.yaml`（及 registry / online store path）為 bundle-relative 或 bundle-root absolute path。
+  - Owner: agent
+  - Files: `trainer_hightier/build_deploy_package.py` 或 `trainer_hightier/deploy/main.py`, `trainer_hightier/feast_repo/`
+  - Dependencies: `S2-1`
+  - Definition of Done: production host 上 Feast apply / materialize / lookup 不讀 dev machine path；smoke 可 reach online store。
+
+## Slice S3: Readiness Persistence
+
+目的：refresh 成功後 DB 保存 audit + latest readiness payload；JSON 作 deploy/scorer gate snapshot。
+
+- ID: `S3-1`
+  - Task: 在 `feature_state_store.py` 新增 latest readiness meta helpers，寫入 `feature_state_meta` keys：
+    `feast_online_readiness_latest_json`、`feast_online_readiness_latest_sha256`、`feast_online_readiness_latest_run_id`、
+    `feast_online_readiness_latest_generated_at`。
+  - Owner: agent
+  - Files: `trainer_hightier/serving/feature_state_store.py`
+  - Dependencies: 無（可與 S1 並行）
+  - Definition of Done: unit test 可讀寫上述 keys；payload 為完整 readiness doc JSON。
+
+- ID: `S3-2`
+  - Task: `feast_readiness.py` 的 `write_feast_online_readiness` 改為 atomic write（temp + replace），與 manifest publish 同模式。
+  - Owner: agent
+  - Files: `trainer_hightier/serving/feast_readiness.py`
+  - Dependencies: 無
+  - Definition of Done: 中斷 write 不會留下半份 JSON；test 覆蓋 atomic replace。
+
+- ID: `S3-3`
+  - Task: `feast_online_refresh.py` 固定 publish 順序：build final readiness doc → persist DB latest payload/hash/run id/generated_at → atomic write JSON → return success。
+  - Owner: agent
+  - Files: `trainer_hightier/serving/feast_online_refresh.py`
+  - Dependencies: `S3-1`, `S3-2`
+  - Definition of Done: DB persistence 或 JSON publish 任一步失敗則 run status=error、verdict!=ok；test 覆蓋 ordering。
+
+## Slice S4: Deploy Startup Auto-refresh
+
+目的：`deploy/main.py` 在 scorer-capable mode 啟動前執行 Feast startup refresh + smoke；fail-fast。
+
+- ID: `S4-1`
+  - Task: 新增 CLI flags：`--no-feast-startup-refresh`（預設 refresh 開）、`--force-feast-refresh`。
+  - Owner: agent
+  - Files: `trainer_hightier/deploy/main.py`
+  - Dependencies: `S2-1`, `S3-3`
+  - Definition of Done: flags 可從 bundle `main.py` 轉發；help text 與 README_DEPLOY 一致。
+
+- ID: `S4-2`
+  - Task: 實作 `_startup_feast_refresh_or_raise`：讀 config + `feast_online_readiness.json`，用 `evaluate_feast_readiness_gate` / freshness helpers 判斷是否需 refresh；missing / stale / forced 時呼叫 `run_feast_online_refresh`。
+  - Owner: agent
+  - Files: `trainer_hightier/deploy/main.py`, `trainer_hightier/serving/feast_readiness.py`
+  - Dependencies: `S4-1`, `S3-3`
+  - Definition of Done: fresh readiness + smoke pass 時跳過 refresh；stale 判斷不 hard-code 在 deploy，只讀 config / readiness metadata。
+
+- ID: `S4-3`
+  - Task: 實作 bundle-local Feast refresh lock（例如 `artifacts/feast/.feast_online_refresh.lock`）：短 timeout wait，超時 fail-fast；不與 legacy snapshot lock 混用。
+  - Owner: agent
+  - Files: `trainer_hightier/deploy/main.py`, `trainer_hightier/config.py`（timeout 常數）
+  - Dependencies: `S4-2`
+  - Definition of Done: 兩個 deploy process 同時 refresh 時第二個在 timeout 內 fail；test 或 manual 可驗證 contention。
+
+- ID: `S4-4`
+  - Task: refresh 成功後執行 deploy Feast readiness gate + allowlist online smoke（reuse `run_deploy_feast_readiness_check`）；任一失敗 abort startup。
+  - Owner: agent
+  - Files: `trainer_hightier/deploy/main.py`
+  - Dependencies: `S4-2`
+  - Definition of Done: refresh ok 但 smoke fail 時不啟動 API / validator / scorer。
+
+- ID: `S4-5`
+  - Task: mode gating：僅 `mode=all` / `mode=scorer` 跑 startup refresh；`mode=api` / `mode=validator` 不觸發 refresh，且在 scorer-capable startup 成功後才啟動（`all` 模式）。
+  - Owner: agent
+  - Files: `trainer_hightier/deploy/main.py`
+  - Dependencies: `S4-4`
+  - Definition of Done: `mode=api` alone 不跑 CH export；`mode=all` 順序為 refresh → smoke → API thread → validator thread → scorer foreground。
+
+- ID: `S4-6`
+  - Task: deploy 明確傳 `--adt-allowlist`、`--canonical-mapping`、`--bundle-dir`（或等效 config）給 scorer subprocess / foreground。
+  - Owner: agent
+  - Files: `trainer_hightier/deploy/main.py`
+  - Dependencies: `S1-3`, `S4-5`
+  - Definition of Done: scorer 啟動 log 顯示 bundle-local allowlist / mapping path。
+
+## Slice S5: Disable Legacy Snapshot Supervisor
+
+目的：scorer v2 不保留雙路 runtime；Parquet snapshot supervisor 不作 mid/long supplier。
+
+- ID: `S5-1`
+  - Task: scorer-capable deploy 預設 **不** 呼叫 `_start_refresh_supervisor` / `_startup_snapshot_repair_or_raise`；移除或 gated 掉 legacy Parquet refresh 作為 v2 主路徑。
+  - Owner: agent
+  - Files: `trainer_hightier/deploy/main.py`
+  - Dependencies: `S4-5`
+  - Definition of Done: `mode=all` 啟動 log 無 mid/slow Parquet snapshot repair；Feast startup refresh 為唯一 mid/long refresh plane。
+
+- ID: `S5-2`
+  - Task: `_preflight_frozen_artifacts` / `_preflight_feature_supplyability` 改為 Feast / bounded PIT aware：不再 hard-require `slow_patron_parquet` 作 scorer v2 blocker。
+  - Owner: agent
+  - Files: `trainer_hightier/deploy/main.py`, `trainer_hightier/serving/feature_supply.py`
+  - Dependencies: `S1-4`, `S5-1`
+  - Definition of Done: Feast bundle preflight 通過時不因 legacy snapshot 缺失 fail；historical manifest keys 可保留但非 v2 gate。
+
+- ID: `S5-3`
+  - Task: 保留 `--no-refresh-supervisor` 僅作 legacy/debug 或文件標 deprecated；文件註明 scorer v2 應使用 `--no-feast-startup-refresh` 作 debug skip。
+  - Owner: agent
+  - Files: `trainer_hightier/deploy/main.py`, `README_DEPLOY.md`（由 builder 生成）
+  - Dependencies: `S5-1`
+  - Definition of Done: operator 文件不再把 Parquet supervisor 描述為 scorer v2 主 refresh path。
+
+## Slice S6: Tests and No-repo Smoke
+
+目的：自動化驗證 startup slice；production gate 可重現。
+
+- ID: `S6-1`
+  - Task: unit tests — latest readiness meta read/write（`S3-1`）、atomic JSON publish（`S3-2`）、refresh publish ordering mock（`S3-3`）。
+  - Owner: agent
+  - Files: `trainer_hightier/tests/test_feature_state_store.py`（或新 test module）, `trainer_hightier/tests/test_feast_online_refresh.py`
+  - Dependencies: `S3-3`
+  - Definition of Done: CI 不需 live CH / Feast 即可驗證 persistence contract。
+
+- ID: `S6-2`
+  - Task: unit tests — deploy lock short-timeout fail-fast、mode gating（mock refresh / smoke）、`--force-feast-refresh` / `--no-feast-startup-refresh`。
+  - Owner: agent
+  - Files: `trainer_hightier/tests/test_deploy_main.py`（或等效）
+  - Dependencies: `S4-5`, `S5-1`
+  - Definition of Done: mock 下 deploy startup 順序與 fail-fast 行為有測試覆蓋。
+
+- ID: `S6-3`
+  - Task: integration smoke — 建最小 bundle fixture，`pip install -r requirements.txt`（mock PyPI 或 test venv），驗證 import + deploy preflight path resolution。
+  - Owner: agent
+  - Files: `trainer_hightier/tests/test_build_deploy_package.py`（或新 test）
+  - Dependencies: `S1-2`, `S2-1`
+  - Definition of Done: 無 repo checkout 的 bundle 結構測試通過；Feast paths 在 `deploy_bundle_paths.json` 可解析。
+
+- ID: `S6-4`
+  - Task: production dry run checklist（manual / user）：在 target host 執行 `python main.py --mode all`，確認 startup refresh → smoke → scorer；記錄 refresh 耗時、RAM、anchor。
+  - Owner: user + agent
+  - Dependencies: `S4-4`, `S5-1`, `S6-3`
+  - Definition of Done: dry run log 含 readiness path、run_id、mid/slow anchor；失敗時 fail-fast 訊息可 action。
+
+## Slice 迭代分組
+
+- **Iteration A（S1 + S2）**：bundle 可建、Feast path bundle-local、依賴可 install。
+  - Exit：`build_deploy_package` 產出含 `feast_repo/` 的 bundle；config override 正確。
+
+- **Iteration B（S3）**：readiness persistence + atomic publish。
+  - Exit：refresh CLI 成功後 DB + JSON 一致；ordering tests 綠。
+
+- **Iteration C（S4 + S5）**：deploy startup auto-refresh、停用 legacy supervisor。
+  - Exit：`python main.py --mode all` 在 mock/staging 上跑通 startup sequence。
+
+- **Iteration D（S6）**：測試 + no-repo smoke + production dry run。
+  - Exit：Release gate（見下）startup 相關項全勾。
+
+## Slice Release Gate
+
+本 slice 完成時至少滿足：
+
+- Bundle：`feast_repo/`、`artifacts/feast/`、`local_state/`、`mapping/adt_allowed_players_q0p99.parquet` 存在且 path 可解析。
+- Install：`pip install -r requirements.txt` 從 PyPI / internal index 成功；`feast` import 成功。
+- Startup：`mode=all` / `mode=scorer` 在 readiness 缺失/stale 時 auto-refresh；fresh 時 skip。
+- Lock：短 timeout contention fail-fast。
+- Publish：final doc → DB latest meta → atomic JSON → deploy smoke。
+- Legacy：Parquet snapshot supervisor 不作 scorer v2 mid/long path。
+- **Out of scope**：post-startup scheduled / daemon Feast refresh（future must-do，另開 slice）。
+
+## 背景：Scorer v2 廣域 Phases（非本輪）
+
+以下 Phase 0–6 為 scorer runtime 整體路線圖；**本輪不重新執行或阻塞於此**，除非 task 明確依賴（例如 scorer 已具備 Feast adapter 才做 production dry run）。
 
 ```mermaid
 flowchart TD
@@ -50,21 +311,21 @@ flowchart TD
 
 ## Phase 0: Contract Alignment
 
-目的：先讓文件 contract 接受 Feast mid/long 作為 scorer v2 adopted supplier，避免 implementation 和 SSOT 互相打架。
+> **狀態**：文件層已完成（SSOT、decision record、implementation plan 已對齊）。保留供追溯。
 
-- ID: `P0-1`
+- ID: `P0-1` **done**
   - Task: 更新 `Scorer Runtime Contract - SSOT.md`，將 Feast mid/long supplier 從 experimental reference 升級為 scorer v2 adopted runtime path。
   - Owner: agent
   - Dependencies: 已定前置決策
   - Definition of Done: SSOT 明確列出 mid-term `fe__*` / long-term `patron__*__w180d_m1snap` 可由 Feast online supplier 供應，且保留 no silent fill / no training artifact rule。
 
-- ID: `P0-2`
+- ID: `P0-2` **done**
   - Task: 更新 `Feast Production Feasibility Spike - DECISION_RECORD.md` 狀態，標記 spike 已進入 scorer v2 integration planning，不再只是 reference。
   - Owner: agent
   - Dependencies: `P0-1`
   - Definition of Done: 文件指出 scorer v2 採用 Feast mid/long；short-term Feast 仍非第一版 scope，short-term `fe__*` production supplier 為 bounded PIT builder。
 
-- ID: `P0-3`
+- ID: `P0-3` **done**
   - Task: 將 missing policy 寫入 contract：cell-level NULL allowed + logged；entity row missing skip + audit；batch missing rate > 10% hard fail。
   - Owner: agent
   - Dependencies: `P0-1`
@@ -272,8 +533,11 @@ Scorer v2 不應標記 production-ready，除非以下項目全數通過：
 
 ## Open Execution Risks
 
-- 真 Feast online store schema 與 spike definitions 可能尚未完全 production 化；需在 `P4` 前確認 feature service 名稱與 entity key。
-- Refresh plane 可能還沒有 scorer 可讀的 readiness metadata；`P5` 可能需要補小型 metadata writer。
+- `feature_experiment` 仍被 serving import 但 wheel exclude 該 package → no-repo `ModuleNotFoundError`（`S1-5` 必須先解）。
+- `build_deploy_package` / `deploy/main.py` 仍驗證 legacy snapshot parquet、仍跑 snapshot supervisor（`S1-4`、`S5-1`）。
+- `feature_state.db` 尚未保存 latest readiness JSON/hash（`S3-1`）。
+- `pyproject.toml` 尚未宣告 `feast` dependency（`S1-1`）。
+- 真 Feast online store schema 與 spike definitions 可能尚未完全 production 化；production dry run 前確認 feature service 名稱與 entity key。
 - short-term `fe__*` 若出現在目前 model feature set，且 bounded PIT builder 尚未支援，會阻擋 scorer readiness；不得以 `fe_short_term_parquet` 解鎖 production。
-- skipped rows audit 若只寫 process log、不落 prediction log，事後追蹤不足；第一版必須落入 prediction log status。
 - `>10%` missing entity threshold 是第一版 operational guardrail；若 dry run 顯示正常業務 coverage 會超過此值，必須回到 SSOT/decision record 重新批准。
+- **Future must-do**：post-startup scheduled Feast refresh 未在本 slice；長期運行需手動 re-refresh 或重啟直至下一 slice。

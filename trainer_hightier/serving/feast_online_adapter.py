@@ -10,18 +10,17 @@ from typing import Any, Protocol
 
 import pandas as pd
 
-from trainer_hightier.config import TRAINER_HIGHTIER_PACKAGE_DIR
-from trainer_hightier.feature_experiment.feast_long_term_spike import (
-    SPIKE_LONG_TERM_FEATURE_COLUMNS,
-    SPIKE_ONLINE_FEATURE_REFS as LONG_SPIKE_ONLINE_FEATURE_REFS,
-    SPIKE_FEATURE_VIEW_NAME as LONG_SPIKE_FEATURE_VIEW_NAME,
-)
-from trainer_hightier.feature_experiment.feast_mid_term_spike import (
-    SPIKE_MID_TERM_FEATURE_COLUMNS,
-    SPIKE_ONLINE_FEATURE_REFS as MID_SPIKE_ONLINE_FEATURE_REFS,
-    SPIKE_FEATURE_SERVICE_NAME as MID_SPIKE_FEATURE_SERVICE_NAME,
-    SPIKE_FEATURE_VIEW_NAME as MID_SPIKE_FEATURE_VIEW_NAME,
-    _feast_entity_rows,
+from trainer_hightier.config import TRAINER_HIGHTIER_PACKAGE_DIR, default_hightier_serving_config
+from trainer_hightier.serving.feast_production_constants import (
+    LONG_SPIKE_FEATURE_VIEW_NAME,
+    LONG_TERM_FEATURE_SERVICE_NAME,
+    LONG_TERM_ONLINE_FEATURE_REFS,
+    MID_SPIKE_FEATURE_SERVICE_NAME,
+    MID_SPIKE_FEATURE_VIEW_NAME,
+    MID_TERM_ONLINE_FEATURE_REFS,
+    PRODUCTION_LONG_TERM_FEATURE_COLUMNS,
+    PRODUCTION_MID_TERM_FEATURE_COLUMNS,
+    feast_entity_rows as _feast_entity_rows,
 )
 from trainer_hightier.serving.production_materialize import DEFAULT_MODEL_SLOW_PATRON_COLUMNS
 
@@ -29,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 FEAST_CANONICAL_ENTITY_NAME: str = "canonical_patron"
 FEAST_CANONICAL_JOIN_KEY: str = "canonical_id"
-FEAST_LONG_TERM_FEATURE_SERVICE_NAME: str = "walkaway_canonical_long_term_spike_v1"
+FEAST_LONG_TERM_FEATURE_SERVICE_NAME: str = LONG_TERM_FEATURE_SERVICE_NAME
 
 
 @dataclass(frozen=True)
@@ -230,7 +229,7 @@ class MockFeastOnlineAdapter:
 
     features_by_canonical: dict[str, dict[str, Any]]
     absent_canonical: frozenset[str] = frozenset()
-    mid_family_columns: frozenset[str] = frozenset(SPIKE_MID_TERM_FEATURE_COLUMNS)
+    mid_family_columns: frozenset[str] = frozenset(PRODUCTION_MID_TERM_FEATURE_COLUMNS)
     slow_family_columns: frozenset[str] = frozenset(DEFAULT_MODEL_SLOW_PATRON_COLUMNS)
 
     def lookup_mid_slow(
@@ -263,7 +262,7 @@ class FeastSdkOnlineAdapter:
 
     feast_repo: Path
     online_feature_refs: tuple[str, ...] = tuple(
-        dict.fromkeys([*MID_SPIKE_ONLINE_FEATURE_REFS, *LONG_SPIKE_ONLINE_FEATURE_REFS])
+        dict.fromkeys([*MID_TERM_ONLINE_FEATURE_REFS, *LONG_TERM_ONLINE_FEATURE_REFS])
     )
 
     def lookup_mid_slow(
@@ -308,7 +307,10 @@ class FeastSdkOnlineAdapter:
 
 
 def default_feast_repo_path() -> Path:
-    """Default Feast repo bundled with ``trainer_hightier``."""
+    """Default Feast repo for scorer v2 (bundle override or package default)."""
+    cfg = default_hightier_serving_config()
+    if cfg.scorer_feast_repo_path is not None:
+        return Path(cfg.scorer_feast_repo_path).resolve()
     return TRAINER_HIGHTIER_PACKAGE_DIR / "feast_repo"
 
 
@@ -321,8 +323,8 @@ def resolve_online_feature_refs(
     slow_columns: tuple[str, ...],
 ) -> tuple[str, ...]:
     """Map model Feast columns to ``feature_view:column`` online refs."""
-    mid_by_col = {r.split(":", 1)[-1]: r for r in MID_SPIKE_ONLINE_FEATURE_REFS}
-    slow_by_col = {r.split(":", 1)[-1]: r for r in LONG_SPIKE_ONLINE_FEATURE_REFS}
+    mid_by_col = {r.split(":", 1)[-1]: r for r in MID_TERM_ONLINE_FEATURE_REFS}
+    slow_by_col = {r.split(":", 1)[-1]: r for r in LONG_TERM_ONLINE_FEATURE_REFS}
     refs: list[str] = []
     unknown: list[str] = []
     for col in mid_columns:
