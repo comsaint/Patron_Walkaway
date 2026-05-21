@@ -121,13 +121,37 @@ def _record_scorer_cycle_metrics(
     model_version: str,
     cycle_readiness: dict[str, Any],
     n_alerts: int,
+    n_batch_rows: int = 0,
+    queue_drained: bool = True,
 ) -> None:
     global _LAST_SCORER_CYCLE_METRICS
     _LAST_SCORER_CYCLE_METRICS = {
         "model_version": str(model_version),
         "cycle_readiness": dict(cycle_readiness),
         "n_alerts": int(n_alerts),
+        "n_batch_rows": int(n_batch_rows),
+        "queue_drained": bool(queue_drained),
     }
+
+
+def _queue_drained_from_batch_rows(n_batch_rows: int, *, cap: int) -> bool:
+    """Return True when incremental batch is below per-cycle cap (no backlog)."""
+    return int(n_batch_rows) < int(max(1, cap))
+
+
+def compute_scorer_cycle_sleep_seconds(
+    *,
+    batch_rows: int,
+    cfg: HightierServingConfig | None = None,
+) -> float:
+    """Poll sleep after one cycle; zero when backlog drain is enabled and batch hit cap."""
+    c = cfg or default_hightier_serving_config()
+    cap = int(c.hightier_scorer_max_bets_per_cycle)
+    if bool(c.scorer_backlog_no_sleep_enabled) and int(batch_rows) >= cap:
+        return 0.0
+    return float(c.scorer_poll_interval_seconds)
+
+
 UTC_TZ = timezone.utc
 
 
@@ -315,35 +339,9 @@ def fetch_bets_incremental_etl_probe(
     return probe
 
 
-def fetch_bets_incremental(
-    last_etl: Optional[pd.Timestamp],
-    *,
-    lookback_hours: float,
-    limit_rows: int,
-    allowlist_player_ids: Optional[frozenset[int]] = None,
-) -> pd.DataFrame:
-    """Fetch new settled bets ordered by arrival (__etl_insert_Dtm).
-
-    When ``allowlist_player_ids`` is ``None``, use a single global query (debug / full population).
-    When it is empty, return an empty frame without hitting ClickHouse.
-    When non-empty, query per ``player_id`` chunk (short ``IN`` lists), merge, then take top ``limit_rows``.
-    """
-    cfg = default_hightier_serving_config()
-    if allowlist_player_ids is not None and not allowlist_player_ids:
-        return pd.DataFrame()
-
-    client = get_clickhouse_client()
-    params, etl_filter = _incremental_params_and_etl_filter(
-        cfg, last_etl, lookback_hours=lookback_hours, limit_rows=limit_rows
-    )
-    placeholder = int(cfg.placeholder_player_id)
-    lim = int(max(1, limit_rows))
-    cid_sel = _TBET_CASINO_PLAYER_ID_SELECT
-    cap = int(cfg.hightier_scorer_chunk_merge_row_cap)
-
-    if allowlist_player_ids is None:
-        q = f"""
-            SELECT
+def _incremental_bet_select_list(*, casino_player_id_select: str) -> str:
+    """Shared SELECT column list for incremental ``t_bet`` fetches."""
+    return f"""
                 bet_id,
                 is_back_bet,
                 bet_type,
@@ -359,7 +357,209 @@ def fetch_bets_incremental(
                 {_TBET_CASINO_WIN_SELECT},
                 {_TBET_PAYOUT_ODDS_SELECT},
                 status,
-                {cid_sel}
+                {casino_player_id_select}
+    """.strip()
+
+
+def _build_allowlist_external_data(player_ids: frozenset[int]) -> Any:
+    """Build ClickHouse external input payload for allowlist ``player_id`` join."""
+    from clickhouse_connect.driver.external import ExternalData
+
+    if not player_ids:
+        raise ValueError("allowlist player_ids must be non-empty for external input join")
+    lines = "\n".join(str(int(x)) for x in sorted(int(x) for x in player_ids))
+    payload = (lines + "\n").encode("utf-8") if lines else b""
+    return ExternalData(
+        file_name="adt_allowlist.tsv",
+        data=payload,
+        fmt="TSV",
+        structure=["player_id Int64"],
+    )
+
+
+def _fetch_bets_incremental_allowlist_chunk(
+    client: Any,
+    *,
+    cfg: HightierServingConfig,
+    allowlist_player_ids: frozenset[int],
+    params: dict[str, Any],
+    etl_filter: str,
+    limit_rows: int,
+    placeholder: int,
+) -> pd.DataFrame:
+    """Legacy allowlist path: chunked ``player_id IN (...)`` queries merged client-side."""
+    lim = int(max(1, limit_rows))
+    cid_sel = _TBET_CASINO_PLAYER_ID_SELECT
+    cap = int(cfg.hightier_scorer_chunk_merge_row_cap)
+    chunk_sz = int(cfg.hightier_scorer_player_id_chunk_size)
+    chunks = split_allowlist_player_id_chunks(allowlist_player_ids, chunk_sz)
+    select_cols = _incremental_bet_select_list(casino_player_id_select=cid_sel)
+    frames: list[pd.DataFrame] = []
+    for i, chunk in enumerate(chunks):
+        in_list = ",".join(str(int(x)) for x in chunk)
+        q = f"""
+            SELECT
+                {select_cols}
+            FROM {cfg.source_db}.{cfg.tbet} FINAL
+            WHERE payout_complete_dtm >= %(start)s
+              AND payout_complete_dtm <= %(bet_avail)s
+              AND payout_complete_dtm IS NOT NULL
+              AND gaming_day IS NOT NULL
+              AND wager > 0
+              AND player_id IS NOT NULL
+              AND player_id != {placeholder}
+              AND player_id IN ({in_list})
+              {etl_filter}
+            ORDER BY __etl_insert_Dtm ASC, bet_id ASC
+            LIMIT %(lim)s
+        """
+        frames.append(client.query_df(q, parameters=params))
+        if cap > 0:
+            total_so_far = sum(len(f) for f in frames)
+            if total_so_far > cap:
+                raise RuntimeError(
+                    "incremental chunk merge exceeds hightier_scorer_chunk_merge_row_cap="
+                    f"{cap} ({total_so_far} rows after chunk {i + 1}/{len(chunks)})"
+                )
+    bets = merge_incremental_chunk_frames(frames, lim)
+    logger.info(
+        "[hightier_scorer] fetch_bets_incremental allowlist_chunks=%d chunk_size=%d merged_rows=%d final_k=%d",
+        len(chunks),
+        chunk_sz,
+        len(bets),
+        lim,
+    )
+    return bets
+
+
+def _fetch_bets_incremental_allowlist_external(
+    client: Any,
+    *,
+    cfg: HightierServingConfig,
+    allowlist_player_ids: frozenset[int],
+    params: dict[str, Any],
+    etl_filter: str,
+    limit_rows: int,
+    placeholder: int,
+) -> pd.DataFrame:
+    """Single-query allowlist path: ``INNER JOIN adt_allowlist`` via query-time external input."""
+    cid_sel = _TBET_CASINO_PLAYER_ID_SELECT
+    select_cols = _incremental_bet_select_list(casino_player_id_select=cid_sel)
+    external = _build_allowlist_external_data(allowlist_player_ids)
+    etl_filter_t = etl_filter.replace("__etl_insert_Dtm", "t.__etl_insert_Dtm") if etl_filter else ""
+    q = f"""
+        SELECT
+            {select_cols}
+        FROM {cfg.source_db}.{cfg.tbet} AS t FINAL
+        INNER JOIN adt_allowlist AS al ON t.player_id = al.player_id
+        WHERE t.payout_complete_dtm >= %(start)s
+          AND t.payout_complete_dtm <= %(bet_avail)s
+          AND t.payout_complete_dtm IS NOT NULL
+          AND t.gaming_day IS NOT NULL
+          AND t.wager > 0
+          AND t.player_id IS NOT NULL
+          AND t.player_id != {placeholder}
+          {etl_filter_t}
+        ORDER BY t.__etl_insert_Dtm ASC, t.bet_id ASC
+        LIMIT %(lim)s
+    """
+    bets = client.query_df(q, parameters=params, external_data=external)
+    logger.info(
+        "[hightier_scorer] fetch_bets_incremental allowlist_external_input n_allowlist=%d rows=%d final_k=%d",
+        len(allowlist_player_ids),
+        len(bets),
+        int(max(1, limit_rows)),
+    )
+    return bets
+
+
+def _fetch_bets_incremental_allowlist(
+    client: Any,
+    *,
+    cfg: HightierServingConfig,
+    allowlist_player_ids: frozenset[int],
+    params: dict[str, Any],
+    etl_filter: str,
+    limit_rows: int,
+    placeholder: int,
+) -> pd.DataFrame:
+    """Route allowlist incremental fetch via external input or legacy chunk merge."""
+    mode = str(cfg.scorer_allowlist_join_mode or "external_input").strip().lower()
+    if mode == "chunk":
+        return _fetch_bets_incremental_allowlist_chunk(
+            client,
+            cfg=cfg,
+            allowlist_player_ids=allowlist_player_ids,
+            params=params,
+            etl_filter=etl_filter,
+            limit_rows=limit_rows,
+            placeholder=placeholder,
+        )
+    if mode != "external_input":
+        raise ValueError(
+            f"scorer_allowlist_join_mode must be 'external_input' or 'chunk', got {mode!r}"
+        )
+    try:
+        return _fetch_bets_incremental_allowlist_external(
+            client,
+            cfg=cfg,
+            allowlist_player_ids=allowlist_player_ids,
+            params=params,
+            etl_filter=etl_filter,
+            limit_rows=limit_rows,
+            placeholder=placeholder,
+        )
+    except Exception as exc:
+        if not bool(cfg.scorer_allowlist_join_fallback_to_chunk):
+            raise RuntimeError(
+                "[hightier_scorer] allowlist external-input join failed; "
+                "set scorer_allowlist_join_fallback_to_chunk=True to use legacy chunk path"
+            ) from exc
+        logger.warning(
+            "[hightier_scorer] allowlist external-input join failed (%s); falling back to chunk path",
+            exc,
+        )
+        return _fetch_bets_incremental_allowlist_chunk(
+            client,
+            cfg=cfg,
+            allowlist_player_ids=allowlist_player_ids,
+            params=params,
+            etl_filter=etl_filter,
+            limit_rows=limit_rows,
+            placeholder=placeholder,
+        )
+
+
+def fetch_bets_incremental(
+    last_etl: Optional[pd.Timestamp],
+    *,
+    lookback_hours: float,
+    limit_rows: int,
+    allowlist_player_ids: Optional[frozenset[int]] = None,
+) -> pd.DataFrame:
+    """Fetch new settled bets ordered by arrival (__etl_insert_Dtm).
+
+    When ``allowlist_player_ids`` is ``None``, use a single global query (debug / full population).
+    When it is empty, return an empty frame without hitting ClickHouse.
+    When non-empty, use configured allowlist join mode (default: external input single query).
+    """
+    cfg = default_hightier_serving_config()
+    if allowlist_player_ids is not None and not allowlist_player_ids:
+        return pd.DataFrame()
+
+    client = get_clickhouse_client()
+    params, etl_filter = _incremental_params_and_etl_filter(
+        cfg, last_etl, lookback_hours=lookback_hours, limit_rows=limit_rows
+    )
+    placeholder = int(cfg.placeholder_player_id)
+    lim = int(max(1, limit_rows))
+    cid_sel = _TBET_CASINO_PLAYER_ID_SELECT
+    select_cols = _incremental_bet_select_list(casino_player_id_select=cid_sel)
+
+    if allowlist_player_ids is None:
+        q = f"""
+            SELECT
+                {select_cols}
             FROM {cfg.source_db}.{cfg.tbet} FINAL
             WHERE payout_complete_dtm >= %(start)s
               AND payout_complete_dtm <= %(bet_avail)s
@@ -374,57 +574,14 @@ def fetch_bets_incremental(
         """
         bets = client.query_df(q, parameters=params)
     else:
-        chunk_sz = int(cfg.hightier_scorer_player_id_chunk_size)
-        chunks = split_allowlist_player_id_chunks(allowlist_player_ids, chunk_sz)
-        frames: list[pd.DataFrame] = []
-        for i, chunk in enumerate(chunks):
-            in_list = ",".join(str(int(x)) for x in chunk)
-            q = f"""
-                SELECT
-                    bet_id,
-                    is_back_bet,
-                    bet_type,
-                    type_of_bet,
-                    __etl_insert_Dtm,
-                    payout_complete_dtm,
-                    gaming_day,
-                    session_id,
-                    player_id,
-                    table_id,
-                    position_idx,
-                    {_TBET_WAGER_SELECT},
-                    {_TBET_CASINO_WIN_SELECT},
-                    {_TBET_PAYOUT_ODDS_SELECT},
-                    status,
-                    {cid_sel}
-                FROM {cfg.source_db}.{cfg.tbet} FINAL
-                WHERE payout_complete_dtm >= %(start)s
-                  AND payout_complete_dtm <= %(bet_avail)s
-                  AND payout_complete_dtm IS NOT NULL
-                  AND gaming_day IS NOT NULL
-                  AND wager > 0
-                  AND player_id IS NOT NULL
-                  AND player_id != {placeholder}
-                  AND player_id IN ({in_list})
-                  {etl_filter}
-                ORDER BY __etl_insert_Dtm ASC, bet_id ASC
-                LIMIT %(lim)s
-            """
-            frames.append(client.query_df(q, parameters=params))
-            if cap > 0:
-                total_so_far = sum(len(f) for f in frames)
-                if total_so_far > cap:
-                    raise RuntimeError(
-                        "incremental chunk merge exceeds hightier_scorer_chunk_merge_row_cap="
-                        f"{cap} ({total_so_far} rows after chunk {i + 1}/{len(chunks)})"
-                    )
-        bets = merge_incremental_chunk_frames(frames, lim)
-        logger.info(
-            "[hightier_scorer] fetch_bets_incremental allowlist_chunks=%d chunk_size=%d merged_rows=%d final_k=%d",
-            len(chunks),
-            chunk_sz,
-            len(bets),
-            lim,
+        bets = _fetch_bets_incremental_allowlist(
+            client,
+            cfg=cfg,
+            allowlist_player_ids=allowlist_player_ids,
+            params=params,
+            etl_filter=etl_filter,
+            limit_rows=lim,
+            placeholder=placeholder,
         )
 
     _postprocess_incremental_bets_timestamps(bets)
@@ -732,13 +889,23 @@ def score_once(
 ) -> int:
     """One incremental scoring cycle; returns number of alerts written."""
     cfg = default_hightier_serving_config()
+    cap = int(cfg.hightier_scorer_max_bets_per_cycle)
     batch = _fetch_scoring_batch(
         conn,
         high_adt_only=high_adt_only,
         allowlist_ids=allowlist_ids,
     )
     if batch is None:
+        _record_scorer_cycle_metrics(
+            model_version=str(bundle.model_version),
+            cycle_readiness={},
+            n_alerts=0,
+            n_batch_rows=0,
+            queue_drained=True,
+        )
         return 0
+    n_batch_rows = len(batch.bets)
+    queue_drained = _queue_drained_from_batch_rows(n_batch_rows, cap=cap)
 
     registry_snap = load_frozen_registry_for_bundle(Path(bundle.bundle_dir))
     supplier_plan = build_scorer_supplier_plan(registry_snap, bundle.feature_columns)
@@ -796,6 +963,8 @@ def score_once(
             model_version=str(bundle.model_version),
             cycle_readiness=cycle_log,
             n_alerts=0,
+            n_batch_rows=n_batch_rows,
+            queue_drained=queue_drained,
         )
         return 0
 
@@ -991,6 +1160,8 @@ def score_once(
             model_version=str(bundle.model_version),
             cycle_readiness=cycle_log,
             n_alerts=0,
+            n_batch_rows=n_batch_rows,
+            queue_drained=queue_drained,
         )
         return 0
     out = staged.loc[m].copy()
@@ -1041,6 +1212,8 @@ def score_once(
         model_version=str(bundle.model_version),
         cycle_readiness=cycle_log,
         n_alerts=n,
+        n_batch_rows=n_batch_rows,
+        queue_drained=queue_drained,
     )
     logger.info("[hightier_scorer] wrote %d alerts (threshold=%.6f)", n, thr)
     return n
@@ -1148,6 +1321,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     cycle_t0 = time.perf_counter() if args.dry_run_report is not None else None
 
     while True:
+        sleep_s = float(cfg.scorer_poll_interval_seconds)
         conn = connect_state_db(Path(cfg.state_db_path))
         try:
             man = read_active_manifest()
@@ -1202,6 +1376,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                 high_adt_only=high_adt_only,
                 allowlist_ids=allow_ids,
             )
+            metrics = get_last_scorer_cycle_metrics() or {}
+            batch_rows = int(metrics.get("n_batch_rows") or 0)
+            sleep_s = compute_scorer_cycle_sleep_seconds(batch_rows=batch_rows, cfg=cfg)
+            logger.info(
+                "[hightier_scorer] cycle_sleep batch_rows=%d cap=%d queue_drained=%s sleep_seconds=%s",
+                batch_rows,
+                int(cfg.hightier_scorer_max_bets_per_cycle),
+                bool(metrics.get("queue_drained", True)),
+                sleep_s,
+            )
         finally:
             conn.close()
         if args.once:
@@ -1234,7 +1418,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     )
                     write_scorer_dry_run_report(report, out)
             break
-        time.sleep(float(cfg.scorer_poll_interval_seconds))
+        time.sleep(sleep_s)
     return 0
 
 

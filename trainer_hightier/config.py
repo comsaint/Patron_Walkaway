@@ -455,6 +455,12 @@ class HightierServingConfig:
     bet_avail_delay_min: int = 1
     session_avail_delay_min: int = 15
     scorer_poll_interval_seconds: float = 30.0
+    #: When True and a cycle hits ``hightier_scorer_max_bets_per_cycle``, skip poll sleep (drain backlog).
+    scorer_backlog_no_sleep_enabled: bool = True
+    #: Allowlist incremental fetch: ``external_input`` (single JOIN query) or legacy ``chunk`` IN-lists.
+    scorer_allowlist_join_mode: str = "external_input"
+    #: When external-input join fails, fall back to legacy chunk queries (default fail-fast).
+    scorer_allowlist_join_fallback_to_chunk: bool = False
     #: Upper bound on cold-start / backfill window for incremental fetches (hours).
     scorer_dynamic_lookback_cap_hours: int = 8
     hightier_scorer_max_bets_per_cycle: int = 2000

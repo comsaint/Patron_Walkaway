@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -77,13 +78,17 @@ def test_fetch_bets_incremental_global_query_no_tbets_casino_expression(monkeypa
 def test_fetch_bets_incremental_allowlist_uses_short_in_lists(monkeypatch: pytest.MonkeyPatch) -> None:
     from trainer_hightier.serving import scorer as scorer_mod
 
-    cfg = replace(HightierServingConfig(), hightier_scorer_player_id_chunk_size=2)
+    cfg = replace(
+        HightierServingConfig(),
+        hightier_scorer_player_id_chunk_size=2,
+        scorer_allowlist_join_mode="chunk",
+    )
     monkeypatch.setattr(scorer_mod, "default_hightier_serving_config", lambda: cfg)
 
     sqls: list[str] = []
 
     class _FC:
-        def query_df(self, sql: str, parameters=None):
+        def query_df(self, sql: str, parameters=None, external_data=None):
             sqls.append(sql)
             return pd.DataFrame()
 
@@ -103,6 +108,124 @@ def test_fetch_bets_incremental_allowlist_uses_short_in_lists(monkeypatch: pytes
         assert "trim(casino_player_id)" not in q.replace(" ", "").lower()
 
 
+def test_fetch_bets_incremental_allowlist_external_input_single_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trainer_hightier.serving import scorer as scorer_mod
+
+    cfg = replace(HightierServingConfig(), scorer_allowlist_join_mode="external_input")
+    monkeypatch.setattr(scorer_mod, "default_hightier_serving_config", lambda: cfg)
+
+    sqls: list[str] = []
+    ext_calls: list[Any] = []
+
+    class _FC:
+        def query_df(self, sql: str, parameters=None, external_data=None):
+            sqls.append(sql)
+            ext_calls.append(external_data)
+            return pd.DataFrame()
+
+    monkeypatch.setattr(scorer_mod, "get_clickhouse_client", lambda: _FC())
+    scorer_mod.fetch_bets_incremental(
+        None,
+        lookback_hours=1.0,
+        limit_rows=10,
+        allowlist_player_ids=frozenset({10, 20, 30}),
+    )
+    assert len(sqls) == 1
+    assert "INNER JOIN adt_allowlist" in sqls[0]
+    assert "player_id IN (" not in sqls[0]
+    assert len(ext_calls) == 1
+    assert ext_calls[0] is not None
+
+
+def test_fetch_bets_incremental_external_input_fail_fast_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trainer_hightier.serving import scorer as scorer_mod
+
+    cfg = replace(
+        HightierServingConfig(),
+        scorer_allowlist_join_mode="external_input",
+        scorer_allowlist_join_fallback_to_chunk=False,
+    )
+    monkeypatch.setattr(scorer_mod, "default_hightier_serving_config", lambda: cfg)
+
+    class _FC:
+        def query_df(self, sql: str, parameters=None, external_data=None):
+            raise RuntimeError("external input unsupported")
+
+    monkeypatch.setattr(scorer_mod, "get_clickhouse_client", lambda: _FC())
+    with pytest.raises(RuntimeError, match="allowlist external-input join failed"):
+        scorer_mod.fetch_bets_incremental(
+            None,
+            lookback_hours=1.0,
+            limit_rows=10,
+            allowlist_player_ids=frozenset({10, 20}),
+        )
+
+
+def test_fetch_bets_incremental_external_input_fallback_to_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trainer_hightier.serving import scorer as scorer_mod
+
+    cfg = replace(
+        HightierServingConfig(),
+        hightier_scorer_player_id_chunk_size=500,
+        scorer_allowlist_join_mode="external_input",
+        scorer_allowlist_join_fallback_to_chunk=True,
+    )
+    monkeypatch.setattr(scorer_mod, "default_hightier_serving_config", lambda: cfg)
+
+    sqls: list[str] = []
+    calls = {"n": 0}
+
+    class _FC:
+        def query_df(self, sql: str, parameters=None, external_data=None):
+            calls["n"] += 1
+            sqls.append(sql)
+            if external_data is not None:
+                raise RuntimeError("external input unsupported")
+            return pd.DataFrame()
+
+    monkeypatch.setattr(scorer_mod, "get_clickhouse_client", lambda: _FC())
+    scorer_mod.fetch_bets_incremental(
+        None,
+        lookback_hours=1.0,
+        limit_rows=10,
+        allowlist_player_ids=frozenset({10, 20, 30}),
+    )
+    assert calls["n"] == 2
+    assert any("INNER JOIN adt_allowlist" in q for q in sqls[:1])
+    assert any("player_id IN (" in q for q in sqls[1:])
+
+
+def test_compute_scorer_cycle_sleep_seconds_backlog_and_steady() -> None:
+    from trainer_hightier.serving.scorer import compute_scorer_cycle_sleep_seconds
+
+    cfg = HightierServingConfig(
+        hightier_scorer_max_bets_per_cycle=2000,
+        scorer_poll_interval_seconds=30.0,
+        scorer_backlog_no_sleep_enabled=True,
+    )
+    assert compute_scorer_cycle_sleep_seconds(batch_rows=2000, cfg=cfg) == 0.0
+    assert compute_scorer_cycle_sleep_seconds(batch_rows=1999, cfg=cfg) == 30.0
+    assert compute_scorer_cycle_sleep_seconds(batch_rows=0, cfg=cfg) == 30.0
+
+    cfg_off = replace(cfg, scorer_backlog_no_sleep_enabled=False)
+    assert compute_scorer_cycle_sleep_seconds(batch_rows=2000, cfg=cfg_off) == 30.0
+
+
+def test_build_allowlist_external_data_tsv_payload() -> None:
+    from trainer_hightier.serving.scorer import _build_allowlist_external_data
+
+    ext = _build_allowlist_external_data(frozenset({30, 10, 20}))
+    assert ext.files
+    assert ext.files[0].name == "adt_allowlist"
+    assert ext.files[0].data == b"10\n20\n30\n"
+
+
 def test_fetch_bets_incremental_merge_row_cap_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     from trainer_hightier.serving import scorer as scorer_mod
 
@@ -110,6 +233,7 @@ def test_fetch_bets_incremental_merge_row_cap_raises(monkeypatch: pytest.MonkeyP
         HightierServingConfig(),
         hightier_scorer_player_id_chunk_size=1,
         hightier_scorer_chunk_merge_row_cap=1,
+        scorer_allowlist_join_mode="chunk",
     )
     monkeypatch.setattr(scorer_mod, "default_hightier_serving_config", lambda: cfg)
 
