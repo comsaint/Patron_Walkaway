@@ -198,6 +198,7 @@ features:
   anchor_rule: prior_gaming_day_end
   grain: canonical_id + anchor_gaming_day
   allowed_training_supplier: mid_term_daily_snapshot
+  runtime_supplier: feast_online_mid
 - feature_id: fe__wager_sum__w15m_over_w1d
   group_id: group_a_velocity_ratios
   source: fe_derived
@@ -216,6 +217,12 @@ features:
   anchor_rule: prior_gaming_day_end
   grain: canonical_id + anchor_gaming_day
   allowed_training_supplier: mid_term_daily_snapshot
+  runtime_supplier: composite
+  runtime_inputs:
+    feast_online_mid:
+    - fe__wager_sum__w1d
+    short_term_pit_builder:
+    - fe__wager_sum__w15m
 - feature_id: fe__wager_sum__w1d
   group_id: group_a_velocity_ratios
   source: fe_derived
@@ -231,6 +238,7 @@ features:
     emits column for parity.
   time_horizon: mid_term
   max_lookback: P1D
+  runtime_supplier: feast_online_mid
 - feature_id: fe__bets_cnt__w15m_over_w1d
   group_id: group_a_velocity_ratios
   source: fe_derived
@@ -361,6 +369,11 @@ features:
   anchor_rule: prior_gaming_day_end
   grain: canonical_id + anchor_gaming_day
   allowed_training_supplier: mid_term_daily_snapshot
+  runtime_supplier: composite
+  runtime_inputs:
+    feast_online_mid:
+    - fe__std_wager_w7d
+    - fe__avg_abs_wager_w7d
 - feature_id: fe__interarrival_mean_sec_w7d
   group_id: group_c_burstiness
   source: fe_derived
@@ -393,6 +406,11 @@ features:
   anchor_rule: prior_gaming_day_end
   grain: canonical_id + anchor_gaming_day
   allowed_training_supplier: mid_term_daily_snapshot
+  runtime_supplier: composite
+  runtime_inputs:
+    feast_online_mid:
+    - fe__prior_odds_mean_w30d
+    - fe__prior_odds_std_w30d
 - feature_id: fe__wager_z_prior_w30d
   group_id: group_d_personal_z
   source: fe_derived
@@ -825,6 +843,13 @@ features:
   anchor_rule: prior_gaming_day_end
   grain: canonical_id + anchor_gaming_day
   allowed_training_supplier: mid_term_daily_snapshot
+  runtime_supplier: composite
+  runtime_inputs:
+    feast_online_mid:
+    - fe__interarrival_avg_w7d
+    - fe__interarrival_std_w7d
+    short_term_pit_builder:
+    - fe__time_since_last_bet_sec
 - feature_id: fe__interarrival__last_gap_to_recent_mean_ratio__w1h
   group_id: group_g_interarrival_dynamics
   source: fe_derived

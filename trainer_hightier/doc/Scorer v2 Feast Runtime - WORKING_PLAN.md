@@ -534,7 +534,7 @@ Scorer v2 不應標記 production-ready，除非以下項目全數通過：
 ## Open Execution Risks
 
 - `feature_experiment` 仍被 serving import 但 wheel exclude 該 package → no-repo `ModuleNotFoundError`（`S1-5` 必須先解）。
-- `build_deploy_package` / `deploy/main.py` 仍驗證 legacy snapshot parquet、仍跑 snapshot supervisor（`S1-4`、`S5-1`）。
+- ~~`build_deploy_package` / `deploy/main.py` 仍驗證 legacy snapshot parquet、仍跑 snapshot supervisor~~ → **已收斂**：Feast-only bundle（無 `snapshots/artifacts/*.parquet`）、metadata-only manifest、deploy preflight 不再 hard-require legacy parquet keys；snapshot supervisor 已停用（`S1-4`、`S5-1`）。
 - `feature_state.db` 尚未保存 latest readiness JSON/hash（`S3-1`）。
 - `pyproject.toml` 尚未宣告 `feast` dependency（`S1-1`）。
 - 真 Feast online store schema 與 spike definitions 可能尚未完全 production 化；production dry run 前確認 feature service 名稱與 entity key。

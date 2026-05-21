@@ -21,9 +21,11 @@ from trainer_hightier.serving.feast_online_adapter import (
     FEAST_CANONICAL_ENTITY_NAME,
     FEAST_CANONICAL_JOIN_KEY,
     MockFeastOnlineAdapter,
+    RowMissingAudit,
     _extract_entity_join_keys,
     apply_entity_missing_policy,
     compute_row_missing_audits,
+    enrich_row_audits_composite_upstream,
     join_feast_lookup,
     resolve_online_feature_refs,
     run_feast_scorer_schema_smoke_check,
@@ -42,6 +44,8 @@ from trainer_hightier.serving.feature_builder import (
     assert_short_term_pit_columns_supported,
 )
 from trainer_hightier.serving.feature_supply import (
+    ScorerSupplierPlan,
+    assert_feast_plan_schema_support_or_raise,
     assert_scorer_supplier_plan_or_raise,
     build_scorer_supplier_plan,
     scorer_supplier_route_counts,
@@ -264,14 +268,138 @@ def test_build_scorer_supplier_plan_splits_composite_mid_term(tmp_path: Path) ->
         snap,
         ("fe__bets_cnt__w1d", "fe__wager_cv_w7d", "fe__wager_sum__w15m"),
     )
-    assert plan.feast_mid_cols == ("fe__bets_cnt__w1d",)
     assert plan.mid_composite_cols == ("fe__wager_cv_w7d",)
     assert plan.short_term_cols == ("fe__wager_sum__w15m",)
     assert "fe__wager_cv_w7d" in MID_TERM_COMPOSITE_FEATURE_COLUMNS
+    assert plan.feast_mid_cols == (
+        "fe__bets_cnt__w1d",
+        "fe__std_wager_w7d",
+        "fe__avg_abs_wager_w7d",
+    )
     counts = scorer_supplier_route_counts(plan)
     assert counts["mid_term_composite"] == 1
-    assert counts["feast_online_mid"] == 1
+    assert counts["feast_online_mid"] == 3
     assert counts["short_term_pit_builder"] == 1
+
+
+def test_build_scorer_supplier_plan_includes_feast_deps_for_all_composites(tmp_path: Path) -> None:
+    """Production composites must pull Feast mid inputs, not only direct model mid cols."""
+    reg = tmp_path / "registry.yaml"
+    lines = ["registry_version: scorer-v2-test", "features:"]
+    rows = [
+        ("fe__bets_cnt__w1d", "mid_term", "P1D"),
+        ("fe__wager_sum__w15m_over_w1d", "mid_term", "P1D"),
+        ("fe__wager_cv_w7d", "mid_term", "P7D"),
+        ("fe__payout_odds_z_prior_w30d", "mid_term", "P30D"),
+        ("fe__interarrival__last_gap_z__w7d", "mid_term", "P7D"),
+    ]
+    for fid, horizon, lookback in rows:
+        lines.extend(
+            [
+                f"  - feature_id: {fid}",
+                "    group_id: g",
+                "    source: fe_derived",
+                "    status: active",
+                "    enabled_for: [baseline]",
+                f"    time_horizon: {horizon}",
+                f"    max_lookback: {lookback}",
+            ]
+        )
+    reg.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    snap = load_candidate_registry(reg)
+    plan = build_scorer_supplier_plan(snap, tuple(fid for fid, _, _ in rows))
+    assert plan.mid_composite_cols == (
+        "fe__wager_sum__w15m_over_w1d",
+        "fe__wager_cv_w7d",
+        "fe__payout_odds_z_prior_w30d",
+        "fe__interarrival__last_gap_z__w7d",
+    )
+    assert set(plan.feast_mid_cols) == {
+        "fe__bets_cnt__w1d",
+        "fe__wager_sum__w1d",
+        "fe__std_wager_w7d",
+        "fe__avg_abs_wager_w7d",
+        "fe__prior_odds_mean_w30d",
+        "fe__prior_odds_std_w30d",
+        "fe__interarrival_avg_w7d",
+        "fe__interarrival_std_w7d",
+    }
+    assert_scorer_supplier_plan_or_raise(plan)
+
+
+def test_registry_runtime_inputs_drive_feast_closure(tmp_path: Path) -> None:
+    """Composite deps come from registry ``runtime_inputs``, not only legacy maps."""
+    reg = tmp_path / "registry.yaml"
+    reg.write_text(
+        """
+registry_version: t
+features:
+  - feature_id: fe__wager_cv_w7d
+    group_id: g
+    source: fe_derived
+    status: active
+    enabled_for: [baseline]
+    time_horizon: mid_term
+    max_lookback: P7D
+    allowed_training_supplier: mid_term_daily_snapshot
+    runtime_supplier: composite
+    runtime_inputs:
+      feast_online_mid:
+        - fe__std_wager_w7d
+        - fe__avg_abs_wager_w7d
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    snap = load_candidate_registry(reg)
+    plan = build_scorer_supplier_plan(snap, ("fe__wager_cv_w7d",))
+    assert plan.mid_composite_cols == ("fe__wager_cv_w7d",)
+    assert set(plan.feast_mid_cols) == {"fe__std_wager_w7d", "fe__avg_abs_wager_w7d"}
+    assert_scorer_supplier_plan_or_raise(plan)
+
+
+def test_assert_feast_plan_schema_rejects_unknown_mid_column(tmp_path: Path) -> None:
+    plan = ScorerSupplierPlan(
+        baseline_cols=(),
+        feast_trial_cols=(),
+        feast_mid_cols=("fe__not_in_production_schema__w1d",),
+        mid_composite_cols=(),
+        feast_slow_cols=(),
+        short_term_cols=(),
+        unknown_cols=(),
+    )
+    with pytest.raises(ValueError, match=r"PRODUCTION_MID_TERM_FEATURE_COLUMNS"):
+        assert_feast_plan_schema_support_or_raise(plan)
+
+
+def test_enrich_row_audits_composite_upstream_nulls() -> None:
+    staged = pd.DataFrame(
+        {
+            "fe__wager_cv_w7d": [None],
+            "fe__std_wager_w7d": [None],
+            "fe__avg_abs_wager_w7d": [10.0],
+        }
+    )
+    audits = [
+        RowMissingAudit(
+            model_features_missing=1,
+            fe_features_missing=1,
+            feast_mid_missing=0,
+            feast_slow_missing=0,
+            short_term_missing=0,
+        )
+    ]
+    enriched = enrich_row_audits_composite_upstream(
+        staged,
+        audits,
+        composite_cols=("fe__wager_cv_w7d",),
+        runtime_inputs_by_feature={
+            "fe__wager_cv_w7d": (("feast_online_mid", ("fe__std_wager_w7d", "fe__avg_abs_wager_w7d")),),
+        },
+    )
+    summary = enriched[0].family_summary()
+    assert summary["composite_upstream_null"] == 1
+    assert summary["upstream_null__fe__std_wager_w7d"] == 1
 
 
 def test_assert_scorer_supplier_plan_rejects_unknown_column(tmp_path: Path) -> None:
@@ -522,6 +650,37 @@ def test_attach_short_term_pit_features_from_bounded_pool() -> None:
     assert "fe__wager_sum__w15m" in got.columns
     assert pd.notna(got.iloc[0]["fe__wager_sum__w15m"])
     assert float(got.iloc[0]["fe__time_since_last_bet_sec"]) == pytest.approx(300.0)
+
+
+def test_attach_short_term_pit_features_accepts_decimal_odds() -> None:
+    """Production ClickHouse decimals should not make DuckDB infer a narrow DECIMAL."""
+    from decimal import Decimal
+
+    hk = ZoneInfo("Asia/Hong_Kong")
+    t0 = pd.Timestamp("2025-06-01 10:00:00", tz=hk)
+    pool = pd.DataFrame(
+        {
+            "bet_id": [1.0, 2.0],
+            "player_id": [10, 10],
+            "canonical_id": ["c10", "c10"],
+            "session_id": [1, 1],
+            "table_id": [1, 1],
+            "gaming_day": pd.to_datetime(["2025-06-01", "2025-06-01"]),
+            "payout_complete_dtm": [t0, t0 + pd.Timedelta(minutes=5)],
+            "wager": [Decimal("50.0000"), Decimal("100.0000")],
+            "payout_odds": [Decimal("2.0000"), Decimal("100.0000")],
+            "casino_win": [Decimal("0.0000"), Decimal("0.0000")],
+        }
+    )
+    staged = pool.loc[[1]].copy()
+
+    got = attach_short_term_pit_features(
+        staged,
+        pool,
+        columns=("fe__odds__payout_odds_to_recent_max_ratio__w1h",),
+    )
+
+    assert float(got.iloc[0]["fe__odds__payout_odds_to_recent_max_ratio__w1h"]) == pytest.approx(50.0)
 
 
 def test_assert_short_term_pit_unsupported_column_raises() -> None:

@@ -17,6 +17,16 @@ import yaml
 _REGISTRY_STATUSES: Final[frozenset[str]] = frozenset({"active", "disabled", "experimental"})
 _REGISTRY_SLOTS: Final[frozenset[str]] = frozenset({"baseline", "candidate", "ablation"})
 _REGISTRY_HORIZONS: Final[frozenset[str]] = frozenset({"none", "short_term", "mid_term", "long_term"})
+_RUNTIME_INPUT_SUPPLIERS: Final[frozenset[str]] = frozenset(
+    {
+        "feast_online_mid",
+        "feast_online_slow",
+        "short_term_pit_builder",
+        "clickhouse_raw",
+        "feast_trial_1h",
+    }
+)
+_RUNTIME_SUPPLIERS: Final[frozenset[str]] = _RUNTIME_INPUT_SUPPLIERS | frozenset({"composite"})
 
 # Boundaries (Packaging / Feature Candidate Registry plans): compare using pandas Timedeltas.
 _BOUNDARY_SHORT_MAX: Final[pd.Timedelta] = pd.Timedelta("PT24H")
@@ -43,6 +53,8 @@ class FeatureRegistryEntryRow:
     anchor_rule: str | None = None
     grain: str | None = None
     allowed_training_supplier: str | None = None
+    runtime_supplier: str | None = None
+    runtime_inputs: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -74,6 +86,35 @@ def _duration_seconds_from_iso8601(s: str) -> float:
     if sec <= 0:
         raise ValueError(f"max_lookback must be a positive duration, got {s!r}")
     return sec
+
+
+def _parse_runtime_inputs(idx: int, fid: str, raw: Any) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Parse ``runtime_inputs`` mapping supplier -> feature id list."""
+
+    if raw is None:
+        return ()
+    if not isinstance(raw, dict):
+        raise TypeError(f"features[{idx}].runtime_inputs must be a mapping for {fid!r}, got {type(raw)}")
+    out: list[tuple[str, tuple[str, ...]]] = []
+    for key, val in raw.items():
+        supplier = str(key).strip()
+        if supplier not in _RUNTIME_INPUT_SUPPLIERS:
+            allowed = ", ".join(sorted(_RUNTIME_INPUT_SUPPLIERS))
+            raise ValueError(
+                f"features[{idx}] {fid!r}: runtime_inputs key {supplier!r} invalid; "
+                f"expected one of [{allowed}]",
+            )
+        if not isinstance(val, list) or not val:
+            raise ValueError(
+                f"features[{idx}] {fid!r}: runtime_inputs[{supplier!r}] must be a non-empty list",
+            )
+        deps = tuple(str(x).strip() for x in val if str(x).strip())
+        if len(deps) != len(val):
+            raise ValueError(
+                f"features[{idx}] {fid!r}: runtime_inputs[{supplier!r}] contains empty feature ids",
+            )
+        out.append((supplier, deps))
+    return tuple(out)
 
 
 def horizon_from_max_lookback_iso8601(max_lookback: str) -> str:
@@ -186,14 +227,31 @@ def _row_from_raw(idx: int, raw: dict[str, Any]) -> FeatureRegistryEntryRow:
     anchor_raw = raw.get("anchor_rule")
     grain_raw = raw.get("grain")
     supplier_raw = raw.get("allowed_training_supplier")
+    runtime_supplier_raw = raw.get("runtime_supplier")
+    runtime_inputs_raw = raw.get("runtime_inputs")
     for key, val in (
         ("cadence", cadence_raw),
         ("anchor_rule", anchor_raw),
         ("grain", grain_raw),
         ("allowed_training_supplier", supplier_raw),
+        ("runtime_supplier", runtime_supplier_raw),
     ):
         if val is not None and (not isinstance(val, str) or not str(val).strip()):
             raise TypeError(f"features[{idx}].{key} must be a non-empty string or null for {fid!r}")
+    runtime_supplier_out: str | None = None
+    if runtime_supplier_raw is not None:
+        runtime_supplier_out = str(runtime_supplier_raw).strip()
+        if runtime_supplier_out not in _RUNTIME_SUPPLIERS:
+            allowed = ", ".join(sorted(_RUNTIME_SUPPLIERS))
+            raise ValueError(
+                f"features[{idx}] {fid!r}: runtime_supplier={runtime_supplier_out!r} invalid; "
+                f"expected one of [{allowed}]",
+            )
+    runtime_inputs_out = _parse_runtime_inputs(idx, fid.strip(), runtime_inputs_raw)
+    if runtime_supplier_out == "composite" and not runtime_inputs_out:
+        raise ValueError(
+            f"features[{idx}] {fid!r}: runtime_supplier=composite requires non-empty runtime_inputs",
+        )
     return FeatureRegistryEntryRow(
         feature_id=fid.strip(),
         group_id=gid.strip(),
@@ -213,6 +271,8 @@ def _row_from_raw(idx: int, raw: dict[str, Any]) -> FeatureRegistryEntryRow:
         allowed_training_supplier=(
             str(supplier_raw).strip() if isinstance(supplier_raw, str) and supplier_raw.strip() else None
         ),
+        runtime_supplier=runtime_supplier_out,
+        runtime_inputs=runtime_inputs_out,
     )
 
 

@@ -161,12 +161,17 @@ def _preflight_frozen_artifacts(bundle_root: Path, rel: dict[str, Any]) -> None:
     man = json.loads(man_path.read_text(encoding="utf-8"))
     if not isinstance(man, dict):
         raise ValueError("active_manifest.json root must be a JSON object")
-    trial = man.get("trial_bet_behavior_parquet")
-    if trial:
-        tp = (snap_root / str(trial)).resolve()
-        if not tp.is_file():
-            raise FileNotFoundError(
-                f"manifest trial_bet_behavior_parquet={trial!r} missing file {tp} (under {snap_root})"
+    for legacy_key in (
+        "trial_bet_behavior_parquet",
+        "slow_patron_parquet",
+        "fe_derived_parquet",
+        "fe_short_term_parquet",
+        "mid_term_snapshot_parquet",
+    ):
+        if man.get(legacy_key):
+            logging.warning(
+                "[deploy] metadata-only Feast bundle ignores legacy manifest key %s",
+                legacy_key,
             )
 
 
@@ -191,9 +196,17 @@ def _preflight_feature_supplyability(bundle_root: Path, rel: dict[str, Any]) -> 
     model_feats = model_feature_columns_from_pickle(model_bundle)
     snap_root = bundle_root / str(rel.get("snapshot_manifest_dir", "snapshots"))
     man_path = snap_root / "active_manifest.json"
-    man = json.loads(man_path.read_text(encoding="utf-8"))
-    if not isinstance(man, dict):
-        raise ValueError("active_manifest.json root must be a JSON object")
+    man: dict[str, Any] = {}
+    if man_path.is_file():
+        raw = json.loads(man_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("active_manifest.json root must be a JSON object")
+        man = raw
+    else:
+        logging.warning(
+            "[deploy] skip feature-supply preflight (active_manifest.json missing under %s)",
+            snap_root,
+        )
 
     def _layer_path(key: str) -> Path | None:
         rel_p = man.get(key)
@@ -604,23 +617,19 @@ def _run_deploy_feast_smoke_or_raise(
     *,
     mapping: Path,
     allowlist: Path,
-    require_mid: bool,
-    require_slow: bool,
+    mid_columns: tuple[str, ...],
+    slow_columns: tuple[str, ...],
 ) -> None:
-    """Run deploy Feast readiness + allowlist lookup smoke."""
-    from trainer_hightier.serving.feast_production_constants import (
-        PRODUCTION_LONG_TERM_FEATURE_COLUMNS,
-        PRODUCTION_MID_TERM_FEATURE_COLUMNS,
-    )
+    """Run deploy Feast readiness + allowlist lookup smoke for model-specific columns."""
     from trainer_hightier.serving.feast_readiness import run_deploy_feast_readiness_check
 
     gate = run_deploy_feast_readiness_check(
-        require_mid=require_mid,
-        require_slow=require_slow,
+        require_mid=bool(mid_columns),
+        require_slow=bool(slow_columns),
         allowlist_parquet=allowlist,
         canonical_mapping_parquet=mapping,
-        mid_columns=PRODUCTION_MID_TERM_FEATURE_COLUMNS if require_mid else (),
-        slow_columns=PRODUCTION_LONG_TERM_FEATURE_COLUMNS if require_slow else (),
+        mid_columns=mid_columns,
+        slow_columns=slow_columns,
         run_lookup_smoke=True,
     )
     if not gate.ok:
@@ -640,6 +649,7 @@ def _startup_feast_refresh_or_raise(
     """Run startup Feast refresh + smoke for scorer-capable deploy modes."""
     from trainer_hightier.serving import feast_online_refresh as refresh_mod
     from trainer_hightier.serving.feature_supply import (
+        assert_scorer_supplier_plan_or_raise,
         build_scorer_supplier_plan,
         load_frozen_registry_for_bundle,
         model_feature_columns_from_pickle,
@@ -654,6 +664,7 @@ def _startup_feast_refresh_or_raise(
     snap = load_frozen_registry_for_bundle(model_bundle)
     model_feats = model_feature_columns_from_pickle(model_bundle)
     plan = build_scorer_supplier_plan(snap, model_feats)
+    assert_scorer_supplier_plan_or_raise(plan)
     require_mid = bool(plan.feast_mid_cols or plan.mid_composite_cols)
     require_slow = bool(plan.feast_slow_cols)
 
@@ -663,8 +674,8 @@ def _startup_feast_refresh_or_raise(
             cfg,
             mapping=mapping,
             allowlist=allowlist,
-            require_mid=require_mid,
-            require_slow=require_slow,
+            mid_columns=plan.feast_mid_cols,
+            slow_columns=plan.feast_slow_cols,
         )
         return
 
@@ -715,8 +726,8 @@ def _startup_feast_refresh_or_raise(
         cfg,
         mapping=mapping,
         allowlist=allowlist,
-        require_mid=require_mid,
-        require_slow=require_slow,
+        mid_columns=plan.feast_mid_cols,
+        slow_columns=plan.feast_slow_cols,
     )
 
 

@@ -643,7 +643,13 @@ WHERE bet_id IN (SELECT bet_id FROM tid)
 
 
 def _prepare_pool_for_fe_derived(pool: pd.DataFrame) -> pd.DataFrame:
-    """Normalize bounded bet pool columns for in-memory fe derived PIT."""
+    """Normalize bounded bet pool columns for in-memory fe derived PIT.
+
+    ``t_bet`` money fields are ``Decimal(19,4)`` in ClickHouse (see
+    ``schema/GDP_GMWDS_Raw_Schema_Dictionary.md`` §4: ``payout_odds`` up to
+    ``100.0000``). Coerce to float64 before ``con.register`` so DuckDB does not
+    infer an undersized DECIMAL from the pool sample.
+    """
 
     need = (
         "bet_id",
@@ -663,10 +669,24 @@ def _prepare_pool_for_fe_derived(pool: pd.DataFrame) -> pd.DataFrame:
             f"pool missing columns required for short-term PIT: {missing}; "
             f"have={list(pool.columns)}"
         )
-    work = pool.loc[:, list(need)].copy()
+    optional = tuple(c for c in ("theo_win", "base_ha") if c in pool.columns)
+    work = pool.loc[:, [*need, *optional]].copy()
     for opt in ("theo_win", "base_ha"):
         if opt not in work.columns:
             work[opt] = np.nan
+    numeric_cols = (
+        "bet_id",
+        "player_id",
+        "session_id",
+        "table_id",
+        "wager",
+        "payout_odds",
+        "casino_win",
+        "theo_win",
+        "base_ha",
+    )
+    for col in numeric_cols:
+        work[col] = pd.to_numeric(work[col], errors="coerce")
     return work
 
 

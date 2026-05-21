@@ -18,7 +18,6 @@ import pandas as pd
 
 from trainer_hightier.config import (
     MID_TERM_SNAPSHOT_MAX_LOOKBACK_DAYS,
-    TRAINER_HIGHTIER_PACKAGE_DIR,
     default_hightier_serving_config,
 )
 from trainer_hightier.serving.feast_production_constants import (
@@ -29,7 +28,11 @@ from trainer_hightier.serving.feast_production_constants import (
 )
 from trainer_hightier.serving.adt_allowlist import load_adt_allowlist_ids, resolve_adt_allowlist_path
 from trainer_hightier.serving.ch_adapter import get_clickhouse_client
-from trainer_hightier.serving.feast_online_adapter import default_feast_repo_path
+from trainer_hightier.serving.feast_online_adapter import (
+    default_feast_repo_path,
+    reset_feast_repo_runtime_state,
+    resolve_feast_artifacts_dir,
+)
 from trainer_hightier.serving.feast_readiness import (
     FEAST_READINESS_SCOPE_PRODUCTION,
     FeastLayerReadiness,
@@ -60,10 +63,6 @@ from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_p
 logger = logging.getLogger(__name__)
 
 _SUPPORTED_LAYERS: Final[frozenset[str]] = frozenset({"mid", "slow"})
-_DEFAULT_FEAST_ARTIFACTS = TRAINER_HIGHTIER_PACKAGE_DIR / "artifacts" / "feast"
-_DEFAULT_MID_FEAST_PARQUET = _DEFAULT_FEAST_ARTIFACTS / "mid_term_spike_canonical.parquet"
-_DEFAULT_SLOW_FEAST_PARQUET = _DEFAULT_FEAST_ARTIFACTS / "long_term_spike_canonical.parquet"
-_DEFAULT_SUMMARY_PATH = _DEFAULT_FEAST_ARTIFACTS / "feast_online_refresh_report.json"
 
 
 @dataclass(frozen=True)
@@ -352,6 +351,7 @@ COPY (
 def run_feast_apply(feast_repo: Path) -> float:
     """Run ``feast apply``; return wall-clock seconds."""
     repo = Path(feast_repo).resolve()
+    reset_feast_repo_runtime_state(repo)
     feast_bin = shutil.which("feast")
     if feast_bin is None:
         raise RuntimeError("feast CLI not found on PATH; install feast==0.63.x")
@@ -442,6 +442,10 @@ def _resolve_refresh_options(
     if not allow.is_file():
         raise FileNotFoundError(f"adt allowlist missing: {allow}")
     cmap = resolve_production_canonical_mapping(canonical_mapping)
+    repo = Path(feast_repo or default_feast_repo_path()).resolve()
+    feast_art = resolve_feast_artifacts_dir(repo)
+    feast_art.mkdir(parents=True, exist_ok=True)
+    readiness = Path(readiness_path or resolve_feast_readiness_path(cfg)).resolve()
     return RefreshOptions(
         layers=parsed_layers,
         source=src,
@@ -449,14 +453,14 @@ def _resolve_refresh_options(
         skip_materialize=skip_materialize,
         smoke_only=smoke_only,
         dry_run=dry_run,
-        feast_repo=Path(feast_repo or default_feast_repo_path()).resolve(),
-        readiness_path=Path(readiness_path or resolve_feast_readiness_path(cfg)).resolve(),
+        feast_repo=repo,
+        readiness_path=readiness,
         canonical_mapping=cmap,
         adt_allowlist=allow,
         local_cleaned_bet=Path(local_cleaned_bet).resolve() if local_cleaned_bet else None,
         local_cleaned_session=Path(local_cleaned_session).resolve() if local_cleaned_session else None,
         max_smoke_entities=int(max_smoke_entities),
-        summary_path=Path(summary_path or _DEFAULT_SUMMARY_PATH).resolve(),
+        summary_path=Path(summary_path or feast_art / "feast_online_refresh_report.json").resolve(),
     )
 
 
@@ -495,7 +499,9 @@ def _refresh_mid_layer(
         publish_readiness=False,
     )
     compute_seconds = round(time.perf_counter() - t0, 3)
-    feast_path = _DEFAULT_MID_FEAST_PARQUET
+    feast_art = resolve_feast_artifacts_dir(opts.feast_repo)
+    feast_art.mkdir(parents=True, exist_ok=True)
+    feast_path = feast_art / "mid_term_spike_canonical.parquet"
     feast_rows = write_mid_feast_parquet(artifact_path, feast_path)
     meta = {**meta, "feast_spike_rows": feast_rows, "feast_spike_parquet": str(feast_path)}
     return LayerRefreshOutcome(
@@ -542,7 +548,9 @@ def _refresh_slow_layer(
         publish_readiness=False,
     )
     compute_seconds = round(time.perf_counter() - t0, 3)
-    feast_path = _DEFAULT_SLOW_FEAST_PARQUET
+    feast_art = resolve_feast_artifacts_dir(opts.feast_repo)
+    feast_art.mkdir(parents=True, exist_ok=True)
+    feast_path = feast_art / "long_term_spike_canonical.parquet"
     feast_rows = write_slow_feast_parquet(artifact_path, feast_path)
     meta = {**meta, "feast_spike_rows": feast_rows, "feast_spike_parquet": str(feast_path)}
     return LayerRefreshOutcome(
@@ -588,7 +596,9 @@ def run_feast_online_refresh(opts: RefreshOptions) -> dict[str, Any]:
     cfg = default_hightier_serving_config()
     init_feature_state_db()
     run_id = _utc_run_id()
-    staging_dir = _DEFAULT_FEAST_ARTIFACTS / "refresh_staging" / run_id
+    feast_art = resolve_feast_artifacts_dir(opts.feast_repo)
+    feast_art.mkdir(parents=True, exist_ok=True)
+    staging_dir = feast_art / "refresh_staging" / run_id
     staging_dir.mkdir(parents=True, exist_ok=True)
     feast_refresh_run_start(
         run_id,

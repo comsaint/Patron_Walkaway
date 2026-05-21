@@ -36,6 +36,13 @@ _MID_TERM_COMPOSITE_SHORT_DEPS: Final[dict[str, tuple[str, ...]]] = {
     "fe__interarrival__last_gap_z__w7d": ("fe__time_since_last_bet_sec",),
 }
 
+_MID_TERM_COMPOSITE_FEAST_DEPS: Final[dict[str, tuple[str, ...]]] = {
+    "fe__wager_sum__w15m_over_w1d": ("fe__wager_sum__w1d",),
+    "fe__wager_cv_w7d": ("fe__std_wager_w7d", "fe__avg_abs_wager_w7d"),
+    "fe__payout_odds_z_prior_w30d": ("fe__prior_odds_mean_w30d", "fe__prior_odds_std_w30d"),
+    "fe__interarrival__last_gap_z__w7d": ("fe__interarrival_avg_w7d", "fe__interarrival_std_w7d"),
+}
+
 MID_TERM_COMPOSITE_FEATURE_COLUMNS: Final[frozenset[str]] = frozenset(
     {
         "fe__wager_sum__w15m_over_w1d",
@@ -188,16 +195,52 @@ def classify_model_fe_features(
     }
 
 
+def runtime_inputs_from_registry(
+    row: FeatureRegistryEntryRow | None,
+    feature_id: str,
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Return runtime input deps from registry row, else legacy composite maps."""
+
+    if row is not None and row.runtime_inputs:
+        return row.runtime_inputs
+    feast_deps = _MID_TERM_COMPOSITE_FEAST_DEPS.get(feature_id, ())
+    short_deps = _MID_TERM_COMPOSITE_SHORT_DEPS.get(feature_id, ())
+    out: list[tuple[str, tuple[str, ...]]] = []
+    if feast_deps:
+        out.append(("feast_online_mid", feast_deps))
+    if short_deps:
+        out.append(("short_term_pit_builder", short_deps))
+    return tuple(out)
+
+
 def short_term_enrich_columns_with_dependencies(
     short_term_columns: tuple[str, ...],
     mid_term_columns: tuple[str, ...],
+    *,
+    registry_by_id: dict[str, FeatureRegistryEntryRow] | None = None,
 ) -> tuple[str, ...]:
     """Return short-term columns plus composite dependency columns required at enrich."""
 
     deps: list[str] = []
+    by_id = registry_by_id or {}
     for mid_col in mid_term_columns:
-        deps.extend(_MID_TERM_COMPOSITE_SHORT_DEPS.get(mid_col, ()))
+        row = by_id.get(mid_col)
+        for supplier, inputs in runtime_inputs_from_registry(row, mid_col):
+            if supplier == "short_term_pit_builder":
+                deps.extend(inputs)
     return tuple(dict.fromkeys([*short_term_columns, *deps]))
+
+
+def feast_mid_columns_with_composite_dependencies(
+    feast_mid_columns: tuple[str, ...],
+    mid_composite_columns: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Return Feast mid columns plus online-store inputs required by mid-term composites."""
+
+    deps: list[str] = []
+    for composite_col in mid_composite_columns:
+        deps.extend(_MID_TERM_COMPOSITE_FEAST_DEPS.get(composite_col, ()))
+    return tuple(dict.fromkeys([*feast_mid_columns, *deps]))
 
 
 def build_feature_cadence_audit(

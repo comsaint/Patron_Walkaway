@@ -156,9 +156,6 @@ def test_mocked_refresh_publishes_readiness_after_smoke(tmp_path: Path, monkeypa
             detail={},
         )
 
-    monkeypatch.setattr(refresh_mod, "_DEFAULT_MID_FEAST_PARQUET", mid_feast)
-    monkeypatch.setattr(refresh_mod, "_DEFAULT_SLOW_FEAST_PARQUET", slow_feast)
-    monkeypatch.setattr(refresh_mod, "_DEFAULT_FEAST_ARTIFACTS", tmp_path)
     monkeypatch.setattr(refresh_mod, "load_adt_allowlist_ids", lambda _p: frozenset({1, 2}))
     monkeypatch.setattr(refresh_mod, "_refresh_mid_layer", _fake_mid)
     monkeypatch.setattr(refresh_mod, "_refresh_slow_layer", _fake_slow)

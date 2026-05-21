@@ -23,17 +23,24 @@ mirrors are available.
 
 ## Package-Time Contract
 
-`build_deploy_package` must verify that the bundle is structurally usable:
+`build_deploy_package` produces a **Feast-only production bundle**. Snapshot feature Parquet layers are **not**
+packaged; mid/long runtime supply comes from Feast online refresh at deploy time.
 
-- model files, frozen registry, wheel, mapping, allowlist, and manifest are present and readable.
+The packager must verify that the bundle is structurally usable:
+
+- model files, frozen registry, wheel, mapping, allowlist, and metadata-only manifest are present and readable.
 - `requirements.txt` supports production install from PyPI or an internal package index; full third-party wheel
   vendoring is optional backup SOP, not the first-slice completion condition.
-- model feature columns can be classified into known suppliers using the frozen registry.
+- model feature columns can be classified into known suppliers using the frozen registry (Feast / PIT / baseline).
 - training-scoped artifacts must not be accepted as production-safe snapshots.
-- optional seed snapshots may be packaged when present.
-- missing or stale production-refreshable layers, such as `mid_term_snapshot_parquet`, do not block a dev package.
-- `fe_short_term_parquet` may be packaged only as historical or test fixture data; production scorer v2 must not
-  read it as a runtime supplier or use it to satisfy readiness for short-term `fe__*`.
+- `snapshots/active_manifest.json` is **metadata-only** (version, coverage, training cutoff, allowlist version audit);
+  it must **not** contain `*_parquet` layer path keys.
+- missing legacy snapshot layers (`slow_patron_parquet`, `mid_term_snapshot_parquet`, `fe_short_term_parquet`, etc.)
+  do **not** block packaging; scorer v2 obtains mid/long from Feast online after deploy startup refresh.
+- `fe_short_term_parquet` is not packaged and is not a production scorer v2 supplier.
+
+Bundled directories: `models/`, `mapping/` (including fixed `adt_allowed_players_q0p99.parquet`), `feast_repo/`,
+`artifacts/feast/`, `local_state/`, and metadata-only `snapshots/active_manifest.json`.
 
 Package-time output may therefore represent a refresh-required bundle.
 
@@ -81,15 +88,15 @@ The scorer must never silently fill missing model features:
 ## Supplier Rules
 
 - `baseline_model`: supplied from raw ClickHouse/scoring input fields.
-- `feast_trial_1h`: supplied online by the serving PIT builder; bundled trial parquet is diagnostic only.
+- `feast_trial_1h`: supplied online by the serving PIT builder; bundled trial parquet is **not** shipped in
+  production bundles and is not a runtime supplier.
 - short-term `fe__*`: supplied by the scorer's bounded on-the-fly PIT builder for the currently deployed model
   feature set only. Unsupported short-term columns are hard failures until explicitly implemented. `fe_short_term_parquet`
   is not a production scorer v2 supplier and must not be wired into production runtime fallback.
 - mid-term `fe__*`: **scorer v2 adopted supplier** is Feast online lookup (production-scoped materialization +
-  refresh plane). Parquet manifest paths remain for refresh/deploy validation but are not the production runtime
-  fallback for scorer v2.
+  refresh plane). Legacy manifest parquet path keys are not packaged and are not production runtime suppliers.
 - `patron__*__w180d_m1snap`: **scorer v2 adopted supplier** is Feast online lookup for canonical slow patron
-  features. Parquet slow snapshots remain for refresh/materialize but not as a silent runtime substitute when Feast
+  features. Parquet slow snapshots are not packaged in production bundles and are not runtime substitutes when Feast
   is configured.
 
 Production scorer v2 must **not** fallback to legacy `fe_derived_parquet`, `fe_short_term_parquet`, or training
@@ -99,7 +106,7 @@ Parquet for model features, silently or explicitly.
 
 - Development packaging does not require latest production data.
 - Training snapshots are not production readiness substitutes.
-- Packaging is not responsible for rebuilding production snapshots.
+- Packaging is not responsible for rebuilding production snapshots or copying snapshot feature Parquet into bundles.
 - Short-term `fe__*` Feast online lookup is not required in scorer v2 first slice; short-term production supply is
   the scorer's bounded on-the-fly PIT builder.
 

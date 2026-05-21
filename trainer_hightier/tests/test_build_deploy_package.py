@@ -8,6 +8,7 @@ import pickle
 import zipfile
 from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import pytest
@@ -16,7 +17,23 @@ from sklearn.dummy import DummyClassifier
 from trainer_hightier.build_deploy_package import build_deploy_package
 from trainer_hightier.config import FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME
 from trainer_hightier.serving.adt_allowlist import sha256_file
-from trainer_hightier.serving.feature_state_store import ActiveSnapshotManifest
+
+
+_PARQUET_MANIFEST_SUFFIX = "_parquet"
+
+
+def _assert_feast_only_bundle(bundle_root: Path) -> dict[str, Any]:
+    """Assert Feast-only bundle contract: no snapshot artifacts, metadata-only manifest."""
+    art_dir = bundle_root / "snapshots" / "artifacts"
+    if art_dir.is_dir():
+        parquet_files = list(art_dir.glob("*.parquet"))
+        assert not parquet_files, f"unexpected snapshot artifacts: {parquet_files}"
+    payload = json.loads((bundle_root / "snapshots" / "active_manifest.json").read_text(encoding="utf-8"))
+    parquet_keys = [k for k in payload if k.endswith(_PARQUET_MANIFEST_SUFFIX) or k.endswith("_parquet")]
+    assert not parquet_keys, f"manifest must be metadata-only; found parquet keys={parquet_keys}"
+    allow = bundle_root / "mapping" / "adt_allowed_players_q0p99.parquet"
+    assert allow.is_file(), f"missing fixed allowlist at {allow}"
+    return payload
 
 
 def _write_minimal_model_bundle(dest: Path) -> None:
@@ -296,7 +313,9 @@ def test_no_strict_skips_gate_without_snapshot(tmp_path: Path) -> None:
     assert (out / "models" / "model.pkl").is_file()
 
 
-def test_static_slow_missing_anchor_fails(tmp_path: Path) -> None:
+def test_static_slow_missing_anchor_skipped_in_feast_only_bundle(tmp_path: Path) -> None:
+    """Feast-only pack skips slow parquet structural gate (mid/long served via Feast online)."""
+
     model_src = tmp_path / "model_in_sa"
     snap_src = tmp_path / "snap_in_sa"
     art = snap_src / "x"
@@ -311,15 +330,17 @@ def test_static_slow_missing_anchor_fails(tmp_path: Path) -> None:
     (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
     mapping = tmp_path / "map-slow-anchor.parquet"
     _write_parquet(mapping)
-    out = tmp_path / "slow-no-anchor"
-    with pytest.raises(ValueError, match=r"unsupported structure"):
-        build_deploy_package(
-            ["--model-source", str(model_src), "--snapshot-manifest-source", str(snap_src),
-             "--mapping-source", str(mapping), "--output-dir", str(out)]
-        )
+    out = tmp_path / "slow-no-anchor-feast-only"
+    build_deploy_package(
+        ["--model-source", str(model_src), "--snapshot-manifest-source", str(snap_src),
+         "--mapping-source", str(mapping), "--output-dir", str(out)]
+    )
+    _assert_feast_only_bundle(out)
 
 
-def test_dynamic_slow_missing_model_column_fails(tmp_path: Path) -> None:
+def test_dynamic_slow_missing_model_column_skipped_in_feast_only(tmp_path: Path) -> None:
+    """feast_slow_180d Parquet gate is skipped when packing Feast-only bundle."""
+
     model_src = tmp_path / "model_in_dyn"
     snap_src = tmp_path / "snap_in_dyn"
     art = snap_src / "x"
@@ -334,16 +355,16 @@ def test_dynamic_slow_missing_model_column_fails(tmp_path: Path) -> None:
     (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
     mapping = tmp_path / "map-dyn.parquet"
     _write_parquet(mapping)
-    out = tmp_path / "dyn-missing-b"
-    with pytest.raises(ValueError, match=r"\bb\b"):
-        build_deploy_package(
-            ["--model-source", str(model_src), "--snapshot-manifest-source", str(snap_src),
-             "--mapping-source", str(mapping), "--output-dir", str(out)]
-        )
+    out = tmp_path / "dyn-missing-b-feast-only"
+    build_deploy_package(
+        ["--model-source", str(model_src), "--snapshot-manifest-source", str(snap_src),
+         "--mapping-source", str(mapping), "--output-dir", str(out)]
+    )
+    _assert_feast_only_bundle(out)
 
 
-def test_static_slow_feast_missing_etl_synthetic_raises(tmp_path: Path) -> None:
-    """Bet-grain slow must expose synthetic ETL timestamp column aligned with Feast materialization."""
+def test_static_slow_feast_missing_etl_skipped_in_feast_only(tmp_path: Path) -> None:
+    """Bet-grain slow ETL column gate skipped for Feast-only production bundle."""
 
     model_src = tmp_path / "model_in_etl"
     snap_src = tmp_path / "snap_in_etl"
@@ -366,12 +387,12 @@ def test_static_slow_feast_missing_etl_synthetic_raises(tmp_path: Path) -> None:
     (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
     mapping = tmp_path / "map-etl.parquet"
     _write_parquet(mapping)
-    out = tmp_path / "slow-no-etl"
-    with pytest.raises(ValueError, match=r"Feast created-timestamp"):
-        build_deploy_package(
-            ["--model-source", str(model_src), "--snapshot-manifest-source", str(snap_src),
-             "--mapping-source", str(mapping), "--output-dir", str(out)]
-        )
+    out = tmp_path / "slow-no-etl-feast-only"
+    build_deploy_package(
+        ["--model-source", str(model_src), "--snapshot-manifest-source", str(snap_src),
+         "--mapping-source", str(mapping), "--output-dir", str(out)]
+    )
+    _assert_feast_only_bundle(out)
 
 
 def test_build_bundle_accepts_anchor_gaming_day_slow(tmp_path: Path) -> None:
@@ -396,7 +417,7 @@ def test_build_bundle_accepts_anchor_gaming_day_slow(tmp_path: Path) -> None:
         ["--model-source", str(model_src), "--snapshot-manifest-source", str(snap_src),
          "--mapping-source", str(mapping), "--output-dir", str(out)]
     )
-    assert (out / "bundle_info.json").is_file()
+    _assert_feast_only_bundle(out)
 
 
 def test_static_canonical_mapping_missing_canonical_id_fails(tmp_path: Path) -> None:
@@ -491,11 +512,11 @@ def test_package_allows_refresh_required_fe_suppliers(tmp_path: Path) -> None:
             str(out),
         ]
     )
-    assert (out / "snapshots" / "active_manifest.json").is_file()
+    _assert_feast_only_bundle(out)
 
 
-def test_pack_copies_fe_short_term_and_mid_term_layers(tmp_path: Path) -> None:
-    """Cadence-aware manifest keys are copied into snapshots/artifacts with rewritten paths."""
+def test_feast_only_bundle_has_no_snapshot_artifact_parquets(tmp_path: Path) -> None:
+    """Feast-only pack must not copy snapshot feature parquet layers into the bundle."""
 
     model_src = tmp_path / "model_cadence_layers"
     snap_src = tmp_path / "snap_cadence_layers"
@@ -545,14 +566,13 @@ def test_pack_copies_fe_short_term_and_mid_term_layers(tmp_path: Path) -> None:
             str(out),
         ]
     )
-    man_out = json.loads((out / "snapshots" / "active_manifest.json").read_text(encoding="utf-8"))
-    assert man_out["fe_short_term_parquet"].startswith("artifacts/")
-    assert man_out["mid_term_snapshot_parquet"].startswith("artifacts/")
-    assert (out / "snapshots" / man_out["fe_short_term_parquet"]).is_file()
-    assert (out / "snapshots" / man_out["mid_term_snapshot_parquet"]).is_file()
+    payload = _assert_feast_only_bundle(out)
+    assert payload["coverage_end_exclusive"] == man["coverage_end_exclusive"]
+    assert "fe_short_term_parquet" not in payload
+    assert "mid_term_snapshot_parquet" not in payload
 
 
-def test_feature_supplyability_bundled_fe_parquet_succeeds(tmp_path: Path) -> None:
+def test_feature_supplyability_feast_only_metadata_manifest(tmp_path: Path) -> None:
     model_src = tmp_path / "model_fe_ok"
     snap_src = tmp_path / "snap_fe_ok"
     art = snap_src / "x"
@@ -582,10 +602,8 @@ def test_feature_supplyability_bundled_fe_parquet_succeeds(tmp_path: Path) -> No
             str(out),
         ]
     )
-    man_out = json.loads((out / "snapshots" / "active_manifest.json").read_text(encoding="utf-8"))
-    assert "fe_short_term_parquet" in man_out
-    fe_rel = man_out["fe_short_term_parquet"]
-    assert (out / "snapshots" / fe_rel).is_file()
+    payload = _assert_feast_only_bundle(out)
+    assert payload["version"] == "mv"
 
 
 def test_trial_parquet_dynamic_gate_when_present(tmp_path: Path) -> None:
@@ -665,6 +683,7 @@ features:
     )
     bio = json.loads((out / "bundle_info.json").read_text(encoding="utf-8"))
     assert bio.get("feature_candidate_registry_sha256") and len(bio["feature_candidate_registry_sha256"]) == 64
+    _assert_feast_only_bundle(out)
 
 
 def test_build_bundle_rewrites_manifest_relative_paths(tmp_path: Path) -> None:
@@ -701,11 +720,9 @@ def test_build_bundle_rewrites_manifest_relative_paths(tmp_path: Path) -> None:
             str(out),
         ]
     )
-    mpath = out / "snapshots" / "active_manifest.json"
-    payload = json.loads(mpath.read_text(encoding="utf-8"))
-    am = ActiveSnapshotManifest.from_dict(payload, manifest_dir=mpath.parent)
-    assert am.slow_patron_parquet.is_file()
-    assert am.adt_allowlist_parquet is not None and am.adt_allowlist_parquet.is_file()
+    payload = _assert_feast_only_bundle(out)
+    assert payload["version"] == "m1"
+    assert payload.get("adt_allowlist_version") == "v-al"
     assert (out / "bundle_info.json").is_file()
     assert (out / "deploy_bundle_paths.json").is_file()
     assert (out / "main.py").is_file()
@@ -895,8 +912,8 @@ def test_deploy_api_health_after_bundle_config(tmp_path: Path) -> None:
         importlib.reload(api_mod)
 
 
-def test_strict_trial_declared_but_missing_raises(tmp_path: Path) -> None:
-    """Manifest declares trial_bet_behavior_parquet but source file absent -> strict fails."""
+def test_strict_trial_declared_but_missing_succeeds_feast_only(tmp_path: Path) -> None:
+    """Feast-only pack ignores missing trial parquet even when declared in source manifest."""
 
     model_src = tmp_path / "model_in"
     snap_src = tmp_path / "snap_in"
@@ -918,20 +935,20 @@ def test_strict_trial_declared_but_missing_raises(tmp_path: Path) -> None:
     (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
     mapping = tmp_path / "maptrial.parquet"
     _write_parquet(mapping)
-    out = tmp_path / "trialbad"
-    with pytest.raises(FileNotFoundError):
-        build_deploy_package(
-            [
-                "--model-source",
-                str(model_src),
-                "--snapshot-manifest-source",
-                str(snap_src),
-                "--mapping-source",
-                str(mapping),
-                "--output-dir",
-                str(out),
-            ]
-        )
+    out = tmp_path / "trial-missing-feast-only"
+    build_deploy_package(
+        [
+            "--model-source",
+            str(model_src),
+            "--snapshot-manifest-source",
+            str(snap_src),
+            "--mapping-source",
+            str(mapping),
+            "--output-dir",
+            str(out),
+        ]
+    )
+    _assert_feast_only_bundle(out)
 
 
 def test_model_version_defaults_and_fingerprint_repeatable(monkeypatch, tmp_path: Path) -> None:
@@ -1024,17 +1041,14 @@ def test_deploy_inputs_autodiscovery_model_source_only(tmp_path: Path) -> None:
 
     out = tmp_path / "from_deploy_inputs_only"
     build_deploy_package(["--model-source", str(model_src), "--output-dir", str(out)])
-    mpath = out / "snapshots" / "active_manifest.json"
-    payload = json.loads(mpath.read_text(encoding="utf-8"))
-    am = ActiveSnapshotManifest.from_dict(payload, manifest_dir=mpath.parent)
-    assert am.slow_patron_parquet.is_file()
-    assert am.adt_allowlist_parquet is not None and am.adt_allowlist_parquet.is_file()
+    payload = _assert_feast_only_bundle(out)
+    assert payload["version"] == "frozen-di"
     copied_map = out / "mapping" / cmap.name
     assert copied_map.is_file()
 
 
-def test_deploy_inputs_mid_term_manifest_freshness_passes(tmp_path: Path) -> None:
-    """Production mid_term_snapshot_parquet is copied and validated for mid-term fe_derived models."""
+def test_deploy_inputs_mid_term_manifest_metadata_only(tmp_path: Path) -> None:
+    """Production mid_term inputs are not copied; metadata-only manifest retains audit fields."""
 
     from trainer_hightier.config import MID_TERM_GRAIN_CANONICAL_DAILY_ASOF
 
@@ -1086,12 +1100,10 @@ def test_deploy_inputs_mid_term_manifest_freshness_passes(tmp_path: Path) -> Non
 
     out = tmp_path / "from_deploy_inputs_fe"
     build_deploy_package(["--model-source", str(model_src), "--output-dir", str(out)])
-    payload = json.loads((out / "snapshots" / "active_manifest.json").read_text(encoding="utf-8"))
+    payload = _assert_feast_only_bundle(out)
     assert payload["coverage_end_exclusive"] == man["coverage_end_exclusive"]
-    assert payload["fe_short_term_parquet"]
-    assert payload["mid_term_snapshot_parquet"]
-    assert (out / "snapshots" / payload["fe_short_term_parquet"]).is_file()
-    assert (out / "snapshots" / payload["mid_term_snapshot_parquet"]).is_file()
+    assert payload.get("training_cutoff_iso") == man["training_cutoff_iso"]
+    assert payload.get("model_version") == man["model_version"]
 
 
 def test_deploy_inputs_fallback_when_absent(monkeypatch, tmp_path: Path) -> None:

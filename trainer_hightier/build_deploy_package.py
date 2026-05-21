@@ -7,9 +7,8 @@ Layout (resolved ``--output-dir``, default ``trainer_hightier.config.DEFAULT_DEP
 - ``requirements.txt`` — local wheel line (transitive deps from PyPI / internal index per wheel metadata)
 - ``.env.example`` — optional ClickHouse / log overrides for :mod:`trainer_hightier.deploy.main`
 - ``models/`` — ``model.pkl``, ``training_metrics.json``, ``feature_candidate_registry.snapshot.yaml`` (frozen feature registry YAML from Step 5), ``model_version``, …
-- ``snapshots/active_manifest.json`` — paths rewritten to bundle-relative
-- ``snapshots/artifacts/*.parquet`` — copied snapshot layers (slow / trial / allowlist)
-- ``mapping/`` — canonical mapping Parquet
+- ``snapshots/active_manifest.json`` — metadata-only audit manifest (no snapshot parquet paths)
+- ``mapping/`` — canonical mapping Parquet + fixed ADT allowlist
 - ``local_state/`` — empty dir for ``state.db`` / ``feature_state.db`` at runtime
 - ``bundle_info.json``, ``deploy_bundle_paths.json``, ``README_DEPLOY.md``
 """
@@ -57,6 +56,36 @@ logger = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _FEAST_REPO_SRC = _REPO_ROOT / "trainer_hightier" / "feast_repo"
 _ADT_ALLOWLIST_BUNDLE_BASENAME = "adt_allowed_players_q0p99.parquet"
+_PARQUET_MANIFEST_KEYS: frozenset[str] = frozenset(
+    {
+        "slow_patron_parquet",
+        "trial_bet_behavior_parquet",
+        "adt_allowlist_parquet",
+        MANIFEST_KEY_FE_DERIVED,
+        MANIFEST_KEY_FE_SHORT_TERM,
+        MANIFEST_KEY_MID_TERM_SNAPSHOT,
+    }
+)
+_METADATA_MANIFEST_PASS_THROUGH: frozenset[str] = frozenset(
+    {
+        "version",
+        "model_version",
+        "coverage_end_exclusive",
+        "training_cutoff_iso",
+        "adt_allowlist_version",
+        "slow_patron_grain",
+        "mid_term_grain",
+        "mid_term_anchor_gaming_day_max",
+        "mid_term_coverage_end_exclusive",
+        "mid_term_generated_at",
+        "mid_term_stale_hard_cap_days",
+        "slow_anchor_gaming_day_max",
+        "slow_generated_at",
+        "slow_monthly_grace_days",
+        "slow_stale_hard_cap_days",
+        "sha256_by_layer",
+    }
+)
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -402,6 +431,74 @@ def _static_parquet_minimum_contracts(
     _static_slow_minimum_contract_pack(slow_pack_path)
 
 
+def _resolve_manifest_layer_file(raw_path: object, *, manifest_basis_dir: Path) -> Path | None:
+    """Resolve a manifest parquet path (absolute or relative to manifest parent)."""
+    if raw_path is None or raw_path == "":
+        return None
+    p = Path(str(raw_path)).expanduser()
+    if p.is_absolute():
+        src = p.resolve()
+    else:
+        src = (Path(manifest_basis_dir).resolve() / p).resolve()
+    return src if src.is_file() else None
+
+
+def _resolve_allowlist_source_for_pack(
+    man: dict[str, Any],
+    *,
+    manifest_basis_dir: Path,
+    model_bundle: Path,
+    strict: bool,
+) -> Path | None:
+    """Locate ADT allowlist parquet for Feast-only bundle (never copied under snapshots/)."""
+    raw = man.get("adt_allowlist_parquet")
+    if raw:
+        found = _resolve_manifest_layer_file(raw, manifest_basis_dir=manifest_basis_dir)
+        if found is not None:
+            return found
+    deploy_inputs = Path(model_bundle).resolve() / "deploy_inputs"
+    for candidate in (
+        deploy_inputs / _ADT_ALLOWLIST_BUNDLE_BASENAME,
+        deploy_inputs / "adt_allowlist.parquet",
+    ):
+        if candidate.is_file():
+            return candidate.resolve()
+    if isinstance(raw, str) and raw.strip():
+        p = Path(raw.strip())
+        if p.is_file():
+            return p.resolve()
+    if strict:
+        raise FileNotFoundError(
+            "[pack] ADT allowlist parquet missing for Feast-only bundle; "
+            "expected deploy_inputs allowlist or resolvable manifest adt_allowlist_parquet"
+        )
+    return None
+
+
+def _build_metadata_only_manifest(
+    source_man: dict[str, Any],
+    *,
+    model_version: str,
+    metrics: dict[str, Any],
+) -> dict[str, Any]:
+    """Build M1 metadata-only manifest (no ``*_parquet`` layer paths)."""
+    out: dict[str, Any] = {}
+    for key in _METADATA_MANIFEST_PASS_THROUGH:
+        if key in source_man and source_man[key] is not None:
+            out[key] = source_man[key]
+    out["version"] = str(source_man.get("version") or model_version)
+    out["model_version"] = str(source_man.get("model_version") or model_version)
+    if "coverage_end_exclusive" not in out:
+        out["coverage_end_exclusive"] = datetime.now(timezone.utc).isoformat()
+    cutoff = metrics.get("training_cutoff_iso") or source_man.get("training_cutoff_iso")
+    if cutoff and "training_cutoff_iso" not in out:
+        out["training_cutoff_iso"] = str(cutoff)
+    for key in list(out.keys()):
+        if key.endswith("_parquet") or key in _PARQUET_MANIFEST_KEYS:
+            out.pop(key, None)
+    return out
+
+
 def _rewrite_feast_feature_store_yaml(feast_repo: Path) -> None:
     """Point Feast offline staging at bundle-local ``artifacts/feast``."""
     yaml_path = feast_repo / "feature_store.yaml"
@@ -425,10 +522,13 @@ def _copy_feast_repo_to_bundle(bundle_root: Path) -> Path:
     shutil.copytree(
         _FEAST_REPO_SRC,
         dest,
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "registry.db", "online_store.db"),
     )
     (dest / "data").mkdir(parents=True, exist_ok=True)
     _rewrite_feast_feature_store_yaml(dest)
+    from trainer_hightier.serving.feast_online_adapter import reset_feast_repo_runtime_state
+
+    reset_feast_repo_runtime_state(dest)
     return dest
 
 
@@ -470,6 +570,7 @@ def _dynamic_registry_parquet_gate(
     model_feats: tuple[str, ...],
     slow_pack_path: Path | None,
     trial_pack_path: Path | None,
+    feast_only: bool = True,
 ) -> None:
     """Ensure Parquet-backed features align with frozen registry rows × model.pkl columns."""
 
@@ -488,6 +589,8 @@ def _dynamic_registry_parquet_gate(
         if src == "fe_derived":
             continue
         if src == "feast_slow_180d":
+            if feast_only:
+                continue
             if slow_pack_path is None or not slow_pack_path.is_file():
                 raise FileNotFoundError(f"[pack-schema] model expects {feat!r} (feast_slow_180d) but slow parquet missing")
             _ensure_parquet_columns(slow_pack_path, role="slow_patron", required=(feat,))
@@ -579,8 +682,8 @@ def _write_readme(path: Path) -> None:
 - `requirements.txt` — local wheel + PyPI / internal-index deps (must install `feast` for refresh)
 - `.env.example` — copy to `.env`; set ClickHouse credentials
 - `models/` — `model.pkl`, `training_metrics.json`, frozen registry snapshot, `model_version`
-- `mapping/` — canonical mapping Parquet
-- `snapshots/` — optional seed Parquet layers + `active_manifest.json` (legacy snapshot plane; **not** scorer v2 mid/long supplier)
+- `mapping/` — canonical mapping Parquet + fixed ADT allowlist (`adt_allowed_players_q0p99.parquet`)
+- `snapshots/` — metadata-only `active_manifest.json` (audit; **no** snapshot parquet layers)
 - `feast_repo/` — Feast definitions + bundle-local online store / registry paths (required for scorer v2)
 - `artifacts/feast/` — writable Feast readiness + refresh reports (bundle-local paths)
 - `local_state/` — `state.db`, `feature_state.db`, `prediction_log.db`
@@ -825,100 +928,39 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
     mver = _ensure_model_bundle(model_bundle, models_dir, strict=strict)
     metrics = _read_training_metrics(models_dir)
 
-    allow_pack_path: Path | None = None
-    slow_pack_path: Path | None = None
-    new_man = dict(man)
-    for key in (
-        "slow_patron_parquet",
-        "trial_bet_behavior_parquet",
-        "adt_allowlist_parquet",
-        MANIFEST_KEY_FE_DERIVED,
-        MANIFEST_KEY_FE_SHORT_TERM,
-        MANIFEST_KEY_MID_TERM_SNAPSHOT,
-    ):
-        rel, _src = _maybe_copy_layer(
-            key,
-            man.get(key),
-            dest_artifacts_dir=art_dir,
-            manifest_parent=snap_dir,
-            manifest_basis_dir=manifest_path.parent,
-            strict=strict,
-        )
-        if rel is not None:
-            new_man[key] = rel
-        elif man.get(key):
-            new_man.pop(key, None)
-
-    slow_rel = new_man.get("slow_patron_parquet")
-    if strict and (not slow_rel or not (snap_dir / slow_rel).is_file()):
-        logger.warning(
-            "[pack] slow_patron_parquet missing; scorer v2 bundle uses Feast online for mid/long"
-        )
-    if isinstance(slow_rel, str) and slow_rel and (snap_dir / slow_rel).is_file():
-        slow_pack_path = (snap_dir / slow_rel).resolve()
-
-    if strict and man.get("trial_bet_behavior_parquet") and not new_man.get("trial_bet_behavior_parquet"):
-        raise FileNotFoundError(
-            "strict pack requires copying trial_bet_behavior_parquet when declared in manifest; "
-            "source file missing or unreadable."
-        )
-
-    if strict and not new_man.get("adt_allowlist_parquet"):
-        raise ValueError(
-            "strict pack requires manifest adt_allowlist_parquet (high_adt_only deploy); "
-            f"manifest keys={sorted(new_man.keys())}"
-        )
-    al_rel = new_man.get("adt_allowlist_parquet")
-    if isinstance(al_rel, str) and al_rel and (snap_dir / al_rel).is_file():
-        allow_pack_path = (snap_dir / al_rel).resolve()
+    allow_src = _resolve_allowlist_source_for_pack(
+        man,
+        manifest_basis_dir=manifest_path.parent,
+        model_bundle=model_bundle,
+        strict=strict,
+    )
 
     map_name = map_src.name
     map_dest_path = map_dir / map_name
     shutil.copy2(map_src, map_dest_path)
 
     fixed_allow_path = map_dir / _ADT_ALLOWLIST_BUNDLE_BASENAME
-    if allow_pack_path is not None and allow_pack_path.is_file():
-        if allow_pack_path.resolve() != fixed_allow_path.resolve():
-            shutil.copy2(allow_pack_path, fixed_allow_path)
+    if allow_src is not None and allow_src.is_file():
+        if allow_src.resolve() != fixed_allow_path.resolve():
+            shutil.copy2(allow_src, fixed_allow_path)
         allow_pack_path = fixed_allow_path
     elif strict:
         raise ValueError(
-            "strict pack requires ADT allowlist parquet for Feast scorer v2 bundle; "
-            f"manifest keys={sorted(new_man.keys())}"
+            "strict pack requires ADT allowlist parquet for Feast scorer v2 bundle"
         )
+    else:
+        allow_pack_path = None
 
-    trial_pack_path: Path | None = None
-    tr_rel = new_man.get("trial_bet_behavior_parquet")
-    if isinstance(tr_rel, str) and tr_rel:
-        tp = (snap_dir / tr_rel).resolve()
-        if tp.is_file():
-            trial_pack_path = tp
-
-    fe_pack_path: Path | None = None
-    fe_rel = new_man.get(MANIFEST_KEY_FE_DERIVED)
-    if isinstance(fe_rel, str) and fe_rel:
-        fp = (snap_dir / fe_rel).resolve()
-        if fp.is_file():
-            fe_pack_path = fp
-
-    fe_short_pack_path: Path | None = None
-    fe_short_rel = new_man.get(MANIFEST_KEY_FE_SHORT_TERM)
-    if isinstance(fe_short_rel, str) and fe_short_rel:
-        fsp = (snap_dir / fe_short_rel).resolve()
-        if fsp.is_file():
-            fe_short_pack_path = fsp
-
-    mid_term_pack_path: Path | None = None
-    mid_rel = new_man.get(MANIFEST_KEY_MID_TERM_SNAPSHOT)
-    if isinstance(mid_rel, str) and mid_rel:
-        mp = (snap_dir / mid_rel).resolve()
-        if mp.is_file():
-            mid_term_pack_path = mp
+    metadata_manifest = _build_metadata_only_manifest(man, model_version=mver, metrics=metrics)
+    if allow_pack_path is not None and allow_pack_path.is_file():
+        al_sha = sha256_file(allow_pack_path)
+        exp_ver = str(man.get("adt_allowlist_version") or "").strip()
+        metadata_manifest["adt_allowlist_version"] = exp_ver or al_sha[:16]
 
     model_cols = _model_feature_columns_from_pickle(models_dir)
     _static_parquet_minimum_contracts(
         strict=strict,
-        slow_pack_path=slow_pack_path,
+        slow_pack_path=None,
         map_dest_path=map_dest_path,
         allow_pack_path=allow_pack_path,
         feast_bundle=True,
@@ -928,34 +970,35 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
         _dynamic_registry_parquet_gate(
             frozen_snap,
             model_feats=model_cols,
-            slow_pack_path=slow_pack_path,
-            trial_pack_path=trial_pack_path,
+            slow_pack_path=None,
+            trial_pack_path=None,
+            feast_only=True,
         )
         assert_feature_supplyability_or_raise(
             frozen_snap,
             model_cols,
-            slow_pack_path=slow_pack_path,
-            trial_pack_path=trial_pack_path,
-            fe_pack_path=fe_pack_path,
-            fe_short_term_pack_path=fe_short_pack_path,
-            mid_term_pack_path=mid_term_pack_path,
-            manifest=dict(new_man) if isinstance(new_man, dict) else None,
+            slow_pack_path=None,
+            trial_pack_path=None,
+            fe_pack_path=None,
+            fe_short_term_pack_path=None,
+            mid_term_pack_path=None,
+            manifest=metadata_manifest,
             validation_stage="package",
             scorer_v2_feast_mode=True,
         )
 
     out_manifest = snap_dir / "active_manifest.json"
-    out_manifest.write_text(json.dumps(new_man, indent=2), encoding="utf-8")
+    out_manifest.write_text(json.dumps(metadata_manifest, indent=2), encoding="utf-8")
 
     allow_sha = sha256_file(allow_pack_path) if allow_pack_path and allow_pack_path.is_file() else None
-    slow_sha = sha256_file(slow_pack_path) if slow_pack_path and slow_pack_path.is_file() else None
+    slow_sha = None
     map_sha = sha256_file(map_dest_path) if map_dest_path.is_file() else None
     _verify_allowlist_training_hash_or_raise(metrics, allow_pack_path)
 
     reg_sha_metric = metrics.get("feature_candidate_registry_sha256") if metrics else None
     reg_sha_s = reg_sha_metric.strip() if isinstance(reg_sha_metric, str) and reg_sha_metric.strip() else None
 
-    man_version = str(new_man.get("version", "") or man.get("version", "") or "unknown")
+    man_version = str(metadata_manifest.get("version", "") or "unknown")
     build_time_iso = datetime.now(timezone.utc).isoformat()
     fingerprint = _stable_fingerprint_payload(
         model_version=mver,

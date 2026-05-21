@@ -456,7 +456,7 @@ class HightierServingConfig:
     session_avail_delay_min: int = 15
     scorer_poll_interval_seconds: float = 30.0
     #: Upper bound on cold-start / backfill window for incremental fetches (hours).
-    scorer_dynamic_lookback_cap_hours: int = 168
+    scorer_dynamic_lookback_cap_hours: int = 8
     hightier_scorer_max_bets_per_cycle: int = 2000
     #: Split ADT allowlist ``player_id`` IN-lists into chunks of this size (ClickHouse query limits).
     hightier_scorer_player_id_chunk_size: int = 500

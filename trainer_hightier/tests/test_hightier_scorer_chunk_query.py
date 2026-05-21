@@ -70,6 +70,7 @@ def test_fetch_bets_incremental_global_query_no_tbets_casino_expression(monkeypa
     assert "CAST(NULL AS Nullable(String))" in q
     assert "CAST(wager AS Float64) AS wager" in q
     assert "CAST(casino_win AS Float64) AS casino_win" in q
+    assert "CAST(payout_odds AS Float64) AS payout_odds" in q
     assert "trim(casino_player_id)" not in q.replace(" ", "").lower()
 
 
@@ -98,6 +99,7 @@ def test_fetch_bets_incremental_allowlist_uses_short_in_lists(monkeypatch: pytes
         assert "player_id IN (" in q
         assert "CAST(wager AS Float64) AS wager" in q
         assert "CAST(casino_win AS Float64) AS casino_win" in q
+        assert "CAST(payout_odds AS Float64) AS payout_odds" in q
         assert "trim(casino_player_id)" not in q.replace(" ", "").lower()
 
 
@@ -171,6 +173,7 @@ def test_fetch_bet_pool_window_chunks_merge(monkeypatch: pytest.MonkeyPatch) -> 
     for q in sqls:
         assert "CAST(wager AS Float64) AS wager" in q
         assert "CAST(casino_win AS Float64) AS casino_win" in q
+        assert "CAST(payout_odds AS Float64) AS payout_odds" in q
 
 
 def test_append_hightier_prediction_log_writes_rows(tmp_path) -> None:

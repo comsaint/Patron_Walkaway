@@ -40,16 +40,22 @@ class RowMissingAudit:
     feast_mid_missing: int
     feast_slow_missing: int
     short_term_missing: int
+    composite_upstream_null: tuple[tuple[str, int], ...] = ()
 
     def family_summary(self) -> dict[str, int]:
         """JSON-serializable family missing counts."""
-        return {
+        out: dict[str, int] = {
             "model_features_missing": self.model_features_missing,
             "fe_features_missing": self.fe_features_missing,
             "feast_mid_missing": self.feast_mid_missing,
             "feast_slow_missing": self.feast_slow_missing,
             "short_term_missing": self.short_term_missing,
         }
+        if self.composite_upstream_null:
+            out["composite_upstream_null"] = sum(n for _, n in self.composite_upstream_null)
+            for col, n in self.composite_upstream_null:
+                out[f"upstream_null__{col}"] = int(n)
+        return out
 
 
 @dataclass(frozen=True)
@@ -139,6 +145,50 @@ def compute_row_missing_audits(
             )
         )
     return out
+
+
+def enrich_row_audits_composite_upstream(
+    staged: pd.DataFrame,
+    audits: list[RowMissingAudit],
+    *,
+    composite_cols: tuple[str, ...],
+    runtime_inputs_by_feature: dict[str, tuple[tuple[str, tuple[str, ...]], ...]],
+) -> list[RowMissingAudit]:
+    """Attach upstream-null counts when composite model columns are null."""
+
+    if staged.empty or not composite_cols or not audits:
+        return audits
+    enriched: list[RowMissingAudit] = []
+    for pos, audit in enumerate(audits):
+        if pos >= len(staged):
+            enriched.append(audit)
+            continue
+        row = staged.iloc[pos]
+        upstream_counts: dict[str, int] = {}
+        for comp in composite_cols:
+            comp_val = row.get(comp) if comp in row.index else None
+            if not _is_null_cell(comp_val):
+                continue
+            for _, deps in runtime_inputs_by_feature.get(comp, ()):
+                for dep in deps:
+                    dep_val = row.get(dep) if dep in row.index else None
+                    if _is_null_cell(dep_val):
+                        upstream_counts[dep] = 1
+        if not upstream_counts:
+            enriched.append(audit)
+            continue
+        merged = tuple((k, upstream_counts[k]) for k in sorted(upstream_counts))
+        enriched.append(
+            RowMissingAudit(
+                model_features_missing=audit.model_features_missing,
+                fe_features_missing=audit.fe_features_missing,
+                feast_mid_missing=audit.feast_mid_missing,
+                feast_slow_missing=audit.feast_slow_missing,
+                short_term_missing=audit.short_term_missing,
+                composite_upstream_null=merged,
+            )
+        )
+    return enriched
 
 
 def build_cycle_readiness_summary(
@@ -312,6 +362,21 @@ def default_feast_repo_path() -> Path:
     if cfg.scorer_feast_repo_path is not None:
         return Path(cfg.scorer_feast_repo_path).resolve()
     return TRAINER_HIGHTIER_PACKAGE_DIR / "feast_repo"
+
+
+def resolve_feast_artifacts_dir(feast_repo: Path) -> Path:
+    """Return bundle-local ``artifacts/feast`` (sibling of ``feast_repo``, never site-packages)."""
+    return Path(feast_repo).resolve().parent / "artifacts" / "feast"
+
+
+def reset_feast_repo_runtime_state(feast_repo: Path) -> None:
+    """Drop registry/online DB so ``feast apply`` materializes bundle-relative paths only."""
+    data_dir = Path(feast_repo).resolve() / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("registry.db", "online_store.db"):
+        db_file = data_dir / name
+        if db_file.is_file():
+            db_file.unlink()
 
 
 def _feast_registry_db_path(feast_repo: Path) -> Path:

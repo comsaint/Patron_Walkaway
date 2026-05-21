@@ -29,15 +29,23 @@ from trainer_hightier.config import (
 from trainer_hightier.feature_experiment.feature_cadence import (
     MID_TERM_COMPOSITE_FEATURE_COLUMNS,
     classify_model_fe_features,
+    runtime_inputs_from_registry,
     short_term_enrich_columns_with_dependencies,
 )
-from trainer_hightier.serving.feast_production_constants import PRODUCTION_MID_TERM_FEATURE_COLUMNS
 from trainer_hightier.feature_experiment.materialize_mid_term_daily_snapshot import (
-    mid_term_snapshot_production_safe,
+    MID_TERM_SNAPSHOT_OUTPUT_COLUMNS,
+)
+from trainer_hightier.serving.feast_production_constants import (
+    PRODUCTION_LONG_TERM_FEATURE_COLUMNS,
+    PRODUCTION_MID_TERM_FEATURE_COLUMNS,
 )
 from trainer_hightier.serving.candidate_registry_loader import (
     CandidateRegistrySnapshot,
+    FeatureRegistryEntryRow,
     load_candidate_registry,
+)
+from trainer_hightier.feature_experiment.materialize_mid_term_daily_snapshot import (
+    mid_term_snapshot_production_safe,
 )
 from trainer_hightier.serving.production_materialize import (
     DEFAULT_MODEL_FE_DERIVED_COLUMNS,
@@ -677,6 +685,25 @@ def load_frozen_registry_for_bundle(model_bundle_dir: Path) -> CandidateRegistry
 
 
 _SPIKE_MID_TERM_COLUMN_SET: frozenset[str] = frozenset(PRODUCTION_MID_TERM_FEATURE_COLUMNS)
+_SPIKE_SLOW_COLUMN_SET: frozenset[str] = frozenset(PRODUCTION_LONG_TERM_FEATURE_COLUMNS)
+_MATERIALIZER_MID_COLUMNS: frozenset[str] = frozenset(
+    c for c in MID_TERM_SNAPSHOT_OUTPUT_COLUMNS if c not in ("canonical_id", "anchor_gaming_day")
+)
+
+
+@dataclass(frozen=True)
+class RuntimeDependencyClosure:
+    """Expanded runtime suppliers for one active model (model outputs + upstream deps)."""
+
+    model_output_cols: tuple[str, ...]
+    baseline_cols: tuple[str, ...]
+    feast_trial_cols: tuple[str, ...]
+    feast_mid_cols: tuple[str, ...]
+    feast_slow_cols: tuple[str, ...]
+    short_term_cols: tuple[str, ...]
+    mid_composite_cols: tuple[str, ...]
+    dependency_only_cols: tuple[str, ...]
+    unknown_cols: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -690,6 +717,160 @@ class ScorerSupplierPlan:
     feast_slow_cols: tuple[str, ...]
     short_term_cols: tuple[str, ...]
     unknown_cols: tuple[str, ...]
+    dependency_only_cols: tuple[str, ...] = ()
+
+
+def _infer_runtime_supplier(
+    row: FeatureRegistryEntryRow | None,
+    feature_id: str,
+    *,
+    mid_set: set[str],
+    short_set: set[str],
+) -> str | None:
+    """Infer runtime supplier when registry row omits ``runtime_supplier``."""
+
+    if row is not None and row.runtime_supplier:
+        return row.runtime_supplier
+    if row is None:
+        if feature_id in _SPIKE_MID_TERM_COLUMN_SET:
+            return "feast_online_mid"
+        if feature_id in _SPIKE_SLOW_COLUMN_SET:
+            return "feast_online_slow"
+        return None
+    src = row.source
+    if src == "baseline_model":
+        return "clickhouse_raw"
+    if src == "feast_trial_1h":
+        return "feast_trial_1h"
+    if src == "feast_slow_180d" or feature_id in DEFAULT_MODEL_SLOW_PATRON_COLUMNS:
+        return "feast_online_slow"
+    if src == "fe_derived":
+        if feature_id in MID_TERM_COMPOSITE_FEATURE_COLUMNS:
+            return "composite"
+        if feature_id in mid_set and feature_id in _SPIKE_MID_TERM_COLUMN_SET:
+            return "feast_online_mid"
+        if feature_id in short_set:
+            return "short_term_pit_builder"
+        if feature_id in mid_set:
+            return "composite" if feature_id in MID_TERM_COMPOSITE_FEATURE_COLUMNS else None
+    return None
+
+
+def _collect_closure_feature_ids(
+    model_feats: tuple[str, ...],
+    by_id: dict[str, FeatureRegistryEntryRow],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Expand model features via registry ``runtime_inputs`` (fail on cycles)."""
+
+    needed: list[str] = []
+    seen: set[str] = set()
+    unknown: list[str] = []
+    stack: list[tuple[str, frozenset[str]]] = [(f, frozenset()) for f in model_feats]
+
+    while stack:
+        fid, ancestors = stack.pop()
+        if fid in ancestors:
+            raise ValueError(f"[feature-supply] cyclic runtime dependency involving {fid!r}")
+        if fid in seen:
+            continue
+        row = by_id.get(fid)
+        if row is None and fid not in _SPIKE_MID_TERM_COLUMN_SET and fid not in _SPIKE_SLOW_COLUMN_SET:
+            if fid in model_feats:
+                unknown.append(fid)
+            seen.add(fid)
+            needed.append(fid)
+            continue
+        seen.add(fid)
+        needed.append(fid)
+        if row is None:
+            continue
+        next_anc = ancestors | {fid}
+        for _, deps in runtime_inputs_from_registry(row, fid):
+            for dep in deps:
+                if dep not in seen:
+                    stack.append((dep, next_anc))
+
+    return tuple(dict.fromkeys(needed)), tuple(dict.fromkeys(unknown))
+
+
+def build_runtime_dependency_closure(
+    snap: CandidateRegistrySnapshot,
+    model_feats: tuple[str, ...],
+) -> RuntimeDependencyClosure:
+    """Build supplier buckets from model outputs plus registry dependency closure."""
+
+    by_id = {r.feature_id: r for r in snap.rows}
+    model_set = set(model_feats)
+    fe_split = classify_model_fe_features(snap, model_feats)
+    mid_set = set(fe_split["mid_term"])
+    short_set = set(fe_split["short_term"])
+    all_feats, unknown_from_closure = _collect_closure_feature_ids(model_feats, by_id)
+
+    baseline: list[str] = []
+    trial: list[str] = []
+    mid: list[str] = []
+    mid_comp: list[str] = []
+    slow: list[str] = []
+    short: list[str] = []
+    unknown: list[str] = list(unknown_from_closure)
+
+    def _append_unique(bucket: list[str], fid: str) -> None:
+        if fid not in bucket:
+            bucket.append(fid)
+
+    def _classify_into_buckets(fid: str, *, is_model_output: bool) -> None:
+        row = by_id.get(fid)
+        supplier = _infer_runtime_supplier(row, fid, mid_set=mid_set, short_set=short_set)
+        if supplier is None:
+            if is_model_output:
+                unknown.append(fid)
+            return
+        if supplier == "clickhouse_raw" and is_model_output:
+            _append_unique(baseline, fid)
+        elif supplier == "feast_trial_1h" and is_model_output:
+            _append_unique(trial, fid)
+        elif supplier == "feast_online_mid":
+            _append_unique(mid, fid)
+        elif supplier == "feast_online_slow":
+            _append_unique(slow, fid)
+        elif supplier == "short_term_pit_builder":
+            _append_unique(short, fid)
+        elif supplier == "composite" and is_model_output:
+            _append_unique(mid_comp, fid)
+            for sup_key, deps in runtime_inputs_from_registry(row, fid):
+                if sup_key == "feast_online_mid":
+                    for dep in deps:
+                        _append_unique(mid, dep)
+                elif sup_key == "feast_online_slow":
+                    for dep in deps:
+                        _append_unique(slow, dep)
+                elif sup_key == "short_term_pit_builder":
+                    for dep in deps:
+                        _append_unique(short, dep)
+
+    for fid in model_feats:
+        _classify_into_buckets(fid, is_model_output=True)
+
+    for fid in all_feats:
+        if fid in model_set:
+            continue
+        _classify_into_buckets(fid, is_model_output=False)
+
+    feast_mid = tuple(dict.fromkeys(c for c in mid if c in _SPIKE_MID_TERM_COLUMN_SET))
+    feast_slow = tuple(dict.fromkeys(c for c in slow if c in _SPIKE_SLOW_COLUMN_SET))
+    short_out = tuple(dict.fromkeys(short))
+    dep_only_out = tuple(c for c in all_feats if c not in model_set and c not in mid_comp)
+    return RuntimeDependencyClosure(
+        model_output_cols=tuple(model_feats),
+        baseline_cols=tuple(dict.fromkeys(baseline)),
+        feast_trial_cols=tuple(dict.fromkeys(trial)),
+        feast_mid_cols=feast_mid,
+        feast_slow_cols=feast_slow,
+        short_term_cols=short_out,
+        mid_composite_cols=tuple(dict.fromkeys(mid_comp)),
+        dependency_only_cols=dep_only_out,
+        unknown_cols=tuple(dict.fromkeys(unknown)),
+    )
 
 
 def build_scorer_supplier_plan(
@@ -697,53 +878,50 @@ def build_scorer_supplier_plan(
     model_feats: tuple[str, ...],
 ) -> ScorerSupplierPlan:
     """Map ``model.pkl`` feature columns to scorer v2 runtime suppliers."""
-    by_id = {r.feature_id: r for r in snap.rows}
-    fe_split = classify_model_fe_features(snap, model_feats)
-    mid_set = set(fe_split["mid_term"])
-    short_set = set(fe_split["short_term"])
-    slow_set = set(DEFAULT_MODEL_SLOW_PATRON_COLUMNS)
-    baseline: list[str] = []
-    trial: list[str] = []
-    mid: list[str] = []
-    mid_composite: list[str] = []
-    slow: list[str] = []
-    short: list[str] = []
-    unknown: list[str] = []
-    for feat in model_feats:
-        row = by_id.get(feat)
-        if row is None:
-            unknown.append(feat)
-            continue
-        src = row.source
-        if src == "baseline_model":
-            baseline.append(feat)
-        elif src == "feast_trial_1h":
-            trial.append(feat)
-        elif src == "feast_slow_180d" or feat in slow_set:
-            slow.append(feat)
-        elif src == "fe_derived":
-            if feat in mid_set:
-                if feat in MID_TERM_COMPOSITE_FEATURE_COLUMNS:
-                    mid_composite.append(feat)
-                elif feat in _SPIKE_MID_TERM_COLUMN_SET:
-                    mid.append(feat)
-                else:
-                    unknown.append(feat)
-            elif feat in short_set:
-                short.append(feat)
-            else:
-                unknown.append(feat)
-        else:
-            unknown.append(feat)
+    closure = build_runtime_dependency_closure(snap, model_feats)
     return ScorerSupplierPlan(
-        baseline_cols=tuple(baseline),
-        feast_trial_cols=tuple(trial),
-        feast_mid_cols=tuple(mid),
-        mid_composite_cols=tuple(mid_composite),
-        feast_slow_cols=tuple(slow),
-        short_term_cols=tuple(short),
-        unknown_cols=tuple(unknown),
+        baseline_cols=closure.baseline_cols,
+        feast_trial_cols=closure.feast_trial_cols,
+        feast_mid_cols=closure.feast_mid_cols,
+        mid_composite_cols=closure.mid_composite_cols,
+        feast_slow_cols=closure.feast_slow_cols,
+        short_term_cols=closure.short_term_cols,
+        unknown_cols=closure.unknown_cols,
+        dependency_only_cols=closure.dependency_only_cols,
     )
+
+
+def assert_composite_implementations_or_raise(plan: ScorerSupplierPlan) -> None:
+    """Every composite model column must have a Python scorer implementation."""
+
+    missing = [c for c in plan.mid_composite_cols if c not in MID_TERM_COMPOSITE_FEATURE_COLUMNS]
+    if missing:
+        raise ValueError(
+            "[feature-supply] composite features lack scorer implementation: "
+            f"{missing[:12]}"
+        )
+
+
+def assert_feast_plan_schema_support_or_raise(plan: ScorerSupplierPlan) -> None:
+    """Fail when plan-required Feast columns are absent from production schema lists."""
+
+    for col in plan.feast_mid_cols:
+        if col not in _SPIKE_MID_TERM_COLUMN_SET:
+            raise ValueError(
+                f"[feature-supply] model requires feast_online_mid column {col!r} "
+                "but it is not in PRODUCTION_MID_TERM_FEATURE_COLUMNS"
+            )
+        if col not in _MATERIALIZER_MID_COLUMNS:
+            raise ValueError(
+                f"[feature-supply] model requires feast_online_mid column {col!r} "
+                "but it is not in MID_TERM_SNAPSHOT_OUTPUT_COLUMNS"
+            )
+    for col in plan.feast_slow_cols:
+        if col not in _SPIKE_SLOW_COLUMN_SET:
+            raise ValueError(
+                f"[feature-supply] model requires feast_online_slow column {col!r} "
+                "but it is not in PRODUCTION_LONG_TERM_FEATURE_COLUMNS"
+            )
 
 
 def assert_scorer_supplier_plan_or_raise(plan: ScorerSupplierPlan) -> None:
@@ -755,6 +933,8 @@ def assert_scorer_supplier_plan_or_raise(plan: ScorerSupplierPlan) -> None:
             "[feature-supply] scorer v2 supplier plan has unknown columns: "
             f"[{tip}{ellipsis}]"
         )
+    assert_composite_implementations_or_raise(plan)
+    assert_feast_plan_schema_support_or_raise(plan)
 
 
 def scorer_supplier_route_counts(plan: ScorerSupplierPlan) -> dict[str, int]:

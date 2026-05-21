@@ -206,9 +206,13 @@ def _effective_etl_cursor(bets: pd.DataFrame) -> pd.Series:
 
 
 #: ``t_bet`` has no loyalty id; keep a nullable column for downstream schema / API parity.
+#: GDP_GMWDS_Raw §4 money columns are ``Decimal(19,4)`` (e.g. ``payout_odds`` 0–100).
+#: Cast at read time so clickhouse_connect / DuckDB never infer a narrow DECIMAL from a
+#: mostly-small sample (production crash: ``100.0000`` vs inferred ``DECIMAL(6,4)``).
 _TBET_CASINO_PLAYER_ID_SELECT = "CAST(NULL AS Nullable(String)) AS casino_player_id"
 _TBET_WAGER_SELECT = "CAST(wager AS Float64) AS wager"
 _TBET_CASINO_WIN_SELECT = "CAST(casino_win AS Float64) AS casino_win"
+_TBET_PAYOUT_ODDS_SELECT = "CAST(payout_odds AS Float64) AS payout_odds"
 
 
 def _incremental_params_and_etl_filter(
@@ -353,7 +357,7 @@ def fetch_bets_incremental(
                 position_idx,
                 {_TBET_WAGER_SELECT},
                 {_TBET_CASINO_WIN_SELECT},
-                payout_odds,
+                {_TBET_PAYOUT_ODDS_SELECT},
                 status,
                 {cid_sel}
             FROM {cfg.source_db}.{cfg.tbet} FINAL
@@ -390,7 +394,7 @@ def fetch_bets_incremental(
                     position_idx,
                     {_TBET_WAGER_SELECT},
                     {_TBET_CASINO_WIN_SELECT},
-                    payout_odds,
+                    {_TBET_PAYOUT_ODDS_SELECT},
                     status,
                     {cid_sel}
                 FROM {cfg.source_db}.{cfg.tbet} FINAL
@@ -467,7 +471,7 @@ def fetch_bet_pool_window(
                 position_idx,
                 {_TBET_WAGER_SELECT},
                 {_TBET_CASINO_WIN_SELECT},
-                payout_odds,
+                {_TBET_PAYOUT_ODDS_SELECT},
                 status,
                 {cid_sel}
             FROM {cfg.source_db}.{cfg.tbet} FINAL
@@ -614,9 +618,7 @@ def _build_staged_features(
     staged = attach_synthetic_etl_and_prediction_visible(batch.bets)
     staged = attach_canonical_id(staged, mapping_parquet=mapping_parquet)
     staged = attach_trial_bet_behavior_1h(staged, pool)
-    mid_term_for_deps = tuple(
-        dict.fromkeys([*supplier_plan.feast_mid_cols, *supplier_plan.mid_composite_cols])
-    )
+    mid_term_for_deps = supplier_plan.mid_composite_cols
     short_cols = short_term_enrich_columns_with_dependencies(
         supplier_plan.short_term_cols,
         mid_term_for_deps,
@@ -943,6 +945,20 @@ def score_once(
         feast_mid_cols=supplier_plan.feast_mid_cols,
         feast_slow_cols=supplier_plan.feast_slow_cols,
         short_term_cols=supplier_plan.short_term_cols,
+    )
+    from trainer_hightier.feature_experiment.feature_cadence import runtime_inputs_from_registry
+    from trainer_hightier.serving.feast_online_adapter import enrich_row_audits_composite_upstream
+
+    _reg_by_id = {r.feature_id: r for r in registry_snap.rows}
+    runtime_inputs_map = {
+        comp: runtime_inputs_from_registry(_reg_by_id.get(comp), comp)
+        for comp in supplier_plan.mid_composite_cols
+    }
+    row_audits = enrich_row_audits_composite_upstream(
+        staged,
+        row_audits,
+        composite_cols=supplier_plan.mid_composite_cols,
+        runtime_inputs_by_feature=runtime_inputs_map,
     )
     if pl_path is not None and str(pl_path).strip():
         try:

@@ -668,6 +668,39 @@ def run_allowlist_feast_lookup_smoke(
     }
 
 
+def assert_readiness_covers_plan_columns(
+    readiness: FeastOnlineReadiness,
+    *,
+    mid_columns: tuple[str, ...],
+    slow_columns: tuple[str, ...],
+) -> str | None:
+    """Return hard-fail reason when readiness metadata omits model-specific Feast columns."""
+
+    if mid_columns and readiness.mid_term is not None:
+        ready = set(readiness.mid_term.feature_columns)
+        if ready:
+            missing = [c for c in mid_columns if c not in ready]
+            if missing:
+                tip = ", ".join(missing[:8])
+                ellipsis = "" if len(missing) <= 8 else ", …"
+                return (
+                    "[feast_readiness] mid_term readiness feature_columns missing plan cols: "
+                    f"[{tip}{ellipsis}]"
+                )
+    if slow_columns and readiness.slow_patron is not None:
+        ready = set(readiness.slow_patron.feature_columns)
+        if ready:
+            missing = [c for c in slow_columns if c not in ready]
+            if missing:
+                tip = ", ".join(missing[:8])
+                ellipsis = "" if len(missing) <= 8 else ", …"
+                return (
+                    "[feast_readiness] slow_patron readiness feature_columns missing plan cols: "
+                    f"[{tip}{ellipsis}]"
+                )
+    return None
+
+
 def run_deploy_feast_readiness_check(
     *,
     require_mid: bool,
@@ -682,6 +715,20 @@ def run_deploy_feast_readiness_check(
     cfg = default_hightier_serving_config()
     path = resolve_feast_readiness_path(cfg)
     readiness = load_feast_online_readiness(path)
+    plan_cov = assert_readiness_covers_plan_columns(
+        readiness,
+        mid_columns=mid_columns,
+        slow_columns=slow_columns,
+    )
+    if plan_cov is not None:
+        return FeastReadinessGateResult(
+            ok=False,
+            mid_fresh=None,
+            slow_fresh=None,
+            hard_failure_reason=plan_cov,
+            readiness_path=path,
+            deploy_lookup_smoke=None,
+        )
     gate = evaluate_feast_readiness_gate(
         readiness,
         require_mid=require_mid,
