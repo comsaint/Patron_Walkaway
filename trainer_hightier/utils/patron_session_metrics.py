@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import date
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -285,10 +286,21 @@ def _validate_adt_allowlist_inputs(profile_csv: Path, mapping_parquet: Path) -> 
         raise ValueError(f"Canonical mapping Parquet missing columns for ADT allowlist: {miss_m}")
 
 
-def _adt_allowlist_copy_inner_sql(*, profile_esc: str, map_esc: str, quantile: float) -> str:
+def _adt_allowlist_copy_inner_sql(
+    *,
+    profile_esc: str,
+    map_esc: str,
+    quantile: float,
+    slow_coverage_subquery: str | None = None,
+) -> str:
     """DuckDB SELECT: profile ADT threshold × mapping → one grouped row per ``player_id``."""
     qf = float(quantile)
     q_lit = repr(qf)
+    slow_cov_clause = ""
+    if slow_coverage_subquery is not None:
+        slow_cov_clause = (
+            f"\n    AND TRIM(CAST(m.canonical_id AS VARCHAR)) IN ({slow_coverage_subquery})"
+        )
     return f"""
 WITH threshold AS (
   SELECT quantile_cont(TRY_CAST(adt AS DOUBLE), {qf}) AS qv
@@ -309,7 +321,7 @@ joined AS (
   WHERE TRY_CAST(m.player_id AS BIGINT) IS NOT NULL
     AND TRY_CAST(p.adt AS DOUBLE) IS NOT NULL
     AND th.qv IS NOT NULL
-    AND TRY_CAST(p.adt AS DOUBLE) >= th.qv
+    AND TRY_CAST(p.adt AS DOUBLE) >= th.qv{slow_cov_clause}
 ),
 agg AS (
   SELECT
@@ -353,12 +365,19 @@ def materialize_adt_allowed_players_parquet(
     duckdb_runtime: DuckDbRuntimeConfig,
     output_parquet: Path | None = None,
     duckdb_join_timeout_s: float = 3600.0,
+    cleaned_session_parquet: Path | None = None,
+    slow_active_anchor: date | None = None,
+    slow_lookback_days: int = 180,
 ) -> Path:
     """Join profile ADT quantile threshold → mapping; write one Parquet row per allowed ``player_id``.
 
     Columns: ``player_id``, ``canonical_id``, ``adt``, ``adt_threshold``, ``adt_quantile``.
     ``quantile_cont(adt, quantile)`` uses non-null patron-profile ``adt`` rows only; patrons at or above
     the threshold keep all mapped ``player_id`` values (deduped per ``player_id``).
+
+    When ``cleaned_session_parquet`` and ``slow_active_anchor`` are set, drop allowlist rows whose
+    ``canonical_id`` has no session in the inclusive ``slow_lookback_days`` window ending on
+    ``slow_active_anchor`` (same rule as slow monthly materialization / post-gap deploy coverage).
     """
     src_p = Path(patron_profile_csv).resolve()
     src_m = Path(canonical_mapping_parquet).resolve()
@@ -372,10 +391,26 @@ def materialize_adt_allowed_players_parquet(
     if out.is_file():
         out.unlink()
 
+    slow_cov_sql: str | None = None
+    if cleaned_session_parquet is not None and slow_active_anchor is not None:
+        from trainer_hightier.utils.slow_patron_180d_monthly import (
+            canonical_ids_with_slow_session_window_subquery,
+        )
+
+        sess_p = Path(cleaned_session_parquet).resolve()
+        if not sess_p.is_file():
+            raise FileNotFoundError(f"cleaned session parquet not found: {sess_p}")
+        slow_cov_sql = canonical_ids_with_slow_session_window_subquery(
+            sess_esc=_path_posix(sess_p).replace("'", "''"),
+            map_esc=_path_posix(src_m).replace("'", "''"),
+            lookback_days=int(slow_lookback_days),
+            active_anchor=slow_active_anchor,
+        )
     inner = _adt_allowlist_copy_inner_sql(
         profile_esc=_path_posix(src_p).replace("'", "''"),
         map_esc=_path_posix(src_m).replace("'", "''"),
         quantile=qf,
+        slow_coverage_subquery=slow_cov_sql,
     )
     _copy_adt_allowlist_select_to_parquet(
         inner_select_sql=inner,

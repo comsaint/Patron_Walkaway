@@ -868,6 +868,23 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
         bet_extras_arg = bet_extras or None
 
         if want_adt_bets and args.canonical_mapping.enabled and allowed_players_pq is not None:
+            from datetime import date as _date_cls
+
+            from trainer_hightier.config import default_hightier_serving_config
+            from trainer_hightier.utils.slow_month_turn import resolve_slow_month_turn_context
+
+            _slow_ctx = resolve_slow_month_turn_context(_date_cls.today())
+            _svc_cfg = default_hightier_serving_config()
+            materialize_adt_allowed_players_parquet(
+                profile_csv_path,
+                mapping_parquet_path,
+                quantile=q_thr,
+                duckdb_runtime=args.duckdb_runtime,
+                output_parquet=allowed_players_pq,
+                cleaned_session_parquet=cleaned_path,
+                slow_active_anchor=_slow_ctx.slow_anchor_required,
+                slow_lookback_days=int(_svc_cfg.production_slow_lookback_days),
+            )
             base_hit = use_preprocess_caches and _hbet.bet_base_clean_cache_is_hit(
                 merged_bet_sources,
                 base_bet_path,
@@ -900,13 +917,6 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     cleaned_bet_path.resolve(),
                 )
             else:
-                materialize_adt_allowed_players_parquet(
-                    profile_csv_path,
-                    mapping_parquet_path,
-                    quantile=q_thr,
-                    duckdb_runtime=args.duckdb_runtime,
-                    output_parquet=allowed_players_pq,
-                )
                 bet_dedup_eff = int(base_bet_cfg.dedup_hash_buckets)
                 mf_bkt = _hbet.bet_base_manifest_dedup_hash_buckets(base_bet_path)
                 if base_hit and mf_bkt is not None:
@@ -1222,11 +1232,20 @@ def _maybe_run_step4(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None)
         fp_eff.resolve(),
         _resolve_splits_dir(args).resolve(),
     )
+    slow_for_split = default_slow_patron_180d_monthly_parquet_path().resolve()
+    step4_cfg = args.step4_split
+    if slow_for_split.is_file():
+        step4_cfg = replace(args.step4_split, slow_patron_parquet=slow_for_split)
+    else:
+        logger.warning(
+            "[Step 4] slow_patron_parquet missing at %s; splits will not filter slow coverage",
+            slow_for_split,
+        )
     t0 = time.perf_counter()
     res = _b4.arrange_and_split_training_data(
         features_parquet=fp_eff,
         duckdb_runtime=args.duckdb_runtime,
-        step4=args.step4_split,
+        step4=step4_cfg,
     )
     elapsed = round(time.perf_counter() - t0, 3)
     if metrics is not None:
@@ -1609,6 +1628,30 @@ def _freeze_deploy_inputs(
     metrics["deploy_inputs_active_manifest"] = str(mf.resolve())
 
 
+def _sync_feast_slow_online_for_step6(
+    repo: Path,
+    metrics: dict[str, Any],
+) -> None:
+    """Materialize training slow Parquet into Feast online before Step 6 replay."""
+    slow_p = default_slow_patron_180d_monthly_parquet_path().resolve()
+    feast_repo = repo / "trainer_hightier" / "feast_repo"
+    if not slow_p.is_file():
+        raise FileNotFoundError(
+            f"[Step 6] cannot sync Feast slow online: training artifact missing at {slow_p}",
+        )
+    from trainer_hightier.serving.feast_online_refresh import sync_training_slow_parquet_to_feast_online
+
+    t0 = time.perf_counter()
+    sync_meta = sync_training_slow_parquet_to_feast_online(feast_repo, slow_parquet=slow_p)
+    metrics["step6_feast_slow_online_sync_seconds"] = round(time.perf_counter() - t0, 3)
+    metrics["step6_feast_slow_online_sync"] = sync_meta
+    logger.info(
+        "[Step 6] synced training slow parquet to Feast online (rows=%s, %.3fs)",
+        sync_meta.get("feast_rows"),
+        metrics["step6_feast_slow_online_sync_seconds"],
+    )
+
+
 def _run_step6_parity_verification(
     args: HighTierTrainArgs,
     metrics: dict[str, Any],
@@ -1623,6 +1666,9 @@ def _run_step6_parity_verification(
 
     import importlib.util
 
+    repo = _repo_root()
+    _sync_feast_slow_online_for_step6(repo, metrics)
+
     step06_path = Path(__file__).resolve().parent / "06_verify_training_serving_parity.py"
     spec = importlib.util.spec_from_file_location("trainer_hightier_step06_verify", step06_path)
     if spec is None or spec.loader is None:
@@ -1630,7 +1676,6 @@ def _run_step6_parity_verification(
     step06_mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(step06_mod)
 
-    repo = _repo_root()
     splits_dir = args.step4_split.splits_output_dir
     if splits_dir is None:
         test_parquet = repo / "trainer_hightier" / "artifacts" / "training_data" / "splits" / "test.parquet"

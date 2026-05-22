@@ -489,6 +489,46 @@ def _materialize_window_from_feast_parquet(feast_parquet: Path) -> tuple[datetim
     return start_dt - timedelta(hours=1), end_dt + timedelta(hours=1)
 
 
+def sync_training_slow_parquet_to_feast_online(
+    feast_repo: Path,
+    *,
+    slow_parquet: Path,
+) -> dict[str, Any]:
+    """Publish training ``slow_patron_180d_monthly.parquet`` into Feast online (scorer v2 path).
+
+    Copies the canonical active-month artifact into bundle-local Feast artifacts, then
+    materializes ``long_term_slow_spike_features`` so Step 6 / production replay match training.
+    """
+    src = Path(slow_parquet).resolve()
+    if not src.is_file():
+        raise FileNotFoundError(f"training slow parquet not found: {src}")
+    repo = Path(feast_repo).resolve()
+    feast_art = resolve_feast_artifacts_dir(repo)
+    feast_art.mkdir(parents=True, exist_ok=True)
+    feast_path = feast_art / "slow_patron_180d_monthly.parquet"
+    t0 = time.perf_counter()
+    feast_rows = write_slow_feast_parquet(src, feast_path)
+    materialize_seconds = run_feast_materialize_views(
+        repo,
+        feature_views=(LONG_SPIKE_FEATURE_VIEW_NAME,),
+        feast_parquets=(feast_path,),
+    )
+    elapsed = round(time.perf_counter() - t0, 3)
+    logger.info(
+        "[feast_online_refresh] synced training slow parquet rows=%d feast_path=%s materialize_s=%.3f",
+        feast_rows,
+        feast_path,
+        materialize_seconds,
+    )
+    return {
+        "slow_source_parquet": str(src),
+        "feast_parquet": str(feast_path),
+        "feast_rows": int(feast_rows),
+        "materialize_seconds": float(materialize_seconds),
+        "elapsed_seconds": elapsed,
+    }
+
+
 def run_feast_materialize_views(
     feast_repo: Path,
     *,

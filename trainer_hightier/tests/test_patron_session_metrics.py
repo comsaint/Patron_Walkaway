@@ -259,3 +259,42 @@ def test_slow_patron_180d_monthly_bet_grain_diagnostic_assigns_latest_anchor(tmp
     assert abs(float(r2["patron__theo_win_sum__w180d_m1snap"]) - 350.0) < 1e-6
     assert int(r2["patron__gaming_days_cnt__w180d_m1snap"]) == 3
     assert abs(float(r2["patron__adt__w180d_m1snap"]) - 350.0 / 3.0) < 1e-6
+
+
+def test_adt_allowlist_excludes_canonical_without_slow_session_window(tmp_path) -> None:
+    """High-ADT allowlist drops patrons with no session in the slow lookback window."""
+    from trainer_hightier.utils.patron_session_metrics import materialize_adt_allowed_players_parquet
+
+    cleaned = tmp_path / "cleaned.parquet"
+    mp = tmp_path / "map.parquet"
+    profile = tmp_path / "profile.csv"
+    anchor = date(2026, 4, 30)
+
+    pd.DataFrame(
+        [
+            _sess_row(10, 1, 500.0, date(2026, 4, 15)),
+            _sess_row(20, 2, 500.0, date(2026, 5, 10)),
+        ]
+    ).to_parquet(cleaned, index=False)
+    pd.DataFrame(
+        {"player_id": [10, 20], "canonical_id": ["in_window", "may_only"]},
+    ).to_parquet(mp, index=False)
+    with profile.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["canonical_id", "adt"])
+        writer.writeheader()
+        writer.writerow({"canonical_id": "in_window", "adt": "500.0"})
+        writer.writerow({"canonical_id": "may_only", "adt": "500.0"})
+
+    out = tmp_path / "allow.parquet"
+    materialize_adt_allowed_players_parquet(
+        profile,
+        mp,
+        quantile=0.01,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        output_parquet=out,
+        cleaned_session_parquet=cleaned,
+        slow_active_anchor=anchor,
+        slow_lookback_days=180,
+    )
+    allowed = pd.read_parquet(out)
+    assert set(allowed["canonical_id"].astype(str)) == {"in_window"}

@@ -401,6 +401,8 @@ class Step4SplitConfig:
     val_day_fraction: float = 0.15
     #: When ``None``, defaults to ``trainer_hightier/artifacts/training_data/splits``.
     splits_output_dir: Path | None = None
+    #: When set, drop split rows whose ``canonical_id`` is absent from this slow monthly Parquet.
+    slow_patron_parquet: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -411,7 +413,7 @@ class Step5TrainConfig:
     #: When ``True``, use :data:`baseline_*` hyperparameters only (no Optuna).
     skip_optuna: bool = False
     #: ``study.optimize(..., timeout=...)`` wall-clock cap in seconds.
-    optuna_timeout_sec: float = 60.0 * 60 * 1  # 1 hour = 60*60
+    optuna_timeout_sec: float = 5 * 60 * 1  # 1 hour = 60*60
     early_stopping_rounds: int = 50
     #: Upper bound on boosting rounds (early stopping usually stops sooner).
     lgb_n_estimators_cap: int = 2000

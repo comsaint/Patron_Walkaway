@@ -160,18 +160,49 @@ def _count_censored_rows(con: duckdb.DuckDBPyConnection) -> int:
     return int(r[0]) if r else 0
 
 
-def _create_filtered_src_view(con: duckdb.DuckDBPyConnection) -> None:
-    """Build ``_step4_src``: keep only uncensored label rows; drop ``walkaway_censored``."""
+def _create_filtered_src_view(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    slow_patron_esc: str | None = None,
+) -> int:
+    """Build ``_step4_src``: uncensored rows; optional slow-monthly ``canonical_id`` coverage filter.
 
+    Returns:
+        Row count excluded for missing slow monthly coverage (0 when filter disabled).
+    """
     wc = _duckdb_quote_ident("walkaway_censored")
+    slow_clause = ""
+    if slow_patron_esc is not None:
+        slow_clause = f"""
+  AND TRIM(CAST(canonical_id AS VARCHAR)) IN (
+    SELECT TRIM(CAST(canonical_id AS VARCHAR))
+    FROM read_parquet('{slow_patron_esc}')
+    WHERE canonical_id IS NOT NULL
+      AND TRIM(CAST(canonical_id AS VARCHAR)) <> ''
+  )"""
     con.execute(
         f"""
 CREATE OR REPLACE TEMP VIEW _step4_src AS
 SELECT * EXCLUDE ({wc})
 FROM _step4_pre
-WHERE {wc} = FALSE
+WHERE {wc} = FALSE{slow_clause}
 """.strip()
     )
+    if slow_patron_esc is None:
+        return 0
+    excluded = con.execute(
+        f"""
+        SELECT COUNT(*) FROM _step4_pre
+        WHERE {wc} = FALSE
+          AND TRIM(CAST(canonical_id AS VARCHAR)) NOT IN (
+            SELECT TRIM(CAST(canonical_id AS VARCHAR))
+            FROM read_parquet('{slow_patron_esc}')
+            WHERE canonical_id IS NOT NULL
+              AND TRIM(CAST(canonical_id AS VARCHAR)) <> ''
+          )
+        """
+    ).fetchone()
+    return int(excluded[0]) if excluded else 0
 
 
 def _gate_src_quality(con: duckdb.DuckDBPyConnection) -> int:
@@ -295,6 +326,8 @@ def _build_step4_report(
     n_days: int,
     n_canon: int,
     censored_rows_excluded: int,
+    slow_coverage_rows_excluded: int,
+    slow_patron_parquet: str | None,
     split_rows: list[tuple[Any, ...]],
     train_p: Path,
     val_p: Path,
@@ -309,6 +342,8 @@ def _build_step4_report(
         "train_day_fraction": train_f,
         "val_day_fraction": val_f,
         "censored_rows_excluded": int(censored_rows_excluded),
+        "slow_coverage_rows_excluded": int(slow_coverage_rows_excluded),
+        "slow_patron_parquet": slow_patron_parquet,
         "rows_after_censor_filter": int(rows_kept),
         "distinct_gaming_days": int(n_days),
         "distinct_canonical_ids": int(n_canon),
@@ -338,7 +373,8 @@ def _execute_step4_duckdb(
     train_f: float,
     val_f: float,
     duckdb_runtime: DuckDbRuntimeConfig,
-) -> tuple[int, Path, Path, Path, list[tuple[Any, ...]], int, int]:
+    slow_patron_esc: str | None = None,
+) -> tuple[int, Path, Path, Path, list[tuple[Any, ...]], int, int, int]:
     """Run DuckDB views and emit split Parquets; return stats for reporting."""
 
     con = duckdb.connect(database=":memory:")
@@ -348,12 +384,17 @@ def _execute_step4_duckdb(
         n_cens = _count_censored_rows(con)
         if n_cens > 0:
             logger.info("Step 4 excluding %d row(s) with walkaway_censored=TRUE", int(n_cens))
-        _create_filtered_src_view(con)
+        n_slow_excl = _create_filtered_src_view(con, slow_patron_esc=slow_patron_esc)
+        if n_slow_excl > 0:
+            logger.info(
+                "Step 4 excluding %d row(s) without slow monthly canonical_id coverage",
+                int(n_slow_excl),
+            )
         n_days = _gate_src_quality(con)
         _create_tagged_view(con, train_f=train_f, val_f=val_f)
         train_p, val_p, test_p = _copy_split_parquets(con, out_dir)
         split_rows, n_canon = _split_aggregates(con)
-        return n_days, train_p, val_p, test_p, split_rows, n_canon, int(n_cens)
+        return n_days, train_p, val_p, test_p, split_rows, n_canon, int(n_cens), int(n_slow_excl)
     finally:
         con.close()
 
@@ -378,13 +419,21 @@ def arrange_and_split_training_data(
     train_f = float(cfg.train_day_fraction)
     val_f = float(cfg.val_day_fraction)
     proj = _projection_sql_cols(cols)
-    n_days, train_p, val_p, test_p, split_rows, n_canon, n_cens_excl = _execute_step4_duckdb(
+    slow_p = cfg.slow_patron_parquet
+    slow_esc: str | None = None
+    if slow_p is not None:
+        slow_path = Path(slow_p).resolve()
+        if not slow_path.is_file():
+            raise FileNotFoundError(f"Step 4 slow_patron_parquet not found: {slow_path}")
+        slow_esc = _path_posix(slow_path).replace("'", "''")
+    n_days, train_p, val_p, test_p, split_rows, n_canon, n_cens_excl, n_slow_excl = _execute_step4_duckdb(
         proj=proj,
         src_esc=src_esc,
         out_dir=out_dir,
         train_f=train_f,
         val_f=val_f,
         duckdb_runtime=duckdb_runtime,
+        slow_patron_esc=slow_esc,
     )
 
     report = _build_step4_report(
@@ -395,6 +444,8 @@ def arrange_and_split_training_data(
         n_days=n_days,
         n_canon=n_canon,
         censored_rows_excluded=n_cens_excl,
+        slow_coverage_rows_excluded=n_slow_excl,
+        slow_patron_parquet=str(Path(slow_p).resolve()) if slow_p is not None else None,
         split_rows=split_rows,
         train_p=train_p,
         val_p=val_p,

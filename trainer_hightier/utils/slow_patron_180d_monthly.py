@@ -219,6 +219,47 @@ LEFT JOIN LATERAL (
 """.strip()
 
 
+def canonical_ids_with_slow_session_window_subquery(
+    *,
+    sess_esc: str,
+    map_esc: str,
+    lookback_days: int,
+    active_anchor: date,
+) -> str:
+    """Return SQL selecting ``canonical_id`` with ≥1 session in the inclusive lookback window.
+
+    Matches the session filter used by ``_single_active_anchor_sql`` snapshots (training slow
+    materialization and ADT allowlist slow-coverage gate).
+    """
+    if lookback_days < 1:
+        raise ValueError(f"lookback_days must be >= 1, got {lookback_days!r}")
+    span = int(lookback_days) - 1
+    anchor_lit = active_anchor.isoformat()
+    return f"""
+SELECT canonical_id
+FROM (
+  SELECT
+    TRIM(CAST(m.canonical_id AS VARCHAR)) AS canonical_id,
+    CAST(s.gaming_day AS DATE) AS gaming_day_d
+  FROM read_parquet('{sess_esc}') s
+  INNER JOIN (
+    SELECT
+      TRY_CAST(player_id AS BIGINT) AS player_id,
+      ANY_VALUE(TRIM(CAST(canonical_id AS VARCHAR))) AS canonical_id
+    FROM read_parquet('{map_esc}')
+    WHERE TRY_CAST(player_id AS BIGINT) IS NOT NULL
+    GROUP BY player_id
+  ) m ON TRY_CAST(s.player_id AS BIGINT) = m.player_id
+  WHERE s.gaming_day IS NOT NULL
+    AND CAST(s.gaming_day AS DATE) IS NOT NULL
+    AND CAST(s.gaming_day AS DATE) <= DATE '{anchor_lit}'
+    AND TRIM(CAST(m.canonical_id AS VARCHAR)) <> ''
+) AS sessions_mapped
+WHERE gaming_day_d >= DATE '{anchor_lit}' - INTERVAL '{span}' DAY
+GROUP BY canonical_id
+""".strip()
+
+
 def _single_active_anchor_sql(
     *,
     sess_esc: str,

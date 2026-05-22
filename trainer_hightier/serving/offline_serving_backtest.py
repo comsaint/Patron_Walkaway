@@ -642,8 +642,20 @@ def ensure_slow_feast_online_materialized(
     adt_allowlist: Path,
     canonical_mapping: Path,
     local_cleaned_session: Path | None = None,
+    training_slow_parquet: Path | None = None,
+    force_from_training_parquet: bool = False,
 ) -> dict[str, Any]:
-    """Populate slow Feast online store via ``feast_online_refresh`` when tables are missing."""
+    """Populate slow Feast online from training parquet or full ``feast_online_refresh``."""
+    if force_from_training_parquet and training_slow_parquet is not None:
+        from trainer_hightier.serving.feast_online_refresh import sync_training_slow_parquet_to_feast_online
+
+        return {
+            "skipped": False,
+            **sync_training_slow_parquet_to_feast_online(
+                feast_repo,
+                slow_parquet=training_slow_parquet,
+            ),
+        }
     if feast_online_slow_table_present(feast_repo):
         return {"skipped": True, "reason": "slow_online_table_already_present"}
     from trainer_hightier.serving.feast_online_refresh import RefreshOptions, run_feast_online_refresh
