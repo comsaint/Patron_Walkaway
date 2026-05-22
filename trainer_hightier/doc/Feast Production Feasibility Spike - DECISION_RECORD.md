@@ -75,7 +75,7 @@ Archived copies used for this record: repo-root `batch2000.json` (mid-term), `lo
 | Verdict | **pass** |
 | CH session export | 221.2s, 6,609,298 rows (`rows_dropped_on_sanitize=0`) |
 | DuckDB slow patron compute | 4.4s |
-| Full slow snapshot rows | 52,410 (`canonical_id` × month-end anchor) |
+| Full slow snapshot rows | 52,410 (`canonical_id` × last full month anchor) |
 | Feast spike rows (latest anchor / patron) | 23,696 |
 | Latest anchor | `2026-05-19` |
 | Feast materialize | 5.1s |

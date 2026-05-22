@@ -43,7 +43,7 @@
 - slow supplier 以 canonical ASOF 為 production 預設與契約：
   - `slow_patron_grain=canonical_asof` 時，強制 schema 需有 `canonical_id + anchor_gaming_day`。
   - `join_slow_patron_snapshot()` 走 canonical ASOF 路徑，非 bet merge。
-- slow monthly anchor 語意修正為 month-end（每月 `MAX(gaming_day)`）。
+- slow monthly anchor 語意修正為 last full month data relative to today (not gaming day)。For example if today is May 10th, the snapshot must be computed using data of last month's end (Apr 30th) and backward; the snapshot is expected to be scheduled on May 1st so it covers full Apr data。
 
 **程式位置**
 - `trainer_hightier/serving/feature_builder.py`
@@ -51,7 +51,7 @@
   - `_join_slow_patron_canonical_asof_snapshot(...)`
   - `join_slow_patron_snapshot(...)`
 - `trainer_hightier/utils/slow_patron_180d_monthly.py`
-  - monthly anchor `MAX(gaming_day_d)`
+  - monthly anchor is last full month data relative to today
 
 ### Issue 3: 缺 production refresh job 與一致 source contract
 

@@ -125,7 +125,7 @@ Typical grain:
 Example:
 
 - Target `gaming_day = 2026-05-19`
-- Use latest monthly snapshot whose per-patron `anchor_gaming_day` is the **last `gaming_day` in each calendar month** (month-end anchor); ASOF join still picks the greatest `anchor_gaming_day <=` target bet `gaming_day`. On calendar day 1st, production refresh targets data through the **previous calendar month-end** anchor.
+- Use latest monthly snapshot whose per-patron `anchor_gaming_day` is the **last full month data relative to today** (not gaming day). For example if today is May 10th, the snapshot must be computed using data of last month's end (Apr 30th) and backward; the snapshot is expected to be scheduled on May 1st so it covers full Apr data. ASOF join still picks the greatest `anchor_gaming_day <=` target bet `gaming_day`.
 
 Production slow patron artifact:
 

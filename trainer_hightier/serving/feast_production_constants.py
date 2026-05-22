@@ -21,6 +21,8 @@ PRODUCTION_MID_TERM_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     "fe__interarrival_std_w7d",
     "fe__max_pcd_w7d",
     "fe__min_pcd_w7d",
+    "fe__payout_odds_avg_w7d",
+    "fe__payout_odds_std_w7d",
 )
 
 PRODUCTION_LONG_TERM_FEATURE_COLUMNS: Final[tuple[str, ...]] = (

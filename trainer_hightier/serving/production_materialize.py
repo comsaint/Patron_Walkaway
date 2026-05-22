@@ -28,28 +28,23 @@ from trainer_hightier.utils.bet_l0_preprocess import (
 )
 from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_parquet_path
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
+from trainer_hightier.utils.slow_month_turn import resolve_slow_month_turn_context
 from trainer_hightier.utils.slow_patron_180d_monthly import materialize_slow_patron_180d_canonical_asof
 
 logger = logging.getLogger(__name__)
 
-# Active high-tier MVP model fe__* columns (must match training_metrics step5_feature_columns).
+# Baseline fe__* after mid-term/composite removal (retrain; no Feast mid in model).
 DEFAULT_MODEL_FE_DERIVED_COLUMNS: tuple[str, ...] = (
     "fe__wager_sum__w15m",
     "fe__bets_cnt__w15m",
-    "fe__bets_cnt__w1d",
-    "fe__wager_sum__w15m_over_w1d",
-    "fe__wager_cv_w7d",
-    "fe__payout_odds_z_prior_w30d",
     "fe__canonical__bets_cnt__today",
     "fe__canonical__wager_sum__today",
     "fe__canonical__avg_wager__today",
     "fe__canonical__elapsed_sec_since_first_bet__today",
     "fe__interarrival__lag2_sec",
-    "fe__interarrival__last_gap_z__w7d",
     "fe__interarrival__last_gap_to_recent_mean_ratio__w1h",
     "fe__interarrival__cv__w1h",
     "fe__odds__payout_odds_z__w1h",
-    "fe__odds__payout_odds_z__w7d",
     "fe__odds__payout_odds_to_recent_max_ratio__w1h",
     "fe__odds__payout_odds_step_ratio",
 )
@@ -251,7 +246,9 @@ def materialize_production_slow_canonical_asof(
         out_parquet=out_parquet,
         lookback_days=lb,
         duckdb_runtime=duckdb_runtime,
+        context_day=date.today(),
     )
+    ctx = resolve_slow_month_turn_context(date.today())
     anchor_max = None
     pf = pq.ParquetFile(out)
     if pf.metadata and pf.metadata.num_rows > 0 and "anchor_gaming_day" in pf.schema_arrow.names:
@@ -271,6 +268,7 @@ def materialize_production_slow_canonical_asof(
         "snapshot_scope": "production",
         "lookback_days": lb,
         "slow_anchor_gaming_day_max": anchor_max.isoformat() if anchor_max else None,
+        **ctx.to_manifest_dict(),
         "sha256": _sha256_file(out),
         **parquet_row_stats(out, key_col="canonical_id"),
     }

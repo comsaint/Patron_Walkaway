@@ -405,7 +405,11 @@ def join_production_fe_suppliers(
         raise ValueError("[feature_builder] mid_term_columns require mid_term_snapshot_parquet")
 
     from trainer_hightier.config import DuckDbRuntimeConfig
-    from trainer_hightier.feature_experiment.dataset_enrich import _MID_TERM_DERIVED_EXPRS
+    from trainer_hightier.feature_experiment.dataset_enrich import (
+        _MID_TERM_DERIVED_EXPRS,
+        _MID_TERM_STAGING_SQL,
+        _mid_term_staging_aliases,
+    )
 
     con = duckdb.connect(database=":memory:")
     try:
@@ -431,6 +435,10 @@ LEFT JOIN read_parquet('{esc}') AS s
             if not mp.is_file():
                 raise FileNotFoundError(f"mid_term snapshot parquet missing: {mp}")
             mesc = str(mp).replace("'", "''")
+            staging_aliases = _mid_term_staging_aliases(mid_term_columns)
+            staging_select = ",\n    ".join(_MID_TERM_STAGING_SQL[a] for a in staging_aliases)
+            if staging_select:
+                staging_select = f",\n    {staging_select}"
             mid_cte = f"""
 mid_snap AS (
   SELECT * FROM read_parquet('{mesc}')
@@ -444,15 +452,7 @@ b_with_day AS (
 ),
 mid_asof AS (
   SELECT
-    bw.*,
-    lst.fe__bets_cnt__w1d AS _snap_bets_cnt_w1d,
-    lst.fe__wager_sum__w1d AS _snap_wager_sum_w1d,
-    lst.fe__prior_odds_mean_w30d AS _snap_prior_odds_mean_w30d,
-    lst.fe__prior_odds_std_w30d AS _snap_prior_odds_std_w30d,
-    lst.fe__std_wager_w7d AS _snap_std_wager_w7d,
-    lst.fe__avg_abs_wager_w7d AS _snap_avg_abs_wager_w7d,
-    lst.fe__interarrival_avg_w7d AS _snap_interarrival_avg_w7d,
-    lst.fe__interarrival_std_w7d AS _snap_interarrival_std_w7d
+    bw.*{staging_select}
   FROM b_with_day AS bw
   LEFT JOIN LATERAL (
     SELECT *
@@ -468,20 +468,7 @@ mid_asof AS (
                 expr = _MID_TERM_DERIVED_EXPRS.get(col, f'CAST(b."{col}" AS DOUBLE)')
                 mid_parts.append(f'{expr} AS "{col}"')
             mid_select = ",\n  ".join(mid_parts)
-            exclude_cols = ", ".join(
-                (
-                    "_cid",
-                    "_gday",
-                    "_snap_bets_cnt_w1d",
-                    "_snap_wager_sum_w1d",
-                    "_snap_prior_odds_mean_w30d",
-                    "_snap_prior_odds_std_w30d",
-                    "_snap_std_wager_w7d",
-                    "_snap_avg_abs_wager_w7d",
-                    "_snap_interarrival_avg_w7d",
-                    "_snap_interarrival_std_w7d",
-                )
-            )
+            exclude_cols = ", ".join(("_cid", "_gday", *staging_aliases))
 
         if mid_cte:
             base_from = "FROM mid_asof AS b"
@@ -610,6 +597,15 @@ def attach_mid_term_composite_columns(
         out["fe__interarrival__last_gap_z__w7d"] = np.where(
             std_gap > 1e-9,
             (gap - avg_gap) / std_gap,
+            np.nan,
+        )
+    if "fe__odds__payout_odds_z__w7d" in col_set:
+        avg_odds = pd.to_numeric(out.get("fe__payout_odds_avg_w7d"), errors="coerce")
+        std_odds = pd.to_numeric(out.get("fe__payout_odds_std_w7d"), errors="coerce")
+        odds = pd.to_numeric(out.get("payout_odds"), errors="coerce")
+        out["fe__odds__payout_odds_z__w7d"] = np.where(
+            np.abs(std_odds) > 1e-12,
+            (odds - avg_odds) / std_odds,
             np.nan,
         )
     logger.info("[feature_builder] attached mid_term composite cols=%d", len(columns))

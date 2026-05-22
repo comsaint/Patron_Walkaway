@@ -204,23 +204,62 @@ def evaluate_slow_freshness(
     monthly_grace_days: int = SLOW_MONTHLY_GRACE_DAYS,
     hard_cap_days: int = SLOW_STALE_HARD_CAP_DAYS,
     close_hour: int = 3,
+    month_epochs: list[date] | None = None,
 ) -> LayerFreshnessResult:
-    """Evaluate slow monthly freshness with monthly grace."""
+    """Evaluate slow monthly freshness under gap/post-gap month-turn contract."""
+    del monthly_grace_days, hard_cap_days  # legacy params retained for call-site compatibility
+    from trainer_hightier.utils.slow_month_turn import resolve_slow_month_turn_context
+
     day = serving_day or serving_gaming_day(close_hour=close_hour)
-    month_end = date(day.year, day.month, 1) - timedelta(days=1)
-    stale = _staleness_days(anchor_max, month_end)
-    base = _classify_staleness(
-        layer="slow",
-        staleness_days=stale,
-        hard_cap_days=hard_cap_days,
-        grace_days=monthly_grace_days,
-    )
+    ctx = resolve_slow_month_turn_context(day, month_epochs=month_epochs)
+    if anchor_max is None:
+        return LayerFreshnessResult(
+            layer="slow",
+            status="missing",
+            staleness_days=None,
+            anchor_max=None,
+            message=(
+                f"slow: missing anchor for phase={ctx.phase} "
+                f"(required={ctx.slow_anchor_required.isoformat()})"
+            ),
+        )
+    if ctx.phase == "post_gap":
+        if anchor_max != ctx.slow_anchor_target:
+            return LayerFreshnessResult(
+                layer="slow",
+                status="hard_cap_breached",
+                staleness_days=None,
+                anchor_max=anchor_max,
+                message=(
+                    f"slow post-gap requires target anchor {ctx.slow_anchor_target.isoformat()}, "
+                    f"got {anchor_max.isoformat()}"
+                ),
+            )
+        return LayerFreshnessResult(
+            layer="slow",
+            status="fresh",
+            staleness_days=0,
+            anchor_max=anchor_max,
+            message="slow: post-gap target anchor satisfied",
+        )
+    allowed = {ctx.slow_anchor_effective, ctx.slow_anchor_target}
+    if anchor_max not in allowed:
+        return LayerFreshnessResult(
+            layer="slow",
+            status="hard_cap_breached",
+            staleness_days=None,
+            anchor_max=anchor_max,
+            message=(
+                f"slow gap-day requires effective/target anchor in {sorted(d.isoformat() for d in allowed)}, "
+                f"got {anchor_max.isoformat()}"
+            ),
+        )
     return LayerFreshnessResult(
-        layer=base.layer,
-        status=base.status,
-        staleness_days=base.staleness_days,
+        layer="slow",
+        status="fresh",
+        staleness_days=0,
         anchor_max=anchor_max,
-        message=base.message,
+        message=f"slow: gap-day anchor ok (phase={ctx.phase})",
     )
 
 
@@ -455,9 +494,8 @@ def build_scoring_snapshot_gate(
                 break
     degraded = (
         mid_term.status == "stale_allowed"
-        or slow.status == "stale_allowed"
+        or (slow.status == "stale_allowed")
         or (mid_term.staleness_days or 0) > 0
-        or (slow.staleness_days or 0) > 0
     )
     return ScoringSnapshotGate(
         mid_term=mid_term,
@@ -503,8 +541,7 @@ def read_slow_anchor_max(path: Path | None, manifest: dict[str, Any] | None) -> 
 
 
 def expected_slow_month_end_anchor(serving_day: date | None = None, *, close_hour: int = 3) -> date:
-    """Expected slow monthly anchor is previous calendar month-end gaming day."""
-
+    """Expected slow target anchor (previous calendar month-end) for ``serving_day``."""
     day = serving_day or serving_gaming_day(close_hour=close_hour)
     return date(day.year, day.month, 1) - timedelta(days=1)
 

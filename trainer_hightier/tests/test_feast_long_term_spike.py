@@ -126,7 +126,7 @@ def test_compute_long_term_spike_snapshot_local(tmp_path: Path) -> None:
     feast_art = tmp_path / "feast"
     cfg = FeastLongTermSpikeConfig(
         feast_repo=tmp_path / "feast_repo",
-        spike_parquet=feast_art / "long_term_spike_canonical.parquet",
+        spike_parquet=feast_art / "slow_patron_180d_monthly.parquet",
         staging_dir=feast_art / "staging",
         canonical_mapping_parquet=cmap,
         duckdb_runtime=DuckDbRuntimeConfig(),
@@ -156,7 +156,7 @@ def test_run_spike_end_to_end_local_mock_feast(tmp_path: Path) -> None:
     report_path = feast_art / "report.json"
     cfg = FeastLongTermSpikeConfig(
         feast_repo=feast_repo,
-        spike_parquet=feast_art / "long_term_spike_canonical.parquet",
+        spike_parquet=feast_art / "slow_patron_180d_monthly.parquet",
         staging_dir=feast_art / "staging",
         report_path=report_path,
         canonical_mapping_parquet=cmap,

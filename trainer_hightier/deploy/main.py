@@ -563,6 +563,40 @@ def _bundle_allowlist_path(bundle_root: Path, rel: dict[str, Any]) -> Path:
     return (bundle_root / rel.get("adt_allowlist_parquet", "mapping/adt_allowed_players_q0p99.parquet")).resolve()
 
 
+def _mid_feast_needs_bootstrap(
+    cfg: HightierServingConfig,
+    *,
+    require_mid: bool,
+    allowlist: Path,
+    mapping: Path,
+    force: bool,
+) -> bool:
+    """Return whether startup mid refresh should use multi-anchor bootstrap."""
+    if not require_mid:
+        return False
+    if force:
+        return True
+    from trainer_hightier.serving import feast_online_refresh as refresh_mod
+    from trainer_hightier.serving.feast_online_adapter import feast_registry_missing
+    from trainer_hightier.serving.feast_readiness import (
+        load_feast_online_readiness,
+        resolve_feast_readiness_path,
+    )
+
+    path = resolve_feast_readiness_path(cfg)
+    readiness = load_feast_online_readiness(path)
+    if readiness is None or readiness.mid_term is None:
+        return True
+    rows = int(readiness.mid_term.row_count or 0)
+    if rows <= 0:
+        return True
+    allow_cnt = refresh_mod.count_allowlist_canonical_ids(allowlist, mapping)
+    if allow_cnt <= 0:
+        return True
+    min_rows = int(allow_cnt * float(cfg.scorer_feast_mid_min_canonical_coverage_fraction))
+    return rows < min_rows
+
+
 def _needs_feast_startup_refresh(
     cfg: HightierServingConfig,
     *,
@@ -632,6 +666,7 @@ def _startup_feast_refresh_or_raise(
 ) -> None:
     """Run startup Feast refresh + smoke for scorer-capable deploy modes."""
     from trainer_hightier.serving import feast_online_refresh as refresh_mod
+    from trainer_hightier.serving.feast_online_adapter import feast_registry_missing
     from trainer_hightier.serving.feature_supply import (
         assert_scorer_supplier_plan_or_raise,
         build_scorer_supplier_plan,
@@ -683,11 +718,19 @@ def _startup_feast_refresh_or_raise(
             layers.append("slow")
         if not layers:
             layers = ["mid", "slow"]
+        bootstrap_mid = _mid_feast_needs_bootstrap(
+            cfg,
+            require_mid=require_mid,
+            allowlist=allowlist,
+            mapping=mapping,
+            force=force,
+        )
+        registry_missing = feast_registry_missing(feast_repo)
         try:
             opts = refresh_mod._resolve_refresh_options(
                 layers=",".join(layers),
                 source="clickhouse",
-                skip_apply=False,
+                skip_apply=(not bootstrap_mid) and not registry_missing,
                 skip_materialize=False,
                 smoke_only=False,
                 dry_run=False,
@@ -699,6 +742,8 @@ def _startup_feast_refresh_or_raise(
                 local_cleaned_session=None,
                 max_smoke_entities=int(cfg.scorer_feast_deploy_lookup_smoke_sample_size),
                 summary_path=(Path(cfg.scorer_feast_readiness_path).parent / "feast_online_refresh_report.json"),
+                bootstrap_mid=bootstrap_mid,
+                apply_schema=bootstrap_mid,
             )
             refresh_mod.run_feast_online_refresh(opts)
         finally:

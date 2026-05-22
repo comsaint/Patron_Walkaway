@@ -354,18 +354,37 @@ def _static_slow_minimum_contract_pack(slow_pack_path: Path) -> None:
 
     Two supported shapes:
 
-    - **Bet-grain (Feast)** — canonical for ``slow_patron_180d_monthly.parquet``: one row per ``bet_id`` with
-      PIT timestamps (see ``contracts/slow_patron_180d_monthly_features.yaml``).
+    - **Canonical active-month (production/training)** — ``canonical_id`` + ``anchor_gaming_day`` +
+      ``event_timestamp`` (see ``contracts/slow_patron_180d_monthly_features.yaml``).
+    - **Bet-grain (diagnostic only)** — one row per ``bet_id`` with PIT timestamps; must not ship in deploy.
     - **Legacy player-grain snapshot** — used by tests / older tooling: ``player_id`` + calendar anchor.
     """
 
     slow_idx = _parquet_lower_column_index(slow_pack_path)
+    canonical_snapshot = ("canonical_id" in slow_idx) and ("anchor_gaming_day" in slow_idx) and (
+        "bet_id" not in slow_idx
+    )
     bet_snapshot = ("bet_id" in slow_idx) and ("prediction_visible_ts_cf" in slow_idx)
     player_snapshot = ("player_id" in slow_idx) and (
         ("anchor_gaming_day" in slow_idx) or ("gaming_day" in slow_idx)
     )
 
-    if bet_snapshot and not player_snapshot:
+    if canonical_snapshot and not bet_snapshot:
+        _ensure_parquet_columns(
+            slow_pack_path,
+            role="slow_patron",
+            required=(
+                "canonical_id",
+                "anchor_gaming_day",
+                "event_timestamp",
+                "patron__theo_win_sum__w180d_m1snap",
+                "patron__gaming_days_cnt__w180d_m1snap",
+                "patron__adt__w180d_m1snap",
+            ),
+        )
+        return
+
+    if bet_snapshot and not player_snapshot and not canonical_snapshot:
         _ensure_parquet_columns(
             slow_pack_path,
             role="slow_patron",
@@ -404,7 +423,8 @@ def _static_slow_minimum_contract_pack(slow_pack_path: Path) -> None:
     ellipsis = "" if len(sample) <= 50 else ", …"
     raise ValueError(
         "[pack-schema] slow_patron parquet unsupported structure: "
-        "need Feast bet-grain (bet_id + prediction_visible_ts_cf + __etl_insert_*synthetic*) "
+        "need canonical active-month (canonical_id + anchor_gaming_day + event_timestamp + patron__*), "
+        "diagnostic bet-grain (bet_id + prediction_visible_ts_cf + __etl_insert_*synthetic*), "
         "or legacy player snapshot (player_id + gaming_day|anchor_gaming_day); "
         f"schema(lowercase-sample)=[{tip}{ellipsis}] — file={slow_pack_path}"
     )

@@ -460,3 +460,21 @@ def test_alerts_protocol_preserves_casino_player_id() -> None:
     assert len(rec) == 1
     assert rec[0]["casino_player_id"] == "CARD99"
     assert rec[0]["is_known_player"] == 1
+
+
+def test_compute_hot_pool_window_start_extends_to_gaming_day_open() -> None:
+    """Pool start must reach gaming-day open when lookback alone is too narrow."""
+
+    from trainer_hightier.serving.scorer import compute_hot_pool_window_start
+
+    hk = ZoneInfo("Asia/Hong_Kong")
+    cfg = replace(HightierServingConfig(), hot_feature_pool_lookback_hours=1, gaming_day_close_hour=3)
+    bets = pd.DataFrame(
+        {
+            "payout_complete_dtm": [pd.Timestamp("2025-01-01 08:00:00", tz=hk)],
+            "gaming_day": [pd.Timestamp("2025-01-01").date()],
+        }
+    )
+    got = compute_hot_pool_window_start(bets, cfg=cfg)
+    expected = pd.Timestamp("2025-01-01 03:00:00", tz=hk).to_pydatetime()
+    assert got == expected

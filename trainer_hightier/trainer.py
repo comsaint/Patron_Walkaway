@@ -50,6 +50,7 @@ from trainer_hightier.config import (
     MID_TERM_SNAPSHOT_SCOPE_TRAINING,
     PartitionIngressConfig,
     Step5TrainConfig,
+    Step6ParityConfig,
     SessionPreprocessConfig,
     Step4SplitConfig,
     configs_from_run_profile,
@@ -104,6 +105,7 @@ PIPELINE_DEBUG_FILENAME: Final[str] = "pipeline_debug.json"
 SPLIT_REPORT_FILENAME: Final[str] = "split_report.json"
 
 _STEP5_CONFIG_DEFAULTS = Step5TrainConfig()
+_STEP6_CONFIG_DEFAULTS = Step6ParityConfig()
 _PARTITION_INGRESS_DEFAULTS = PartitionIngressConfig()
 
 
@@ -217,6 +219,8 @@ class HighTierTrainArgs:
     features_input_parquet: Path | None = None
     # Step 5: LightGBM + optional Optuna on Step 4 split Parquets.
     step5: Step5TrainConfig = field(default_factory=Step5TrainConfig)
+    # Step 6: train/serve parity verification after Step 5 bundle materialization.
+    step6: Step6ParityConfig = field(default_factory=Step6ParityConfig)
     # Feature ledger for Step 5 baseline columns; ``None`` uses default contracts YAML path.
     feature_candidate_registry: Path | None = None
     #: ``--run-profile`` CLI name (MLflow param); programmatic callers default to :data:`DEFAULT_RUN_PROFILE_NAME`.
@@ -1478,7 +1482,11 @@ def _freeze_deploy_inputs(
         MANIFEST_KEY_MID_TERM_GRAIN,
         MANIFEST_KEY_MID_TERM_SNAPSHOT,
         MANIFEST_KEY_MID_TERM_STALE_HARD_CAP_DAYS,
+        MANIFEST_KEY_SLOW_ANCHOR_EFFECTIVE,
+        MANIFEST_KEY_SLOW_ANCHOR_MAX,
+        MANIFEST_KEY_SLOW_ANCHOR_TARGET,
         MANIFEST_KEY_SLOW_MONTHLY_GRACE_DAYS,
+        MANIFEST_KEY_SLOW_MONTH_TURN_PHASE,
         MANIFEST_KEY_SLOW_STALE_HARD_CAP_DAYS,
         MID_TERM_GRAIN_CANONICAL_DAILY_ASOF,
         MID_TERM_SNAPSHOT_DEPLOY_PARQUET_BASENAME,
@@ -1489,6 +1497,8 @@ def _freeze_deploy_inputs(
         SLOW_STALE_HARD_CAP_DAYS,
         FE_DERIVED_SOURCE_KIND_SHIPPED,
     )
+    from trainer_hightier.utils.slow_month_turn import resolve_slow_month_turn_context
+    from datetime import date as _date_cls
 
     fe_src: Path | None = None
     fe_metric = metrics.get("main_trainer_fe_derived_parquet")
@@ -1564,6 +1574,11 @@ def _freeze_deploy_inputs(
     if slow_src.is_file() and (di / slow_src.name).is_file():
         man["slow_patron_parquet"] = slow_src.name
         man["slow_patron_grain"] = SLOW_PATRON_GRAIN_CANONICAL_ASOF
+        slow_ctx = resolve_slow_month_turn_context(_date_cls.today())
+        man[MANIFEST_KEY_SLOW_ANCHOR_TARGET] = slow_ctx.slow_anchor_target.isoformat()
+        man[MANIFEST_KEY_SLOW_ANCHOR_EFFECTIVE] = slow_ctx.slow_anchor_effective.isoformat()
+        man[MANIFEST_KEY_SLOW_MONTH_TURN_PHASE] = slow_ctx.phase
+        man[MANIFEST_KEY_SLOW_ANCHOR_MAX] = slow_ctx.slow_anchor_required.isoformat()
     if fe_dest is not None and fe_dest.is_file():
         man["fe_derived_parquet"] = fe_dest.name
     if fe_short_dest is not None and fe_short_dest.is_file():
@@ -1592,6 +1607,64 @@ def _freeze_deploy_inputs(
     mf.write_text(json.dumps(man, indent=2), encoding="utf-8")
     metrics["deploy_inputs_dir"] = str(di.resolve())
     metrics["deploy_inputs_active_manifest"] = str(mf.resolve())
+
+
+def _run_step6_parity_verification(
+    args: HighTierTrainArgs,
+    metrics: dict[str, Any],
+    *,
+    bundle_dir: Path,
+) -> None:
+    """Run Step 6 parity gate and persist JSON beside the model bundle."""
+    if not args.step6.run_step6:
+        logger.info("[Step 6] skipped (step6.run_step6=False)")
+        return
+    from datetime import date as _date_cls
+
+    import importlib.util
+
+    step06_path = Path(__file__).resolve().parent / "06_verify_training_serving_parity.py"
+    spec = importlib.util.spec_from_file_location("trainer_hightier_step06_verify", step06_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load Step 6 module from {step06_path}")
+    step06_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(step06_mod)
+
+    repo = _repo_root()
+    splits_dir = args.step4_split.splits_output_dir
+    if splits_dir is None:
+        test_parquet = repo / "trainer_hightier" / "artifacts" / "training_data" / "splits" / "test.parquet"
+    else:
+        test_parquet = Path(splits_dir).resolve() / "test.parquet"
+    cleaned_bet = repo / "trainer_hightier" / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet"
+    feast_repo = repo / "trainer_hightier" / "feast_repo"
+    out_json = Path(bundle_dir).resolve() / "feature_parity_verification.json"
+    report = step06_mod.build_report_from_config(
+        model_dirs=[Path(bundle_dir).resolve()],
+        test_parquet=test_parquet,
+        cleaned_bet_root=cleaned_bet,
+        feast_repo=feast_repo,
+        as_of_date=_date_cls.today(),
+        parity_cfg=args.step6,
+    )
+    out_json.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    metrics["feature_parity_verification_json"] = str(out_json.resolve())
+    metrics["step6_slow_gate_failed"] = int(report.get("n_failed_slow_gate", 0))
+    metrics["step6_all_feature_gate_failed"] = int(report.get("n_failed_all_feature_gate", 0))
+    logger.info(
+        "[Step 6] wrote %s slow_gate_failed=%s all_feature_gate_failed=%s",
+        out_json.name,
+        report.get("n_failed_slow_gate"),
+        report.get("n_failed_all_feature_gate"),
+    )
+    exit_code = step06_mod.report_exit_code(report, parity_cfg=args.step6)
+    if exit_code != 0:
+        raise RuntimeError(
+            "[Step 6] parity gate failed "
+            f"(hard_fail_slow_gate={args.step6.hard_fail_slow_gate}, "
+            f"hard_fail_all_feature_gate={args.step6.hard_fail_all_feature_gate}); "
+            f"see {out_json}"
+        )
 
 
 def _run_training_execute_steps(args: HighTierTrainArgs, metrics: dict[str, Any]) -> _b5.Step5Result | None:
@@ -1680,6 +1753,11 @@ def run_training(args: HighTierTrainArgs) -> None:
                         metrics,
                         bundle_dir=exec_args.step5_bundle_dir.resolve(),
                         model_version=model_version,
+                    )
+                    _run_step6_parity_verification(
+                        exec_args,
+                        metrics,
+                        bundle_dir=exec_args.step5_bundle_dir.resolve(),
                     )
                 rp_parent = exec_args.step5_bundle_dir.resolve() if exec_args.step5_bundle_dir else versions_root
                 rp = rp_parent / "run_report.json"
@@ -1788,6 +1866,18 @@ def _build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         dest="skip_step5",
         help="Do not train Step 5 LightGBM on Step 4 split Parquets.",
+    )
+    p.add_argument(
+        "--skip-step6",
+        action="store_true",
+        dest="skip_step6",
+        help="Do not run Step 6 train/serve parity verification after Step 5.",
+    )
+    p.add_argument(
+        "--step6-warning-only",
+        action="store_true",
+        dest="step6_warning_only",
+        help="Run Step 6 but do not fail training when slow_gate fails (writes JSON only).",
     )
     p.add_argument(
         "--skip-optuna",
@@ -1931,6 +2021,11 @@ def _train_args_from_cli_namespace(ns: argparse.Namespace) -> HighTierTrainArgs:
             run_step5=not bool(ns.skip_step5),
             skip_optuna=bool(ns.skip_optuna),
             optuna_timeout_sec=float(ns.optuna_timeout_sec),
+        ),
+        step6=replace(
+            _STEP6_CONFIG_DEFAULTS,
+            run_step6=not bool(ns.skip_step6),
+            hard_fail_slow_gate=not bool(ns.step6_warning_only),
         ),
         feature_candidate_registry=(
             Path(ns.feature_candidate_registry).resolve() if ns.feature_candidate_registry else None

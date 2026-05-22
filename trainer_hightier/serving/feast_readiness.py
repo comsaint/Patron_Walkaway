@@ -608,6 +608,64 @@ LIMIT {int(max(1, sample_size))}
     return [str(x).strip() for x in df["canonical_id"].tolist() if str(x).strip()]
 
 
+def _mid_cell_null_rate(
+    cell_null_counts: dict[str, int],
+    *,
+    mid_columns: tuple[str, ...],
+    sample_size: int,
+) -> float:
+    """Average null fraction across ``mid_columns`` in the smoke sample."""
+    if sample_size <= 0 or not mid_columns:
+        return 0.0
+    total = 0
+    for col in mid_columns:
+        total += int(cell_null_counts.get(col, sample_size))
+    return float(total) / float(sample_size * len(mid_columns))
+
+
+def evaluate_feast_lookup_smoke_gate(
+    smoke: dict[str, Any],
+    *,
+    mid_columns: tuple[str, ...],
+    entity_missing_fail_fraction: float,
+    mid_cell_null_fail_fraction: float,
+    feast_spike_rows: int | None = None,
+    allowlist_canonical_count: int | None = None,
+    min_canonical_coverage_fraction: float,
+) -> tuple[bool, str | None]:
+    """Return (ok, hard_failure_reason) for deploy / refresh smoke."""
+    entity_rate = float(smoke.get("entity_missing_rate") or 0.0)
+    if entity_rate > float(entity_missing_fail_fraction):
+        return (
+            False,
+            "[feast_readiness] allowlist lookup smoke entity missing rate "
+            f"{entity_rate} exceeds fail_fraction={entity_missing_fail_fraction}",
+        )
+    if mid_columns:
+        raw_mid = smoke.get("mid_cell_null_rate")
+        mid_rate = float(raw_mid if raw_mid is not None else 1.0)
+        if mid_rate > float(mid_cell_null_fail_fraction):
+            return (
+                False,
+                "[feast_readiness] allowlist lookup smoke mid cell null rate "
+                f"{mid_rate} exceeds fail_fraction={mid_cell_null_fail_fraction}",
+            )
+    if (
+        feast_spike_rows is not None
+        and allowlist_canonical_count is not None
+        and int(allowlist_canonical_count) > 0
+    ):
+        coverage = float(feast_spike_rows) / float(allowlist_canonical_count)
+        if coverage < float(min_canonical_coverage_fraction):
+            return (
+                False,
+                "[feast_readiness] mid Feast canonical coverage "
+                f"{coverage:.4f} below min={min_canonical_coverage_fraction} "
+                f"(rows={feast_spike_rows}, allowlist_canonical={allowlist_canonical_count})",
+            )
+    return True, None
+
+
 def run_allowlist_feast_lookup_smoke(
     *,
     feast_repo: Path,
@@ -617,6 +675,7 @@ def run_allowlist_feast_lookup_smoke(
     slow_columns: tuple[str, ...],
     sample_size: int,
     entity_missing_fail_fraction: float,
+    mid_cell_null_fail_fraction: float | None = None,
 ) -> dict[str, Any]:
     """P5-3: sample allowlist canonical ids against Feast online store."""
     from feast import FeatureStore
@@ -655,16 +714,37 @@ def run_allowlist_feast_lookup_smoke(
             else:
                 cell_null_counts[col] = int(lk[col].isna().sum())
     rate = float(n_entity_missing) / float(len(cids))
-    ok = rate <= float(entity_missing_fail_fraction)
+    mid_rate = _mid_cell_null_rate(
+        cell_null_counts,
+        mid_columns=mid_columns,
+        sample_size=len(cids),
+    )
+    cfg = default_hightier_serving_config()
+    mid_fail = float(
+        mid_cell_null_fail_fraction
+        if mid_cell_null_fail_fraction is not None
+        else cfg.scorer_feast_mid_cell_null_fail_fraction
+    )
+    entity_ok = rate <= float(entity_missing_fail_fraction)
+    mid_ok = (not mid_columns) or mid_rate <= mid_fail
+    ok = entity_ok and mid_ok
+    distinct_in_store: int | None = None
+    if not out.empty and FEAST_CANONICAL_JOIN_KEY in out.columns:
+        distinct_in_store = int(
+            out[FEAST_CANONICAL_JOIN_KEY].astype(str).str.strip().nunique()
+        )
     return {
         "ok": ok,
         "sample_size": len(cids),
         "n_entity_missing": n_entity_missing,
         "entity_missing_rate": round(rate, 4),
         "entity_missing_fail_fraction": float(entity_missing_fail_fraction),
+        "mid_cell_null_rate": round(mid_rate, 4),
+        "mid_cell_null_fail_fraction": mid_fail,
         "lookup_latency_ms": latency_ms,
         "feature_refs": len(refs),
         "cell_null_counts": cell_null_counts,
+        "distinct_canonical_in_store": distinct_in_store,
     }
 
 
@@ -750,17 +830,25 @@ def run_deploy_feast_readiness_check(
                 slow_columns=slow_columns,
                 sample_size=int(cfg.scorer_feast_deploy_lookup_smoke_sample_size),
                 entity_missing_fail_fraction=float(cfg.scorer_feast_entity_missing_fail_fraction),
+                mid_cell_null_fail_fraction=float(cfg.scorer_feast_mid_cell_null_fail_fraction),
             )
-            if not smoke.get("ok"):
+            smoke_ok, smoke_reason = evaluate_feast_lookup_smoke_gate(
+                smoke,
+                mid_columns=mid_columns,
+                entity_missing_fail_fraction=float(cfg.scorer_feast_entity_missing_fail_fraction),
+                mid_cell_null_fail_fraction=float(cfg.scorer_feast_mid_cell_null_fail_fraction),
+                feast_spike_rows=None,
+                allowlist_canonical_count=None,
+                min_canonical_coverage_fraction=float(
+                    cfg.scorer_feast_mid_min_canonical_coverage_fraction
+                ),
+            )
+            if not smoke_ok:
                 return FeastReadinessGateResult(
                     ok=False,
                     mid_fresh=gate.mid_fresh,
                     slow_fresh=gate.slow_fresh,
-                    hard_failure_reason=(
-                        "[feast_readiness] allowlist lookup smoke entity missing rate "
-                        f"{smoke.get('entity_missing_rate')} exceeds fail_fraction="
-                        f"{smoke.get('entity_missing_fail_fraction')}"
-                    ),
+                    hard_failure_reason=smoke_reason,
                     readiness_path=path,
                     deploy_lookup_smoke=smoke,
                 )

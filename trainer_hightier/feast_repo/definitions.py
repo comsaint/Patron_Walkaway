@@ -19,7 +19,10 @@ Trial：需先執行 ``trainer_hightier.utils.trial_bet_behavior_1h.materialize_
 與 ``walkaway_bet_trial_v1`` 才可通過來源檢核。
 
 Slow patron：需先執行 ``trainer_hightier.utils.slow_patron_180d_monthly.materialize_slow_patron_180d_monthly``
-產生 ``artifacts/feast/slow_patron_180d_monthly.parquet`` 後，``slow_patron_180d_monthly_features`` 方可通過檢核。
+產生 **canonical-grain** ``artifacts/feast/slow_patron_180d_monthly.parquet``（含 ``canonical_id``、
+``anchor_gaming_day``、``event_timestamp``）後，``slow_patron_180d_monthly_features`` 方可通過檢核。
+``walkaway_bet_trial_v1`` 僅含 cleaned + trial（bet entity）；slow 請用 ``walkaway_canonical_slow_snap_v1``
+或 Step 3 分解快取路徑。
 """
 
 from __future__ import annotations
@@ -42,6 +45,13 @@ bet = Entity(
     join_keys=["bet_id"],
     value_type=ValueType.DOUBLE,
     description="Bet grain after L0 DQ + dedup; join key matches Parquet ``bet_id``.",
+)
+
+canonical_patron = Entity(
+    name="canonical_patron",
+    join_keys=["canonical_id"],
+    value_type=ValueType.STRING,
+    description="Patron grain for slow monthly snapshots and mid-term daily snapshots (canonical_id).",
 )
 
 cleaned_bet_source = FileSource(
@@ -136,16 +146,14 @@ slow_patron_180d_monthly_source = FileSource(
     name="slow_patron_180d_monthly_parquet",
     path=_slow_180_source_path,
     file_format=ParquetFormat(),
-    timestamp_field="prediction_visible_ts_cf",
-    created_timestamp_column="__etl_insert_Dtm_synthetic",
+    timestamp_field="event_timestamp",
 )
 
 slow_patron_180d_monthly_features = FeatureView(
     name="slow_patron_180d_monthly_features",
-    entities=[bet],
-    ttl=timedelta(days=50),
+    entities=[canonical_patron],
+    ttl=timedelta(days=220),
     schema=[
-        Field(name="bet_id", dtype=Float64),
         Field(name="patron__theo_win_sum__w180d_m1snap", dtype=Float64),
         Field(name="patron__gaming_days_cnt__w180d_m1snap", dtype=Int64),
         Field(name="patron__adt__w180d_m1snap", dtype=Float64),
@@ -153,8 +161,8 @@ slow_patron_180d_monthly_features = FeatureView(
     source=slow_patron_180d_monthly_source,
     tags={
         "owner": "trainer_hightier",
-        "semantics": "counterfactual_pit",
-        "cadence": "monthly_first_gaming_day_snapshot",
+        "semantics": "canonical_monthly_active_anchor",
+        "cadence": "monthly_last_full_calendar_month",
         "contract": "trainer_hightier/contracts/slow_patron_180d_monthly_features.yaml",
     },
 )
@@ -164,8 +172,12 @@ walkaway_bet_trial_v1 = FeatureService(
     features=[
         cleaned_bet_features,
         trial_bet_behavior_1h_features,
-        slow_patron_180d_monthly_features,
     ],
+)
+
+walkaway_canonical_slow_snap_v1 = FeatureService(
+    name="walkaway_canonical_slow_snap_v1",
+    features=[slow_patron_180d_monthly_features],
 )
 
 walkaway_bet_v1 = FeatureService(
@@ -180,6 +192,7 @@ walkaway_bet_trial_clock_v1 = FeatureService(
     features=[trial_bet_behavior_1h_features],
 )
 
+# Backward-compatible alias (same canonical FV; name retained for Step 3 cache keys / scripts).
 walkaway_bet_slow_snap_v1 = FeatureService(
     name="walkaway_bet_slow_snap_v1",
     features=[slow_patron_180d_monthly_features],
@@ -190,13 +203,6 @@ _SPIKE_MID_TERM_PARQUET = (
     _REPO_ROOT.parent / "artifacts" / "feast" / "mid_term_spike_canonical.parquet"
 ).resolve()
 _spike_mid_term_source_path = str(_SPIKE_MID_TERM_PARQUET)
-
-canonical_patron = Entity(
-    name="canonical_patron",
-    join_keys=["canonical_id"],
-    value_type=ValueType.STRING,
-    description="Patron grain for mid-term daily snapshots (canonical_id).",
-)
 
 mid_term_spike_canonical_source = FileSource(
     name="mid_term_spike_canonical_parquet",
@@ -226,6 +232,8 @@ mid_term_daily_spike_features = FeatureView(
         Field(name="fe__interarrival_std_w7d", dtype=Float64),
         Field(name="fe__max_pcd_w7d", dtype=UnixTimestamp),
         Field(name="fe__min_pcd_w7d", dtype=UnixTimestamp),
+        Field(name="fe__payout_odds_avg_w7d", dtype=Float64),
+        Field(name="fe__payout_odds_std_w7d", dtype=Float64),
     ],
     source=mid_term_spike_canonical_source,
     tags={
@@ -240,15 +248,10 @@ walkaway_canonical_mid_term_spike_v1 = FeatureService(
     features=[mid_term_daily_spike_features],
 )
 
-# --- Canonical-grain long-term spike (see feast_long_term_spike.py) ---
-_SPIKE_LONG_TERM_PARQUET = (
-    _REPO_ROOT.parent / "artifacts" / "feast" / "long_term_spike_canonical.parquet"
-).resolve()
-_spike_long_term_source_path = str(_SPIKE_LONG_TERM_PARQUET)
-
+# --- Production slow online (same canonical Parquet as training; see feast_online_refresh.py) ---
 long_term_spike_canonical_source = FileSource(
     name="long_term_spike_canonical_parquet",
-    path=_spike_long_term_source_path,
+    path=_slow_180_source_path,
     file_format=ParquetFormat(),
     timestamp_field="event_timestamp",
 )
@@ -265,8 +268,8 @@ long_term_slow_spike_features = FeatureView(
     source=long_term_spike_canonical_source,
     tags={
         "owner": "trainer_hightier",
-        "cadence": "monthly_canonical_asof",
-        "spike": "feast_long_term_feasibility",
+        "cadence": "monthly_canonical_active_anchor",
+        "contract": "trainer_hightier/contracts/slow_patron_180d_monthly_features.yaml",
     },
 )
 

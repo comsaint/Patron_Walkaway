@@ -218,7 +218,15 @@ def _row_from_raw(idx: int, raw: dict[str, Any]) -> FeatureRegistryEntryRow:
         max_lookback_out = ml_raw.strip()
         _duration_seconds_from_iso8601(max_lookback_out)
         expected_h = horizon_from_max_lookback_iso8601(max_lookback_out)
-        if time_horizon != expected_h:
+        supplier_override = str(raw.get("allowed_training_supplier") or "").strip()
+        cadence_override = str(raw.get("cadence") or "").strip()
+        allow_event_level_short_pit = (
+            time_horizon == "short_term"
+            and supplier_override == "short_term_pit_builder"
+            and cadence_override == "event_level"
+            and expected_h == "mid_term"
+        )
+        if time_horizon != expected_h and not allow_event_level_short_pit:
             raise ValueError(
                 f"features[{idx}] {fid!r}: time_horizon={time_horizon!r} inconsistent with max_lookback="
                 f"{max_lookback_out!r} (expected time_horizon={expected_h!r})",

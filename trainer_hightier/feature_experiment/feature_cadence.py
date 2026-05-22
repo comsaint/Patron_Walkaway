@@ -41,6 +41,7 @@ _MID_TERM_COMPOSITE_FEAST_DEPS: Final[dict[str, tuple[str, ...]]] = {
     "fe__wager_cv_w7d": ("fe__std_wager_w7d", "fe__avg_abs_wager_w7d"),
     "fe__payout_odds_z_prior_w30d": ("fe__prior_odds_mean_w30d", "fe__prior_odds_std_w30d"),
     "fe__interarrival__last_gap_z__w7d": ("fe__interarrival_avg_w7d", "fe__interarrival_std_w7d"),
+    "fe__odds__payout_odds_z__w7d": ("fe__payout_odds_avg_w7d", "fe__payout_odds_std_w7d"),
 }
 
 MID_TERM_COMPOSITE_FEATURE_COLUMNS: Final[frozenset[str]] = frozenset(
@@ -49,6 +50,7 @@ MID_TERM_COMPOSITE_FEATURE_COLUMNS: Final[frozenset[str]] = frozenset(
         "fe__wager_cv_w7d",
         "fe__payout_odds_z_prior_w30d",
         "fe__interarrival__last_gap_z__w7d",
+        "fe__odds__payout_odds_z__w7d",
     }
 )
 

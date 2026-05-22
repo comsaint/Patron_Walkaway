@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import importlib
 from datetime import date
+from pathlib import Path
 
+import duckdb
+import pandas as pd
 import pytest
+
+from trainer_hightier.config import DuckDbRuntimeConfig
 
 _bt3 = importlib.import_module("trainer_hightier.03_build_training_data")
 
@@ -48,9 +53,61 @@ def test_affected_slow_group_spans_farther_than_trial_group() -> None:
     plan = (
         ("cleaned", "walkaway_bet_v1", 31),
         ("trial_clock", "walkaway_bet_trial_clock_v1", 2),
-        ("slow_snap", "walkaway_bet_slow_snap_v1", 180),
+        ("slow_snap", "walkaway_canonical_slow_snap_v1", 180),
     )
     aff = _bt3._affected_month_indices_by_group(months, dirt, plan)
     assert aff["trial_clock"] == {2}
     assert aff["trial_clock"] <= aff["slow_snap"]
     assert 0 in aff["slow_snap"]
+
+
+def test_slow_parquet_grain_canonical_vs_bet(tmp_path: Path) -> None:
+    canon = tmp_path / "slow_canon.parquet"
+    pd.DataFrame(
+        {
+            "canonical_id": ["c1"],
+            "anchor_gaming_day": [date(2026, 4, 30)],
+            "patron__theo_win_sum__w180d_m1snap": [1.0],
+            "patron__gaming_days_cnt__w180d_m1snap": [2],
+            "patron__adt__w180d_m1snap": [0.5],
+        }
+    ).to_parquet(canon, index=False)
+    assert _bt3._slow_parquet_grain(canon) == "canonical"
+
+    bet = tmp_path / "slow_bet.parquet"
+    pd.DataFrame({"bet_id": [1.0], "patron__theo_win_sum__w180d_m1snap": [1.0]}).to_parquet(bet, index=False)
+    assert _bt3._slow_parquet_grain(bet) == "bet"
+
+
+def test_attach_canonical_slow_snap_for_entities(tmp_path: Path) -> None:
+    ent = tmp_path / "entity.parquet"
+    pd.DataFrame({"bet_id": [10.0], "event_timestamp": [pd.Timestamp("2024-07-01", tz="UTC")]}).to_parquet(
+        ent, index=False
+    )
+    bet = tmp_path / "bet.parquet"
+    pd.DataFrame({"bet_id": [10.0], "player_id": [99]}).to_parquet(bet, index=False)
+    cmap = tmp_path / "map.parquet"
+    pd.DataFrame({"player_id": [99], "canonical_id": ["c1"]}).to_parquet(cmap, index=False)
+    slow = tmp_path / "slow.parquet"
+    pd.DataFrame(
+        {
+            "canonical_id": ["c1"],
+            "anchor_gaming_day": [date(2026, 4, 30)],
+            "patron__theo_win_sum__w180d_m1snap": [42.0],
+            "patron__gaming_days_cnt__w180d_m1snap": [3],
+            "patron__adt__w180d_m1snap": [14.0],
+        }
+    ).to_parquet(slow, index=False)
+    out = tmp_path / "out.parquet"
+    _bt3._attach_canonical_slow_snap_for_entities(
+        entity_parquet=ent,
+        cleaned_bet_parquet=bet,
+        canonical_mapping_parquet=cmap,
+        slow_parquet=slow,
+        output_parquet=out,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+    )
+    row = duckdb.sql(f"SELECT * FROM read_parquet('{out.as_posix()}')").fetchone()
+    assert row is not None
+    assert float(row[0]) == 10.0
+    assert float(row[2]) == 42.0

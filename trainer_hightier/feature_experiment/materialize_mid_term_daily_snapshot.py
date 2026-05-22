@@ -50,6 +50,8 @@ MID_TERM_SNAPSHOT_OUTPUT_COLUMNS: tuple[str, ...] = (
     "fe__interarrival_std_w7d",
     "fe__max_pcd_w7d",
     "fe__min_pcd_w7d",
+    "fe__payout_odds_avg_w7d",
+    "fe__payout_odds_std_w7d",
 )
 
 
@@ -189,7 +191,9 @@ rolling AS (
     AVG(interarrival_sec) OVER w7d AS fe__interarrival_avg_w7d,
     STDDEV_POP(interarrival_sec) OVER w7d AS fe__interarrival_std_w7d,
     MAX(pcd) OVER w7d AS fe__max_pcd_w7d,
-    MIN(pcd) OVER w7d AS fe__min_pcd_w7d
+    MIN(pcd) OVER w7d AS fe__min_pcd_w7d,
+    AVG(payout_odds) OVER w7d AS fe__payout_odds_avg_w7d,
+    STDDEV_POP(payout_odds) OVER w7d AS fe__payout_odds_std_w7d
   FROM with_iv
   WINDOW
     w7d AS (
@@ -223,7 +227,9 @@ SELECT
   fe__interarrival_avg_w7d,
   fe__interarrival_std_w7d,
   fe__max_pcd_w7d,
-  fe__min_pcd_w7d
+  fe__min_pcd_w7d,
+  fe__payout_odds_avg_w7d,
+  fe__payout_odds_std_w7d
 FROM rolling
 {anchor_pred}
   AND rn_day_desc = 1

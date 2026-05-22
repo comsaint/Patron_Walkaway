@@ -57,6 +57,7 @@ from trainer_hightier.utils.bet_l0_preprocess import (
     cleaned_bet_dataset_has_any_parquet,
     resolved_cleaned_bet_read_parquet_sql,
 )
+from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_parquet_path
 from trainer_hightier.utils.slow_patron_180d_monthly import (
     default_slow_patron_180d_monthly_parquet_path,
     materialize_slow_patron_180d_monthly,
@@ -317,7 +318,7 @@ def _feast_group_plan(aggregate_feature_service: str) -> tuple[tuple[str, str, i
         return (
             ("cleaned", "walkaway_bet_v1", 31),
             ("trial_clock", "walkaway_bet_trial_clock_v1", 2),
-            ("slow_snap", "walkaway_bet_slow_snap_v1", 180),
+            ("slow_snap", "walkaway_canonical_slow_snap_v1", 180),
         )
     if s == "walkaway_bet_v1":
         return (("cleaned", "walkaway_bet_v1", 31),)
@@ -454,11 +455,18 @@ def _duckdb_join_decomposed_month_features(
         """.strip()
     if slow_p is not None:
         s_esc = _path_posix(slow_p).replace("'", "''")
-        join_sql += f"""
+        slow_schema = set(pq.read_schema(slow_p).names)
+        if "canonical_id" in slow_schema and "bet_id" not in slow_schema:
+            join_sql += f"""
+        LEFT JOIN read_parquet('{s_esc}') AS s
+          ON TRIM(CAST(c.canonical_id AS VARCHAR)) = TRIM(CAST(s.canonical_id AS VARCHAR))
+            """.strip()
+        else:
+            join_sql += f"""
         LEFT JOIN read_parquet('{s_esc}') AS s
           ON TRY_CAST(c.bet_id AS DOUBLE) = TRY_CAST(s.bet_id AS DOUBLE)
          AND CAST(c.event_timestamp AS TIMESTAMPTZ) = CAST(s.event_timestamp AS TIMESTAMPTZ)
-        """.strip()
+            """.strip()
     select_extra = ""
     if trial_p is not None:
         select_extra += ", " + trial_cols
@@ -474,6 +482,79 @@ COPY (
     Path(merged_out).parent.mkdir(parents=True, exist_ok=True)
     if Path(merged_out).is_file():
         Path(merged_out).unlink()
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        con.execute(sql)
+    finally:
+        con.close()
+
+
+def _slow_parquet_grain(path: Path) -> str:
+    """Return ``canonical`` or ``bet`` from materialized slow Parquet columns."""
+
+    names = set(pq.read_schema(path).names)
+    if "canonical_id" in names and "bet_id" not in names:
+        return "canonical"
+    if "bet_id" in names:
+        return "bet"
+    raise ValueError(
+        f"slow parquet has unsupported schema at {path.resolve()}; "
+        f"expected canonical_id+anchor or bet_id grain, got {sorted(names)}"
+    )
+
+
+def _attach_canonical_slow_snap_for_entities(
+    *,
+    entity_parquet: Path,
+    cleaned_bet_parquet: Path,
+    canonical_mapping_parquet: Path,
+    slow_parquet: Path,
+    output_parquet: Path,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> None:
+    """Project canonical slow features onto bet entities (train-serve parity path).
+
+    Skips Feast ``walkaway_canonical_slow_snap_v1`` when slow artifact is
+    ``canonical_active_month`` grain (no ``prediction_visible_ts_cf``).
+    """
+
+    e_esc = _path_posix(entity_parquet).replace("'", "''")
+    bet_from = resolved_cleaned_bet_read_parquet_sql(cleaned_bet_parquet)
+    map_esc = _path_posix(canonical_mapping_parquet).replace("'", "''")
+    slow_esc = _path_posix(slow_parquet).replace("'", "''")
+    out_esc = _path_posix(output_parquet).replace("'", "''")
+    slow_cols = ", ".join(f's."{c}"' for c in _SLOW_MERGE_COLS)
+    sql = f"""
+COPY (
+  SELECT
+    e.bet_id,
+    e.event_timestamp,
+    {slow_cols}
+  FROM read_parquet('{e_esc}') AS e
+  INNER JOIN (
+    SELECT
+      TRY_CAST(bet_id AS DOUBLE) AS bet_id,
+      TRY_CAST(player_id AS BIGINT) AS player_id
+    FROM {bet_from} AS _cbd
+    WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
+      AND TRY_CAST(player_id AS BIGINT) IS NOT NULL
+  ) AS b ON TRY_CAST(e.bet_id AS DOUBLE) = b.bet_id
+  LEFT JOIN (
+    SELECT DISTINCT
+      TRY_CAST(player_id AS BIGINT) AS player_id,
+      TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id
+    FROM read_parquet('{map_esc}')
+    WHERE TRY_CAST(player_id AS BIGINT) IS NOT NULL
+      AND TRIM(CAST(canonical_id AS VARCHAR)) <> ''
+  ) AS m ON b.player_id = m.player_id
+  LEFT JOIN read_parquet('{slow_esc}') AS s
+    ON TRIM(CAST(m.canonical_id AS VARCHAR)) = TRIM(CAST(s.canonical_id AS VARCHAR))
+) TO '{out_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+""".strip()
+    output_parquet.parent.mkdir(parents=True, exist_ok=True)
+    if output_parquet.is_file():
+        output_parquet.unlink()
     con = duckdb.connect(database=":memory:")
     try:
         apply_duckdb_runtime_pragmas(con, duckdb_runtime)
@@ -875,6 +956,17 @@ def build_training_data(cfg: BuildTrainingDataArgs) -> Path:
     )
 
     cache_root_layout = Path(out_dir) / "cache" / "feast_month_group_v1" / cleaned_token / cfg.feature_service_name.strip()
+    slow_derived_p = default_slow_patron_180d_monthly_parquet_path(repo_root=REPO_ROOT)
+    slow_canonical_attach = (
+        use_group_cache
+        and slow_derived_p.is_file()
+        and _slow_parquet_grain(slow_derived_p) == "canonical"
+    )
+    if slow_canonical_attach:
+        logger.info(
+            "Slow snap uses canonical_active_month attach (skip Feast %s).",
+            "walkaway_canonical_slow_snap_v1",
+        )
 
     try:
         if month_batch:
@@ -959,12 +1051,22 @@ def build_training_data(cfg: BuildTrainingDataArgs) -> Path:
                             yrmo,
                             nrow,
                         )
-                        _feast_features_to_parquet(
-                            feast_repo=cfg.feast_repo,
-                            entity_parquet=ent_fp,
-                            feature_service_name=feast_svc,
-                            features_parquet=tm_p,
-                        )
+                        if gid == "slow_snap" and slow_canonical_attach:
+                            _attach_canonical_slow_snap_for_entities(
+                                entity_parquet=ent_fp,
+                                cleaned_bet_parquet=cfg.cleaned_bet_parquet,
+                                canonical_mapping_parquet=default_canonical_mapping_parquet_path(),
+                                slow_parquet=slow_derived_p,
+                                output_parquet=tm_p,
+                                duckdb_runtime=cfg.duckdb_runtime,
+                            )
+                        else:
+                            _feast_features_to_parquet(
+                                feast_repo=cfg.feast_repo,
+                                entity_parquet=ent_fp,
+                                feature_service_name=feast_svc,
+                                features_parquet=tm_p,
+                            )
                         if cache_p.is_file():
                             cache_p.unlink()
                         shutil.move(str(tm_p.resolve()), str(cache_p.resolve()))

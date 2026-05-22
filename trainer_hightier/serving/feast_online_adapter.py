@@ -383,6 +383,11 @@ def _feast_registry_db_path(feast_repo: Path) -> Path:
     return Path(feast_repo).resolve() / "data" / "registry.db"
 
 
+def feast_registry_missing(feast_repo: Path) -> bool:
+    """Return True when ``feast_repo/data/registry.db`` is absent (fresh deploy bundle)."""
+    return not _feast_registry_db_path(feast_repo).is_file()
+
+
 def resolve_online_feature_refs(
     mid_columns: tuple[str, ...],
     slow_columns: tuple[str, ...],

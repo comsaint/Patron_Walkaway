@@ -678,6 +678,37 @@ def fetch_bet_pool_window(
     return bets
 
 
+def compute_hot_pool_window_start(
+    bets: pd.DataFrame,
+    *,
+    cfg: HightierServingConfig | None = None,
+) -> datetime:
+    """Earliest hot-pool open bound: lookback plus same-gaming-day coverage floor."""
+    if bets.empty:
+        raise ValueError("compute_hot_pool_window_start requires non-empty bets")
+    cfg = cfg or default_hightier_serving_config()
+    p_min = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce").min()
+    if pd.isna(p_min):
+        raise ValueError("bets payout_complete_dtm is all null")
+    lookback_start = (
+        p_min - timedelta(hours=int(cfg.hot_feature_pool_lookback_hours))
+    ).to_pydatetime()
+    candidates: list[datetime] = [lookback_start]
+    if "gaming_day" in bets.columns:
+        hk = ZoneInfo(cfg.hk_tz)
+        close_hour = int(cfg.gaming_day_close_hour)
+        for raw_gday in pd.to_datetime(bets["gaming_day"], errors="coerce").dropna().unique():
+            gday = pd.Timestamp(raw_gday).date()
+            day_start = datetime(gday.year, gday.month, gday.day, close_hour, 0, 0, tzinfo=hk)
+            if getattr(p_min, "tzinfo", None) is not None:
+                day_start = day_start.astimezone(p_min.tzinfo)
+            candidates.append(day_start)
+    pool_start = min(candidates)
+    if getattr(p_min, "tzinfo", None) is not None and pool_start.tzinfo is None:
+        pool_start = pool_start.replace(tzinfo=p_min.tzinfo)
+    return pool_start
+
+
 @dataclass(frozen=True)
 class _ScoringBatch:
     """Bounded incremental batch ready for feature build."""
@@ -745,9 +776,8 @@ def _fetch_scoring_batch(
         return None
 
     cursor = _effective_etl_cursor(bets)
-    p_min = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce").min()
     p_max = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce").max()
-    pool_start = (p_min - timedelta(hours=int(cfg.hot_feature_pool_lookback_hours))).to_pydatetime()
+    pool_start = compute_hot_pool_window_start(bets, cfg=cfg)
     pool_end = p_max.to_pydatetime()
     pids = sorted({int(x) for x in bets["player_id"].dropna().unique().tolist()})
     fan_cap = int(cfg.hightier_scorer_pool_player_fanout_cap)

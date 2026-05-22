@@ -199,9 +199,10 @@ def _load_audit_bets(
 
 def _build_scoring_pool(bets: pd.DataFrame, *, cfg: HightierServingConfig) -> pd.DataFrame:
     """Bounded hot pool matching ``scorer._fetch_scoring_batch`` semantics."""
-    p_min = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce").min()
+    from trainer_hightier.serving.scorer import compute_hot_pool_window_start
+
     p_max = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce").max()
-    pool_start = (p_min - timedelta(hours=int(cfg.hot_feature_pool_lookback_hours))).to_pydatetime()
+    pool_start = compute_hot_pool_window_start(bets, cfg=cfg)
     pool_end = p_max.to_pydatetime()
     pids = sorted({int(x) for x in bets["player_id"].dropna().unique().tolist()})
     fan_cap = int(cfg.hightier_scorer_pool_player_fanout_cap)

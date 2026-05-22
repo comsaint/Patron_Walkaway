@@ -184,14 +184,13 @@ features:
   group_id: group_a_velocity_ratios
   source: fe_derived
   semantic_owner: trainer_hightier/feature_experiment/materialize_mid_term_daily_snapshot.py
-  status: active
+  status: disabled
   enabled_for:
-  - baseline
   - candidate
   - ablation
-  drop_reason_code: null
+  drop_reason_code: train_serve_mid_term_parity_removed
   last_updated_experiment: run_20260515T175157Z
-  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass.'
+  note: 'Removed from baseline for simpler retrain: mid-term Feast/daily snapshot train-serve parity risk.'
   time_horizon: mid_term
   max_lookback: P1D
   cadence: daily_gaming_day
@@ -203,14 +202,13 @@ features:
   group_id: group_a_velocity_ratios
   source: fe_derived
   semantic_owner: trainer_hightier/feature_experiment/dataset_enrich.py
-  status: active
+  status: disabled
   enabled_for:
-  - baseline
   - candidate
   - ablation
-  drop_reason_code: null
+  drop_reason_code: train_serve_mid_term_parity_removed
   last_updated_experiment: run_20260515T175157Z
-  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass.'
+  note: 'Composite depends on mid-term fe__wager_sum__w1d; disabled for simpler retrain.'
   time_horizon: mid_term
   max_lookback: P1D
   cadence: daily_gaming_day
@@ -355,14 +353,13 @@ features:
   group_id: group_c_burstiness
   source: fe_derived
   semantic_owner: trainer_hightier/feature_experiment/materialize_mid_term_daily_snapshot.py
-  status: active
+  status: disabled
   enabled_for:
-  - baseline
   - candidate
   - ablation
-  drop_reason_code: null
+  drop_reason_code: train_serve_mid_term_parity_removed
   last_updated_experiment: run_20260515T175157Z
-  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass.'
+  note: 'Mid-term composite (std/avg_abs wager w7d); disabled for simpler retrain.'
   time_horizon: mid_term
   max_lookback: P7D
   cadence: daily_gaming_day
@@ -392,14 +389,13 @@ features:
   group_id: group_d_personal_z
   source: fe_derived
   semantic_owner: trainer_hightier/feature_experiment/dataset_enrich.py
-  status: active
+  status: disabled
   enabled_for:
-  - baseline
   - candidate
   - ablation
-  drop_reason_code: null
+  drop_reason_code: train_serve_mid_term_parity_removed
   last_updated_experiment: run_20260515T175157Z
-  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass.'
+  note: 'Mid-term composite (prior odds w30d); disabled for simpler retrain.'
   time_horizon: mid_term
   max_lookback: P30D
   cadence: daily_gaming_day
@@ -620,7 +616,7 @@ features:
   last_updated_experiment: run_20260515T175157Z
   note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0026,
     dRecall +0.0119.'
-  time_horizon: mid_term
+  time_horizon: short_term
   max_lookback: P1D
   cadence: event_level
   anchor_rule: target_prediction_time
@@ -639,7 +635,7 @@ features:
   last_updated_experiment: run_20260515T175157Z
   note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0026,
     dRecall +0.0119.'
-  time_horizon: mid_term
+  time_horizon: short_term
   max_lookback: P1D
   cadence: event_level
   anchor_rule: target_prediction_time
@@ -658,7 +654,7 @@ features:
   last_updated_experiment: run_20260515T175157Z
   note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0026,
     dRecall +0.0119.'
-  time_horizon: mid_term
+  time_horizon: short_term
   max_lookback: P1D
   cadence: event_level
   anchor_rule: target_prediction_time
@@ -677,7 +673,7 @@ features:
   last_updated_experiment: run_20260515T175157Z
   note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0026,
     dRecall +0.0119.'
-  time_horizon: mid_term
+  time_horizon: short_term
   max_lookback: P1D
   cadence: event_level
   anchor_rule: target_prediction_time
@@ -828,15 +824,13 @@ features:
   group_id: group_g_interarrival_dynamics
   source: fe_derived
   semantic_owner: trainer_hightier/feature_experiment/dataset_enrich.py
-  status: active
+  status: disabled
   enabled_for:
-  - baseline
   - candidate
   - ablation
-  drop_reason_code: null
+  drop_reason_code: train_serve_mid_term_parity_removed
   last_updated_experiment: run_20260515T175157Z
-  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0018,
-    dRecall +0.0071.'
+  note: 'Mid-term composite (interarrival w7d); disabled for simpler retrain.'
   time_horizon: mid_term
   max_lookback: P7D
   cadence: daily_gaming_day
@@ -957,22 +951,25 @@ features:
 - feature_id: fe__odds__payout_odds_z__w7d
   group_id: group_q_payout_odds_dynamics
   source: fe_derived
-  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-  status: active
+  semantic_owner: trainer_hightier/feature_experiment/dataset_enrich.py
+  status: disabled
   enabled_for:
-  - baseline
   - candidate
   - ablation
-  drop_reason_code: null
+  drop_reason_code: train_serve_mid_term_parity_removed
   last_updated_experiment: run_20260515T175157Z
-  note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass; LOO dAP +0.0004,
-    dRecall +0.0030.'
+  note: 'Mid-term composite (payout odds z w7d); disabled for simpler retrain.'
   time_horizon: mid_term
   max_lookback: P7D
-  cadence: event_level
-  anchor_rule: target_prediction_time
-  grain: bet_id
-  allowed_training_supplier: short_term_pit_builder
+  cadence: daily_gaming_day
+  anchor_rule: prior_gaming_day_end
+  grain: canonical_id + anchor_gaming_day
+  allowed_training_supplier: mid_term_daily_snapshot
+  runtime_supplier: composite
+  runtime_inputs:
+    feast_online_mid:
+    - fe__payout_odds_avg_w7d
+    - fe__payout_odds_std_w7d
 - feature_id: fe__odds__payout_odds_to_recent_max_ratio__w1h
   group_id: group_q_payout_odds_dynamics
   source: fe_derived

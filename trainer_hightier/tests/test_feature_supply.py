@@ -254,3 +254,19 @@ features:
         manifest={"coverage_end_exclusive": "2099-01-01T00:00:00+00:00"},
     )
     assert summary["features"][0]["supplier"] == "online_trial_builder"
+
+
+def test_default_registry_feast_schema_supports_payout_odds_w7d_composite() -> None:
+    """Default registry composite route must pass scorer and Feast schema gates."""
+
+    from trainer_hightier.serving.feature_supply import (
+        assert_feast_plan_schema_support_or_raise,
+        assert_scorer_supplier_plan_or_raise,
+        build_scorer_supplier_plan,
+    )
+
+    snap = load_candidate_registry(None)
+    plan = build_scorer_supplier_plan(snap, ("fe__odds__payout_odds_z__w7d",))
+    assert plan.mid_composite_cols == ("fe__odds__payout_odds_z__w7d",)
+    assert_scorer_supplier_plan_or_raise(plan)
+    assert_feast_plan_schema_support_or_raise(plan)

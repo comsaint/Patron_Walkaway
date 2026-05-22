@@ -44,20 +44,46 @@ CASE
   THEN CAST((s."fe__time_since_last_bet_sec" - b._snap_interarrival_avg_w7d) / b._snap_interarrival_std_w7d AS DOUBLE)
   ELSE CAST(NULL AS DOUBLE)
 END""".strip(),
+    "fe__odds__payout_odds_z__w7d": """
+CASE
+  WHEN b._snap_payout_odds_std_w7d IS NOT NULL AND ABS(b._snap_payout_odds_std_w7d) > 1e-12
+   AND b._snap_payout_odds_avg_w7d IS NOT NULL AND TRY_CAST(b.payout_odds AS DOUBLE) IS NOT NULL
+  THEN CAST((TRY_CAST(b.payout_odds AS DOUBLE) - b._snap_payout_odds_avg_w7d) / b._snap_payout_odds_std_w7d AS DOUBLE)
+  ELSE CAST(NULL AS DOUBLE)
+END""".strip(),
 }
 
-_MID_TERM_STAGING_COLUMNS: tuple[str, ...] = (
-    "_cid",
-    "_gday",
-    "_snap_bets_cnt_w1d",
-    "_snap_wager_sum_w1d",
-    "_snap_prior_odds_mean_w30d",
-    "_snap_prior_odds_std_w30d",
-    "_snap_std_wager_w7d",
-    "_snap_avg_abs_wager_w7d",
-    "_snap_interarrival_avg_w7d",
-    "_snap_interarrival_std_w7d",
-)
+_MID_TERM_STAGING_SQL: dict[str, str] = {
+    "_snap_bets_cnt_w1d": "lst.fe__bets_cnt__w1d AS _snap_bets_cnt_w1d",
+    "_snap_wager_sum_w1d": "lst.fe__wager_sum__w1d AS _snap_wager_sum_w1d",
+    "_snap_prior_odds_mean_w30d": "lst.fe__prior_odds_mean_w30d AS _snap_prior_odds_mean_w30d",
+    "_snap_prior_odds_std_w30d": "lst.fe__prior_odds_std_w30d AS _snap_prior_odds_std_w30d",
+    "_snap_std_wager_w7d": "lst.fe__std_wager_w7d AS _snap_std_wager_w7d",
+    "_snap_avg_abs_wager_w7d": "lst.fe__avg_abs_wager_w7d AS _snap_avg_abs_wager_w7d",
+    "_snap_interarrival_avg_w7d": "lst.fe__interarrival_avg_w7d AS _snap_interarrival_avg_w7d",
+    "_snap_interarrival_std_w7d": "lst.fe__interarrival_std_w7d AS _snap_interarrival_std_w7d",
+    "_snap_payout_odds_avg_w7d": "lst.fe__payout_odds_avg_w7d AS _snap_payout_odds_avg_w7d",
+    "_snap_payout_odds_std_w7d": "lst.fe__payout_odds_std_w7d AS _snap_payout_odds_std_w7d",
+}
+
+_MID_TERM_COL_TO_STAGING: dict[str, tuple[str, ...]] = {
+    "fe__bets_cnt__w1d": ("_snap_bets_cnt_w1d",),
+    "fe__wager_sum__w1d": ("_snap_wager_sum_w1d",),
+    "fe__wager_sum__w15m_over_w1d": ("_snap_wager_sum_w1d",),
+    "fe__wager_cv_w7d": ("_snap_std_wager_w7d", "_snap_avg_abs_wager_w7d"),
+    "fe__payout_odds_z_prior_w30d": ("_snap_prior_odds_mean_w30d", "_snap_prior_odds_std_w30d"),
+    "fe__interarrival__last_gap_z__w7d": ("_snap_interarrival_avg_w7d", "_snap_interarrival_std_w7d"),
+    "fe__odds__payout_odds_z__w7d": ("_snap_payout_odds_avg_w7d", "_snap_payout_odds_std_w7d"),
+}
+
+
+def _mid_term_staging_aliases(mid_term_columns: tuple[str, ...]) -> tuple[str, ...]:
+    """Return snapshot staging aliases required by requested mid-term output columns."""
+
+    needed: list[str] = []
+    for col in mid_term_columns:
+        needed.extend(_MID_TERM_COL_TO_STAGING.get(col, ()))
+    return tuple(dict.fromkeys(needed))
 
 
 def _esc(p: Path) -> str:
@@ -138,6 +164,10 @@ LEFT JOIN read_parquet('{fq}') AS s
     exclude_cols = ""
     if mid_term_columns and mid_term_snapshot_parquet is not None:
         mq = _esc(mid_term_snapshot_parquet)
+        staging_aliases = _mid_term_staging_aliases(mid_term_columns)
+        staging_select = ",\n    ".join(_MID_TERM_STAGING_SQL[a] for a in staging_aliases)
+        if staging_select:
+            staging_select = f",\n    {staging_select}"
         mid_cte = f"""
 mid_snap AS (
   SELECT * FROM read_parquet('{mq}')
@@ -157,15 +187,7 @@ mid_asof AS (
       WHEN lst.anchor_gaming_day IS NULL OR bw._gday IS NULL THEN CAST(NULL AS BIGINT)
       ELSE DATE_DIFF('day', CAST(lst.anchor_gaming_day AS DATE), bw._gday)
     END AS {MID_TERM_SNAPSHOT_AGE_AUDIT_COLUMN},
-    CASE WHEN lst.anchor_gaming_day IS NULL THEN 1 ELSE 0 END AS {MID_TERM_SNAPSHOT_MISSING_AUDIT_COLUMN},
-    lst.fe__bets_cnt__w1d AS _snap_bets_cnt_w1d,
-    lst.fe__wager_sum__w1d AS _snap_wager_sum_w1d,
-    lst.fe__prior_odds_mean_w30d AS _snap_prior_odds_mean_w30d,
-    lst.fe__prior_odds_std_w30d AS _snap_prior_odds_std_w30d,
-    lst.fe__std_wager_w7d AS _snap_std_wager_w7d,
-    lst.fe__avg_abs_wager_w7d AS _snap_avg_abs_wager_w7d,
-    lst.fe__interarrival_avg_w7d AS _snap_interarrival_avg_w7d,
-    lst.fe__interarrival_std_w7d AS _snap_interarrival_std_w7d
+    CASE WHEN lst.anchor_gaming_day IS NULL THEN 1 ELSE 0 END AS {MID_TERM_SNAPSHOT_MISSING_AUDIT_COLUMN}{staging_select}
   FROM b_with_day AS bw
   LEFT JOIN LATERAL (
     SELECT *
@@ -186,7 +208,7 @@ mid_asof AS (
   b.{MID_TERM_ANCHOR_AUDIT_COLUMN},
   b.{MID_TERM_SNAPSHOT_AGE_AUDIT_COLUMN},
   b.{MID_TERM_SNAPSHOT_MISSING_AUDIT_COLUMN}"""
-        exclude_cols = ", ".join(_MID_TERM_STAGING_COLUMNS)
+        exclude_cols = ", ".join(("_cid", "_gday", *staging_aliases))
 
     if mid_cte:
         base_from = "FROM mid_asof AS b"

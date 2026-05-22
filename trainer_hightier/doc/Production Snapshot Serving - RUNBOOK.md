@@ -66,7 +66,7 @@ Slow eligibility is evaluated **at most once per calendar day** (HK) in the depl
 python -m trainer_hightier.serving.snapshot_updater --refresh-slow --production
 ```
 
-Slow layer allows 1-day monthly grace; stale-but-allowed up to 3 days (defaults). Monthly anchor semantics: **previous calendar month-end** per patron (`MAX(gaming_day)` in month); see `slow_patron_180d_monthly` contract YAML.
+Slow layer allows 1-day monthly grace; stale-but-allowed up to 3 days (defaults). Monthly anchor semantics: **last full month data relative to today** (not gaming day). For example if today is May 10th, the snapshot must be computed using data of last month's end (Apr 30th) and backward; the snapshot is expected to be scheduled on May 1st so it covers full Apr data. See `slow_patron_180d_monthly` contract YAML.
 
 ## Hard-cap breach
 
@@ -110,3 +110,36 @@ python -m trainer_hightier.deploy.main --bundle-dir /path/to/bundle --no-refresh
 ```
 
 Use only when an external job owns all refresh cadence.
+
+## Scorer v2 — Feast online mid bootstrap / daily refresh
+
+For model `20260520-032615-df799bd` and later scorer v2 bundles using Feast mid lookup (not snapshot manifest mid parquet). See also [Mid-Term Feast Train-Serve Parity Incident - 20260522.md](Mid-Term%20Feast%20Train-Serve%20Parity%20Incident%20-%2020260522.md).
+
+**Bootstrap** (first deploy, `--force-feast-refresh`, or mid coverage < 95% of allowlist):
+
+```bash
+python -m trainer_hightier.serving.feast_online_refresh \
+  --layers mid --source clickhouse --bootstrap-mid --apply-schema \
+  --feast-repo /path/to/bundle/feast_repo \
+  --adt-allowlist /path/to/bundle/mapping/adt_allowed_players_q0p99.parquet \
+  --canonical-mapping /path/to/bundle/mapping/canonical_player_mapping.parquet
+```
+
+**Daily incremental** (carry-forward; does not reset Feast online store):
+
+```bash
+python -m trainer_hightier.serving.feast_online_refresh \
+  --layers mid --source clickhouse --skip-apply \
+  --feast-repo /path/to/bundle/feast_repo \
+  --adt-allowlist /path/to/bundle/mapping/adt_allowed_players_q0p99.parquet \
+  --canonical-mapping /path/to/bundle/mapping/canonical_player_mapping.parquet
+```
+
+Post-refresh validation:
+
+```bash
+python -m trainer_hightier.serving.audit_production_readiness ...
+python -m trainer_hightier.serving.audit_supplier_root_cause ...
+```
+
+Readiness gate now requires `mid_cell_null_rate` < 5% on allowlist smoke sample, not only `entity_missing_rate`.

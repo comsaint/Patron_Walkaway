@@ -20,15 +20,24 @@ from trainer_hightier.feature_experiment.feature_cadence import (
 from trainer_hightier.serving.production_materialize import DEFAULT_MODEL_FE_DERIVED_COLUMNS
 
 
-def test_active_mid_term_model_features_use_daily_snapshot_supplier() -> None:
-    """Baseline mid-term ``fe__*`` must resolve to daily snapshot supplier after registry update."""
+_DISABLED_BASELINE_MID: tuple[str, ...] = (
+    "fe__bets_cnt__w1d",
+    "fe__wager_sum__w15m_over_w1d",
+    "fe__wager_cv_w7d",
+    "fe__payout_odds_z_prior_w30d",
+    "fe__interarrival__last_gap_z__w7d",
+    "fe__odds__payout_odds_z__w7d",
+)
+
+
+def test_disabled_mid_term_features_still_resolve_daily_snapshot_supplier() -> None:
+    """Disabled baseline mid-term ``fe__*`` keep daily snapshot cadence metadata."""
 
     snap = load_candidate_registry(None)
     raw_rows = load_registry_raw_feature_dicts(None)
-    split = classify_model_fe_features(snap, DEFAULT_MODEL_FE_DERIVED_COLUMNS, raw_rows=raw_rows)
-    assert "fe__bets_cnt__w1d" in split["mid_term"]
-    assert "fe__wager_sum__w15m" in split["short_term"]
-    assert "fe__wager_cv_w7d" in split["mid_term"]
+    split = classify_model_fe_features(snap, _DISABLED_BASELINE_MID, raw_rows=raw_rows)
+    assert "fe__wager_sum__w15m" not in split["mid_term"]
+    assert set(split["mid_term"]) == set(_DISABLED_BASELINE_MID)
     for feat in split["mid_term"]:
         row = next(r for r in snap.rows if r.feature_id == feat)
         resolved = resolve_feature_cadence(row, next(x for x in raw_rows if x["feature_id"] == feat))
@@ -78,4 +87,4 @@ def test_build_feature_cadence_audit_counts_terms() -> None:
     audit = build_feature_cadence_audit(snap, snap.model_feature_columns)
     assert audit["model_feature_count"] == len(snap.model_feature_columns)
     assert audit["term_counts"]["short_term"] >= 1
-    assert audit["term_counts"]["mid_term"] >= 1
+    assert audit["term_counts"].get("mid_term", 0) == 0

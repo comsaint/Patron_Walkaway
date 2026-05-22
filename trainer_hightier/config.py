@@ -58,7 +58,13 @@ MANIFEST_KEY_MID_TERM_GENERATED_AT: Final[str] = "mid_term_generated_at"
 MANIFEST_KEY_MID_TERM_STALE_HARD_CAP_DAYS: Final[str] = "mid_term_stale_hard_cap_days"
 MANIFEST_KEY_FE_SHORT_TERM: Final[str] = "fe_short_term_parquet"
 MANIFEST_KEY_SLOW_ANCHOR_MAX: Final[str] = "slow_anchor_gaming_day_max"
+MANIFEST_KEY_SLOW_ANCHOR_TARGET: Final[str] = "slow_anchor_target"
+MANIFEST_KEY_SLOW_ANCHOR_EFFECTIVE: Final[str] = "slow_anchor_effective"
+MANIFEST_KEY_SLOW_MONTH_TURN_PHASE: Final[str] = "slow_month_turn_phase"
 MANIFEST_KEY_SLOW_GENERATED_AT: Final[str] = "slow_generated_at"
+SLOW_SNAPSHOT_SCOPE_PRODUCTION: Final[str] = "production"
+SLOW_SNAPSHOT_SCOPE_DIAGNOSTIC: Final[str] = "diagnostic"
+SLOW_SNAPSHOT_SCOPE_TRAINING: Final[str] = "training_model_contract"
 MANIFEST_KEY_SLOW_MONTHLY_GRACE_DAYS: Final[str] = "slow_monthly_grace_days"
 MANIFEST_KEY_SLOW_STALE_HARD_CAP_DAYS: Final[str] = "slow_stale_hard_cap_days"
 MID_TERM_GRAIN_CANONICAL_DAILY_ASOF: Final[str] = "canonical_daily_asof"
@@ -105,6 +111,12 @@ SCORER_FEAST_READINESS_ENABLED: Final[bool] = True
 #: Allowlist canonical ids sampled for deploy-time Feast online lookup smoke.
 SCORER_FEAST_DEPLOY_LOOKUP_SMOKE_SAMPLE_SIZE: Final[int] = 20
 FEAST_STARTUP_REFRESH_LOCK_WAIT_SECONDS: Final[int] = 30
+#: Bootstrap mid-term Feast refresh: anchor days materialized (carry-forward ASOF parity).
+PRODUCTION_MID_FEAST_BOOTSTRAP_ANCHOR_DAYS: Final[int] = 60
+#: Hard-fail when sampled mid Feast columns exceed this null fraction (aligns with training ~5%).
+SCORER_FEAST_MID_CELL_NULL_FAIL_FRACTION: Final[float] = 0.05
+#: Minimum fraction of allowlist canonical ids present in mid Feast online store after refresh.
+SCORER_FEAST_MID_MIN_CANONICAL_COVERAGE_FRACTION: Final[float] = 0.95
 
 # Baseline MODEL columns: softer FQG (high PSI → WARN; unique-constant under sample → WARN; WARN auto-allowlist).
 _FQG_BASELINE_MODEL_SOFT_COLUMNS: tuple[str, ...] = (
@@ -399,7 +411,7 @@ class Step5TrainConfig:
     #: When ``True``, use :data:`baseline_*` hyperparameters only (no Optuna).
     skip_optuna: bool = False
     #: ``study.optimize(..., timeout=...)`` wall-clock cap in seconds.
-    optuna_timeout_sec: float = 60.0 * 60 * 3  # 1 hour = 60*60
+    optuna_timeout_sec: float = 60.0 * 60 * 1  # 1 hour = 60*60
     early_stopping_rounds: int = 50
     #: Upper bound on boosting rounds (early stopping usually stops sooner).
     lgb_n_estimators_cap: int = 2000
@@ -411,6 +423,17 @@ class Step5TrainConfig:
     baseline_reg_lambda: float = 0.0
     #: When ``True``, final artifact model refits on train+val (test remains holdout-only).
     refit_train_plus_val: bool = True
+
+
+@dataclass(frozen=True)
+class Step6ParityConfig:
+    """Step 6: post-training train/serve parity verification gate."""
+
+    run_step6: bool = True
+    hard_fail_slow_gate: bool = True
+    hard_fail_all_feature_gate: bool = False
+    max_rows: int = 200_000
+    batch_size: int = 5000
 
 
 @dataclass(frozen=True)
@@ -535,6 +558,12 @@ class HightierServingConfig:
     feast_startup_refresh_lock_wait_seconds: int = FEAST_STARTUP_REFRESH_LOCK_WAIT_SECONDS
     #: Deploy / dry-run allowlist sample size for Feast online lookup smoke.
     scorer_feast_deploy_lookup_smoke_sample_size: int = SCORER_FEAST_DEPLOY_LOOKUP_SMOKE_SAMPLE_SIZE
+    #: Bootstrap anchor-day span for mid-term Feast online refresh (Option A carry-forward).
+    production_mid_feast_bootstrap_anchor_days: int = PRODUCTION_MID_FEAST_BOOTSTRAP_ANCHOR_DAYS
+    #: Hard-fail smoke when mid Feast cell null rate exceeds this fraction.
+    scorer_feast_mid_cell_null_fail_fraction: float = SCORER_FEAST_MID_CELL_NULL_FAIL_FRACTION
+    #: Hard-fail refresh when mid Feast rows cover less than this fraction of allowlist canonicals.
+    scorer_feast_mid_min_canonical_coverage_fraction: float = SCORER_FEAST_MID_MIN_CANONICAL_COVERAGE_FRACTION
 
 
 _DEFAULT_HIGHTIER_SERVING: HightierServingConfig = HightierServingConfig()

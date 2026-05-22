@@ -80,7 +80,7 @@ def default_long_term_spike_config() -> FeastLongTermSpikeConfig:
     cfg = default_hightier_serving_config()
     return FeastLongTermSpikeConfig(
         feast_repo=pkg / "feast_repo",
-        spike_parquet=feast_art / "long_term_spike_canonical.parquet",
+        spike_parquet=feast_art / "slow_patron_180d_monthly.parquet",
         staging_dir=feast_art / "long_term_spike_staging",
         report_path=feast_art / "long_term_spike_report.json",
         local_cleaned_session=default_cleaned_session_parquet_path(),

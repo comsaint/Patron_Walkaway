@@ -5,16 +5,114 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import replace
+from datetime import date, timedelta
 from pathlib import Path
 import pandas as pd
 import pytest
 
 from trainer_hightier.config import default_hightier_serving_config
 from trainer_hightier.serving import feast_online_refresh as refresh_mod
+from trainer_hightier.serving.feast_production_constants import PRODUCTION_MID_TERM_FEATURE_COLUMNS
+from trainer_hightier.serving.feast_readiness import evaluate_feast_lookup_smoke_gate
 from trainer_hightier.serving.feature_state_store import (
     feature_state_meta_get,
     init_feature_state_db,
 )
+
+
+def _mid_feature_row(canonical_id: str, anchor_day: str, *, wager: float) -> dict[str, object]:
+    row: dict[str, object] = {
+        "canonical_id": canonical_id,
+        "anchor_gaming_day": pd.Timestamp(anchor_day),
+    }
+    for col in PRODUCTION_MID_TERM_FEATURE_COLUMNS:
+        row[col] = wager if col == "fe__wager_sum__w1d" else 1.0
+    return row
+
+
+def _mid_feast_row(canonical_id: str, anchor_day: str, *, wager: float) -> dict[str, object]:
+    ts = pd.Timestamp(anchor_day) + pd.Timedelta(hours=23, minutes=59, seconds=59)
+    row: dict[str, object] = {
+        "canonical_id": canonical_id,
+        "event_timestamp": ts,
+    }
+    for col in PRODUCTION_MID_TERM_FEATURE_COLUMNS:
+        row[col] = wager if col == "fe__wager_sum__w1d" else 1.0
+    return row
+
+
+def test_mid_export_bounds_daily_uses_single_anchor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(refresh_mod, "serving_gaming_day", lambda **_k: date(2025, 6, 2))
+    monkeypatch.setattr(refresh_mod, "expected_mid_term_anchor", lambda _day: date(2025, 6, 1))
+    anchor_start, anchor_end, bets_start, bets_end = refresh_mod._mid_export_bounds(
+        close_hour=6,
+        bootstrap_mid=False,
+    )
+    assert anchor_start == anchor_end == date(2025, 6, 1)
+    assert bets_end == date(2025, 6, 1)
+    assert bets_start == date(2025, 6, 1) - timedelta(days=int(refresh_mod.MID_TERM_SNAPSHOT_MAX_LOOKBACK_DAYS) - 1)
+
+
+def test_mid_export_bounds_bootstrap_spans_anchor_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(refresh_mod, "serving_gaming_day", lambda **_k: date(2025, 6, 2))
+    monkeypatch.setattr(refresh_mod, "expected_mid_term_anchor", lambda _day: date(2025, 6, 1))
+    anchor_start, anchor_end, bets_start, _bets_end = refresh_mod._mid_export_bounds(
+        close_hour=6,
+        bootstrap_mid=True,
+        bootstrap_anchor_days=60,
+    )
+    assert anchor_end == date(2025, 6, 1)
+    assert anchor_start == date(2025, 4, 3)
+    assert bets_start == anchor_start - timedelta(days=int(refresh_mod.MID_TERM_SNAPSHOT_MAX_LOOKBACK_DAYS) - 1)
+
+
+def test_merge_mid_feast_carry_forward_keeps_latest_per_canonical(tmp_path: Path) -> None:
+    prev = tmp_path / "prev_feast.parquet"
+    daily = tmp_path / "daily_prod.parquet"
+    out = tmp_path / "merged_feast.parquet"
+    pd.DataFrame(
+        [
+            _mid_feast_row("c1", "2025-05-01", wager=10.0),
+            _mid_feast_row("c2", "2025-05-01", wager=20.0),
+        ]
+    ).to_parquet(prev, index=False)
+    pd.DataFrame(
+        [
+            _mid_feature_row("c1", "2025-05-02", wager=99.0),
+            _mid_feature_row("c3", "2025-05-02", wager=30.0),
+        ]
+    ).to_parquet(daily, index=False)
+    rows = refresh_mod.merge_mid_feast_carry_forward(
+        previous_feast_parquet=prev,
+        daily_snapshot_parquet=daily,
+        feast_out=out,
+    )
+    assert rows == 3
+    merged = pd.read_parquet(out)
+    by_cid = merged.set_index("canonical_id")
+    assert float(by_cid.loc["c1", "fe__wager_sum__w1d"]) == 99.0
+    assert float(by_cid.loc["c2", "fe__wager_sum__w1d"]) == 20.0
+    assert float(by_cid.loc["c3", "fe__wager_sum__w1d"]) == 30.0
+
+
+def test_evaluate_feast_lookup_smoke_gate_fails_on_mid_cell_null_only() -> None:
+    cfg = default_hightier_serving_config()
+    smoke = {
+        "entity_missing_rate": 0.0,
+        "mid_cell_null_rate": 1.0,
+    }
+    ok, reason = evaluate_feast_lookup_smoke_gate(
+        smoke,
+        mid_columns=("fe__wager_sum__w1d",),
+        entity_missing_fail_fraction=float(cfg.scorer_feast_entity_missing_fail_fraction),
+        mid_cell_null_fail_fraction=float(cfg.scorer_feast_mid_cell_null_fail_fraction),
+        feast_spike_rows=None,
+        allowlist_canonical_count=None,
+        min_canonical_coverage_fraction=float(cfg.scorer_feast_mid_min_canonical_coverage_fraction),
+    )
+    assert not ok
+    assert reason is not None
+    assert "mid cell null rate" in reason
 
 
 def test_parse_refresh_layers_rejects_unknown() -> None:
@@ -130,6 +228,7 @@ def test_mocked_refresh_publishes_readiness_after_smoke(tmp_path: Path, monkeypa
             status="ok",
             meta={
                 "row_count": 2,
+                "feast_spike_rows": 2,
                 "snapshot_scope": "production",
                 "mid_term_anchor_gaming_day_max": "2025-05-31",
             },
@@ -159,15 +258,15 @@ def test_mocked_refresh_publishes_readiness_after_smoke(tmp_path: Path, monkeypa
     monkeypatch.setattr(refresh_mod, "load_adt_allowlist_ids", lambda _p: frozenset({1, 2}))
     monkeypatch.setattr(refresh_mod, "_refresh_mid_layer", _fake_mid)
     monkeypatch.setattr(refresh_mod, "_refresh_slow_layer", _fake_slow)
-    monkeypatch.setattr(refresh_mod, "run_feast_apply", lambda _repo: 0.5)
+    monkeypatch.setattr(refresh_mod, "run_feast_apply", lambda _repo, **kwargs: 0.5)
     monkeypatch.setattr(refresh_mod, "run_feast_materialize_views", lambda *_a, **_k: 1.0)
     monkeypatch.setattr(
-        refresh_mod,
-        "run_allowlist_feast_lookup_smoke",
+        "trainer_hightier.serving.feast_online_refresh.run_allowlist_feast_lookup_smoke",
         lambda **_k: {
             "ok": True,
             "sample_size": 2,
             "entity_missing_rate": 0.0,
+            "mid_cell_null_rate": 0.0,
             "cell_null_counts": {},
         },
     )
@@ -188,6 +287,8 @@ def test_mocked_refresh_publishes_readiness_after_smoke(tmp_path: Path, monkeypa
         local_cleaned_session=None,
         max_smoke_entities=2,
         summary_path=summary,
+        bootstrap_mid=False,
+        apply_schema=False,
     )
     report = refresh_mod.run_feast_online_refresh(opts)
     assert report["verdict"] == "ok"
@@ -226,7 +327,7 @@ def test_smoke_failure_does_not_publish_readiness(tmp_path: Path, monkeypatch: p
         lambda **_k: refresh_mod.LayerRefreshOutcome(
             layer="mid",
             status="ok",
-            meta={"row_count": 1, "mid_term_anchor_gaming_day_max": "2025-05-31"},
+            meta={"row_count": 1, "feast_spike_rows": 1, "mid_term_anchor_gaming_day_max": "2025-05-31"},
             export_meta={"rows_exported": 1},
             artifact_path=tmp_path / "mid.parquet",
             feast_parquet_path=tmp_path / "mid_feast.parquet",
@@ -234,12 +335,16 @@ def test_smoke_failure_does_not_publish_readiness(tmp_path: Path, monkeypatch: p
             detail={},
         ),
     )
-    monkeypatch.setattr(refresh_mod, "run_feast_apply", lambda _repo: 0.1)
+    monkeypatch.setattr(refresh_mod, "run_feast_apply", lambda _repo, **kwargs: 0.1)
     monkeypatch.setattr(refresh_mod, "run_feast_materialize_views", lambda *_a, **_k: 0.1)
     monkeypatch.setattr(
-        refresh_mod,
-        "run_allowlist_feast_lookup_smoke",
-        lambda **_k: {"ok": False, "entity_missing_rate": 0.5, "sample_size": 2},
+        "trainer_hightier.serving.feast_online_refresh.run_allowlist_feast_lookup_smoke",
+        lambda **_k: {
+            "ok": False,
+            "entity_missing_rate": 0.5,
+            "mid_cell_null_rate": 0.0,
+            "sample_size": 2,
+        },
     )
     opts = refresh_mod.RefreshOptions(
         layers=frozenset({"mid"}),
@@ -256,8 +361,10 @@ def test_smoke_failure_does_not_publish_readiness(tmp_path: Path, monkeypatch: p
         local_cleaned_session=None,
         max_smoke_entities=2,
         summary_path=tmp_path / "report.json",
+        bootstrap_mid=False,
+        apply_schema=False,
     )
-    with pytest.raises(RuntimeError, match="Feast online smoke failed"):
+    with pytest.raises(RuntimeError, match="entity missing rate"):
         refresh_mod.run_feast_online_refresh(opts)
     assert not readiness.exists()
     conn = sqlite3.connect(db_path)
@@ -268,6 +375,77 @@ def test_smoke_failure_does_not_publish_readiness(tmp_path: Path, monkeypatch: p
     finally:
         conn.close()
     assert status == "error"
+
+
+def test_slow_only_refresh_runs_feast_apply_when_registry_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deploy slow-only first boot must apply schema before materialize."""
+    allow = tmp_path / "allow.parquet"
+    cmap = tmp_path / "map.parquet"
+    pd.DataFrame({"player_id": [1]}).to_parquet(allow, index=False)
+    pd.DataFrame({"player_id": [1], "canonical_id": ["c1"]}).to_parquet(cmap, index=False)
+    feast_repo = tmp_path / "feast_repo"
+    (feast_repo / "data").mkdir(parents=True)
+    readiness = tmp_path / "feast_online_readiness.json"
+    db_path = tmp_path / "feature_state.db"
+    apply_calls: list[bool] = []
+
+    def _capture_apply(_repo: Path, **kwargs: object) -> float:
+        apply_calls.append(bool(kwargs.get("reset_runtime")))
+        return 0.1
+
+    monkeypatch.setattr(refresh_mod, "load_adt_allowlist_ids", lambda _p: frozenset({1}))
+    monkeypatch.setattr(
+        refresh_mod,
+        "_refresh_slow_layer",
+        lambda **_k: refresh_mod.LayerRefreshOutcome(
+            layer="slow",
+            status="ok",
+            meta={"row_count": 1, "feast_spike_rows": 1, "slow_anchor_gaming_day_max": "2025-05-31"},
+            export_meta={"rows_exported": 1},
+            artifact_path=tmp_path / "slow.parquet",
+            feast_parquet_path=tmp_path / "slow_feast.parquet",
+            compute_seconds=0.1,
+            detail={},
+        ),
+    )
+    monkeypatch.setattr(refresh_mod, "run_feast_apply", _capture_apply)
+    monkeypatch.setattr(refresh_mod, "run_feast_materialize_views", lambda *_a, **_k: 0.1)
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_refresh.run_allowlist_feast_lookup_smoke",
+        lambda **_k: {
+            "ok": True,
+            "sample_size": 1,
+            "entity_missing_rate": 0.0,
+            "mid_cell_null_rate": 0.0,
+            "cell_null_counts": {},
+        },
+    )
+    _patch_feature_state_db(monkeypatch, db_path)
+    init_feature_state_db(db_path)
+    opts = refresh_mod.RefreshOptions(
+        layers=frozenset({"slow"}),
+        source="clickhouse",
+        skip_apply=True,
+        skip_materialize=False,
+        smoke_only=False,
+        dry_run=False,
+        feast_repo=feast_repo,
+        readiness_path=readiness,
+        canonical_mapping=cmap,
+        adt_allowlist=allow,
+        local_cleaned_bet=None,
+        local_cleaned_session=None,
+        max_smoke_entities=1,
+        summary_path=tmp_path / "report.json",
+        bootstrap_mid=False,
+        apply_schema=False,
+    )
+    report = refresh_mod.run_feast_online_refresh(opts)
+    assert report["verdict"] == "ok"
+    assert apply_calls == [False]
 
 
 def test_init_feature_state_db_creates_feast_refresh_tables(tmp_path: Path) -> None:

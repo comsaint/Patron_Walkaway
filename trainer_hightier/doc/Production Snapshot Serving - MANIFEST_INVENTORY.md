@@ -61,7 +61,7 @@ Historical `fe_derived_parquet` must not be the release gate for scorer v2 model
   - `source_mirror/cleaned_bet/` — compact rolling cleaned bet partitions (mid-term + short-term).
   - `source_mirror/cleaned_session.parquet` — compact cleaned session mirror (slow monthly).
 - Paths and retention are defined in `trainer_hightier.config` (`production_cleaned_bet_mirror_dir`, `production_cleaned_session_mirror_parquet`, retention days); not environment variables.
-- Slow monthly anchor is **previous calendar month-end gaming day** (`MAX(gaming_day)` per patron per month); production refresh on the 1st uses data through that anchor.
+- Slow monthly anchor is **last full month data relative to today** (not gaming day). For example if today is May 10th, the snapshot must be computed using data of last month's end (Apr 30th) and backward; the snapshot is expected to be scheduled on May 1st so it covers full Apr data.
 - The supervisor writes staging artifacts first, validates them, and only then atomically publishes `active_manifest.json`.
 - A bundle-local `.snapshot_refresh_supervisor.lock` prevents multiple deploy processes from materializing and publishing snapshots concurrently. Stale lock cleanup is governed by `snapshot_refresh_lock_stale_minutes`.
 - `--no-refresh-supervisor` is available only for debug or deployments that intentionally use an external scheduler.

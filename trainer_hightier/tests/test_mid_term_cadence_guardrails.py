@@ -13,7 +13,7 @@ from trainer_hightier.feature_experiment.materialize_fe_derived import (
 
 
 def test_legacy_mid_term_columns_documented_in_fe_derived() -> None:
-    """Active model mid-term columns must be listed as legacy rolling outputs."""
+    """Former baseline mid-term columns must stay listed as legacy rolling outputs."""
 
     active_mid = {
         "fe__bets_cnt__w1d",

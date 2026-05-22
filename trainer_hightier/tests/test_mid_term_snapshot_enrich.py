@@ -355,6 +355,84 @@ def test_day_end_snapshot_uses_last_bet_inclusive_state(tmp_path: Path) -> None:
     assert float(row["fe__wager_sum__w1d"]) == pytest.approx(300.0)
     assert int(row["fe__bets_cnt__w7d"]) == 3
     assert float(row["fe__wager_sum__w7d"]) == pytest.approx(350.0)
+    assert float(row["fe__payout_odds_avg_w7d"]) == pytest.approx(2.0)
+    assert float(row["fe__payout_odds_std_w7d"]) == pytest.approx(0.408248290463863, rel=1e-6)
+
+
+def test_enrich_training_payout_odds_z_w7d_from_mid_snapshot(tmp_path: Path) -> None:
+    """7d odds z-score training enrich uses prior-day mid snapshot stats + bet odds."""
+
+    cleaned = tmp_path / "cleaned_odds_z"
+    _write_cleaned_bet(
+        cleaned,
+        [
+            {
+                "player_id": 1,
+                "gaming_day": pd.Timestamp("2026-05-17"),
+                "payout_complete_dtm": pd.Timestamp("2026-05-17T12:00:00Z"),
+                "wager": 50.0,
+                "payout_odds": 1.5,
+            },
+            {
+                "player_id": 1,
+                "gaming_day": pd.Timestamp("2026-05-18"),
+                "payout_complete_dtm": pd.Timestamp("2026-05-18T10:00:00Z"),
+                "wager": 100.0,
+                "payout_odds": 2.0,
+            },
+        ],
+    )
+    cmap = tmp_path / "map_odds_z.parquet"
+    _write_mapping(cmap)
+    mid = tmp_path / "mid_odds_z.parquet"
+    materialize_mid_term_daily_snapshot(
+        cleaned_bet_parquet=cleaned,
+        out_parquet=mid,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        canonical_mapping_parquet=cmap,
+        snapshot_scope=MID_TERM_SNAPSHOT_SCOPE_PRODUCTION,
+    )
+    base = tmp_path / "base_odds_z.parquet"
+    pd.DataFrame(
+        {
+            "bet_id": [42.0],
+            "canonical_id": ["c1"],
+            "gaming_day": pd.Timestamp("2026-05-19"),
+            "payout_odds": [2.5],
+        }
+    ).to_parquet(base, index=False)
+    train_out = tmp_path / "train_odds_z.parquet"
+    enrich_training_parquet_with_cadence_suppliers(
+        base_training_parquet=base,
+        fe_short_term_parquet=None,
+        mid_term_snapshot_parquet=mid,
+        out_parquet=train_out,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        short_term_columns=(),
+        mid_term_columns=("fe__odds__payout_odds_z__w7d",),
+    )
+    got = pd.read_parquet(train_out)
+    avg = float(
+        duckdb.sql(
+            f"""
+            SELECT fe__payout_odds_avg_w7d
+            FROM read_parquet('{mid.as_posix()}')
+            WHERE canonical_id = 'c1'
+              AND CAST(anchor_gaming_day AS DATE) = DATE '2026-05-18'
+            """
+        ).fetchone()[0]
+    )
+    std = float(
+        duckdb.sql(
+            f"""
+            SELECT fe__payout_odds_std_w7d
+            FROM read_parquet('{mid.as_posix()}')
+            WHERE canonical_id = 'c1'
+              AND CAST(anchor_gaming_day AS DATE) = DATE '2026-05-18'
+            """
+        ).fetchone()[0]
+    )
+    assert float(got.iloc[0]["fe__odds__payout_odds_z__w7d"]) == pytest.approx((2.5 - avg) / std)
 
 
 def test_train_serve_mid_term_asof_parity(tmp_path: Path) -> None:

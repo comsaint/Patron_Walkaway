@@ -145,9 +145,50 @@ def test_patron_profile_csv_aggregates_by_canonical_id(tmp_path) -> None:
     assert int(float(ell["session_count"])) == 1
 
 
-def test_slow_patron_180d_monthly_materialize_assigns_latest_anchor(tmp_path) -> None:
-    """Monthly MIN(gaming_day) anchor + lateral join picks correct snapshot per bet."""
-    from trainer_hightier.utils.slow_patron_180d_monthly import materialize_slow_patron_180d_monthly
+def test_slow_patron_canonical_active_month_single_anchor(tmp_path) -> None:
+    """Canonical active-month materializer emits one global anchor row per patron."""
+    from trainer_hightier.utils.slow_patron_180d_monthly import materialize_slow_patron_canonical_active_month
+
+    gd1 = date(2024, 1, 5)
+    gd2 = date(2024, 1, 12)
+    gd3 = date(2024, 2, 2)
+    sess = pd.DataFrame(
+        [
+            _sess_row(100, 1, 100.0, gd1),
+            _sess_row(100, 2, 50.0, gd2),
+            _sess_row(100, 3, 200.0, gd3),
+        ]
+    )
+    mp = tmp_path / "map.parquet"
+    pq.write_table(
+        pa.Table.from_pandas(pd.DataFrame({"player_id": [100], "canonical_id": ["c1"]})),
+        mp,
+    )
+    spq = tmp_path / "sess.parquet"
+    pq.write_table(pa.Table.from_pandas(sess), spq)
+    out = tmp_path / "slow_canonical.parquet"
+
+    materialize_slow_patron_canonical_active_month(
+        cleaned_session_parquet=spq,
+        canonical_mapping_parquet=mp,
+        out_parquet=out,
+        context_day=date(2024, 6, 15),
+        lookback_days=180,
+    )
+    got = pd.read_parquet(out)
+    assert len(got) == 1
+    assert str(got.iloc[0]["canonical_id"]) == "c1"
+    anchors = pd.to_datetime(got["anchor_gaming_day"]).dt.date.tolist()
+    assert anchors == [date(2024, 5, 31)]
+    assert "event_timestamp" in got.columns
+    assert pd.notna(got.iloc[0]["event_timestamp"])
+
+
+def test_slow_patron_180d_monthly_bet_grain_diagnostic_assigns_latest_anchor(tmp_path) -> None:
+    """Diagnostic bet-grain path still supports multi-anchor ASOF (non-deploy)."""
+    from trainer_hightier.utils.slow_patron_180d_monthly import (
+        materialize_slow_patron_180d_monthly_bet_grain_diagnostic,
+    )
 
     gd1 = date(2024, 1, 5)
     gd2 = date(2024, 1, 12)
@@ -197,7 +238,7 @@ def test_slow_patron_180d_monthly_materialize_assigns_latest_anchor(tmp_path) ->
     pq.write_table(pa.Table.from_pandas(bets), bpq)
     out = tmp_path / "slow180.parquet"
 
-    materialize_slow_patron_180d_monthly(
+    materialize_slow_patron_180d_monthly_bet_grain_diagnostic(
         cleaned_session_parquet=spq,
         canonical_mapping_parquet=mp,
         cleaned_bet_parquet=bpq,

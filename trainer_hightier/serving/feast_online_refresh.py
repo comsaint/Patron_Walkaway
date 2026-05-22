@@ -30,6 +30,7 @@ from trainer_hightier.serving.adt_allowlist import load_adt_allowlist_ids, resol
 from trainer_hightier.serving.ch_adapter import get_clickhouse_client
 from trainer_hightier.serving.feast_online_adapter import (
     default_feast_repo_path,
+    feast_registry_missing,
     reset_feast_repo_runtime_state,
     resolve_feast_artifacts_dir,
 )
@@ -43,6 +44,7 @@ from trainer_hightier.serving.feast_readiness import (
     merge_layer_readiness,
     resolve_feast_readiness_path,
     run_allowlist_feast_lookup_smoke,
+    evaluate_feast_lookup_smoke_gate,
     write_feast_online_readiness,
 )
 from trainer_hightier.serving.feature_state_store import (
@@ -83,6 +85,8 @@ class RefreshOptions:
     local_cleaned_session: Path | None
     max_smoke_entities: int
     summary_path: Path
+    bootstrap_mid: bool
+    apply_schema: bool
 
 
 @dataclass
@@ -123,14 +127,54 @@ def _split_player_id_chunks(ids: frozenset[int], chunk_size: int) -> list[list[i
     return [sorted_ids[i : i + chunk_size] for i in range(0, len(sorted_ids), chunk_size)]
 
 
-def _mid_export_bounds(*, close_hour: int) -> tuple[date, date, date, date]:
+def _path_esc(path: Path) -> str:
+    return str(Path(path).resolve()).replace("\\", "/").replace("'", "''")
+
+
+def count_allowlist_canonical_ids(
+    allowlist_parquet: Path,
+    canonical_mapping_parquet: Path,
+) -> int:
+    """Count distinct canonical ids reachable from the ADT allowlist."""
+    allow_esc = _path_esc(allowlist_parquet)
+    map_esc = _path_esc(canonical_mapping_parquet)
+    row = duckdb.sql(
+        f"""
+        SELECT COUNT(DISTINCT TRIM(CAST(m.canonical_id AS VARCHAR)))
+        FROM read_parquet('{allow_esc}') AS a
+        INNER JOIN read_parquet('{map_esc}') AS m
+          ON CAST(a.player_id AS BIGINT) = CAST(m.player_id AS BIGINT)
+        WHERE m.canonical_id IS NOT NULL
+          AND TRIM(CAST(m.canonical_id AS VARCHAR)) != ''
+        """,
+    ).fetchone()
+    return int(row[0] if row and row[0] is not None else 0)
+
+
+def _mid_export_bounds(
+    *,
+    close_hour: int,
+    bootstrap_mid: bool = False,
+    bootstrap_anchor_days: int | None = None,
+) -> tuple[date, date, date, date]:
     """Return anchor_start, anchor_end, bets_gday_start, bets_gday_end."""
+    cfg = default_hightier_serving_config()
     serving_day = serving_gaming_day(close_hour=close_hour)
     anchor_end = expected_mid_term_anchor(serving_day)
-    anchor_start = anchor_end
+    if bootstrap_mid:
+        days = int(
+            bootstrap_anchor_days
+            if bootstrap_anchor_days is not None
+            else cfg.production_mid_feast_bootstrap_anchor_days
+        )
+        if days < 1:
+            raise ValueError(f"bootstrap_anchor_days must be >= 1, got {days!r}")
+        anchor_start = anchor_end - timedelta(days=days - 1)
+    else:
+        anchor_start = anchor_end
     lb = int(MID_TERM_SNAPSHOT_MAX_LOOKBACK_DAYS)
     bets_gday_end = anchor_end
-    bets_gday_start = anchor_end - timedelta(days=lb - 1)
+    bets_gday_start = anchor_start - timedelta(days=lb - 1)
     return anchor_start, anchor_end, bets_gday_start, bets_gday_end
 
 
@@ -284,6 +328,63 @@ def export_clickhouse_sessions_to_parquet(
     }
 
 
+def merge_mid_feast_carry_forward(
+    *,
+    previous_feast_parquet: Path | None,
+    daily_snapshot_parquet: Path,
+    feast_out: Path,
+) -> int:
+    """Merge daily production snapshot into carry-forward Feast mid parquet."""
+    dst = Path(feast_out).resolve()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst_esc = _path_esc(dst)
+    new_esc = _path_esc(daily_snapshot_parquet)
+    feat_cols = ", ".join(f'"{c}"' for c in PRODUCTION_MID_TERM_FEATURE_COLUMNS)
+    prev_path = Path(previous_feast_parquet).resolve() if previous_feast_parquet else None
+    if prev_path is not None and prev_path.is_file():
+        prev_esc = _path_esc(prev_path)
+        combined_sql = f"""
+        SELECT TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id,
+               CAST(event_timestamp AS DATE) AS anchor_gaming_day,
+               {feat_cols}
+        FROM read_parquet('{prev_esc}')
+        UNION ALL
+        SELECT TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id,
+               CAST(anchor_gaming_day AS DATE) AS anchor_gaming_day,
+               {feat_cols}
+        FROM read_parquet('{new_esc}')
+        """
+    else:
+        combined_sql = f"""
+        SELECT TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id,
+               CAST(anchor_gaming_day AS DATE) AS anchor_gaming_day,
+               {feat_cols}
+        FROM read_parquet('{new_esc}')
+        """
+    sql = f"""
+COPY (
+  SELECT canonical_id, {feat_cols},
+    CAST((CAST(anchor_gaming_day AS TIMESTAMP) + INTERVAL '1' DAY - INTERVAL '1' SECOND) AS TIMESTAMPTZ)
+      AS event_timestamp
+  FROM (
+    SELECT canonical_id, anchor_gaming_day, {feat_cols},
+      ROW_NUMBER() OVER (
+        PARTITION BY canonical_id
+        ORDER BY anchor_gaming_day DESC
+      ) AS rn
+    FROM ({combined_sql}) AS combined
+  ) AS ranked
+  WHERE rn = 1
+) TO '{dst_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+""".strip()
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.execute(sql)
+        return int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{dst_esc}')").fetchone()[0])
+    finally:
+        con.close()
+
+
 def write_mid_feast_parquet(full_snap: Path, feast_out: Path) -> int:
     """Collapse to latest anchor per canonical_id and add ``event_timestamp``."""
     src = str(Path(full_snap).resolve()).replace("\\", "/").replace("'", "''")
@@ -348,10 +449,11 @@ COPY (
         con.close()
 
 
-def run_feast_apply(feast_repo: Path) -> float:
-    """Run ``feast apply``; return wall-clock seconds."""
+def run_feast_apply(feast_repo: Path, *, reset_runtime: bool = False) -> float:
+    """Run ``feast apply``; optionally reset repo runtime state first."""
     repo = Path(feast_repo).resolve()
-    reset_feast_repo_runtime_state(repo)
+    if reset_runtime:
+        reset_feast_repo_runtime_state(repo)
     feast_bin = shutil.which("feast")
     if feast_bin is None:
         raise RuntimeError("feast CLI not found on PATH; install feast==0.63.x")
@@ -422,6 +524,8 @@ def _resolve_refresh_options(
     local_cleaned_session: Path | None,
     max_smoke_entities: int,
     summary_path: Path | None,
+    bootstrap_mid: bool = False,
+    apply_schema: bool = False,
 ) -> RefreshOptions:
     cfg = default_hightier_serving_config()
     parsed_layers = parse_refresh_layers(layers)
@@ -461,6 +565,8 @@ def _resolve_refresh_options(
         local_cleaned_session=Path(local_cleaned_session).resolve() if local_cleaned_session else None,
         max_smoke_entities=int(max_smoke_entities),
         summary_path=Path(summary_path or feast_art / "feast_online_refresh_report.json").resolve(),
+        bootstrap_mid=bool(bootstrap_mid),
+        apply_schema=bool(apply_schema),
     )
 
 
@@ -473,6 +579,8 @@ def _refresh_mid_layer(
     cfg = default_hightier_serving_config()
     anchor_start, anchor_end, bets_start, bets_end = _mid_export_bounds(
         close_hour=int(cfg.gaming_day_close_hour),
+        bootstrap_mid=opts.bootstrap_mid,
+        bootstrap_anchor_days=int(cfg.production_mid_feast_bootstrap_anchor_days),
     )
     if opts.source == "clickhouse":
         bet_path = staging_dir / "ch_bets_export.parquet"
@@ -502,8 +610,24 @@ def _refresh_mid_layer(
     feast_art = resolve_feast_artifacts_dir(opts.feast_repo)
     feast_art.mkdir(parents=True, exist_ok=True)
     feast_path = feast_art / "mid_term_spike_canonical.parquet"
-    feast_rows = write_mid_feast_parquet(artifact_path, feast_path)
-    meta = {**meta, "feast_spike_rows": feast_rows, "feast_spike_parquet": str(feast_path)}
+    if opts.bootstrap_mid or not feast_path.is_file():
+        feast_rows = write_mid_feast_parquet(artifact_path, feast_path)
+        bootstrap_completed = True
+    else:
+        feast_rows = merge_mid_feast_carry_forward(
+            previous_feast_parquet=feast_path,
+            daily_snapshot_parquet=artifact_path,
+            feast_out=feast_path,
+        )
+        bootstrap_completed = False
+    meta = {
+        **meta,
+        "feast_spike_rows": feast_rows,
+        "feast_spike_parquet": str(feast_path),
+        "mid_term_bootstrap_completed": bootstrap_completed,
+        "anchor_start": anchor_start.isoformat(),
+        "anchor_end": anchor_end.isoformat(),
+    }
     return LayerRefreshOutcome(
         layer="mid",
         status="ok",
@@ -512,7 +636,11 @@ def _refresh_mid_layer(
         artifact_path=artifact_path,
         feast_parquet_path=feast_path,
         compute_seconds=compute_seconds,
-        detail={"anchor_start": anchor_start.isoformat(), "anchor_end": anchor_end.isoformat()},
+        detail={
+            "anchor_start": anchor_start.isoformat(),
+            "anchor_end": anchor_end.isoformat(),
+            "bootstrap_mid": opts.bootstrap_mid,
+        },
     )
 
 
@@ -550,7 +678,7 @@ def _refresh_slow_layer(
     compute_seconds = round(time.perf_counter() - t0, 3)
     feast_art = resolve_feast_artifacts_dir(opts.feast_repo)
     feast_art.mkdir(parents=True, exist_ok=True)
-    feast_path = feast_art / "long_term_spike_canonical.parquet"
+    feast_path = feast_art / "slow_patron_180d_monthly.parquet"
     feast_rows = write_slow_feast_parquet(artifact_path, feast_path)
     meta = {**meta, "feast_spike_rows": feast_rows, "feast_spike_parquet": str(feast_path)}
     return LayerRefreshOutcome(
@@ -613,6 +741,8 @@ def run_feast_online_refresh(opts: RefreshOptions) -> dict[str, Any]:
         "source": opts.source,
         "dry_run": opts.dry_run,
         "smoke_only": opts.smoke_only,
+        "bootstrap_mid": opts.bootstrap_mid,
+        "apply_schema": opts.apply_schema,
     }
     apply_seconds: float | None = None
     materialize_seconds: float | None = None
@@ -630,8 +760,15 @@ def run_feast_online_refresh(opts: RefreshOptions) -> dict[str, Any]:
                 layer_outcomes.append(_refresh_mid_layer(opts=opts, staging_dir=staging_dir, player_ids=player_ids))
             if "slow" in opts.layers:
                 layer_outcomes.append(_refresh_slow_layer(opts=opts, staging_dir=staging_dir, player_ids=player_ids))
-            if not opts.skip_apply:
-                apply_seconds = run_feast_apply(opts.feast_repo)
+            registry_missing = feast_registry_missing(opts.feast_repo)
+            do_apply = registry_missing or (
+                (opts.bootstrap_mid or opts.apply_schema) and not opts.skip_apply
+            )
+            if do_apply:
+                apply_seconds = run_feast_apply(
+                    opts.feast_repo,
+                    reset_runtime=(opts.bootstrap_mid or opts.apply_schema) and not registry_missing,
+                )
             if not opts.skip_materialize:
                 views: list[str] = []
                 parquets: list[Path] = []
@@ -656,11 +793,33 @@ def run_feast_online_refresh(opts: RefreshOptions) -> dict[str, Any]:
             slow_columns=slow_cols,
             sample_size=opts.max_smoke_entities,
             entity_missing_fail_fraction=float(cfg.scorer_feast_entity_missing_fail_fraction),
+            mid_cell_null_fail_fraction=float(cfg.scorer_feast_mid_cell_null_fail_fraction),
         )
-        if not smoke.get("ok"):
-            raise RuntimeError(
-                f"Feast online smoke failed: entity_missing_rate={smoke.get('entity_missing_rate')}"
-            )
+        feast_spike_rows: int | None = None
+        allowlist_canonical_count: int | None = None
+        if "mid" in opts.layers:
+            for outcome in layer_outcomes:
+                if outcome.layer == "mid":
+                    feast_spike_rows = int(outcome.meta.get("feast_spike_rows") or 0)
+                    break
+            if not opts.smoke_only:
+                allowlist_canonical_count = count_allowlist_canonical_ids(
+                    opts.adt_allowlist,
+                    opts.canonical_mapping,
+                )
+        smoke_ok, smoke_reason = evaluate_feast_lookup_smoke_gate(
+            smoke,
+            mid_columns=mid_cols,
+            entity_missing_fail_fraction=float(cfg.scorer_feast_entity_missing_fail_fraction),
+            mid_cell_null_fail_fraction=float(cfg.scorer_feast_mid_cell_null_fail_fraction),
+            feast_spike_rows=feast_spike_rows,
+            allowlist_canonical_count=allowlist_canonical_count,
+            min_canonical_coverage_fraction=float(
+                cfg.scorer_feast_mid_min_canonical_coverage_fraction
+            ),
+        )
+        if not smoke_ok:
+            raise RuntimeError(smoke_reason or "Feast online smoke failed")
         readiness_doc: FeastOnlineReadiness | None = load_feast_online_readiness(opts.readiness_path)
         for outcome in layer_outcomes:
             layer_doc = _layer_readiness_from_outcome(outcome, smoke=smoke)
@@ -735,6 +894,8 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--layers", default="mid,slow", help="comma-separated: mid,slow")
     pr.add_argument("--source", default="clickhouse", choices=("clickhouse", "local_cleaned"))
     pr.add_argument("--skip-apply", action="store_true")
+    pr.add_argument("--apply-schema", action="store_true", help="run feast apply + reset runtime state")
+    pr.add_argument("--bootstrap-mid", action="store_true", help="multi-anchor mid bootstrap + carry-forward base")
     pr.add_argument("--skip-materialize", action="store_true")
     pr.add_argument("--smoke-only", action="store_true")
     pr.add_argument("--dry-run", action="store_true")
@@ -762,6 +923,8 @@ def main(argv: list[str] | None = None) -> int:
         local_cleaned_session=args.local_cleaned_session,
         max_smoke_entities=args.max_smoke_entities,
         summary_path=args.summary_path,
+        bootstrap_mid=bool(args.bootstrap_mid),
+        apply_schema=bool(args.apply_schema),
     )
     report = run_feast_online_refresh(opts)
     logger.info("[feast_online_refresh] verdict=%s", report.get("verdict"))

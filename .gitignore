@@ -265,3 +265,4 @@ trainer_hightier/artifacts/**
 tmp/
 archive/*
 archive/trainer/**
+.data/**

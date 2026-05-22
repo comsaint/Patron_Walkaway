@@ -292,6 +292,7 @@ def test_build_scorer_supplier_plan_includes_feast_deps_for_all_composites(tmp_p
         ("fe__wager_cv_w7d", "mid_term", "P7D"),
         ("fe__payout_odds_z_prior_w30d", "mid_term", "P30D"),
         ("fe__interarrival__last_gap_z__w7d", "mid_term", "P7D"),
+        ("fe__odds__payout_odds_z__w7d", "mid_term", "P7D"),
     ]
     for fid, horizon, lookback in rows:
         lines.extend(
@@ -313,6 +314,7 @@ def test_build_scorer_supplier_plan_includes_feast_deps_for_all_composites(tmp_p
         "fe__wager_cv_w7d",
         "fe__payout_odds_z_prior_w30d",
         "fe__interarrival__last_gap_z__w7d",
+        "fe__odds__payout_odds_z__w7d",
     )
     assert set(plan.feast_mid_cols) == {
         "fe__bets_cnt__w1d",
@@ -323,6 +325,8 @@ def test_build_scorer_supplier_plan_includes_feast_deps_for_all_composites(tmp_p
         "fe__prior_odds_std_w30d",
         "fe__interarrival_avg_w7d",
         "fe__interarrival_std_w7d",
+        "fe__payout_odds_avg_w7d",
+        "fe__payout_odds_std_w7d",
     }
     assert_scorer_supplier_plan_or_raise(plan)
 
@@ -449,6 +453,8 @@ def test_attach_mid_term_composite_columns_from_feast_inputs() -> None:
             "fe__time_since_last_bet_sec": [20.0],
             "fe__interarrival_avg_w7d": [10.0],
             "fe__interarrival_std_w7d": [5.0],
+            "fe__payout_odds_avg_w7d": [2.0],
+            "fe__payout_odds_std_w7d": [0.5],
         }
     )
     got = attach_mid_term_composite_columns(
@@ -458,12 +464,26 @@ def test_attach_mid_term_composite_columns_from_feast_inputs() -> None:
             "fe__wager_cv_w7d",
             "fe__payout_odds_z_prior_w30d",
             "fe__interarrival__last_gap_z__w7d",
+            "fe__odds__payout_odds_z__w7d",
         ),
     )
     assert float(got.iloc[0]["fe__wager_sum__w15m_over_w1d"]) == pytest.approx(0.3)
     assert float(got.iloc[0]["fe__wager_cv_w7d"]) == pytest.approx(0.4)
     assert float(got.iloc[0]["fe__payout_odds_z_prior_w30d"]) == pytest.approx(1.0)
     assert float(got.iloc[0]["fe__interarrival__last_gap_z__w7d"]) == pytest.approx(2.0)
+    assert float(got.iloc[0]["fe__odds__payout_odds_z__w7d"]) == pytest.approx(1.0)
+
+
+def test_default_registry_routes_payout_odds_z_w7d_as_mid_composite() -> None:
+    """Production registry must route 7d odds z-score via Feast mid + composite."""
+
+    snap = load_candidate_registry(None)
+    plan = build_scorer_supplier_plan(snap, ("fe__odds__payout_odds_z__w7d",))
+    assert plan.mid_composite_cols == ("fe__odds__payout_odds_z__w7d",)
+    assert plan.short_term_cols == ()
+    assert "fe__payout_odds_avg_w7d" in plan.feast_mid_cols
+    assert "fe__payout_odds_std_w7d" in plan.feast_mid_cols
+    assert_scorer_supplier_plan_or_raise(plan)
 
 
 def test_entity_missing_policy_hard_fail_above_threshold() -> None:
