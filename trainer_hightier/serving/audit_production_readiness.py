@@ -23,7 +23,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from trainer_hightier.config import HightierServingConfig, set_hightier_serving_deploy_override
+from trainer_hightier.config import (
+    HightierServingConfig,
+    apply_hightier_serving_environ_overrides,
+    set_hightier_serving_deploy_override,
+)
 from trainer_hightier.feature_experiment.feature_cadence import _MID_TERM_COMPOSITE_FEAST_DEPS
 from trainer_hightier.serving.feast_online_adapter import FeastSdkOnlineAdapter
 from trainer_hightier.serving.feast_readiness import (
@@ -397,7 +401,7 @@ def run_audit(argv: list[str] | None = None) -> int:
     bundle_root = Path(args.bundle_dir).resolve()
     rel = _load_bundle_rel(bundle_root)
     _load_dotenv(bundle_root)
-    cfg = _serving_config_for_bundle(bundle_root, rel)
+    cfg = apply_hightier_serving_environ_overrides(_serving_config_for_bundle(bundle_root, rel))
     set_hightier_serving_deploy_override(cfg)
     model_dir = bundle_root / rel.get("model_bundle_dir", "models")
     bundle = load_hightier_model_bundle(bundle_dir=model_dir)

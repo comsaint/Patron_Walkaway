@@ -11,7 +11,9 @@ Other packages may still *call* shared helpers; only **config** stays local here
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import os
+
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Final
@@ -555,6 +557,32 @@ def default_hightier_serving_config() -> HightierServingConfig:
     if _DEPLOY_SERVING_OVERRIDE is not None:
         return _DEPLOY_SERVING_OVERRIDE
     return _DEFAULT_HIGHTIER_SERVING
+
+
+def apply_hightier_serving_environ_overrides(cfg: HightierServingConfig) -> HightierServingConfig:
+    """Overlay ClickHouse fields from process env (after optional bundle ``.env`` load).
+
+    Recognized variables: ``CH_HOST``, ``CH_PORT``, ``CH_USER``, ``CH_PASS`` or
+    ``CH_PASSWORD``, ``CH_SECURE``, ``SOURCE_DB``.
+    """
+    kw: dict[str, object] = {}
+    if (v := str(os.environ.get("CH_HOST", "")).strip()):
+        kw["ch_host"] = v
+    if str(os.environ.get("CH_PORT", "")).strip():
+        kw["ch_port"] = int(str(os.environ["CH_PORT"]).strip())
+    if (v := str(os.environ.get("CH_USER", "")).strip()):
+        kw["ch_user"] = v
+    pw = str(os.environ.get("CH_PASS", "")).strip() or str(os.environ.get("CH_PASSWORD", "")).strip()
+    if pw:
+        kw["ch_password"] = pw
+    if str(os.environ.get("CH_SECURE", "")).strip():
+        raw = str(os.environ.get("CH_SECURE", "")).strip().lower()
+        kw["ch_secure"] = raw in ("1", "true", "yes", "on")
+    if (v := str(os.environ.get("SOURCE_DB", "")).strip()):
+        kw["source_db"] = v
+    if not kw:
+        return cfg
+    return replace(cfg, **kw)
 
 
 def list_run_profile_names() -> tuple[str, ...]:

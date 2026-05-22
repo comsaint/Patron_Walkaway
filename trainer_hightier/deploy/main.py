@@ -21,7 +21,12 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from trainer_hightier.config import HK_TZ, HightierServingConfig, set_hightier_serving_deploy_override
+from trainer_hightier.config import (
+    HK_TZ,
+    HightierServingConfig,
+    apply_hightier_serving_environ_overrides,
+    set_hightier_serving_deploy_override,
+)
 from trainer_hightier.serving.contracts import (
     META_KEY_MID_TERM_REFRESH_LAST_ATTEMPT,
     META_KEY_REFRESH_SUPERVISOR_LAST_CHECK,
@@ -116,27 +121,6 @@ def _parse_bool(raw: str | None, *, default: bool) -> bool:
 def _resolve_log_level() -> int:
     key = (os.environ.get("DEPLOY_LOG_LEVEL") or os.environ.get("LOGLEVEL") or "INFO").strip().upper()
     return int(getattr(logging, key, logging.INFO))
-
-
-def _apply_environ_overrides_to_serving(cfg: HightierServingConfig) -> HightierServingConfig:
-    """Overlay CH / DB fields from the process environment (after optional ``.env`` load)."""
-    kw: dict[str, Any] = {}
-    if (v := str(os.environ.get("CH_HOST", "")).strip()):
-        kw["ch_host"] = v
-    if str(os.environ.get("CH_PORT", "")).strip():
-        kw["ch_port"] = int(str(os.environ["CH_PORT"]).strip())
-    if (v := str(os.environ.get("CH_USER", "")).strip()):
-        kw["ch_user"] = v
-    pw = str(os.environ.get("CH_PASS", "")).strip() or str(os.environ.get("CH_PASSWORD", "")).strip()
-    if pw:
-        kw["ch_password"] = pw
-    if str(os.environ.get("CH_SECURE", "")).strip():
-        kw["ch_secure"] = _parse_bool(os.environ.get("CH_SECURE"), default=cfg.ch_secure)
-    if (v := str(os.environ.get("SOURCE_DB", "")).strip()):
-        kw["source_db"] = v
-    if not kw:
-        return cfg
-    return replace(cfg, **kw)
 
 
 def _preflight_frozen_artifacts(bundle_root: Path, rel: dict[str, Any]) -> None:
@@ -759,7 +743,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     rel = _load_rel_paths(br)
     cfg = _serving_config_for_bundle(br, rel)
-    cfg = _apply_environ_overrides_to_serving(cfg)
+    cfg = apply_hightier_serving_environ_overrides(cfg)
     set_hightier_serving_deploy_override(cfg)
     import trainer_hightier.serving.runtime_config  # noqa: F401  # establish paths
 

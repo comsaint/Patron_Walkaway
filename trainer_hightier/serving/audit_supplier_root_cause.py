@@ -39,7 +39,11 @@ import numpy as np
 import pandas as pd
 from zoneinfo import ZoneInfo
 
-from trainer_hightier.config import HightierServingConfig, set_hightier_serving_deploy_override
+from trainer_hightier.config import (
+    HightierServingConfig,
+    apply_hightier_serving_environ_overrides,
+    set_hightier_serving_deploy_override,
+)
 from trainer_hightier.feature_experiment.feature_cadence import (
     feast_mid_columns_with_composite_dependencies,
     runtime_inputs_from_registry,
@@ -488,7 +492,7 @@ def run_supplier_root_cause_audit(
     bundle_root = Path(bundle_dir).resolve()
     rel = _load_bundle_rel(bundle_root)
     _load_dotenv(bundle_root)
-    cfg = _serving_config_for_bundle(bundle_root, rel)
+    cfg = apply_hightier_serving_environ_overrides(_serving_config_for_bundle(bundle_root, rel))
     set_hightier_serving_deploy_override(cfg)
 
     model_dir = bundle_root / rel.get("model_bundle_dir", "models")
