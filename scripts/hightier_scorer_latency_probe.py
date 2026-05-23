@@ -171,70 +171,114 @@ def _prediction_log_stage(args: argparse.Namespace, bundle: Any, staged: Any, pr
     )
 
 
-def main() -> int:
-    """Run one probe cycle and print JSON timings."""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    args = _parse_args()
-    model_dir = args.model_dir.resolve()
-    mapping = _resolve_model_input(model_dir, args.mapping, "canonical_player_mapping.parquet")
-    allowlist = _resolve_model_input(model_dir, args.allowlist, "adt_allowed_players_q0p99.parquet")
-    _configure_serving(args)
-
-    timings: dict[str, float] = {}
-    total_t0 = time.perf_counter()
+def _load_probe_artifacts(
+    timings: dict[str, float],
+    model_dir: Path,
+    allowlist_path: Path,
+    *,
+    no_high_adt_only: bool,
+) -> tuple[Any, Any, Any, frozenset[Any]]:
+    """Load model bundle, frozen registry, supplier plan, and optional ADT allowlist."""
     bundle = _time_stage(timings, "load_model", lambda: load_hightier_model_bundle(bundle_dir=model_dir))
     registry_snap = _time_stage(timings, "load_registry", lambda: load_frozen_registry_for_bundle(model_dir))
     plan = build_scorer_supplier_plan(registry_snap, bundle.feature_columns)
     assert_scorer_supplier_plan_or_raise(plan)
-    allow_ids = frozenset() if args.no_high_adt_only else _time_stage(timings, "load_allowlist", lambda: load_adt_allowlist_ids(allowlist))
+    if no_high_adt_only:
+        allow_ids: frozenset[Any] = frozenset()
+    else:
+        allow_ids = _time_stage(timings, "load_allowlist", lambda: load_adt_allowlist_ids(allowlist_path))
+    return bundle, registry_snap, plan, allow_ids
 
-    conn = _prepare_state(args.state_db.resolve())
+
+def _fetch_probe_batch(
+    timings: dict[str, float],
+    state_db: Path,
+    *,
+    high_adt_only: bool,
+    allowlist_ids: frozenset[Any],
+) -> Any | None:
+    """Fetch one scoring batch from probe state DB; return None when empty."""
+    conn = _prepare_state(state_db)
     try:
-        batch = _time_stage(
+        return _time_stage(
             timings,
             "fetch_incremental_and_pool",
             lambda: _fetch_scoring_batch(
                 conn,
-                high_adt_only=not args.no_high_adt_only,
-                allowlist_ids=allow_ids,
+                high_adt_only=high_adt_only,
+                allowlist_ids=allowlist_ids,
             ),
         )
     finally:
         conn.close()
-    if batch is None:
-        print(json.dumps({"status": "no_batch", "timings": timings}, indent=2, sort_keys=True))
-        return 0
 
-    staged = _time_stage(
+
+def _build_short_term_staged(timings: dict[str, float], batch: Any, mapping: Path, plan: Any) -> Any:
+    """Build short-term staged features for the scoring batch."""
+    return _time_stage(
         timings,
         "build_short_term_features",
         lambda: _build_staged_features(batch, mapping_parquet=mapping, supplier_plan=plan),
     )
-    if not args.skip_feast:
-        adapter = FeastSdkOnlineAdapter(feast_repo=args.feast_repo.resolve())
-        staged, skipped, _ = _time_stage(
-            timings,
-            "feast_lookup_join",
-            lambda: _attach_feast_mid_slow(
-                staged,
-                adapter,
-                mid_columns=plan.feast_mid_cols,
-                slow_columns=plan.feast_slow_cols,
-                fail_fraction=default_hightier_serving_config().scorer_feast_entity_missing_fail_fraction,
-            ),
-        )
-        timings["feast_skipped_rows"] = float(len(skipped))
-        staged = _time_stage(
-            timings,
-            "mid_composites",
-            lambda: attach_mid_term_composite_columns(staged, plan.mid_composite_cols),
-        )
-        assert_features_ready(staged, bundle.feature_columns)
-        x_frame = coerce_categoricals(staged[list(bundle.feature_columns)].copy(), bundle.categorical_columns, dict(bundle.category_categories))
-        prob = _time_stage(timings, "predict", lambda: bundle.model.predict_proba(x_frame)[:, 1])
-        audits = _time_stage(timings, "row_audits", lambda: _build_row_audits(staged, bundle, plan, registry_snap))
-        _time_stage(timings, "prediction_log", lambda: _prediction_log_stage(args, bundle, staged, prob, audits))
 
+
+def _run_feast_predict_pipeline(
+    timings: dict[str, float],
+    args: argparse.Namespace,
+    staged: Any,
+    bundle: Any,
+    plan: Any,
+    registry_snap: Any,
+) -> Any:
+    """Run Feast join, composites, predict, audits, and optional prediction log."""
+    adapter = FeastSdkOnlineAdapter(feast_repo=args.feast_repo.resolve())
+    staged, skipped, _ = _time_stage(
+        timings,
+        "feast_lookup_join",
+        lambda: _attach_feast_mid_slow(
+            staged,
+            adapter,
+            mid_columns=plan.feast_mid_cols,
+            slow_columns=plan.feast_slow_cols,
+            fail_fraction=default_hightier_serving_config().scorer_feast_entity_missing_fail_fraction,
+        ),
+    )
+    timings["feast_skipped_rows"] = float(len(skipped))
+    staged = _time_stage(
+        timings,
+        "mid_composites",
+        lambda: attach_mid_term_composite_columns(staged, plan.mid_composite_cols),
+    )
+    assert_features_ready(staged, bundle.feature_columns)
+    x_frame = coerce_categoricals(
+        staged[list(bundle.feature_columns)].copy(),
+        bundle.categorical_columns,
+        dict(bundle.category_categories),
+    )
+    prob = _time_stage(timings, "predict", lambda: bundle.model.predict_proba(x_frame)[:, 1])
+    audits = _time_stage(timings, "row_audits", lambda: _build_row_audits(staged, bundle, plan, registry_snap))
+    _time_stage(timings, "prediction_log", lambda: _prediction_log_stage(args, bundle, staged, prob, audits))
+    return staged
+
+
+def _emit_no_batch_result(timings: dict[str, float]) -> int:
+    """Print JSON for an empty scoring batch and return exit code 0."""
+    print(json.dumps({"status": "no_batch", "timings": timings}, indent=2, sort_keys=True))
+    return 0
+
+
+def _emit_ok_result(
+    timings: dict[str, float],
+    total_t0: float,
+    *,
+    model_dir: Path,
+    mapping: Path,
+    allowlist: Path,
+    batch: Any,
+    staged: Any,
+    plan: Any,
+) -> int:
+    """Print JSON for a successful probe cycle and return exit code 0."""
     timings["total"] = _elapsed_since(total_t0)
     result = {
         "status": "ok",
@@ -247,6 +291,44 @@ def main() -> int:
     }
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
+
+
+def main() -> int:
+    """Run one probe cycle and print JSON timings."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    args = _parse_args()
+    model_dir = args.model_dir.resolve()
+    mapping = _resolve_model_input(model_dir, args.mapping, "canonical_player_mapping.parquet")
+    allowlist = _resolve_model_input(model_dir, args.allowlist, "adt_allowed_players_q0p99.parquet")
+    _configure_serving(args)
+
+    timings: dict[str, float] = {}
+    total_t0 = time.perf_counter()
+    bundle, registry_snap, plan, allow_ids = _load_probe_artifacts(
+        timings, model_dir, allowlist, no_high_adt_only=args.no_high_adt_only
+    )
+    batch = _fetch_probe_batch(
+        timings,
+        args.state_db.resolve(),
+        high_adt_only=not args.no_high_adt_only,
+        allowlist_ids=allow_ids,
+    )
+    if batch is None:
+        return _emit_no_batch_result(timings)
+
+    staged = _build_short_term_staged(timings, batch, mapping, plan)
+    if not args.skip_feast:
+        staged = _run_feast_predict_pipeline(timings, args, staged, bundle, plan, registry_snap)
+    return _emit_ok_result(
+        timings,
+        total_t0,
+        model_dir=model_dir,
+        mapping=mapping,
+        allowlist=allowlist,
+        batch=batch,
+        staged=staged,
+        plan=plan,
+    )
 
 
 if __name__ == "__main__":
