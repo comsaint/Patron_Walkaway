@@ -219,8 +219,8 @@ Registry `runtime_inputs`：
 
 ### P1 — 契約與觀測
 
-- [ ] 在 prediction log / readiness 記錄 `mid_term_anchor_max`、`snapshot_age_days`、mid null top features
-- [ ] 文件化 train/serve mid contract 於 `Scorer Runtime Contract - SSOT.md`（若與本 incident 決策一致）
+- [x] 在 prediction log / readiness 記錄 `mid_term_anchor_max`、`snapshot_age_days`、mid null top features
+- [x] 文件化 train/serve mid contract 於 `Scorer Runtime Contract - SSOT.md`（Option A 決策）
 
 ### P2 — 下一版模型（若採 Option B）
 

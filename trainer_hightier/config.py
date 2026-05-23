@@ -111,6 +111,8 @@ SCORER_FEAST_READINESS_ENABLED: Final[bool] = True
 #: Allowlist canonical ids sampled for deploy-time Feast online lookup smoke.
 SCORER_FEAST_DEPLOY_LOOKUP_SMOKE_SAMPLE_SIZE: Final[int] = 20
 FEAST_STARTUP_REFRESH_LOCK_WAIT_SECONDS: Final[int] = 30
+FEAST_REFRESH_SUPERVISOR_POLL_SECONDS: Final[int] = 300
+FEAST_BACKGROUND_REFRESH_LOCK_WAIT_SECONDS: Final[int] = 0
 #: Bootstrap mid-term Feast refresh: anchor days materialized (carry-forward ASOF parity).
 PRODUCTION_MID_FEAST_BOOTSTRAP_ANCHOR_DAYS: Final[int] = 60
 #: Hard-fail when sampled mid Feast columns exceed this null fraction (aligns with training ~5%).
@@ -573,6 +575,8 @@ class HightierServingConfig:
     scorer_feast_repo_path: Path | None = None
     #: Max seconds to wait for bundle-local Feast refresh lock before fail-fast.
     feast_startup_refresh_lock_wait_seconds: int = FEAST_STARTUP_REFRESH_LOCK_WAIT_SECONDS
+    feast_refresh_supervisor_poll_seconds: int = FEAST_REFRESH_SUPERVISOR_POLL_SECONDS
+    feast_background_refresh_lock_wait_seconds: int = FEAST_BACKGROUND_REFRESH_LOCK_WAIT_SECONDS
     #: Deploy / dry-run allowlist sample size for Feast online lookup smoke.
     scorer_feast_deploy_lookup_smoke_sample_size: int = SCORER_FEAST_DEPLOY_LOOKUP_SMOKE_SAMPLE_SIZE
     #: Bootstrap anchor-day span for mid-term Feast online refresh (Option A carry-forward).

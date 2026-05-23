@@ -851,6 +851,90 @@ def test_prediction_log_writes_missing_family_json(tmp_path: Path) -> None:
     assert row[2] is not None and "feast_mid_missing" in row[2]
 
 
+def test_prediction_log_writes_mid_observability_columns(tmp_path: Path) -> None:
+    import json
+    import sqlite3
+
+    db = tmp_path / "pred.db"
+    init_prediction_log_db(db)
+    staged = pd.DataFrame({"bet_id": [1.0], "player_id": [10], "canonical_id": ["c1"]})
+    features = pd.DataFrame({"fe__bets_cnt__w1d": [1.0], "fe__payout_odds_avg_w7d": [pd.NA]})
+    append_hightier_prediction_log(
+        db,
+        scored_at="2025-01-01T00:00:00+08:00",
+        model_version="mv",
+        staged=staged,
+        prob=np.array([0.5]),
+        threshold=0.9,
+        features=features,
+        feature_columns=("fe__bets_cnt__w1d", "fe__payout_odds_avg_w7d"),
+        mid_term_anchor_gaming_day_max="2026-05-11",
+        mid_term_snapshot_age_days=0,
+        mid_null_top_features_json=json.dumps(
+            [{"feature_id": "fe__payout_odds_avg_w7d", "null_count": 1, "null_rate": 1.0}],
+            separators=(",", ":"),
+        ),
+    )
+    conn = sqlite3.connect(db)
+    try:
+        row = conn.execute(
+            """
+            SELECT mid_term_anchor_gaming_day_max, mid_term_snapshot_age_days,
+                   mid_null_top_features_json
+            FROM prediction_log
+            """
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == ("2026-05-11", 0, '[{"feature_id":"fe__payout_odds_avg_w7d","null_count":1,"null_rate":1.0}]')
+
+
+def test_mid_observability_helpers() -> None:
+    from datetime import date
+
+    from trainer_hightier.serving.feast_readiness import (
+        FeastLayerReadiness,
+        compute_batch_mid_null_top_features,
+        compute_mid_null_top_features,
+        compute_mid_snapshot_age_days,
+    )
+
+    top = compute_mid_null_top_features(
+        {"fe__bets_cnt__w1d": 0, "fe__payout_odds_avg_w7d": 20, "patron__x": 5},
+        sample_size=20,
+        top_k=3,
+    )
+    assert top[0]["feature_id"] == "fe__payout_odds_avg_w7d"
+    assert top[0]["null_count"] == 20
+    assert top[0]["null_rate"] == 1.0
+    frame = pd.DataFrame({"fe__bets_cnt__w1d": [1.0, None], "fe__wager_sum__w1d": [1.0, 2.0]})
+    batch_top = compute_batch_mid_null_top_features(
+        frame,
+        ("fe__bets_cnt__w1d", "fe__wager_sum__w1d"),
+    )
+    assert batch_top[0]["feature_id"] == "fe__bets_cnt__w1d"
+    assert batch_top[0]["null_count"] == 1
+    layer = FeastLayerReadiness(
+        layer="mid_term",
+        source_scope="production",
+        anchor_gaming_day_max=date(2026, 5, 11),
+        generated_at=pd.Timestamp.now(tz=ZoneInfo("Asia/Hong_Kong")).to_pydatetime(),
+        row_count=100,
+        distinct_canonical_count=100,
+        cell_null_counts={"fe__payout_odds_avg_w7d": 20},
+        lookup_sample_size=20,
+        lookup_entity_present_rate=1.0,
+        feature_columns=("fe__payout_odds_avg_w7d",),
+        feast_feature_view="mid_term_daily_spike_features",
+        materialize_source="test",
+        expected_anchor_gaming_day=date(2026, 5, 11),
+    )
+    payload = layer.to_dict()
+    assert payload["snapshot_age_days"] == 0
+    assert payload["mid_null_top_features"][0]["feature_id"] == "fe__payout_odds_avg_w7d"
+    assert compute_mid_snapshot_age_days(date(2026, 5, 11), date(2026, 5, 11)) == 0
+
+
 def test_skipped_entity_missing_log(tmp_path: Path) -> None:
     db = tmp_path / "pred.db"
     init_prediction_log_db(db)
@@ -1148,6 +1232,7 @@ def test_feast_readiness_gate_fails_when_document_missing(tmp_path: Path) -> Non
 
 
 def test_feast_readiness_roundtrip_and_fresh_gate(tmp_path: Path) -> None:
+    import json
     from datetime import date
 
     from trainer_hightier.serving.feast_readiness import (
@@ -1158,10 +1243,16 @@ def test_feast_readiness_roundtrip_and_fresh_gate(tmp_path: Path) -> None:
         load_feast_online_readiness,
         write_feast_online_readiness,
     )
-    from trainer_hightier.serving.snapshot_freshness import expected_mid_term_anchor, serving_gaming_day
+    from trainer_hightier.serving.snapshot_freshness import (
+        expected_mid_term_anchor,
+        expected_slow_month_end_anchor,
+        serving_gaming_day,
+    )
 
     hk = ZoneInfo("Asia/Hong_Kong")
-    anchor = expected_mid_term_anchor(serving_gaming_day(close_hour=3))
+    serving = serving_gaming_day(close_hour=3)
+    anchor = expected_mid_term_anchor(serving)
+    slow_anchor = expected_slow_month_end_anchor(serving, close_hour=3)
     report = {
         "snapshot_scope": "production",
         "mid_term_anchor_gaming_day_max": anchor.isoformat(),
@@ -1175,7 +1266,7 @@ def test_feast_readiness_roundtrip_and_fresh_gate(tmp_path: Path) -> None:
     slow_layer = FeastLayerReadiness(
         layer="slow_patron",
         source_scope="adt_allowlist",
-        anchor_gaming_day_max=date(anchor.year, anchor.month, 1),
+        anchor_gaming_day_max=slow_anchor,
         generated_at=mid_layer.generated_at,
         row_count=50,
         distinct_canonical_count=None,
@@ -1199,6 +1290,8 @@ def test_feast_readiness_roundtrip_and_fresh_gate(tmp_path: Path) -> None:
     assert loaded is not None
     assert loaded.mid_term is not None
     assert loaded.mid_term.anchor_gaming_day_max == anchor
+    raw = json.loads(out.read_text(encoding="utf-8"))
+    assert raw["mid_term"]["snapshot_age_days"] == 0
     gate = evaluate_feast_readiness_gate(
         loaded,
         require_mid=True,

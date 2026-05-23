@@ -34,8 +34,7 @@ Excluded:
   must not compute or materialize mid/long features.
 - No production dependency on local cleaned Parquet tables. Local cleaned inputs may exist only as explicit debug or
   fixture overrides.
-- Scheduled or daemon Feast refresh after startup is **out of scope for the first deploy slice** but is a **future must-do**
-  (see `Scorer v2 Feast Runtime - IMPLEMENTATION_PLAN.md` and deploy bundle docs).
+- Post-startup refresh cadence is owned by [`Feast Post-Startup Refresh Supervisor - IMPLEMENTATION_PLAN.md`](Feast%20Post-Startup%20Refresh%20Supervisor%20-%20IMPLEMENTATION_PLAN.md) (`deploy/main.py` daemon); this module remains the refresh body only.
 
 ## Decisions
 
@@ -52,7 +51,8 @@ Excluded:
   but is not the operational source of truth.
 - Production deploy runs **startup Feast online refresh** for scorer-capable modes when readiness is missing, stale, or
   forced; refresh or smoke failure is fail-fast.
-- **Post-startup scheduled/daemon refresh** is a future must-do; the first slice does not implement it.
+- **Post-startup daemon refresh** is implemented in `deploy/main.py` (supervisor thread); see
+  [`Feast Post-Startup Refresh Supervisor - IMPLEMENTATION_PLAN.md`](Feast%20Post-Startup%20Refresh%20Supervisor%20-%20IMPLEMENTATION_PLAN.md).
 
 ## Module Boundaries
 
@@ -376,8 +376,7 @@ See also: `Scorer Runtime Contract - SSOT.md` (Deploy-Time Contract), `Scorer v2
 
 ## Open Questions
 
-- Implementation timing for **post-startup scheduled/daemon Feast refresh** (future must-do; not in first deploy slice).
-- Whether production Feast feature views should be renamed before the first scheduled refresh rollout, or whether the
-  existing spike names remain accepted for scorer v2 first slice.
+- Whether production Feast feature views should be renamed before broader rollout, or whether the
+  existing spike names remain accepted for scorer v2 production.
 - Whether `feature_state.db` should keep only latest summary rows plus full detail JSON, or retain all historical
   refresh rows indefinitely.

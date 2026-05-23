@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sqlite3
 import time
@@ -1161,6 +1162,16 @@ def score_once(
     )
     if pl_path is not None and str(pl_path).strip():
         try:
+            from trainer_hightier.serving.feast_readiness import compute_batch_mid_null_top_features
+
+            mid_top = (
+                compute_batch_mid_null_top_features(staged, supplier_plan.feast_mid_cols)
+                if supplier_plan.feast_mid_cols
+                else []
+            )
+            mid_top_json = (
+                json.dumps(mid_top, separators=(",", ":"), ensure_ascii=False) if mid_top else None
+            )
             append_hightier_prediction_log(
                 pl_path,
                 scored_at=scored_at_iso,
@@ -1176,6 +1187,11 @@ def score_once(
                 mid_term_freshness_status=mid_fresh.status,
                 slow_freshness_status=slow_fresh.status,
                 snapshot_scoring_degraded=gate.degraded,
+                mid_term_anchor_gaming_day_max=(
+                    mid_anchor.isoformat() if mid_anchor is not None else None
+                ),
+                mid_term_snapshot_age_days=mid_fresh.staleness_days,
+                mid_null_top_features_json=mid_top_json,
             )
         except Exception as exc:
             logger.warning("[hightier_scorer] prediction_log write failed: %s", exc)

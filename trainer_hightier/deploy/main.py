@@ -28,6 +28,10 @@ from trainer_hightier.config import (
     set_hightier_serving_deploy_override,
 )
 from trainer_hightier.serving.contracts import (
+    META_KEY_FEAST_REFRESH_SUPERVISOR_LAST_ATTEMPT,
+    META_KEY_FEAST_REFRESH_SUPERVISOR_LAST_CHECK,
+    META_KEY_FEAST_REFRESH_SUPERVISOR_LAST_SUCCESS,
+    META_KEY_FEAST_SLOW_REFRESH_LAST_CHECK_DAY,
     META_KEY_MID_TERM_REFRESH_LAST_ATTEMPT,
     META_KEY_REFRESH_SUPERVISOR_LAST_CHECK,
     META_KEY_SLOW_REFRESH_LAST_ATTEMPT,
@@ -62,6 +66,11 @@ def _parse_deploy_args(argv: list[str] | None) -> argparse.Namespace:
         "--force-feast-refresh",
         action="store_true",
         help="Force Feast online refresh even when readiness looks fresh.",
+    )
+    pr.add_argument(
+        "--no-feast-refresh-supervisor",
+        action="store_true",
+        help="Disable post-startup Feast refresh supervisor daemon (debug only).",
     )
     return pr.parse_args(argv)
 
@@ -530,13 +539,21 @@ def _feast_refresh_lock_path(cfg: HightierServingConfig) -> Path:
     return lock_dir / ".feast_online_refresh.lock"
 
 
-def _try_acquire_feast_refresh_lock(cfg: HightierServingConfig) -> int | None:
-    """Acquire Feast refresh lock with short timeout; return fd or None."""
+def _try_acquire_feast_refresh_lock(
+    cfg: HightierServingConfig,
+    *,
+    wait_seconds: int | None = None,
+) -> int | None:
+    """Acquire Feast refresh lock; return fd or None when unavailable."""
     lock = _feast_refresh_lock_path(cfg)
-    wait_s = max(1, int(cfg.feast_startup_refresh_lock_wait_seconds))
-    deadline = time.monotonic() + wait_s
+    if wait_seconds is None:
+        wait_s = int(cfg.feast_startup_refresh_lock_wait_seconds)
+    else:
+        wait_s = int(wait_seconds)
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-    while True:
+    deadline = time.monotonic() + max(0, wait_s)
+
+    def _attempt() -> int | None:
         try:
             fd = os.open(str(lock), flags)
             os.write(
@@ -545,9 +562,17 @@ def _try_acquire_feast_refresh_lock(cfg: HightierServingConfig) -> int | None:
             )
             return fd
         except FileExistsError:
-            if time.monotonic() >= deadline:
-                return None
-            time.sleep(0.25)
+            return None
+
+    if wait_s <= 0:
+        return _attempt()
+    while True:
+        fd = _attempt()
+        if fd is not None:
+            return fd
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.25)
 
 
 def _release_feast_refresh_lock(cfg: HightierServingConfig, fd: int) -> None:
@@ -760,6 +785,274 @@ def _startup_feast_refresh_or_raise(
     )
 
 
+def _feast_supplier_requirements(model_bundle: Path) -> tuple[bool, bool]:
+    """Return whether the deployed model requires Feast mid and slow suppliers."""
+    from trainer_hightier.serving.feature_supply import (
+        build_scorer_supplier_plan,
+        load_frozen_registry_for_bundle,
+        model_feature_columns_from_pickle,
+    )
+
+    snap = load_frozen_registry_for_bundle(model_bundle)
+    model_feats = model_feature_columns_from_pickle(model_bundle)
+    plan = build_scorer_supplier_plan(snap, model_feats)
+    require_mid = bool(plan.feast_mid_cols or plan.mid_composite_cols)
+    require_slow = bool(plan.feast_slow_cols)
+    return require_mid, require_slow
+
+
+def _feast_mid_refresh_needed(
+    cfg: HightierServingConfig,
+    readiness: Any,
+    *,
+    require_mid: bool,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    """Return whether post-startup Feast mid refresh should run now."""
+    from trainer_hightier.serving.feast_readiness import FeastOnlineReadiness
+    from trainer_hightier.serving.snapshot_freshness import evaluate_mid_term_freshness
+
+    if not require_mid:
+        return False, "mid not required"
+    if readiness is None or not isinstance(readiness, FeastOnlineReadiness):
+        return True, "mid readiness missing"
+    if readiness.mid_term is None:
+        return True, "mid_term layer missing from readiness"
+    anchor = readiness.mid_term.anchor_gaming_day_max
+    now_hk = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(HK_TZ))
+    from trainer_hightier.serving.snapshot_freshness import serving_gaming_day
+
+    serving_day = serving_gaming_day(now_hk, close_hour=int(cfg.gaming_day_close_hour))
+    status = evaluate_mid_term_freshness(
+        anchor_max=anchor,
+        serving_day=serving_day,
+        hard_cap_days=int(cfg.mid_term_stale_hard_cap_days),
+        close_hour=int(cfg.gaming_day_close_hour),
+    )
+    after_refresh_target = int(now_hk.hour) >= int(cfg.mid_term_refresh_target_hour)
+    if status.status in ("missing", "hard_cap_breached"):
+        return True, status.message
+    if status.status == "stale_allowed" and after_refresh_target:
+        return True, status.message
+    return False, status.message
+
+
+def _feast_slow_refresh_needed(
+    cfg: HightierServingConfig,
+    readiness: Any,
+    *,
+    require_slow: bool,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    """Return whether post-startup Feast slow refresh should run now."""
+    from trainer_hightier.serving.feature_state_store import (
+        feature_state_meta_get,
+        feature_state_meta_set,
+    )
+    from trainer_hightier.serving.feast_readiness import FeastOnlineReadiness
+    from trainer_hightier.serving.snapshot_freshness import evaluate_slow_freshness
+
+    if not require_slow:
+        return False, "slow not required"
+    if readiness is None or not isinstance(readiness, FeastOnlineReadiness):
+        return True, "slow readiness missing"
+    if readiness.slow_patron is None:
+        return True, "slow_patron layer missing from readiness"
+    anchor = readiness.slow_patron.anchor_gaming_day_max
+    now_hk = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(HK_TZ))
+    from trainer_hightier.serving.snapshot_freshness import serving_gaming_day
+
+    serving_day = serving_gaming_day(now_hk, close_hour=int(cfg.gaming_day_close_hour))
+    status = evaluate_slow_freshness(
+        anchor_max=anchor,
+        serving_day=serving_day,
+        monthly_grace_days=int(cfg.slow_monthly_grace_days),
+        hard_cap_days=int(cfg.slow_stale_hard_cap_days),
+        close_hour=int(cfg.gaming_day_close_hour),
+    )
+    if status.status in ("missing", "hard_cap_breached"):
+        return True, status.message
+    today = now_hk.date().isoformat()
+    last_check = feature_state_meta_get(
+        META_KEY_FEAST_SLOW_REFRESH_LAST_CHECK_DAY,
+        path=cfg.feature_state_db_path,
+    )
+    if last_check == today:
+        return False, "feast slow refresh already checked today"
+    feature_state_meta_set(
+        META_KEY_FEAST_SLOW_REFRESH_LAST_CHECK_DAY,
+        today,
+        path=cfg.feature_state_db_path,
+    )
+    if status.status == "stale_allowed":
+        return True, status.message
+    return False, status.message
+
+
+def _feast_refresh_supervisor_once(
+    bundle_root: Path,
+    rel: dict[str, Any],
+    cfg: HightierServingConfig,
+    *,
+    mapping: Path,
+    allowlist: Path,
+    require_mid: bool,
+    require_slow: bool,
+) -> None:
+    """Run one post-startup Feast refresh supervisor poll."""
+    from trainer_hightier.serving import feast_online_refresh as refresh_mod
+    from trainer_hightier.serving.feast_online_adapter import feast_registry_missing
+    from trainer_hightier.serving.feast_readiness import (
+        load_feast_online_readiness,
+        resolve_feast_readiness_path,
+    )
+    from trainer_hightier.serving.feature_state_store import feature_state_meta_set
+
+    feature_state_meta_set(
+        META_KEY_FEAST_REFRESH_SUPERVISOR_LAST_CHECK,
+        datetime.now(timezone.utc).isoformat(),
+        path=cfg.feature_state_db_path,
+    )
+    readiness_path = resolve_feast_readiness_path(cfg)
+    readiness = load_feast_online_readiness(readiness_path)
+    mid_needed, mid_reason = _feast_mid_refresh_needed(
+        cfg, readiness, require_mid=require_mid
+    )
+    slow_needed, slow_reason = _feast_slow_refresh_needed(
+        cfg, readiness, require_slow=require_slow
+    )
+    if not mid_needed and not slow_needed:
+        logging.info(
+            "[deploy] feast refresh supervisor: not needed mid=%s slow=%s",
+            mid_reason,
+            slow_reason,
+        )
+        return
+    fd = _try_acquire_feast_refresh_lock(
+        cfg,
+        wait_seconds=int(cfg.feast_background_refresh_lock_wait_seconds),
+    )
+    if fd is None:
+        logging.info(
+            "[deploy] feast refresh supervisor: refresh skipped; lock held elsewhere"
+        )
+        return
+    feast_repo = Path(cfg.scorer_feast_repo_path or (bundle_root / "feast_repo")).resolve()
+    layers: list[str] = []
+    if mid_needed:
+        layers.append("mid")
+    if slow_needed:
+        layers.append("slow")
+    logging.warning(
+        "[deploy] feast refresh supervisor: refreshing layers=%s mid=%s slow=%s",
+        layers,
+        mid_reason,
+        slow_reason,
+    )
+    feature_state_meta_set(
+        META_KEY_FEAST_REFRESH_SUPERVISOR_LAST_ATTEMPT,
+        datetime.now(timezone.utc).isoformat(),
+        path=cfg.feature_state_db_path,
+    )
+    try:
+        registry_missing = feast_registry_missing(feast_repo)
+        opts = refresh_mod._resolve_refresh_options(
+            layers=",".join(layers),
+            source="clickhouse",
+            skip_apply=not registry_missing,
+            skip_materialize=False,
+            smoke_only=False,
+            dry_run=False,
+            feast_repo=feast_repo,
+            readiness_path=cfg.scorer_feast_readiness_path,
+            canonical_mapping=mapping,
+            adt_allowlist=allowlist,
+            local_cleaned_bet=None,
+            local_cleaned_session=None,
+            max_smoke_entities=int(cfg.scorer_feast_deploy_lookup_smoke_sample_size),
+            summary_path=(
+                Path(cfg.scorer_feast_readiness_path).parent
+                / "feast_online_refresh_report.json"
+            ),
+            bootstrap_mid=False,
+            apply_schema=False,
+        )
+        report = refresh_mod.run_feast_online_refresh(opts)
+        if report.get("verdict") == "ok":
+            feature_state_meta_set(
+                META_KEY_FEAST_REFRESH_SUPERVISOR_LAST_SUCCESS,
+                datetime.now(timezone.utc).isoformat(),
+                path=cfg.feature_state_db_path,
+            )
+        else:
+            logging.warning(
+                "[deploy] feast refresh supervisor: refresh verdict=%s",
+                report.get("verdict"),
+            )
+    except Exception:
+        logging.exception(
+            "[deploy] feast refresh supervisor: refresh attempt failed; "
+            "last good readiness remains active"
+        )
+    finally:
+        _release_feast_refresh_lock(cfg, fd)
+
+
+def _feast_refresh_supervisor_loop(
+    bundle_root: Path,
+    rel: dict[str, Any],
+    cfg: HightierServingConfig,
+    *,
+    mapping: Path,
+    allowlist: Path,
+    require_mid: bool,
+    require_slow: bool,
+) -> None:
+    """Continuously maintain Feast online readiness for this deploy process."""
+    interval = max(60, int(cfg.feast_refresh_supervisor_poll_seconds))
+    while True:
+        _feast_refresh_supervisor_once(
+            bundle_root,
+            rel,
+            cfg,
+            mapping=mapping,
+            allowlist=allowlist,
+            require_mid=require_mid,
+            require_slow=require_slow,
+        )
+        time.sleep(interval)
+
+
+def _start_feast_refresh_supervisor(
+    bundle_root: Path,
+    rel: dict[str, Any],
+    cfg: HightierServingConfig,
+    *,
+    mapping: Path,
+    allowlist: Path,
+    require_mid: bool,
+    require_slow: bool,
+) -> None:
+    """Launch the post-startup Feast refresh supervisor daemon thread."""
+    th = threading.Thread(
+        target=_feast_refresh_supervisor_loop,
+        args=(bundle_root, rel, cfg),
+        kwargs={
+            "mapping": mapping,
+            "allowlist": allowlist,
+            "require_mid": require_mid,
+            "require_slow": require_slow,
+        },
+        name="hightier-feast-refresh-supervisor",
+        daemon=True,
+    )
+    th.start()
+    logging.info(
+        "[deploy] feast refresh supervisor thread started poll_seconds=%d",
+        int(cfg.feast_refresh_supervisor_poll_seconds),
+    )
+
+
 def _scorer_argv(
     *,
     model_bundle: Path,
@@ -811,6 +1104,17 @@ def main(argv: list[str] | None = None) -> int:
         logging.warning(
             "[deploy] mode=%s does not run Feast startup refresh; use mode=all or mode=scorer first",
             mode,
+        )
+    if mode in ("all", "scorer") and not bool(args.no_feast_refresh_supervisor):
+        require_mid, require_slow = _feast_supplier_requirements(model_bundle)
+        _start_feast_refresh_supervisor(
+            br,
+            rel,
+            cfg,
+            mapping=mapping,
+            allowlist=allowlist,
+            require_mid=require_mid,
+            require_slow=require_slow,
         )
     _preflight_feature_supplyability(br, rel)
     _emit_deploy_boot_info(br, cfg, rel)

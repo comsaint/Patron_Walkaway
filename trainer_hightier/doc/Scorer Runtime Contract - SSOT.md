@@ -64,7 +64,7 @@ Production deploy (`trainer_hightier.deploy.main`) for scorer-capable modes (`al
 
 `mode=api` and `mode=validator` alone must not run Feast refresh; they start only after scorer-capable startup succeeds.
 
-**Future must-do:** scheduled or daemon Feast online refresh after startup (see `Feast Online Refresh - IMPLEMENTATION_PLAN.md` and `Scorer v2 Feast Runtime - IMPLEMENTATION_PLAN.md`). Startup refresh alone is not sufficient for long-running production without manual re-refresh or restart.
+**Post-startup refresh (adopted):** `mode=all` / `mode=scorer` start a **Feast refresh supervisor daemon** after startup refresh (default on; `--no-feast-refresh-supervisor` to disable). The supervisor polls `feast_online_readiness.json`, triggers mid/slow `run_feast_online_refresh` on eligibility, uses a non-blocking bundle-local lock, and **fail-soft** on refresh errors (scorer continues with last-good readiness). See [`Feast Post-Startup Refresh Supervisor - IMPLEMENTATION_PLAN.md`](Feast%20Post-Startup%20Refresh%20Supervisor%20-%20IMPLEMENTATION_PLAN.md).
 
 ## Scoring-Time Contract
 
@@ -75,6 +75,32 @@ The scorer must never silently fill missing model features:
 - wrong-grain or training-scoped mid-term snapshots are hard failures.
 - unsupported short-term `fe__*` are hard failures until the on-the-fly PIT supplier implements them.
 - prediction logs should expose snapshot freshness/degraded state and missing-feature counts.
+- **P1 observability (mid-term Feast)**: each scored batch in ``prediction_log`` records
+  ``mid_term_anchor_gaming_day_max``, ``mid_term_snapshot_age_days``, and
+  ``mid_null_top_features_json`` (batch-level top null mid ``fe__*`` columns). Combined
+  ``feast_online_readiness.json`` mid layer records ``anchor_gaming_day_max``,
+  ``expected_anchor_gaming_day``, ``snapshot_age_days``, and ``mid_null_top_features``
+  from deploy/refresh smoke ``cell_null_counts``.
+
+### Mid-term train/serve contract (Option A — current production)
+
+This incident decision applies to models trained with **unlimited ASOF** mid-term joins
+(e.g. ``20260520-032615-df799bd``) while production scorer v2 supplies mid ``fe__*`` via
+Feast online lookup.
+
+| Aspect | Training | Production (scorer v2) |
+|--------|----------|------------------------|
+| Mid supplier | Step 3.5 / Step 4 ASOF join to latest anchor ``<=`` bet ``gaming_day`` | Feast online ``mid_term_daily_spike_features`` after startup refresh |
+| Anchor semantics | Per-row ASOF from full training history | **Carry-forward**: latest materialized anchor per canonical; bootstrap seeds from training mid snapshot + production incremental merge |
+| Coverage | All training-eligible canonicals at ASOF | Allowlist canonicals with ``>= 95%`` Feast row coverage after bootstrap |
+| Freshness | N/A at scoring time | ``anchor_gaming_day_max`` vs ``expected_anchor_gaming_day`` (calendar or data-bounded when local mirror lags) |
+| Null policy | Structural nulls allowed in features | Cell null allowed for ``predict_proba``; entity row missing → skip row; batch entity-missing rate ``> 10%`` → hard fail |
+| Observability | Training audit cols on enriched rows | ``prediction_log`` + ``feast_online_readiness.json`` fields above |
+
+**Do not** deploy finite-window-only refresh (e.g. N=7/14 without carry-forward) onto
+unlimited-ASOF trained weights without retrain — it changes feature distributions.
+
+**Next model (Option B)**: bounded ASOF with explicit ``N`` in registry; see incident doc P2.
 
 ### Scorer v2 Feast missing policy
 

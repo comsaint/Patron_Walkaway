@@ -68,7 +68,7 @@ class FeastLayerReadiness:
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-serializable payload for ``feast_online_readiness.json``."""
-        return {
+        out: dict[str, Any] = {
             "layer": self.layer,
             "source_scope": self.source_scope,
             "anchor_gaming_day_max": (
@@ -89,6 +89,20 @@ class FeastLayerReadiness:
             "feast_feature_view": self.feast_feature_view,
             "materialize_source": self.materialize_source,
         }
+        if self.layer == "mid_term":
+            age = compute_mid_snapshot_age_days(
+                self.anchor_gaming_day_max,
+                self.expected_anchor_gaming_day,
+            )
+            if age is not None:
+                out["snapshot_age_days"] = age
+            top = compute_mid_null_top_features(
+                self.cell_null_counts,
+                sample_size=self.lookup_sample_size,
+            )
+            if top:
+                out["mid_null_top_features"] = top
+        return out
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> FeastLayerReadiness:
@@ -196,6 +210,8 @@ class FeastReadinessGateResult:
             out["mid_anchor_max"] = (
                 self.mid_fresh.anchor_max.isoformat() if self.mid_fresh.anchor_max else None
             )
+            if self.mid_fresh.staleness_days is not None:
+                out["mid_snapshot_age_days"] = int(self.mid_fresh.staleness_days)
         if self.slow_fresh is not None:
             out["slow_freshness"] = self.slow_fresh.status
             out["slow_anchor_max"] = (
@@ -227,6 +243,73 @@ def _parse_anchor(value: Any) -> date | None:
     if not text:
         return None
     return pd.Timestamp(text).date()
+
+
+def compute_mid_snapshot_age_days(
+    anchor_max: date | None,
+    expected_anchor: date | None = None,
+    *,
+    close_hour: int = 3,
+) -> int | None:
+    """Gaming-day staleness of mid anchor vs expected serving anchor (P1 observability)."""
+    from trainer_hightier.serving.snapshot_freshness import (
+        _staleness_days,
+        expected_mid_term_anchor,
+        serving_gaming_day,
+    )
+
+    if anchor_max is None:
+        return None
+    expected = expected_anchor or expected_mid_term_anchor(serving_gaming_day(close_hour=close_hour))
+    return _staleness_days(anchor_max, expected)
+
+
+def compute_mid_null_top_features(
+    cell_null_counts: dict[str, int],
+    *,
+    sample_size: int | None = None,
+    top_k: int = 5,
+) -> list[dict[str, Any]]:
+    """Rank mid ``fe__*`` columns by smoke-sample null count (P1 observability)."""
+    if not cell_null_counts:
+        return []
+    denom = int(sample_size) if sample_size is not None and int(sample_size) > 0 else None
+    ranked: list[tuple[str, int, float | None]] = []
+    for col, raw_null in cell_null_counts.items():
+        if not str(col).startswith("fe__"):
+            continue
+        n_null = int(raw_null)
+        if n_null <= 0:
+            continue
+        null_rate = float(n_null) / float(denom) if denom is not None else None
+        ranked.append((str(col), n_null, null_rate))
+    ranked.sort(key=lambda item: (-item[1], item[0]))
+    out: list[dict[str, Any]] = []
+    for feature_id, null_count, null_rate in ranked[: max(1, int(top_k))]:
+        row: dict[str, Any] = {"feature_id": feature_id, "null_count": null_count}
+        if null_rate is not None:
+            row["null_rate"] = round(null_rate, 4)
+        out.append(row)
+    return out
+
+
+def compute_batch_mid_null_top_features(
+    frame: pd.DataFrame,
+    mid_columns: tuple[str, ...],
+    *,
+    top_k: int = 5,
+) -> list[dict[str, Any]]:
+    """Rank mid columns by null count across one scored batch."""
+    if frame is None or frame.empty or not mid_columns:
+        return []
+    counts: dict[str, int] = {}
+    n_rows = len(frame)
+    for col in mid_columns:
+        if col not in frame.columns:
+            counts[str(col)] = n_rows
+        else:
+            counts[str(col)] = int(frame[col].isna().sum())
+    return compute_mid_null_top_features(counts, sample_size=n_rows, top_k=top_k)
 
 
 def _hk_now() -> datetime:

@@ -150,9 +150,12 @@ Scorer v2 bundle 必須包含或產生下列 bundle-local 路徑；不得把 dev
 
 歷史 `trainer_hightier.deploy.main` Parquet snapshot refresh supervisor（`run_mid_term_refresh` / `run_slow_refresh`）**不是** scorer v2 mid/long supplier path。Scorer v2 deploy 應停用該 supervisor，改以 Feast online readiness 為準。
 
-### Future must-do: refresh cadence after startup
+### Post-startup Feast refresh supervisor (adopted)
 
-Startup auto-refresh 只解決首次啟動；**不足以**支撐跨 gaming day 長期運行。後續 slice 必須加入 **排程或 daemon Feast online refresh**（cron、外部 orchestrator、或 deploy background loop）。在此之前，營運需手動重跑 `feast_online_refresh` 或重啟 deploy。
+`mode=all` / `mode=scorer` 在 startup Feast refresh 成功後，預設啟動 **in-process daemon supervisor**（poll 300s）維持 mid/long anchor freshness。Background refresh reuse `run_feast_online_refresh`；失敗 **fail-soft**（log + retry，保留 last-good readiness）；lock **non-blocking skip**。詳見 [`Feast Post-Startup Refresh Supervisor - IMPLEMENTATION_PLAN.md`](Feast%20Post-Startup%20Refresh%20Supervisor%20-%20IMPLEMENTATION_PLAN.md)。
+
+- CLI：`--no-feast-refresh-supervisor`（debug；停用 background supervisor，不影響 startup refresh）
+- 勿與 external cron 同時啟用 daemon + cron refresh
 
 ### 5. State and Logging
 
@@ -189,7 +192,7 @@ Production deploy（`mode=all` / `mode=scorer`）在啟動 scorer v2 前必須�
 
 Deploy-time gate 不通過時，不啟動正式 scorer。
 
-**Future must-do：** post-startup 排程 Feast refresh（見上文 Deploy bundle 小節）。
+Post-startup supervisor 詳見 [`Feast Post-Startup Refresh Supervisor - IMPLEMENTATION_PLAN.md`](Feast%20Post-Startup%20Refresh%20Supervisor%20-%20IMPLEMENTATION_PLAN.md)。
 
 ### Scoring-Time Gate
 
@@ -244,9 +247,10 @@ Feast spike 顯示 mid-term 主要風險是 `prior_*` NULL 與單日 active cove
 - 使 refresh job 寫入 scorer 可讀的 readiness metadata。
 - 保留 shared / incremental export 的擴充方向，降低每日 full pull 對 ClickHouse 與本機 RAM 的壓力。
 
-### Phase 3b: Post-startup refresh cadence (future must-do)
+### Phase 3b: Post-startup refresh cadence (adopted)
 
-**不在第一版 deploy slice。** Startup auto-refresh 之後，production 仍需要 **排程或 daemon Feast online refresh**，避免 mid/long anchor 過期卻只能重啟 process。此為 **future must-do**，不是可選優化。
+Implemented as deploy-managed **Feast refresh supervisor daemon** in `trainer_hightier/deploy/main.py`. See
+[`Feast Post-Startup Refresh Supervisor - IMPLEMENTATION_PLAN.md`](Feast%20Post-Startup%20Refresh%20Supervisor%20-%20IMPLEMENTATION_PLAN.md).
 
 ### Phase 4: Validation and Rollout
 

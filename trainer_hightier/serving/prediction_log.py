@@ -26,6 +26,9 @@ _PREDICTION_LOG_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("scoring_status", "TEXT"),
     ("model_features_missing", "INTEGER"),
     ("missing_family_json", "TEXT"),
+    ("mid_term_anchor_gaming_day_max", "TEXT"),
+    ("mid_term_snapshot_age_days", "INTEGER"),
+    ("mid_null_top_features_json", "TEXT"),
 )
 
 
@@ -172,6 +175,9 @@ def append_hightier_prediction_log(
     mid_term_freshness_status: str | None = None,
     slow_freshness_status: str | None = None,
     snapshot_scoring_degraded: bool = False,
+    mid_term_anchor_gaming_day_max: str | None = None,
+    mid_term_snapshot_age_days: int | None = None,
+    mid_null_top_features_json: str | None = None,
 ) -> None:
     """Batch-insert one scoring cycle into ``prediction_log`` (no-op if path disabled or frame empty).
 
@@ -263,6 +269,11 @@ def append_hightier_prediction_log(
                 status,
                 model_miss,
                 family_json,
+                _str_or_none(mid_term_anchor_gaming_day_max),
+                int(mid_term_snapshot_age_days)
+                if mid_term_snapshot_age_days is not None
+                else None,
+                mid_null_top_features_json,
             )
         )
 
@@ -279,8 +290,9 @@ def append_hightier_prediction_log(
                 is_alert, is_rated_obs, threshold, features_json, fe_features_missing,
                 snapshot_version, mid_term_freshness_status, slow_freshness_status,
                 snapshot_scoring_degraded, scoring_status, model_features_missing,
-                missing_family_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                missing_family_json, mid_term_anchor_gaming_day_max,
+                mid_term_snapshot_age_days, mid_null_top_features_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )

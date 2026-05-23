@@ -750,7 +750,8 @@ Default behavior for `mode=all` / `mode=scorer`:
 3. If Feast readiness missing/stale (or `--force-feast-refresh`): acquire a short-timeout lock and run **startup Feast online refresh** from ClickHouse
 4. Persist latest readiness payload/hash in `feature_state.db`, then atomically publish `artifacts/feast/feast_online_readiness.json`
 5. Run deploy Feast readiness + allowlist online smoke
-6. Start API (background), validator (background), scorer (foreground)
+6. Start **Feast refresh supervisor** daemon (default; mid+slow eligibility poll every 300s; fail-soft on errors)
+7. Start API (background), validator (background), scorer (foreground)
 
 If lock acquisition, refresh, readiness persistence/publish, or smoke fails, startup **aborts** (no partial scorer).
 
@@ -758,9 +759,12 @@ Flags:
 
 - `--no-feast-startup-refresh` — skip startup refresh (debug only; scorer will likely fail readiness gate)
 - `--force-feast-refresh` — force refresh even if readiness looks fresh
+- `--no-feast-refresh-supervisor` — disable post-startup daemon (debug; use only if external cron owns refresh)
 - `--host` / `--port` — API bind address
 
-Manual refresh (ops):
+Do **not** run external cron refresh concurrently with the in-process supervisor (same bundle lock).
+
+Manual refresh (ops fallback):
 
 ```bash
 python -m trainer_hightier.serving.feast_online_refresh \\
@@ -769,9 +773,8 @@ python -m trainer_hightier.serving.feast_online_refresh \\
   --canonical-mapping mapping/canonical_player_mapping.parquet
 ```
 
-## Future must-do (not in first bundle slice)
-
-**Scheduled or daemon Feast online refresh** after startup is required for long-running production without daily process restarts. Until implemented, re-run `feast_online_refresh` or restart deploy when gaming-day anchors go stale.
+Supervisor observability: `feature_state.db` → `feature_state_meta` keys `feast_refresh_supervisor_last_check_iso`,
+`feast_refresh_supervisor_last_attempt_iso`, `feast_refresh_supervisor_last_success_iso`.
 
 ## Legacy note
 
