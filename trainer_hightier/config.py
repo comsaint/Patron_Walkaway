@@ -117,6 +117,21 @@ PRODUCTION_MID_FEAST_BOOTSTRAP_ANCHOR_DAYS: Final[int] = 60
 SCORER_FEAST_MID_CELL_NULL_FAIL_FRACTION: Final[float] = 0.05
 #: Minimum fraction of allowlist canonical ids present in mid Feast online store after refresh.
 SCORER_FEAST_MID_MIN_CANONICAL_COVERAGE_FRACTION: Final[float] = 0.95
+#: Mid columns checked for cell-null smoke (core daily snapshot primitives; ASOF parity focus).
+SCORER_FEAST_MID_SMOKE_COLUMNS: Final[tuple[str, ...]] = (
+    "fe__bets_cnt__w1d",
+    "fe__wager_sum__w1d",
+    "fe__bets_cnt__w7d",
+    "fe__wager_sum__w7d",
+    "fe__bets_cnt__w30d",
+    "fe__wager_sum__w30d",
+    "fe__std_wager_w7d",
+    "fe__avg_abs_wager_w7d",
+)
+#: Default training mid snapshot used to seed production Feast bootstrap (repo-local).
+DEFAULT_TRAINING_MID_SNAPSHOT_PARQUET: Final[str] = (
+    "trainer_hightier/artifacts/training_data/_main_trainer_mid_term_daily_snapshot.parquet"
+)
 
 # Baseline MODEL columns: softer FQG (high PSI → WARN; unique-constant under sample → WARN; WARN auto-allowlist).
 _FQG_BASELINE_MODEL_SOFT_COLUMNS: tuple[str, ...] = (
@@ -566,6 +581,10 @@ class HightierServingConfig:
     scorer_feast_mid_cell_null_fail_fraction: float = SCORER_FEAST_MID_CELL_NULL_FAIL_FRACTION
     #: Hard-fail refresh when mid Feast rows cover less than this fraction of allowlist canonicals.
     scorer_feast_mid_min_canonical_coverage_fraction: float = SCORER_FEAST_MID_MIN_CANONICAL_COVERAGE_FRACTION
+    #: Mid columns used for cell-null smoke gate (core ASOF parity primitives).
+    scorer_feast_mid_smoke_columns: tuple[str, ...] = SCORER_FEAST_MID_SMOKE_COLUMNS
+    #: Optional training mid snapshot parquet for bootstrap seed; ``None`` uses package default when present.
+    training_mid_snapshot_parquet: Path | None = None
 
 
 _DEFAULT_HIGHTIER_SERVING: HightierServingConfig = HightierServingConfig()

@@ -4,8 +4,17 @@
 
 ## Current Status
 
-- 事故狀態：**根因已確認（train-serve 語意不一致 + production refresh 覆蓋崩塌 + readiness gate 盲點）**；程式修復與模型策略尚未落地。
-- 影響模型：`out/models_high_tier_mvp/20260520-032615-df799bd`（deploy bundle `gmwds_deploy_20260520-032615-df799bd`）。
+- 事故狀態：**根因已確認；historical mid bootstrap + readiness gate 硬化已落地；2026-05-23 P0 閉環 E2E pass。**
+- **P0 驗證（2026-05-23，v3）**：
+  - `deploy_e2e_gate` + `--bootstrap-mid` + **training mid snapshot seed** 於 incident 模型 bundle（`20260520-032615-df799bd`）觸發 mid+slow refresh。
+  - Mid Feast parquet canonical 覆蓋：**99 → 3582**（allowlist 3584；覆蓋率 **99.9%**）。
+  - Refresh smoke：`mid_cell_null_rate=0.0`（core 8 權 smoke 欄位）。
+  - Deploy smoke：`mid_cell_null_rate=0.0`；freshness **fresh**（`expected_anchor_gaming_day=2026-05-11`，data-bounded，local cleaned 資料上限）。
+  - Scorability replay：**pass**（`out/p0_incident_deploy_e2e_gate_report_v3.json`，`verdict=pass`）。
+  - Slow-only 最新模型（`20260522-232846-7961db8`）deploy E2E gate **verdict=pass**。
+  - `build_deploy_package` 已接入 Step 6 parity gate（strict 預設要求 `feature_parity_verification.json` + slow gate pass）。
+- **程式修復摘要**：training mid snapshot seed → carry-forward merge；core mid smoke columns（8 欄）；deploy lookup 合併 smoke 欄位避免 false null rate；`expected_anchor_gaming_day` data-bounded freshness。
+- 影響模型：`out/models_high_tier_mvp/20260520-032615-df799bd`（deploy bundle `out/deploy_hightier/p0-incident-df799bd`）。
 - 診斷工具：已新增 `trainer_hightier/serving/audit_supplier_root_cause.py`（逐列 supplier 主因分類）。
 
 ## Symptoms

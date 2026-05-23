@@ -339,18 +339,18 @@ def load_bets_from_cleaned_parquet(
         )
         q = f"""
             SELECT
-                bet_id,
-                is_back_bet,
-                bet_type,
-                type_of_bet,
-                payout_complete_dtm,
-                CAST(gaming_day AS TIMESTAMP) AS gaming_day,
-                session_id,
-                player_id,
-                table_id,
-                wager,
-                casino_win,
-                payout_odds
+                b.bet_id,
+                b.is_back_bet,
+                b.bet_type,
+                b.type_of_bet,
+                b.payout_complete_dtm,
+                CAST(b.gaming_day AS TIMESTAMP) AS gaming_day,
+                b.session_id,
+                b.player_id,
+                b.table_id,
+                b.wager,
+                b.casino_win,
+                b.payout_odds
             FROM read_parquet('{glob_path}', hive_partitioning=true) AS b
             INNER JOIN allowlist AS a ON b.player_id = a.player_id
             WHERE CAST(b.gaming_day AS DATE) >= CAST(? AS DATE)
@@ -1057,7 +1057,19 @@ def run_offline_serving_backtest(
         lookback_hours=lookback_hours,
         max_bets=max_bets,
     )
-    batch = build_offline_scoring_batch(bets, cfg=ctx.cfg)
+    if local_cleaned_bet is not None:
+        pool = build_pool_from_cleaned_parquet(
+            bets,
+            cleaned_root=Path(local_cleaned_bet).resolve(),
+            cfg=ctx.cfg,
+        )
+        batch = _ScoringBatch(
+            bets=bets.reset_index(drop=True),
+            cursor=pd.to_datetime(bets["__etl_insert_Dtm"], errors="coerce"),
+            pool=pool,
+        )
+    else:
+        batch = build_offline_scoring_batch(bets, cfg=ctx.cfg)
     needs_feast = bool(
         ctx.supplier_plan.feast_mid_cols or ctx.supplier_plan.feast_slow_cols
     )

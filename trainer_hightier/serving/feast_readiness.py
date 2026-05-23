@@ -64,6 +64,7 @@ class FeastLayerReadiness:
     feature_columns: tuple[str, ...]
     feast_feature_view: str | None
     materialize_source: str
+    expected_anchor_gaming_day: date | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-serializable payload for ``feast_online_readiness.json``."""
@@ -72,6 +73,11 @@ class FeastLayerReadiness:
             "source_scope": self.source_scope,
             "anchor_gaming_day_max": (
                 self.anchor_gaming_day_max.isoformat() if self.anchor_gaming_day_max else None
+            ),
+            "expected_anchor_gaming_day": (
+                self.expected_anchor_gaming_day.isoformat()
+                if self.expected_anchor_gaming_day
+                else None
             ),
             "generated_at": self.generated_at.isoformat(),
             "row_count": self.row_count,
@@ -89,6 +95,8 @@ class FeastLayerReadiness:
         """Parse one layer block from readiness JSON."""
         anchor_raw = raw.get("anchor_gaming_day_max")
         anchor = pd.Timestamp(str(anchor_raw)).date() if anchor_raw else None
+        exp_raw = raw.get("expected_anchor_gaming_day")
+        expected_anchor = pd.Timestamp(str(exp_raw)).date() if exp_raw else None
         gen_raw = raw.get("generated_at")
         if not gen_raw:
             raise ValueError(f"[feast_readiness] layer {raw.get('layer')!r} missing generated_at")
@@ -121,6 +129,7 @@ class FeastLayerReadiness:
                 str(raw["feast_feature_view"]) if raw.get("feast_feature_view") else None
             ),
             materialize_source=str(raw.get("materialize_source") or "unknown"),
+            expected_anchor_gaming_day=expected_anchor,
         )
 
 
@@ -258,22 +267,26 @@ def layer_readiness_from_mid_spike_report(report: dict[str, Any]) -> FeastLayerR
 
 
 def layer_readiness_from_production_mid_meta(meta: dict[str, Any]) -> FeastLayerReadiness:
-    """Build mid-term readiness from ``materialize_production_mid_term_daily_snapshot`` sidecar meta."""
+    """Build mid-term readiness from production refresh / materialize meta."""
+    distinct = meta.get("distinct_canonical_count")
+    if distinct is None and meta.get("feast_spike_rows") is not None:
+        distinct = int(meta["feast_spike_rows"])
+    elif distinct is None and meta.get("distinct_bet_count") is not None:
+        distinct = int(meta["distinct_bet_count"])
     return FeastLayerReadiness(
         layer="mid_term",
         source_scope=str(meta.get("snapshot_scope") or FEAST_READINESS_SCOPE_PRODUCTION).strip(),
         anchor_gaming_day_max=_parse_anchor(meta.get("mid_term_anchor_gaming_day_max")),
         generated_at=_hk_now(),
-        row_count=int(meta.get("row_count") or 0),
-        distinct_canonical_count=int(meta["distinct_bet_count"])
-        if meta.get("distinct_bet_count") is not None
-        else None,
+        row_count=int(meta.get("feast_spike_rows") or meta.get("row_count") or 0),
+        distinct_canonical_count=int(distinct) if distinct is not None else None,
         cell_null_counts={},
         lookup_sample_size=None,
         lookup_entity_present_rate=None,
         feature_columns=PRODUCTION_MID_TERM_FEATURE_COLUMNS,
         feast_feature_view="mid_term_daily_spike_features",
-        materialize_source="production_materialize",
+        materialize_source=str(meta.get("materialize_source") or "production_materialize"),
+        expected_anchor_gaming_day=_parse_anchor(meta.get("mid_term_expected_anchor_gaming_day")),
     )
 
 
@@ -550,6 +563,7 @@ def evaluate_feast_readiness_gate(
                 anchor_max=readiness.mid_term.anchor_gaming_day_max,
                 hard_cap_days=mid_hard_cap_days,
                 close_hour=close_hour,
+                expected_anchor=readiness.mid_term.expected_anchor_gaming_day,
             )
             if mid_fresh.status == "hard_cap_breached":
                 raise RuntimeError(mid_fresh.message)
@@ -632,6 +646,7 @@ def evaluate_feast_lookup_smoke_gate(
     feast_spike_rows: int | None = None,
     allowlist_canonical_count: int | None = None,
     min_canonical_coverage_fraction: float,
+    mid_smoke_columns: tuple[str, ...] | None = None,
 ) -> tuple[bool, str | None]:
     """Return (ok, hard_failure_reason) for deploy / refresh smoke."""
     entity_rate = float(smoke.get("entity_missing_rate") or 0.0)
@@ -641,7 +656,8 @@ def evaluate_feast_lookup_smoke_gate(
             "[feast_readiness] allowlist lookup smoke entity missing rate "
             f"{entity_rate} exceeds fail_fraction={entity_missing_fail_fraction}",
         )
-    if mid_columns:
+    null_cols = mid_smoke_columns if mid_smoke_columns is not None else mid_columns
+    if null_cols:
         raw_mid = smoke.get("mid_cell_null_rate")
         mid_rate = float(raw_mid if raw_mid is not None else 1.0)
         if mid_rate > float(mid_cell_null_fail_fraction):
@@ -676,10 +692,14 @@ def run_allowlist_feast_lookup_smoke(
     sample_size: int,
     entity_missing_fail_fraction: float,
     mid_cell_null_fail_fraction: float | None = None,
+    mid_smoke_columns: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """P5-3: sample allowlist canonical ids against Feast online store."""
     from feast import FeatureStore
 
+    cfg = default_hightier_serving_config()
+    smoke_cols = mid_smoke_columns if mid_smoke_columns is not None else cfg.scorer_feast_mid_smoke_columns
+    lookup_mid = tuple(dict.fromkeys([*mid_columns, *smoke_cols]))
     cids = _sample_canonical_ids_from_allowlist(
         allowlist_parquet,
         canonical_mapping_parquet,
@@ -687,7 +707,7 @@ def run_allowlist_feast_lookup_smoke(
     )
     if not cids:
         raise ValueError("[feast_readiness] allowlist sample produced zero canonical_id rows")
-    refs = list(resolve_online_feature_refs(mid_columns, slow_columns))
+    refs = list(resolve_online_feature_refs(lookup_mid, slow_columns))
     store = FeatureStore(repo_path=str(Path(feast_repo).resolve()))
     t0 = time.perf_counter()
     out = store.get_online_features(
@@ -695,7 +715,7 @@ def run_allowlist_feast_lookup_smoke(
         entity_rows=feast_entity_rows(cids),
     ).to_df()
     latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
-    wanted = tuple(dict.fromkeys([*mid_columns, *slow_columns]))
+    wanted = tuple(dict.fromkeys([*lookup_mid, *slow_columns]))
     n_entity_missing = 0
     cell_null_counts: dict[str, int] = {c: 0 for c in wanted}
     if out.empty or FEAST_CANONICAL_JOIN_KEY not in out.columns:
@@ -716,7 +736,7 @@ def run_allowlist_feast_lookup_smoke(
     rate = float(n_entity_missing) / float(len(cids))
     mid_rate = _mid_cell_null_rate(
         cell_null_counts,
-        mid_columns=mid_columns,
+        mid_columns=smoke_cols,
         sample_size=len(cids),
     )
     cfg = default_hightier_serving_config()
@@ -741,6 +761,7 @@ def run_allowlist_feast_lookup_smoke(
         "entity_missing_fail_fraction": float(entity_missing_fail_fraction),
         "mid_cell_null_rate": round(mid_rate, 4),
         "mid_cell_null_fail_fraction": mid_fail,
+        "mid_smoke_columns": list(smoke_cols),
         "lookup_latency_ms": latency_ms,
         "feature_refs": len(refs),
         "cell_null_counts": cell_null_counts,
@@ -831,6 +852,7 @@ def run_deploy_feast_readiness_check(
                 sample_size=int(cfg.scorer_feast_deploy_lookup_smoke_sample_size),
                 entity_missing_fail_fraction=float(cfg.scorer_feast_entity_missing_fail_fraction),
                 mid_cell_null_fail_fraction=float(cfg.scorer_feast_mid_cell_null_fail_fraction),
+                mid_smoke_columns=cfg.scorer_feast_mid_smoke_columns,
             )
             smoke_ok, smoke_reason = evaluate_feast_lookup_smoke_gate(
                 smoke,
@@ -842,6 +864,7 @@ def run_deploy_feast_readiness_check(
                 min_canonical_coverage_fraction=float(
                     cfg.scorer_feast_mid_min_canonical_coverage_fraction
                 ),
+                mid_smoke_columns=cfg.scorer_feast_mid_smoke_columns,
             )
             if not smoke_ok:
                 return FeastReadinessGateResult(

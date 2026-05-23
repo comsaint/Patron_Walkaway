@@ -177,10 +177,11 @@ def evaluate_mid_term_freshness(
     serving_day: date | None = None,
     hard_cap_days: int = MID_TERM_STALE_HARD_CAP_DAYS,
     close_hour: int = 3,
+    expected_anchor: date | None = None,
 ) -> LayerFreshnessResult:
     """Evaluate mid-term freshness against expected ``D - 1`` anchor."""
     day = serving_day or serving_gaming_day(close_hour=close_hour)
-    expected = expected_mid_term_anchor(day)
+    expected = expected_anchor or expected_mid_term_anchor(day)
     stale = _staleness_days(anchor_max, expected)
     base = _classify_staleness(
         layer="mid_term",

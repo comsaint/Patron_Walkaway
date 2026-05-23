@@ -105,6 +105,29 @@ features:
 """
 
 
+def _write_step6_parity_pass_fixture(model_bundle: Path) -> None:
+    """Write a minimal passing Step 6 parity report for pack gate tests."""
+    payload = {
+        "schema_version": "feature_parity_verification_v2",
+        "n_failed_slow_gate": 0,
+        "n_failed_all_feature_gate": 0,
+        "parity_gate": {
+            "hard_fail_slow_gate": True,
+            "hard_fail_all_feature_gate": False,
+        },
+        "models": [
+            {
+                "slow_gate": {"verdict": "pass"},
+                "all_feature_gate": {"verdict": "pass"},
+            },
+        ],
+    }
+    (Path(model_bundle) / "feature_parity_verification.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+
 def _write_frozen_registry_abc_fixture(
     model_bundle: Path,
     metrics_extras: dict | None = None,
@@ -117,6 +140,7 @@ def _write_frozen_registry_abc_fixture(
     body = dict(metrics_extras or {})
     body["feature_candidate_registry_sha256"] = sha256_file(snap)
     (model_bundle / "training_metrics.json").write_text(json.dumps(body), encoding="utf-8")
+    _write_step6_parity_pass_fixture(model_bundle)
 
 
 def _write_fe_derived_fixture(path: Path, *, include_registry_feat: bool = True) -> None:
@@ -228,6 +252,73 @@ def _write_parquet(path: Path) -> None:
     pd.DataFrame({"player_id": [1, 2], "canonical_id": [901, 902]}).to_parquet(path, index=False)
 
 
+def test_strict_missing_step6_parity_fails(tmp_path: Path) -> None:
+    """Strict pack requires passing Step 6 parity artifact beside the model bundle."""
+
+    model_src = tmp_path / "model_no_step6"
+    snap_src = tmp_path / "snap_no_step6"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_slow_bet_fixture(slow)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    _write_frozen_registry_abc_fixture(model_src)
+    (model_src / "feature_parity_verification.json").unlink(missing_ok=True)
+    man = {"version": "mv", "slow_patron_parquet": str(slow.resolve()), "adt_allowlist_parquet": str(allow.resolve())}
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-no-step6.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "bundle-no-step6"
+    with pytest.raises(FileNotFoundError, match=r"feature_parity_verification\.json"):
+        build_deploy_package(
+            [
+                "--model-source",
+                str(model_src),
+                "--snapshot-manifest-source",
+                str(snap_src),
+                "--mapping-source",
+                str(mapping),
+                "--output-dir",
+                str(out),
+            ]
+        )
+
+
+def test_skip_step6_gate_allows_missing_parity(tmp_path: Path) -> None:
+    model_src = tmp_path / "model_skip_step6"
+    snap_src = tmp_path / "snap_skip_step6"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_slow_bet_fixture(slow)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    _write_frozen_registry_abc_fixture(model_src)
+    (model_src / "feature_parity_verification.json").unlink(missing_ok=True)
+    man = {"version": "mv", "slow_patron_parquet": str(slow.resolve()), "adt_allowlist_parquet": str(allow.resolve())}
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-skip-step6.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "bundle-skip-step6"
+    build_deploy_package(
+        [
+            "--model-source",
+            str(model_src),
+            "--snapshot-manifest-source",
+            str(snap_src),
+            "--mapping-source",
+            str(mapping),
+            "--output-dir",
+            str(out),
+            "--skip-step6-gate",
+        ]
+    )
+    assert (out / "models" / "model.pkl").is_file()
+
+
 def test_schema_registry_sha256_mismatch_fails(tmp_path: Path) -> None:
     """training_metrics.registry sha must match frozen snapshot bytes."""
 
@@ -246,6 +337,7 @@ def test_schema_registry_sha256_mismatch_fails(tmp_path: Path) -> None:
         json.dumps({"feature_candidate_registry_sha256": "0" * 64}),
         encoding="utf-8",
     )
+    _write_step6_parity_pass_fixture(model_src)
     man = {"version": "mv", "slow_patron_parquet": str(slow.resolve()), "adt_allowlist_parquet": str(allow.resolve())}
     (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
     mapping = tmp_path / "map-hash.parquet"
@@ -277,7 +369,7 @@ def test_strict_missing_frozen_registry_snapshot_fails(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match=r"feature_candidate_registry\.snapshot\.yaml"):
         build_deploy_package(
             ["--model-source", str(model_src), "--snapshot-manifest-source", str(snap_src),
-             "--mapping-source", str(mapping), "--output-dir", str(out)]
+             "--mapping-source", str(mapping), "--output-dir", str(out), "--skip-step6-gate"]
         )
 
 
@@ -543,6 +635,7 @@ def test_feast_only_bundle_has_no_snapshot_artifact_parquets(tmp_path: Path) -> 
         json.dumps({"feature_candidate_registry_sha256": sha256_file(reg)}),
         encoding="utf-8",
     )
+    _write_step6_parity_pass_fixture(model_src)
     man = _manifest_abc_layers(
         slow=slow,
         allow=allow,
@@ -665,6 +758,7 @@ features:
     snap_p.write_text(yaml_body.strip() + "\n", encoding="utf-8")
     metrics = {"feature_candidate_registry_sha256": sha256_file(snap_p)}
     (model_src / "training_metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+    _write_step6_parity_pass_fixture(model_src)
 
     pd.DataFrame({"player_id": [1], "trial_feat": [0.42]}).to_parquet(trial, index=False)
     man = {
@@ -1083,6 +1177,7 @@ def test_deploy_inputs_mid_term_manifest_metadata_only(tmp_path: Path) -> None:
         json.dumps({"feature_candidate_registry_sha256": sha256_file(snap_reg)}),
         encoding="utf-8",
     )
+    _write_step6_parity_pass_fixture(model_src)
     man = {
         "version": "frozen-di-fe",
         "slow_patron_parquet": slow_name,

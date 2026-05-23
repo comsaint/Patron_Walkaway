@@ -38,6 +38,7 @@ from trainer_hightier.config import (
     FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME,
     MANIFEST_KEY_FE_SHORT_TERM,
     MANIFEST_KEY_MID_TERM_SNAPSHOT,
+    Step6ParityConfig,
     default_hightier_serving_config,
 )
 from trainer_hightier.serving.candidate_registry_loader import (
@@ -140,6 +141,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Fail when required artifacts are missing (default: strict).",
+    )
+    pr.add_argument(
+        "--skip-step6-gate",
+        action="store_true",
+        help="Skip Step 6 train/serve parity gate (default: require passing gate in strict mode).",
     )
     return pr.parse_args(argv)
 
@@ -908,6 +914,53 @@ def _read_training_metrics(models_dest: Path) -> dict[str, Any]:
         return {}
 
 
+_STEP6_PARITY_JSON = "feature_parity_verification.json"
+
+
+def _assert_step6_parity_gate_or_raise(
+    model_bundle: Path,
+    *,
+    strict: bool,
+    skip_step6_gate: bool,
+    parity_cfg: Step6ParityConfig | None = None,
+) -> None:
+    """Require Step 6 parity artifact and enforce configured hard-fail gates."""
+    if skip_step6_gate or not strict:
+        if skip_step6_gate:
+            logger.warning("[pack-step6] skipping train/serve parity gate (--skip-step6-gate)")
+        return
+    cfg = parity_cfg or Step6ParityConfig()
+    parity_path = Path(model_bundle) / _STEP6_PARITY_JSON
+    if not parity_path.is_file():
+        raise FileNotFoundError(
+            f"[pack-step6] missing {_STEP6_PARITY_JSON} under {model_bundle}; "
+            "retrain with Step 6 enabled or pass --skip-step6-gate (non-production only)."
+        )
+    try:
+        report = json.loads(parity_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"[pack-step6] invalid {_STEP6_PARITY_JSON}: {parity_path}") from exc
+    if not isinstance(report, dict):
+        raise ValueError(f"[pack-step6] expected JSON object in {parity_path}")
+    slow_failed = int(report.get("n_failed_slow_gate", 0))
+    all_failed = int(report.get("n_failed_all_feature_gate", 0))
+    if cfg.hard_fail_slow_gate and slow_failed > 0:
+        raise ValueError(
+            f'[pack-step6] slow-feature parity gate failed '
+            f"(n_failed_slow_gate={slow_failed}); see {parity_path}"
+        )
+    if cfg.hard_fail_all_feature_gate and all_failed > 0:
+        raise ValueError(
+            '[pack-step6] all-feature parity gate failed '
+            f"(n_failed_all_feature_gate={all_failed}); see {parity_path}"
+        )
+    logger.info(
+        "[pack-step6] parity gate passed (slow_failed=%s all_feature_failed=%s)",
+        slow_failed,
+        all_failed,
+    )
+
+
 def build_deploy_package(argv: list[str] | None = None) -> Path:
     """Build deploy tree at resolved ``--output-dir`` (or default); return resolved output path."""
 
@@ -916,6 +969,11 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
     model_bundle = _resolved_model_bundle_dir(
         model_source=args.model_source,
         model_version=args.model_version,
+    )
+    _assert_step6_parity_gate_or_raise(
+        model_bundle,
+        strict=strict,
+        skip_step6_gate=bool(args.skip_step6_gate),
     )
     map_src = _canonical_mapping_origin(args, model_bundle=model_bundle)
     if not map_src.is_file():

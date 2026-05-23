@@ -87,6 +87,8 @@ class RefreshOptions:
     summary_path: Path
     bootstrap_mid: bool
     apply_schema: bool
+    training_mid_snapshot_parquet: Path | None = None
+    use_training_mid_seed: bool = True
 
 
 @dataclass
@@ -328,6 +330,101 @@ def export_clickhouse_sessions_to_parquet(
     }
 
 
+def default_training_mid_snapshot_parquet_path() -> Path:
+    """Return repo-local default training mid snapshot path."""
+    return Path(__file__).resolve().parents[1] / "artifacts" / "training_data" / (
+        "_main_trainer_mid_term_daily_snapshot.parquet"
+    )
+
+
+def resolve_training_mid_snapshot_parquet(opts: RefreshOptions) -> Path | None:
+    """Resolve training mid snapshot for bootstrap seed, or ``None`` when unavailable."""
+    cfg = default_hightier_serving_config()
+    candidates: list[Path] = []
+    if opts.training_mid_snapshot_parquet is not None:
+        candidates.append(Path(opts.training_mid_snapshot_parquet).resolve())
+    if cfg.training_mid_snapshot_parquet is not None:
+        candidates.append(Path(cfg.training_mid_snapshot_parquet).resolve())
+    candidates.append(default_training_mid_snapshot_parquet_path().resolve())
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+def materialize_training_mid_feast_seed(
+    *,
+    training_mid_snapshot: Path,
+    allowlist_parquet: Path,
+    canonical_mapping_parquet: Path,
+    anchor_end: date,
+    out_parquet: Path,
+) -> dict[str, Any]:
+    """Filter training mid snapshot to allowlist canonicals with anchors <= ``anchor_end``."""
+    import pyarrow.parquet as pq
+
+    src = Path(training_mid_snapshot).resolve()
+    if not src.is_file():
+        raise FileNotFoundError(f"training mid snapshot missing: {src}")
+    schema_cols = set(pq.read_schema(src).names)
+    feat_exprs = []
+    for col in PRODUCTION_MID_TERM_FEATURE_COLUMNS:
+        if col in schema_cols:
+            feat_exprs.append(f'"{col}"')
+        else:
+            feat_exprs.append(f'CAST(NULL AS DOUBLE) AS "{col}"')
+    feat_sql = ", ".join(feat_exprs)
+    dst = Path(out_parquet).resolve()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    src_esc = _path_esc(src)
+    allow_esc = _path_esc(allowlist_parquet)
+    map_esc = _path_esc(canonical_mapping_parquet)
+    dst_esc = _path_esc(dst)
+    sql = f"""
+COPY (
+  SELECT TRIM(CAST(s.canonical_id AS VARCHAR)) AS canonical_id,
+         CAST(s.anchor_gaming_day AS DATE) AS anchor_gaming_day,
+         {feat_sql}
+  FROM read_parquet('{src_esc}') AS s
+  INNER JOIN (
+    SELECT DISTINCT TRIM(CAST(m.canonical_id AS VARCHAR)) AS canonical_id
+    FROM read_parquet('{allow_esc}') AS a
+    INNER JOIN read_parquet('{map_esc}') AS m
+      ON CAST(a.player_id AS BIGINT) = CAST(m.player_id AS BIGINT)
+    WHERE TRIM(CAST(m.canonical_id AS VARCHAR)) <> ''
+  ) AS allow
+    ON TRIM(CAST(s.canonical_id AS VARCHAR)) = allow.canonical_id
+  WHERE CAST(s.anchor_gaming_day AS DATE) <= CAST('{anchor_end.isoformat()}' AS DATE)
+) TO '{dst_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+""".strip()
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.execute(sql)
+        stats = con.execute(
+            f"""
+            SELECT COUNT(*) AS rows,
+                   COUNT(DISTINCT canonical_id) AS distinct_canonical
+            FROM read_parquet('{dst_esc}')
+            """,
+        ).fetchone()
+    finally:
+        con.close()
+    rows = int(stats[0] if stats and stats[0] is not None else 0)
+    distinct = int(stats[1] if stats and stats[1] is not None else 0)
+    if rows <= 0 or distinct <= 0:
+        raise ValueError(
+            f"training mid seed produced no rows (rows={rows}, distinct_canonical={distinct}) "
+            f"from {src}"
+        )
+    return {
+        "source": str(src),
+        "rows": rows,
+        "distinct_canonical": distinct,
+        "anchor_end": anchor_end.isoformat(),
+        "path": str(dst),
+    }
+
+
 def merge_mid_feast_carry_forward(
     *,
     previous_feast_parquet: Path | None,
@@ -383,6 +480,53 @@ COPY (
         return int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{dst_esc}')").fetchone()[0])
     finally:
         con.close()
+
+
+def read_feast_mid_spike_stats(feast_parquet: Path) -> dict[str, Any]:
+    """Return row count, distinct canonical, and max anchor from Feast mid spike parquet."""
+    esc = _path_esc(feast_parquet)
+    row = duckdb.sql(
+        f"""
+        SELECT COUNT(*) AS rows,
+               COUNT(DISTINCT canonical_id) AS distinct_canonical,
+               MAX(CAST(event_timestamp AS DATE)) AS anchor_max
+        FROM read_parquet('{esc}')
+        """,
+    ).fetchone()
+    if row is None:
+        return {"rows": 0, "distinct_canonical": 0, "anchor_max": None}
+    anchor_max = row[2]
+    if anchor_max is not None and hasattr(anchor_max, "date"):
+        anchor_max = anchor_max.date()
+    elif anchor_max is not None:
+        anchor_max = pd.Timestamp(anchor_max).date()
+    return {
+        "rows": int(row[0] or 0),
+        "distinct_canonical": int(row[1] or 0),
+        "anchor_max": anchor_max,
+    }
+
+
+def enrich_mid_refresh_meta_from_feast(
+    meta: dict[str, Any],
+    *,
+    feast_path: Path,
+    training_seed_meta: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Attach final Feast spike stats and data-bounded expected anchor to refresh meta."""
+    stats = read_feast_mid_spike_stats(feast_path)
+    out = {
+        **meta,
+        "feast_spike_rows": int(stats["rows"]),
+        "distinct_canonical_count": int(stats["distinct_canonical"]),
+        "mid_term_anchor_gaming_day_max": (
+            stats["anchor_max"].isoformat() if stats["anchor_max"] is not None else None
+        ),
+        "materialize_source": "feast_online_refresh",
+    }
+    if training_seed_meta is not None and stats["anchor_max"] is not None:
+        out["mid_term_expected_anchor_gaming_day"] = stats["anchor_max"].isoformat()
+    return out
 
 
 def write_mid_feast_parquet(full_snap: Path, feast_out: Path) -> int:
@@ -566,6 +710,8 @@ def _resolve_refresh_options(
     summary_path: Path | None,
     bootstrap_mid: bool = False,
     apply_schema: bool = False,
+    training_mid_snapshot_parquet: Path | None = None,
+    use_training_mid_seed: bool = True,
 ) -> RefreshOptions:
     cfg = default_hightier_serving_config()
     parsed_layers = parse_refresh_layers(layers)
@@ -607,6 +753,12 @@ def _resolve_refresh_options(
         summary_path=Path(summary_path or feast_art / "feast_online_refresh_report.json").resolve(),
         bootstrap_mid=bool(bootstrap_mid),
         apply_schema=bool(apply_schema),
+        training_mid_snapshot_parquet=(
+            Path(training_mid_snapshot_parquet).resolve()
+            if training_mid_snapshot_parquet is not None
+            else None
+        ),
+        use_training_mid_seed=bool(use_training_mid_seed),
     )
 
 
@@ -650,7 +802,37 @@ def _refresh_mid_layer(
     feast_art = resolve_feast_artifacts_dir(opts.feast_repo)
     feast_art.mkdir(parents=True, exist_ok=True)
     feast_path = feast_art / "mid_term_spike_canonical.parquet"
-    if opts.bootstrap_mid or not feast_path.is_file():
+    training_seed_meta: dict[str, Any] | None = None
+    if opts.bootstrap_mid and opts.use_training_mid_seed:
+        seed_src = resolve_training_mid_snapshot_parquet(opts)
+        if seed_src is not None:
+            seed_staging = staging_dir / "mid_training_seed.parquet"
+            training_seed_meta = materialize_training_mid_feast_seed(
+                training_mid_snapshot=seed_src,
+                allowlist_parquet=opts.adt_allowlist,
+                canonical_mapping_parquet=opts.canonical_mapping,
+                anchor_end=anchor_end,
+                out_parquet=seed_staging,
+            )
+            seed_feast = staging_dir / "mid_training_seed_feast.parquet"
+            write_mid_feast_parquet(seed_staging, seed_feast)
+            feast_rows = merge_mid_feast_carry_forward(
+                previous_feast_parquet=seed_feast,
+                daily_snapshot_parquet=artifact_path,
+                feast_out=feast_path,
+            )
+            bootstrap_completed = True
+        elif opts.bootstrap_mid or not feast_path.is_file():
+            feast_rows = write_mid_feast_parquet(artifact_path, feast_path)
+            bootstrap_completed = True
+        else:
+            feast_rows = merge_mid_feast_carry_forward(
+                previous_feast_parquet=feast_path,
+                daily_snapshot_parquet=artifact_path,
+                feast_out=feast_path,
+            )
+            bootstrap_completed = False
+    elif opts.bootstrap_mid or not feast_path.is_file():
         feast_rows = write_mid_feast_parquet(artifact_path, feast_path)
         bootstrap_completed = True
     else:
@@ -668,6 +850,13 @@ def _refresh_mid_layer(
         "anchor_start": anchor_start.isoformat(),
         "anchor_end": anchor_end.isoformat(),
     }
+    if training_seed_meta is not None:
+        meta["training_mid_seed"] = training_seed_meta
+    meta = enrich_mid_refresh_meta_from_feast(
+        meta,
+        feast_path=feast_path,
+        training_seed_meta=training_seed_meta,
+    )
     return LayerRefreshOutcome(
         layer="mid",
         status="ok",
@@ -834,6 +1023,7 @@ def run_feast_online_refresh(opts: RefreshOptions) -> dict[str, Any]:
             sample_size=opts.max_smoke_entities,
             entity_missing_fail_fraction=float(cfg.scorer_feast_entity_missing_fail_fraction),
             mid_cell_null_fail_fraction=float(cfg.scorer_feast_mid_cell_null_fail_fraction),
+            mid_smoke_columns=cfg.scorer_feast_mid_smoke_columns,
         )
         feast_spike_rows: int | None = None
         allowlist_canonical_count: int | None = None
@@ -857,6 +1047,7 @@ def run_feast_online_refresh(opts: RefreshOptions) -> dict[str, Any]:
             min_canonical_coverage_fraction=float(
                 cfg.scorer_feast_mid_min_canonical_coverage_fraction
             ),
+            mid_smoke_columns=cfg.scorer_feast_mid_smoke_columns,
         )
         if not smoke_ok:
             raise RuntimeError(smoke_reason or "Feast online smoke failed")
@@ -936,6 +1127,12 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--skip-apply", action="store_true")
     pr.add_argument("--apply-schema", action="store_true", help="run feast apply + reset runtime state")
     pr.add_argument("--bootstrap-mid", action="store_true", help="multi-anchor mid bootstrap + carry-forward base")
+    pr.add_argument(
+        "--no-training-mid-seed",
+        action="store_true",
+        help="skip training historical mid snapshot seed during bootstrap",
+    )
+    pr.add_argument("--training-mid-snapshot", type=Path, default=None, help="training mid snapshot parquet seed")
     pr.add_argument("--skip-materialize", action="store_true")
     pr.add_argument("--smoke-only", action="store_true")
     pr.add_argument("--dry-run", action="store_true")
@@ -965,6 +1162,8 @@ def main(argv: list[str] | None = None) -> int:
         summary_path=args.summary_path,
         bootstrap_mid=bool(args.bootstrap_mid),
         apply_schema=bool(args.apply_schema),
+        training_mid_snapshot_parquet=args.training_mid_snapshot,
+        use_training_mid_seed=not bool(args.no_training_mid_seed),
     )
     report = run_feast_online_refresh(opts)
     logger.info("[feast_online_refresh] verdict=%s", report.get("verdict"))

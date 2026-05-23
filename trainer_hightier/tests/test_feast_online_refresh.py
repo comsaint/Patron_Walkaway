@@ -95,6 +95,33 @@ def test_merge_mid_feast_carry_forward_keeps_latest_per_canonical(tmp_path: Path
     assert float(by_cid.loc["c3", "fe__wager_sum__w1d"]) == 30.0
 
 
+def test_materialize_training_mid_feast_seed_filters_allowlist(tmp_path: Path) -> None:
+    train = tmp_path / "train_mid.parquet"
+    allow = tmp_path / "allow.parquet"
+    mapping = tmp_path / "map.parquet"
+    out = tmp_path / "seed.parquet"
+    pd.DataFrame(
+        [
+            _mid_feature_row("c1", "2025-05-01", wager=10.0),
+            _mid_feature_row("c2", "2025-05-01", wager=20.0),
+            _mid_feature_row("c1", "2025-06-01", wager=11.0),
+        ]
+    ).to_parquet(train, index=False)
+    pd.DataFrame({"player_id": [1, 2]}).to_parquet(allow, index=False)
+    pd.DataFrame({"player_id": [1, 2], "canonical_id": ["c1", "c2"]}).to_parquet(mapping, index=False)
+    meta = refresh_mod.materialize_training_mid_feast_seed(
+        training_mid_snapshot=train,
+        allowlist_parquet=allow,
+        canonical_mapping_parquet=mapping,
+        anchor_end=date(2025, 6, 15),
+        out_parquet=out,
+    )
+    assert meta["distinct_canonical"] == 2
+    seeded = pd.read_parquet(out)
+    assert set(seeded["canonical_id"].astype(str)) == {"c1", "c2"}
+    assert len(seeded) == 3
+
+
 def test_evaluate_feast_lookup_smoke_gate_fails_on_mid_cell_null_only() -> None:
     cfg = default_hightier_serving_config()
     smoke = {
