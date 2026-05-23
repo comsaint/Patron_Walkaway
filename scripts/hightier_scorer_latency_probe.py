@@ -171,22 +171,32 @@ def _prediction_log_stage(args: argparse.Namespace, bundle: Any, staged: Any, pr
     )
 
 
+def _resolve_high_adt_only(*, no_high_adt_only: bool) -> bool:
+    """Match production scorer: config gate plus ``--no-high-adt-only`` debug override."""
+    cfg = default_hightier_serving_config()
+    return bool(cfg.high_adt_only) and (not bool(no_high_adt_only))
+
+
 def _load_probe_artifacts(
     timings: dict[str, float],
     model_dir: Path,
     allowlist_path: Path,
     *,
-    no_high_adt_only: bool,
+    high_adt_only: bool,
 ) -> tuple[Any, Any, Any, frozenset[Any]]:
     """Load model bundle, frozen registry, supplier plan, and optional ADT allowlist."""
     bundle = _time_stage(timings, "load_model", lambda: load_hightier_model_bundle(bundle_dir=model_dir))
     registry_snap = _time_stage(timings, "load_registry", lambda: load_frozen_registry_for_bundle(model_dir))
     plan = build_scorer_supplier_plan(registry_snap, bundle.feature_columns)
     assert_scorer_supplier_plan_or_raise(plan)
-    if no_high_adt_only:
-        allow_ids: frozenset[Any] = frozenset()
-    else:
+    if high_adt_only:
         allow_ids = _time_stage(timings, "load_allowlist", lambda: load_adt_allowlist_ids(allowlist_path))
+        if not allow_ids:
+            raise ValueError(
+                f"adt allowlist is empty at {allowlist_path}; cannot run high_adt_only probe"
+            )
+    else:
+        allow_ids = frozenset()
     return bundle, registry_snap, plan, allow_ids
 
 
@@ -304,13 +314,14 @@ def main() -> int:
 
     timings: dict[str, float] = {}
     total_t0 = time.perf_counter()
+    high_adt_only = _resolve_high_adt_only(no_high_adt_only=args.no_high_adt_only)
     bundle, registry_snap, plan, allow_ids = _load_probe_artifacts(
-        timings, model_dir, allowlist, no_high_adt_only=args.no_high_adt_only
+        timings, model_dir, allowlist, high_adt_only=high_adt_only
     )
     batch = _fetch_probe_batch(
         timings,
         args.state_db.resolve(),
-        high_adt_only=not args.no_high_adt_only,
+        high_adt_only=high_adt_only,
         allowlist_ids=allow_ids,
     )
     if batch is None:
