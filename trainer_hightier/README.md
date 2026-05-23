@@ -9,6 +9,7 @@
 | **資料進場** | **僅** partition snapshot：`<repo>/data/partitions`（預設，**遞迴**掃描）或 `--partition-snapshot-dir` 下的 `t_session__part_YYYYMM.parquet` / `t_bet__part_YYYYMM.parquet`；**不再**讀 `<repo>/data/gmwds_t_*.parquet` 單檔 |
 | **Session 清洗** | L0 → 清洗後 Parquet（DuckDB 單段為預設；可選 pandas 分片後再 DuckDB merge） |
 | **訓練 / 特徵** | Step 3–5 與主 CLI 可跑通；特徵選欄由 [contracts/feature_candidate_registry.yaml](./contracts/feature_candidate_registry.yaml) 驅動（見下文） |
+| **Production serving** | Scorer v2 + Feast online mid/long；`build_deploy_package` 產出自包含 bundle；`deploy.main` 負責 startup / post-startup Feast refresh（見下文） |
 | **評估 demo** | `python -m trainer_hightier` 為合成資料的 precision floor 示範，**不是**完整訓練 CLI |
 
 詳細操作、快取與除錯請見 [RUNBOOK.md](./RUNBOOK.md)。
@@ -110,6 +111,61 @@ python -m trainer_hightier
 - 實驗跑完：run 目錄內 `feature_experiment_report.json` 的 `candidate_registry` 與相關區塊。
 
 維護流程與常見錯誤見 [RUNBOOK.md](./RUNBOOK.md)（含主 trainer 與實驗管線差異）。
+
+## Production deploy（scorer v2 + Feast）
+
+訓練完成並通過建包 gate 後，自 **repo 根目錄**建置可部署 bundle：
+
+```bash
+python -m trainer_hightier.build_deploy_package --model-version <run_id> [--archive]
+```
+
+預設輸出至 `out/deploy_hightier/<model_version>/`（詳見 [RUNBOOK.md](./RUNBOOK.md) §打包搬機）。目標機在 **bundle 根目錄**：
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env   # 至少設定 CH_USER、CH_PASS
+python main.py --mode all --bundle-dir .
+```
+
+### Deploy 啟動順序（`mode=all` / `mode=scorer`）
+
+1. Preflight model、mapping、allowlist、`feast_repo`
+2. **Startup Feast online refresh**（readiness 缺失 / stale 或 `--force-feast-refresh` 時；失敗 **fail-fast**）
+3. Deploy Feast readiness + allowlist online smoke
+4. **Feast refresh supervisor**（daemon thread，預設 **on**；每 300s poll，依 gaming day / 月轉 eligibility 自動 refresh mid + slow）
+5. API（background）、validator（background）、scorer（foreground）
+
+Post-startup refresh 為 **fail-soft**：失敗只 log + 下輪 retry，scorer 繼續用 last-good `feast_online_readiness.json`。
+
+### 常用 CLI flags
+
+| Flag | 說明 |
+|------|------|
+| `--no-feast-startup-refresh` | 略過 startup refresh（debug；scorer 多半無法通過 readiness gate） |
+| `--force-feast-refresh` | 強制 startup refresh |
+| `--no-feast-refresh-supervisor` | 停用 post-startup daemon（debug；若改用 external cron 才開，勿與 daemon 並用） |
+| `--mode api` / `scorer` / `validator` | 僅跑單一元件；supervisor 僅在 `all` / `scorer` 啟動 |
+
+### 手動 refresh（ops fallback）
+
+```bash
+python -m trainer_hightier.serving.feast_online_refresh \
+  --source clickhouse --layers mid,slow \
+  --adt-allowlist mapping/adt_allowed_players_q0p99.parquet \
+  --canonical-mapping mapping/canonical_player_mapping.parquet
+```
+
+Supervisor 觀測：`local_state/feature_state.db` → `feature_state_meta` 鍵 `feast_refresh_supervisor_last_check_iso`、`_last_attempt_iso`、`_last_success_iso`。
+
+### 規格文件
+
+| 文件 | 說明 |
+|------|------|
+| [doc/Scorer Runtime Contract - SSOT.md](./doc/Scorer%20Runtime%20Contract%20-%20SSOT.md) | Deploy / scoring contract |
+| [doc/Feast Post-Startup Refresh Supervisor - IMPLEMENTATION_PLAN.md](./doc/Feast%20Post-Startup%20Refresh%20Supervisor%20-%20IMPLEMENTATION_PLAN.md) | Post-startup daemon 設計 |
+| [doc/Feast Online Refresh - IMPLEMENTATION_PLAN.md](./doc/Feast%20Online%20Refresh%20-%20IMPLEMENTATION_PLAN.md) | Refresh orchestration CLI |
+| bundle 內 `README_DEPLOY.md` | 建包時生成的 operator 速查 |
 
 ## 依賴
 
