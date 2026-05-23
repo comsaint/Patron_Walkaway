@@ -22,6 +22,13 @@ Or sample recent allowlist bets from ClickHouse (no log required):
         --bundle-dir /path/to/deploy_bundle \\
         --max-bets 2000 \\
         --lookback-hours 6
+
+Or replay from local cleaned bet parquet (no ClickHouse):
+
+    python -m trainer_hightier.serving.audit_supplier_root_cause \\
+        --bundle-dir /path/to/deploy_bundle \\
+        --local-cleaned-bet trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet \\
+        --max-bets 500
 """
 
 from __future__ import annotations
@@ -31,7 +38,7 @@ import json
 import logging
 from collections import Counter
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Final
 
@@ -171,9 +178,26 @@ def _load_audit_bets(
     prediction_log: Path | None,
     max_bets: int | None,
     lookback_hours: float,
+    local_cleaned_bet: Path | None = None,
+    gaming_day_start: date | None = None,
+    gaming_day_end: date | None = None,
 ) -> pd.DataFrame:
-    """Load bet rows to diagnose (from log bet_ids or incremental allowlist fetch)."""
+    """Load bet rows to diagnose (local parquet, log bet_ids, or incremental CH fetch)."""
     cap = int(max_bets) if max_bets is not None else 5000
+    if local_cleaned_bet is not None:
+        if gaming_day_start is None or gaming_day_end is None:
+            raise ValueError(
+                "[root-cause] --local-cleaned-bet requires --gaming-day-start and --gaming-day-end"
+            )
+        from trainer_hightier.serving.offline_serving_backtest import load_bets_from_cleaned_parquet
+
+        return load_bets_from_cleaned_parquet(
+            Path(local_cleaned_bet),
+            allowlist_ids=allowlist_ids,
+            gaming_day_start=gaming_day_start,
+            gaming_day_end=gaming_day_end,
+            max_bets=cap,
+        )
     if prediction_log is not None:
         bet_ids = _load_bet_ids_from_prediction_log(prediction_log, max_bets=max_bets)
         if not bet_ids:
@@ -488,6 +512,9 @@ def run_supplier_root_cause_audit(
     batch_size: int = 500,
     only_null_features: bool = True,
     max_examples_per_feature: int = 20,
+    local_cleaned_bet: Path | None = None,
+    gaming_day_start: date | None = None,
+    gaming_day_end: date | None = None,
 ) -> dict[str, Any]:
     """Execute full provenance audit and return JSON-serializable report."""
     bundle_root = Path(bundle_dir).resolve()
@@ -520,8 +547,20 @@ def run_supplier_root_cause_audit(
         prediction_log=prediction_log,
         max_bets=max_bets,
         lookback_hours=lookback_hours,
+        local_cleaned_bet=local_cleaned_bet,
+        gaming_day_start=gaming_day_start,
+        gaming_day_end=gaming_day_end,
     )
-    pool = _build_scoring_pool(bets, cfg=cfg)
+    if local_cleaned_bet is not None:
+        from trainer_hightier.serving.offline_serving_backtest import build_pool_from_cleaned_parquet
+
+        pool = build_pool_from_cleaned_parquet(
+            bets,
+            cleaned_root=Path(local_cleaned_bet).resolve(),
+            cfg=cfg,
+        )
+    else:
+        pool = _build_scoring_pool(bets, cfg=cfg)
     pool = attach_canonical_id(pool, mapping_parquet=mapping)
 
     snaps = _run_supplier_pipeline(
@@ -556,7 +595,13 @@ def run_supplier_root_cause_audit(
         "model_version": bundle.model_version,
         "n_bets_diagnosed": len(bets),
         "n_pool_rows": len(pool),
-        "bet_source": "prediction_log" if prediction_log is not None else "clickhouse_incremental",
+        "bet_source": (
+            "prediction_log"
+            if prediction_log is not None
+            else "local_cleaned"
+            if local_cleaned_bet is not None
+            else "clickhouse_incremental"
+        ),
         "supplier_plan": {
             "short_term_cols": list(plan.short_term_cols),
             "feast_mid_cols": list(plan.feast_mid_cols),
@@ -585,6 +630,14 @@ def run_audit(argv: list[str] | None = None) -> int:
     pr.add_argument("--prediction-log", type=Path, default=None, help="exported prediction_log CSV")
     pr.add_argument("--output-json", type=Path, default=None, help="write machine-readable report")
     pr.add_argument("--max-bets", type=int, default=None, help="cap diagnosed bets")
+    pr.add_argument(
+        "--local-cleaned-bet",
+        type=Path,
+        default=None,
+        help="hive-partitioned cleaned bet parquet root (no ClickHouse)",
+    )
+    pr.add_argument("--gaming-day-start", type=str, default=None, help="YYYY-MM-DD with --local-cleaned-bet")
+    pr.add_argument("--gaming-day-end", type=str, default=None, help="YYYY-MM-DD with --local-cleaned-bet")
     pr.add_argument("--lookback-hours", type=float, default=6.0, help="CH incremental lookback")
     pr.add_argument("--batch-size", type=int, default=500, help="Feast lookup batch size")
     pr.add_argument(
@@ -596,6 +649,25 @@ def run_audit(argv: list[str] | None = None) -> int:
     args = pr.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+    g_start: date | None = None
+    g_end: date | None = None
+    if args.gaming_day_start:
+        g_start = date.fromisoformat(str(args.gaming_day_start).strip())
+    if args.gaming_day_end:
+        g_end = date.fromisoformat(str(args.gaming_day_end).strip())
+    if args.local_cleaned_bet is not None and (g_start is None or g_end is None):
+        from trainer_hightier.serving.deploy_e2e_gate import resolve_model_bundle_test_gaming_days
+
+        bundle_root = Path(args.bundle_dir).resolve()
+        rel = _load_bundle_rel(bundle_root)
+        model_dir = bundle_root / rel.get("model_bundle_dir", "models")
+        g_start, g_end = resolve_model_bundle_test_gaming_days(model_dir)
+        logger.info(
+            "[root-cause] gaming days from split_report.json test split: %s .. %s",
+            g_start,
+            g_end,
+        )
+
     report = run_supplier_root_cause_audit(
         bundle_dir=args.bundle_dir,
         prediction_log=args.prediction_log,
@@ -604,6 +676,9 @@ def run_audit(argv: list[str] | None = None) -> int:
         batch_size=int(args.batch_size),
         only_null_features=not bool(args.audit_all_rows),
         max_examples_per_feature=int(args.max_examples),
+        local_cleaned_bet=args.local_cleaned_bet,
+        gaming_day_start=g_start,
+        gaming_day_end=g_end,
     )
     text = json.dumps(report, indent=2, default=str)
     print(text)
