@@ -14,8 +14,10 @@ import sqlite3
 import sys
 import time
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -23,7 +25,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from trainer_hightier.config import default_hightier_serving_config, set_hightier_serving_deploy_override
+from trainer_hightier.config import (
+    HK_TZ,
+    default_hightier_serving_config,
+    set_hightier_serving_deploy_override,
+)
 from trainer_hightier.feature_experiment.feature_cadence import runtime_inputs_from_registry
 from trainer_hightier.serving.adt_allowlist import load_adt_allowlist_ids
 from trainer_hightier.serving.feast_online_adapter import (
@@ -153,7 +159,7 @@ def _prediction_log_stage(args: argparse.Namespace, bundle: Any, staged: Any, pr
     init_prediction_log_db(args.prediction_log_db)
     append_hightier_prediction_log(
         args.prediction_log_db,
-        scored_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        scored_at=datetime.now(ZoneInfo(HK_TZ)).isoformat(),
         model_version=str(bundle.model_version),
         staged=staged,
         prob=prob,
