@@ -9,16 +9,17 @@ Example (deploy bundle + ClickHouse gaming-day window)::
     python -m trainer_hightier.serving.offline_serving_backtest \\
         --bundle-dir /path/to/deploy_bundle \\
         --gaming-day-start 2026-05-01 --gaming-day-end 2026-05-07 \\
-        --max-bets 2000 \\
-        --output-json ./artifacts/offline_serving_backtest.json
+        --max-bets 2000
+
+When ``--output-json`` is omitted, the report defaults to
+``<model-bundle>/offline_serving_backtest.json`` (canonical training bundle when available).
 
 Example (local cleaned bet mirror, no ClickHouse)::
 
     python -m trainer_hightier.serving.offline_serving_backtest \\
-        --bundle-dir /path/to/deploy_bundle \\
+        --model-dir out/models_high_tier_mvp/20260522-124003-245bd1f \\
         --local-cleaned-bet ./source_mirror/cleaned_bet \\
-        --gaming-day-start 2026-05-01 --gaming-day-end 2026-05-07 \\
-        --output-json ./artifacts/offline_serving_backtest.json
+        --gaming-day-start 2026-05-01 --gaming-day-end 2026-05-07
 """
 
 from __future__ import annotations
@@ -42,6 +43,11 @@ from trainer_hightier.config import (
     HightierServingConfig,
     apply_hightier_serving_environ_overrides,
     set_hightier_serving_deploy_override,
+)
+from trainer_hightier.core.model_bundle_paths import (
+    OFFLINE_SERVING_BACKTEST_REPORT_FILENAME,
+    model_bundle_report_path,
+    resolve_model_bundle_for_reports,
 )
 from trainer_hightier.serving.adt_allowlist import load_adt_allowlist_ids
 from trainer_hightier.serving.audit_production_readiness import (
@@ -1086,6 +1092,33 @@ def run_offline_serving_backtest(
     return summarize_offline_result(result, ctx)
 
 
+def resolve_backtest_output_json(
+    *,
+    output_json: Path | None,
+    model_dir: Path | None,
+    bundle_dir: Path | None,
+) -> Path | None:
+    """Resolve CLI output path or default beside the model bundle."""
+    if output_json is not None:
+        return Path(output_json).resolve()
+    try:
+        bundle = resolve_model_bundle_for_reports(
+            model_dir=model_dir,
+            deploy_bundle_dir=bundle_dir,
+        )
+    except (FileNotFoundError, ValueError):
+        return None
+    return model_bundle_report_path(bundle, OFFLINE_SERVING_BACKTEST_REPORT_FILENAME)
+
+
+def write_backtest_report(path: Path, report: dict[str, Any]) -> None:
+    """Persist offline backtest JSON under the model bundle."""
+    out = Path(path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    logger.info("[offline_backtest] wrote %s", out)
+
+
 def run_cli(argv: list[str] | None = None) -> int:
     """CLI entry for offline serving backtest."""
     pr = argparse.ArgumentParser(
@@ -1107,7 +1140,15 @@ def run_cli(argv: list[str] | None = None) -> int:
     pr.add_argument("--prediction-log", type=Path, default=None, help="CSV with bet_id column")
     pr.add_argument("--lookback-hours", type=float, default=6.0, help="when no gaming-day window")
     pr.add_argument("--max-bets", type=int, default=5000)
-    pr.add_argument("--output-json", type=Path, default=None)
+    pr.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help=(
+            "write JSON report path (default: <model-bundle>/"
+            f"{OFFLINE_SERVING_BACKTEST_REPORT_FILENAME})"
+        ),
+    )
     pr.add_argument(
         "--strict-smoke",
         action="store_true",
@@ -1155,10 +1196,13 @@ def run_cli(argv: list[str] | None = None) -> int:
         )
         text = json.dumps(report, indent=2, default=str)
         print(text)
-        if args.output_json is not None:
-            out = Path(args.output_json)
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(text, encoding="utf-8")
+        out = resolve_backtest_output_json(
+            output_json=args.output_json,
+            model_dir=mdir,
+            bundle_dir=args.bundle_dir,
+        )
+        if out is not None:
+            write_backtest_report(out, report)
         return 0
 
     g_start = _parse_gaming_day(args.gaming_day_start) if args.gaming_day_start else None
@@ -1179,11 +1223,13 @@ def run_cli(argv: list[str] | None = None) -> int:
     )
     text = json.dumps(report, indent=2, default=str)
     print(text)
-    if args.output_json is not None:
-        out = Path(args.output_json)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(text, encoding="utf-8")
-        logger.info("[offline_backtest] wrote %s", out)
+    out = resolve_backtest_output_json(
+        output_json=args.output_json,
+        model_dir=args.model_dir,
+        bundle_dir=args.bundle_dir,
+    )
+    if out is not None:
+        write_backtest_report(out, report)
     critical = int(report.get("n_skipped_entity_missing", 0)) + len(
         report.get("post_join_smoke_failures") or [],
     )

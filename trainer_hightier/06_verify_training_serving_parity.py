@@ -13,7 +13,10 @@ Example (post-gap deploy gate):
     python trainer_hightier/06_verify_training_serving_parity.py \\
       --model-dir out/models_high_tier_mvp/20260522-124003-245bd1f \\
       --as-of-date 2026-05-22 \\
-      --output-json out/feature_parity_verification.json
+      --output-json out/models_high_tier_mvp/20260522-124003-245bd1f/feature_parity_verification.json
+
+When ``--output-json`` is omitted and exactly one model bundle is verified, the report
+defaults to ``<model-dir>/feature_parity_verification.json``.
 """
 
 from __future__ import annotations
@@ -32,6 +35,10 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from trainer_hightier.config import HightierServingConfig, Step6ParityConfig
+from trainer_hightier.core.model_bundle_paths import (
+    FEATURE_PARITY_REPORT_FILENAME,
+    model_bundle_report_path,
+)
 from trainer_hightier.serving.offline_serving_backtest import (
     _ScoringBatch,
     _bets_frame_from_test_batch,
@@ -731,6 +738,18 @@ def build_report_from_config(
     return build_report(args)
 
 
+def resolve_output_json_path(args: argparse.Namespace, model_dirs: list[Path]) -> Path:
+    """Resolve CLI ``--output-json`` or default beside a single model bundle."""
+    if args.output_json is not None:
+        return Path(args.output_json).resolve()
+    if len(model_dirs) != 1:
+        raise ValueError(
+            "--output-json is required when verifying multiple model bundles; "
+            f"got {len(model_dirs)} model dirs",
+        )
+    return model_bundle_report_path(model_dirs[0], FEATURE_PARITY_REPORT_FILENAME)
+
+
 def report_exit_code(report: dict[str, Any], *, parity_cfg: Step6ParityConfig) -> int:
     """Aggregate exit code across models for configured gates."""
     for model in report.get("models", []):
@@ -773,7 +792,15 @@ def run_cli(argv: list[str] | None = None) -> int:
         default=False,
         help="exit non-zero when all_feature_gate fails (default: false, monitoring only)",
     )
-    parser.add_argument("--output-json", type=Path, required=True)
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help=(
+            "write JSON report path (default: <single-model-dir>/"
+            f"{FEATURE_PARITY_REPORT_FILENAME})"
+        ),
+    )
     parser.add_argument("--no-fail", action="store_true", help="always exit 0 after writing JSON")
     args = parser.parse_args(argv)
     parity_cfg = Step6ParityConfig(
@@ -782,8 +809,12 @@ def run_cli(argv: list[str] | None = None) -> int:
         max_rows=int(args.max_rows),
         batch_size=int(args.batch_size),
     )
+    model_dirs = resolve_model_dirs(args)
+    try:
+        out = resolve_output_json_path(args, model_dirs)
+    except ValueError as exc:
+        parser.error(str(exc))
     report = build_report(args)
-    out = Path(args.output_json).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     print(f"wrote {out}")

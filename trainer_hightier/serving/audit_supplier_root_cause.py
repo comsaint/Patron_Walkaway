@@ -13,8 +13,10 @@ Run on the deploy host (same bundle layout as ``deploy/main.py``):
 
     python -m trainer_hightier.serving.audit_supplier_root_cause \\
         --bundle-dir /path/to/deploy_bundle \\
-        --prediction-log /path/to/gmwds_deploy_predict_log.csv \\
-        --output-json ./artifacts/feast/supplier_root_cause.json
+        --prediction-log /path/to/gmwds_deploy_predict_log.csv
+
+When ``--output-json`` is omitted, the report defaults to
+``<model-bundle>/supplier_root_cause.json`` (canonical training bundle when available).
 
 Or sample recent allowlist bets from ClickHouse (no log required):
 
@@ -50,6 +52,11 @@ from trainer_hightier.config import (
     HightierServingConfig,
     apply_hightier_serving_environ_overrides,
     set_hightier_serving_deploy_override,
+)
+from trainer_hightier.core.model_bundle_paths import (
+    SUPPLIER_ROOT_CAUSE_REPORT_FILENAME,
+    model_bundle_report_path,
+    resolve_model_bundle_for_reports,
 )
 from trainer_hightier.feature_experiment.feature_cadence import (
     feast_mid_columns_with_composite_dependencies,
@@ -628,7 +635,15 @@ def run_audit(argv: list[str] | None = None) -> int:
     )
     pr.add_argument("--bundle-dir", type=Path, required=True, help="deploy bundle root")
     pr.add_argument("--prediction-log", type=Path, default=None, help="exported prediction_log CSV")
-    pr.add_argument("--output-json", type=Path, default=None, help="write machine-readable report")
+    pr.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help=(
+            "write machine-readable report (default: <model-bundle>/"
+            f"{SUPPLIER_ROOT_CAUSE_REPORT_FILENAME})"
+        ),
+    )
     pr.add_argument("--max-bets", type=int, default=None, help="cap diagnosed bets")
     pr.add_argument(
         "--local-cleaned-bet",
@@ -682,11 +697,17 @@ def run_audit(argv: list[str] | None = None) -> int:
     )
     text = json.dumps(report, indent=2, default=str)
     print(text)
-    if args.output_json is not None:
-        out = Path(args.output_json)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(text, encoding="utf-8")
-        logger.info("[root-cause] wrote %s", out)
+    out = (
+        Path(args.output_json).resolve()
+        if args.output_json is not None
+        else model_bundle_report_path(
+            resolve_model_bundle_for_reports(deploy_bundle_dir=args.bundle_dir),
+            SUPPLIER_ROOT_CAUSE_REPORT_FILENAME,
+        )
+    )
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text, encoding="utf-8")
+    logger.info("[root-cause] wrote %s", out)
 
     critical = sum(
         int(v)

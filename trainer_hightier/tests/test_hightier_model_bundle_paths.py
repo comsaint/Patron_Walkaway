@@ -11,8 +11,11 @@ from unittest.mock import patch
 import pytest
 
 from trainer_hightier.core.model_bundle_paths import (
+    DEPLOY_E2E_GATE_REPORT_FILENAME,
     LATEST_MODEL_MANIFEST_NAME,
+    model_bundle_report_path,
     resolve_model_bundle_dir,
+    resolve_model_bundle_for_reports,
 )
 from trainer_hightier.config import DuckDbRuntimeConfig, Step5TrainConfig
 from trainer_hightier.trainer import HighTierTrainArgs, run_training
@@ -116,3 +119,43 @@ def test_run_training_raises_when_existing_model_under_version(
     ):
         with pytest.raises(FileExistsError, match="existing high-tier Step 5"):
             run_training(args)
+
+
+def test_resolve_model_bundle_for_reports_prefers_canonical_training_dir(tmp_path: Path) -> None:
+    """Deploy gate reports target ``versions_root/<model_version>`` when it exists."""
+
+    versions_root = tmp_path / "out" / "models_high_tier_mvp"
+    mv = "20260522-124003-245bd1f"
+    canonical = versions_root / mv
+    canonical.mkdir(parents=True)
+    (canonical / "model.pkl").write_bytes(b"m")
+    (canonical / "model_version").write_text(mv, encoding="utf-8")
+
+    deploy = tmp_path / "deploy"
+    embedded = deploy / "models"
+    embedded.mkdir(parents=True)
+    (embedded / "model.pkl").write_bytes(b"m")
+    (embedded / "model_version").write_text(mv, encoding="utf-8")
+    (deploy / "deploy_bundle_paths.json").write_text(
+        json.dumps({"model_bundle_dir": "models"}),
+        encoding="utf-8",
+    )
+
+    resolved = resolve_model_bundle_for_reports(
+        deploy_bundle_dir=deploy,
+        versions_root=versions_root,
+    )
+    assert resolved == canonical.resolve()
+    out = model_bundle_report_path(resolved, DEPLOY_E2E_GATE_REPORT_FILENAME)
+    assert out.parent == canonical.resolve()
+    assert out.name == DEPLOY_E2E_GATE_REPORT_FILENAME
+
+
+def test_resolve_model_bundle_for_reports_explicit_model_dir(tmp_path: Path) -> None:
+    """Explicit ``--model-dir`` wins over deploy bundle layout."""
+
+    explicit = tmp_path / "bundle"
+    explicit.mkdir()
+    (explicit / "model.pkl").write_bytes(b"m")
+    resolved = resolve_model_bundle_for_reports(model_dir=explicit)
+    assert resolved == explicit.resolve()

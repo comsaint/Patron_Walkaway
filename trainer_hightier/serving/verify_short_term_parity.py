@@ -1,10 +1,10 @@
 """Offline checks: lookback sweep vs training parquet; canonical multi-card pool coverage.
 
-Writes JSON under ``--output-json``. Example::
+When ``--output-json`` is omitted, writes ``<model-dir>/short_term_parity_verification.json``.
+Example::
 
     python -m trainer_hightier.serving.verify_short_term_parity \\
-        --model-dir out/models_high_tier_mvp/20260522-124003-245bd1f \\
-        --output-json out/models_high_tier_mvp/20260522-124003-245bd1f/short_term_parity_verification.json
+        --model-dir out/models_high_tier_mvp/20260522-124003-245bd1f
 """
 
 from __future__ import annotations
@@ -20,6 +20,10 @@ import numpy as np
 import pandas as pd
 
 from trainer_hightier.config import HightierServingConfig
+from trainer_hightier.core.model_bundle_paths import (
+    SHORT_TERM_PARITY_REPORT_FILENAME,
+    model_bundle_report_path,
+)
 from trainer_hightier.feature_experiment.materialize_fe_derived import (
     compute_fe_derived_features_from_pool,
 )
@@ -464,7 +468,15 @@ def main() -> None:
     parser.add_argument("--feast-repo", type=Path, default=Path("trainer_hightier/feast_repo"))
     parser.add_argument("--max-rows", type=int, default=80_000)
     parser.add_argument("--lookbacks", type=str, default="6,8,12")
-    parser.add_argument("--output-json", type=Path, required=True)
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help=(
+            "write JSON report path (default: <model-dir>/"
+            f"{SHORT_TERM_PARITY_REPORT_FILENAME})"
+        ),
+    )
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir).resolve()
@@ -508,7 +520,11 @@ def main() -> None:
             mapping_parquet=ctx.mapping_parquet,
         ),
     }
-    out = Path(args.output_json).resolve()
+    out = (
+        Path(args.output_json).resolve()
+        if args.output_json is not None
+        else model_bundle_report_path(model_dir, SHORT_TERM_PARITY_REPORT_FILENAME)
+    )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"wrote {out}")

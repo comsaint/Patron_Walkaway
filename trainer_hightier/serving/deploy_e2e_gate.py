@@ -8,8 +8,12 @@ Example (default: recreate ``bundle/.venv``, pip install ``requirements.txt``, r
     python -m trainer_hightier.serving.deploy_e2e_gate \\
         --bundle-dir out/deploy_hightier/20260522-124003-245bd1f \\
         --local-cleaned-bet trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet \\
-        --local-cleaned-session trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_session.parquet \\
-        --output-json artifacts/feast/deploy_e2e_gate_report.json
+        --local-cleaned-session trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_session.parquet
+
+When ``--output-json`` is omitted, the report defaults to
+``out/models_high_tier_mvp/<model_version>/deploy_e2e_gate_report.json`` when the
+canonical training bundle exists; otherwise it falls back to the deploy bundle's
+embedded ``models/`` directory.
 
 Use ``--no-provision-venv`` only when already running inside the bundle venv (faster dev loop).
 """
@@ -35,6 +39,11 @@ from trainer_hightier.config import (
     HightierServingConfig,
     apply_hightier_serving_environ_overrides,
     set_hightier_serving_deploy_override,
+)
+from trainer_hightier.core.model_bundle_paths import (
+    DEPLOY_E2E_GATE_REPORT_FILENAME,
+    model_bundle_report_path,
+    resolve_model_bundle_for_reports,
 )
 from trainer_hightier.deploy import main as deploy_main
 from trainer_hightier.serving.feature_supply import (
@@ -191,7 +200,15 @@ def parse_gate_args(argv: list[str] | None = None) -> DeployE2EGateOptions:
         required=True,
         help="cleaned session parquet (required for slow layer)",
     )
-    pr.add_argument("--output-json", type=Path, default=None, help="write JSON report path")
+    pr.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help=(
+            "write JSON report path (default: canonical training model bundle / "
+            f"{DEPLOY_E2E_GATE_REPORT_FILENAME})"
+        ),
+    )
     pr.add_argument(
         "--gaming-day-start",
         type=str,
@@ -701,6 +718,12 @@ def run_deploy_e2e_gate(opts: DeployE2EGateOptions) -> DeployE2EGateReport:
     import trainer_hightier.serving.runtime_config  # noqa: F401
 
     model_bundle = contract["model_bundle"]
+    report_bundle = resolve_model_bundle_for_reports(deploy_bundle_dir=bundle_root)
+    if opts.output_json is None:
+        opts = replace(
+            opts,
+            output_json=model_bundle_report_path(report_bundle, DEPLOY_E2E_GATE_REPORT_FILENAME),
+        )
     opts = apply_default_scorability_gaming_days(opts, model_bundle)
     mapping = contract["mapping"]
     allowlist = contract["allowlist"]
@@ -779,6 +802,7 @@ def run_deploy_e2e_gate(opts: DeployE2EGateOptions) -> DeployE2EGateReport:
     )
     if opts.output_json is not None:
         write_gate_report(opts.output_json, report)
+        logger.info("[deploy_e2e_gate] wrote %s", opts.output_json)
     return report
 
 
