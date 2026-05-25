@@ -49,7 +49,7 @@ from trainer_hightier.serving.feature_builder import (
     attach_short_term_pit_features,
     attach_synthetic_etl_and_prediction_visible,
     attach_trial_bet_behavior_1h,
-    coerce_categoricals,
+    prepare_lgbm_feature_matrix,
 )
 from trainer_hightier.serving.feast_readiness import (
     evaluate_feast_readiness_gate,
@@ -1138,10 +1138,11 @@ def score_once(
         meta_set(conn, META_KEY_SLOW_STALENESS_DAYS, str(slow_fresh.staleness_days))
 
     assert_features_ready(staged, bundle.feature_columns)
-    X = coerce_categoricals(
-        staged[list(bundle.feature_columns)].copy(),
-        bundle.categorical_columns,
-        dict(bundle.category_categories),
+    X = prepare_lgbm_feature_matrix(
+        staged,
+        feature_columns=bundle.feature_columns,
+        categorical_columns=bundle.categorical_columns,
+        category_categories=dict(bundle.category_categories),
     )
     prob = bundle.model.predict_proba(X)[:, 1]
     thr = float(bundle.threshold)

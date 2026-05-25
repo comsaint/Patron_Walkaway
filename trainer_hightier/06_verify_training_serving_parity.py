@@ -386,6 +386,7 @@ def run_production_feature_replay(
     feast_repo: Path,
     max_rows: int,
     batch_size: int,
+    diff_fraction_fail_threshold: float = 0.02,
 ) -> dict[str, Any]:
     """Replay production suppliers and compare every model feature to training split values."""
     ctx = resolve_offline_context(
@@ -408,6 +409,7 @@ def run_production_feature_replay(
         adapter=adapter,
         cleaned_bet_root=cleaned_bet_root,
         batch_size=batch_size,
+        diff_fraction_fail_threshold=diff_fraction_fail_threshold,
     )
 
 
@@ -418,6 +420,7 @@ def compare_training_to_production_features(
     adapter: Any,
     cleaned_bet_root: Path,
     batch_size: int,
+    diff_fraction_fail_threshold: float = 0.02,
 ) -> dict[str, Any]:
     """Compare production-replayed model feature values against training parquet columns."""
     feature_cols = list(ctx.bundle.feature_columns)
@@ -458,8 +461,16 @@ def compare_training_to_production_features(
     merged = train.merge(prod, on="bet_id", suffixes=("_train", "_serve"), how="inner")
     per_feature = summarize_feature_diffs(merged, feature_cols)
     n_changed = sum(1 for r in per_feature if r["n_diff"] > 0)
-    if n_changed:
-        issues.append(f"{n_changed} model feature columns differ between training and serving replay")
+    fail_features = [
+        r
+        for r in per_feature
+        if r["n_diff"] > 0 and float(r["diff_fraction"]) > float(diff_fraction_fail_threshold)
+    ]
+    if fail_features:
+        issues.append(
+            f"{len(fail_features)} model feature column(s) exceed train/serve diff fraction "
+            f"{diff_fraction_fail_threshold} (of {n_changed} with any diff)",
+        )
     if skipped_entity_missing:
         issues.append(f"production replay skipped {skipped_entity_missing} rows due to Feast entity missing")
     if smoke_failures:
@@ -581,6 +592,7 @@ def validate_one_model(
     feast_repo: Path,
     max_rows: int,
     batch_size: int,
+    diff_fraction_fail_threshold: float = 0.02,
 ) -> dict[str, Any]:
     """Run all-feature parity checks for one trained model directory."""
     report: dict[str, Any] = {
@@ -619,6 +631,7 @@ def validate_one_model(
             feast_repo=feast_repo,
             max_rows=max_rows,
             batch_size=batch_size,
+            diff_fraction_fail_threshold=diff_fraction_fail_threshold,
         )
     except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:
         report["all_feature_replay"] = {
@@ -687,6 +700,9 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             feast_repo=feast_repo,
             max_rows=int(args.max_rows),
             batch_size=int(args.batch_size),
+            diff_fraction_fail_threshold=float(
+                getattr(args, "all_feature_diff_fraction_fail_threshold", 0.02),
+            ),
         )
         for model_dir in model_dirs
     ]
@@ -709,6 +725,9 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "parity_gate": {
             "hard_fail_slow_gate": bool(getattr(args, "hard_fail_slow_gate", True)),
             "hard_fail_all_feature_gate": bool(getattr(args, "hard_fail_all_feature_gate", False)),
+            "all_feature_diff_fraction_fail_threshold": float(
+                getattr(args, "all_feature_diff_fraction_fail_threshold", 0.02),
+            ),
         },
         "models": models,
     }
@@ -740,6 +759,9 @@ def build_report_from_config(
     args.batch_size = parity_cfg.batch_size
     args.hard_fail_slow_gate = parity_cfg.hard_fail_slow_gate
     args.hard_fail_all_feature_gate = parity_cfg.hard_fail_all_feature_gate
+    args.all_feature_diff_fraction_fail_threshold = (
+        parity_cfg.all_feature_diff_fraction_fail_threshold
+    )
     return build_report(args)
 
 

@@ -133,12 +133,13 @@ def _prepare_xy(df: pd.DataFrame, *, feature_columns: tuple[str, ...]) -> tuple[
     uniq = np.unique(y)
     if not np.isin(uniq, [0, 1]).all():
         raise ValueError(f"Labels must be binary {{0,1}}; got unique {uniq.tolist()}")
-    X = df[list(feature_columns)].copy()
-    for c in feature_columns:
-        if c in CAT_COLUMNS:
-            X[c] = X[c].astype(str).replace({"nan": "__NA__"}).fillna("__NA__").astype("category")
-        else:
-            X[c] = pd.to_numeric(X[c], errors="coerce")
+    from trainer_hightier.serving.feature_builder import prepare_lgbm_feature_matrix
+
+    X = prepare_lgbm_feature_matrix(
+        df,
+        feature_columns=feature_columns,
+        categorical_columns=CAT_COLUMNS,
+    )
     return X, y
 
 

@@ -390,6 +390,7 @@ def join_production_fe_suppliers(
     mid_term_snapshot_parquet: Path | None,
     short_term_columns: tuple[str, ...],
     mid_term_columns: tuple[str, ...],
+    include_audit_columns: bool = False,
 ) -> pd.DataFrame:
     """Join short-term bet-grain and mid-term canonical ASOF ``fe__*`` suppliers."""
 
@@ -404,14 +405,22 @@ def join_production_fe_suppliers(
     if mid_term_columns and mid_term_snapshot_parquet is None:
         raise ValueError("[feature_builder] mid_term_columns require mid_term_snapshot_parquet")
 
-    from trainer_hightier.config import DuckDbRuntimeConfig, PRODUCTION_MID_ASOF_BACKFILL_DAYS
+    from trainer_hightier.config import (
+        DuckDbRuntimeConfig,
+        MID_TERM_ANCHOR_AUDIT_COLUMN,
+        MID_TERM_SNAPSHOT_AGE_AUDIT_COLUMN,
+        MID_TERM_SNAPSHOT_MISSING_AUDIT_COLUMN,
+        PRODUCTION_MID_ASOF_BACKFILL_DAYS,
+    )
     from trainer_hightier.feature_experiment.dataset_enrich import (
+        _MID_TERM_COL_TO_STAGING,
         _MID_TERM_DERIVED_EXPRS,
         _MID_TERM_STAGING_SQL,
         _mid_term_staging_aliases,
     )
     from trainer_hightier.serving.mid_term_bounded_asof import (
         mid_asof_lateral_lower_bound_sql,
+        mid_snapshot_missing_flag_sql,
         resolve_mid_asof_backfill_days,
     )
 
@@ -445,6 +454,21 @@ LEFT JOIN read_parquet('{esc}') AS s
                 staging_select = f",\n    {staging_select}"
             backfill_n = resolve_mid_asof_backfill_days(PRODUCTION_MID_ASOF_BACKFILL_DAYS)
             lateral_lb = mid_asof_lateral_lower_bound_sql("bw._gday", n_days=backfill_n)
+            if include_audit_columns:
+                missing_expr = mid_snapshot_missing_flag_sql(
+                    "lst.anchor_gaming_day",
+                    "bw._gday",
+                    n_days=backfill_n,
+                )
+                audit_mid_select = f""",
+    CAST(lst.anchor_gaming_day AS DATE) AS {MID_TERM_ANCHOR_AUDIT_COLUMN},
+    CASE
+      WHEN lst.anchor_gaming_day IS NULL OR bw._gday IS NULL THEN CAST(NULL AS BIGINT)
+      ELSE DATE_DIFF('day', CAST(lst.anchor_gaming_day AS DATE), bw._gday)
+    END AS {MID_TERM_SNAPSHOT_AGE_AUDIT_COLUMN},
+    {missing_expr} AS {MID_TERM_SNAPSHOT_MISSING_AUDIT_COLUMN}"""
+            else:
+                audit_mid_select = ""
             mid_cte = f"""
 mid_snap AS (
   SELECT * FROM read_parquet('{mesc}')
@@ -458,7 +482,7 @@ b_with_day AS (
 ),
 mid_asof AS (
   SELECT
-    bw.*{staging_select}
+    bw.*{audit_mid_select}{staging_select}
   FROM b_with_day AS bw
   LEFT JOIN LATERAL (
     SELECT *
@@ -472,7 +496,13 @@ mid_asof AS (
 )"""
             mid_parts = []
             for col in mid_term_columns:
-                expr = _MID_TERM_DERIVED_EXPRS.get(col, f'CAST(b."{col}" AS DOUBLE)')
+                staging = _MID_TERM_COL_TO_STAGING.get(col, ())
+                if col in _MID_TERM_DERIVED_EXPRS:
+                    expr = _MID_TERM_DERIVED_EXPRS[col]
+                elif len(staging) == 1:
+                    expr = f'CAST(b."{staging[0]}" AS DOUBLE)'
+                else:
+                    expr = f'CAST(b."{col}" AS DOUBLE)'
                 mid_parts.append(f'{expr} AS "{col}"')
             mid_select = ",\n  ".join(mid_parts)
             exclude_cols = ", ".join(("_cid", "_gday", *staging_aliases))
@@ -514,6 +544,48 @@ SELECT
         return out
     finally:
         con.close()
+
+
+def attach_mid_term_snapshot_asof(
+    staged: pd.DataFrame,
+    *,
+    mid_term_snapshot_parquet: Path,
+    mid_term_columns: tuple[str, ...],
+) -> pd.DataFrame:
+    """Attach training-compatible bounded mid ASOF primitives and audit columns."""
+    if staged.empty or not mid_term_columns:
+        return staged
+    joined = join_production_fe_suppliers(
+        staged,
+        fe_short_term_parquet=None,
+        mid_term_snapshot_parquet=mid_term_snapshot_parquet,
+        short_term_columns=(),
+        mid_term_columns=mid_term_columns,
+        include_audit_columns=True,
+    )
+    if "bet_id" not in staged.columns or "bet_id" not in joined.columns:
+        raise ValueError("[feature_builder] attach_mid_term_snapshot_asof requires bet_id")
+    from trainer_hightier.config import (
+        MID_TERM_ANCHOR_AUDIT_COLUMN,
+        MID_TERM_SNAPSHOT_AGE_AUDIT_COLUMN,
+        MID_TERM_SNAPSHOT_MISSING_AUDIT_COLUMN,
+    )
+
+    merge_cols = [
+        c
+        for c in (
+            *mid_term_columns,
+            MID_TERM_ANCHOR_AUDIT_COLUMN,
+            MID_TERM_SNAPSHOT_AGE_AUDIT_COLUMN,
+            MID_TERM_SNAPSHOT_MISSING_AUDIT_COLUMN,
+        )
+        if c in joined.columns
+    ]
+    if not merge_cols:
+        return staged
+    payload = joined[["bet_id", *merge_cols]].drop_duplicates("bet_id", keep="last")
+    out = staged.drop(columns=[c for c in merge_cols if c in staged.columns], errors="ignore")
+    return out.merge(payload, on="bet_id", how="left")
 
 
 def assert_short_term_pit_columns_supported(columns: tuple[str, ...]) -> None:
@@ -769,6 +841,36 @@ def coerce_categoricals(
             out[c] = out[c].astype("category")
             continue
         out[c] = pd.Categorical(out[c], categories=list(cats))
+    return out
+
+
+def prepare_lgbm_feature_matrix(
+    frame: pd.DataFrame,
+    *,
+    feature_columns: tuple[str, ...] | list[str],
+    categorical_columns: Iterable[str],
+    category_categories: dict[str, list] | None = None,
+) -> pd.DataFrame:
+    """Build a LightGBM-ready feature matrix (matches Step 5 ``_prepare_xy`` coercion)."""
+    cols = list(feature_columns)
+    out = frame[cols].copy()
+    cat_set = frozenset(categorical_columns)
+    cats_map = dict(category_categories or {})
+    for c in cols:
+        if c in cat_set:
+            cats = cats_map.get(c)
+            if not cats:
+                out[c] = (
+                    out[c]
+                    .astype(str)
+                    .replace({"nan": "__NA__"})
+                    .fillna("__NA__")
+                    .astype("category")
+                )
+            else:
+                out[c] = pd.Categorical(out[c], categories=list(cats))
+        else:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
     return out
 
 

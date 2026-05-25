@@ -70,8 +70,9 @@ from trainer_hightier.serving.feast_online_adapter import (
 from trainer_hightier.serving.feature_builder import (
     assert_features_ready,
     attach_mid_term_composite_columns,
+    attach_mid_term_snapshot_asof,
     attach_synthetic_etl_and_prediction_visible,
-    coerce_categoricals,
+    prepare_lgbm_feature_matrix,
     join_slow_patron_snapshot,
 )
 from trainer_hightier.serving.feature_supply import (
@@ -109,6 +110,7 @@ class OfflineBacktestContext:
     mapping_parquet: Path
     feast_repo: Path | None
     slow_patron_parquet: Path | None
+    mid_term_snapshot_parquet: Path | None
     use_feast_online: bool
     cfg: HightierServingConfig
     bundle: HightierModelBundle
@@ -166,6 +168,27 @@ def _resolve_feast_repo_path(
     return repo
 
 
+def _resolve_training_mid_snapshot_path(
+    *,
+    model_dir: Path,
+    mid_term_snapshot_parquet: Path | None,
+) -> Path | None:
+    """Resolve Step 3.5 training mid snapshot for historical parity replay."""
+    if mid_term_snapshot_parquet is not None:
+        p = Path(mid_term_snapshot_parquet).resolve()
+        return p if p.is_file() else None
+    candidates = (
+        TRAINER_HIGHTIER_PACKAGE_DIR
+        / "artifacts"
+        / "training_data"
+        / "_main_trainer_mid_term_daily_snapshot.parquet",
+    )
+    for cand in candidates:
+        if cand.is_file():
+            return cand.resolve()
+    return None
+
+
 def resolve_offline_context(
     *,
     bundle_dir: Path | None,
@@ -174,8 +197,10 @@ def resolve_offline_context(
     allowlist_parquet: Path | None,
     feast_repo: Path | None,
     slow_patron_parquet: Path | None,
+    mid_term_snapshot_parquet: Path | None = None,
     use_feast_online: bool = True,
     allow_slow_parquet_fallback: bool = False,
+    use_training_mid_snapshot_for_parity: bool = True,
 ) -> OfflineBacktestContext:
     """Resolve bundle, mapping, allowlist, and Feast repo (deploy bundle or explicit paths)."""
     if bundle_dir is not None:
@@ -248,12 +273,21 @@ def resolve_offline_context(
 
     allowlist_ids = frozenset(load_adt_allowlist_ids(Path(allowlist)))
     registry_by_id = {r.feature_id: r for r in snap.rows}
+    mid_snap: Path | None = None
+    if use_training_mid_snapshot_for_parity and (
+        plan.feast_mid_cols or plan.mid_composite_cols
+    ):
+        mid_snap = _resolve_training_mid_snapshot_path(
+            model_dir=Path(model_path),
+            mid_term_snapshot_parquet=mid_term_snapshot_parquet,
+        )
     return OfflineBacktestContext(
         bundle_root=bundle_root,
         model_dir=Path(model_path),
         mapping_parquet=Path(mapping),
         feast_repo=feast_path,
         slow_patron_parquet=Path(slow_p) if slow_p is not None else None,
+        mid_term_snapshot_parquet=mid_snap,
         use_feast_online=bool(use_feast_online),
         cfg=cfg,
         bundle=bundle,
@@ -769,15 +803,45 @@ def run_offline_production_pipeline(
     )
     fail_frac = float(ctx.cfg.scorer_feast_entity_missing_fail_fraction)
     needs_feast = bool(plan.feast_mid_cols or plan.feast_slow_cols)
+    mid_from_snapshot = (
+        ctx.mid_term_snapshot_parquet is not None
+        and bool(plan.feast_mid_cols)
+    )
+    if mid_from_snapshot:
+        staged = attach_mid_term_snapshot_asof(
+            staged,
+            mid_term_snapshot_parquet=ctx.mid_term_snapshot_parquet,
+            mid_term_columns=plan.feast_mid_cols,
+        )
     if needs_feast and ctx.use_feast_online:
         adapter = feast_adapter or _build_feast_online_adapter(ctx)
-        staged, skipped, feast_diag = _attach_feast_mid_slow(
-            staged,
-            adapter,
-            mid_columns=plan.feast_mid_cols,
-            slow_columns=plan.feast_slow_cols,
-            fail_fraction=fail_frac,
-        )
+        if mid_from_snapshot:
+            slow_only = plan.feast_slow_cols
+            if slow_only:
+                staged, skipped, feast_diag = _attach_feast_mid_slow(
+                    staged,
+                    adapter,
+                    mid_columns=(),
+                    slow_columns=slow_only,
+                    fail_fraction=fail_frac,
+                )
+            else:
+                skipped = staged.iloc[0:0].copy()
+                feast_diag = FeastLookupDiagnostics(
+                    lookup_latency_ms=0.0,
+                    n_requested=len(staged),
+                    n_mid_present=len(staged),
+                    n_slow_present=0,
+                    n_entity_missing=0,
+                )
+        else:
+            staged, skipped, feast_diag = _attach_feast_mid_slow(
+                staged,
+                adapter,
+                mid_columns=plan.feast_mid_cols,
+                slow_columns=plan.feast_slow_cols,
+                fail_fraction=fail_frac,
+            )
     elif needs_feast and allow_slow_parquet_fallback:
         slow_path = Path(ctx.slow_patron_parquet or "").resolve()
         if not slow_path.is_file():
@@ -804,11 +868,12 @@ def run_offline_production_pipeline(
         )
     from trainer_hightier.serving.mid_term_bounded_asof import apply_mid_term_bounded_asof
 
-    staged = apply_mid_term_bounded_asof(
-        staged,
-        mid_primitive_columns=plan.feast_mid_cols,
-        n_days=int(ctx.cfg.production_mid_asof_backfill_days),
-    )
+    if not mid_from_snapshot:
+        staged = apply_mid_term_bounded_asof(
+            staged,
+            mid_primitive_columns=plan.feast_mid_cols,
+            n_days=int(ctx.cfg.production_mid_asof_backfill_days),
+        )
     staged = attach_mid_term_composite_columns(staged, plan.mid_composite_cols)
     mid_cols = tuple(
         dict.fromkeys([*plan.feast_mid_cols, *plan.mid_composite_cols]),
@@ -817,10 +882,11 @@ def run_offline_production_pipeline(
     if smoke and strict_smoke:
         raise ValueError("post_join_feature_smoke failed: " + "; ".join(smoke))
     assert_features_ready(staged, ctx.bundle.feature_columns)
-    x_frame = coerce_categoricals(
-        staged[list(ctx.bundle.feature_columns)].copy(),
-        ctx.bundle.categorical_columns,
-        dict(ctx.bundle.category_categories),
+    x_frame = prepare_lgbm_feature_matrix(
+        staged,
+        feature_columns=ctx.bundle.feature_columns,
+        categorical_columns=ctx.bundle.categorical_columns,
+        category_categories=dict(ctx.bundle.category_categories),
     )
     prob = ctx.bundle.model.predict_proba(x_frame)[:, 1]
     readiness: dict[str, Any] = {}
@@ -889,10 +955,11 @@ def evaluate_training_features_baseline(
     df = pd.read_parquet(test_parquet)
     y = df["walkaway_label"].astype(np.int8).to_numpy()
     cols = list(ctx.bundle.feature_columns)
-    x = coerce_categoricals(
-        df[cols].copy(),
-        ctx.bundle.categorical_columns,
-        dict(ctx.bundle.category_categories),
+    x = prepare_lgbm_feature_matrix(
+        df,
+        feature_columns=tuple(cols),
+        categorical_columns=ctx.bundle.categorical_columns,
+        category_categories=dict(ctx.bundle.category_categories),
     )
     scores = ctx.bundle.model.predict_proba(x)[:, 1]
     thr = float(ctx.bundle.threshold)

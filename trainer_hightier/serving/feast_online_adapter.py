@@ -332,7 +332,13 @@ class FeastSdkOnlineAdapter:
         if not ids:
             return pd.DataFrame(columns=["canonical_id", *wanted])
         store = FeatureStore(repo_path=str(Path(self.feast_repo).resolve()))
-        refs = list(resolve_online_feature_refs(mid_columns, slow_columns))
+        refs = list(
+            resolve_online_feature_refs(
+                mid_columns,
+                slow_columns,
+                feast_repo=Path(self.feast_repo),
+            )
+        )
         if not refs:
             raise ValueError(
                 f"[feast_adapter] no online feature refs resolved for columns={wanted!r}"
@@ -392,9 +398,144 @@ def feast_registry_missing(feast_repo: Path) -> bool:
     return not _feast_registry_db_path(feast_repo).is_file()
 
 
+def feast_registry_feature_view_columns(feast_repo: Path, view_name: str) -> frozenset[str]:
+    """Return column names registered for a Feast feature view."""
+    from feast import FeatureStore
+
+    repo = Path(feast_repo).resolve()
+    store = FeatureStore(repo_path=str(repo))
+    feature_view = store.get_feature_view(view_name)
+    return frozenset(str(field.name) for field in list(getattr(feature_view, "schema", []) or []))
+
+
+def mid_anchor_column_in_feast_registry(feast_repo: Path) -> bool:
+    """True when ``anchor_gaming_day`` is registered on the mid-term spike feature view."""
+    try:
+        cols = feast_registry_feature_view_columns(feast_repo, MID_SPIKE_FEATURE_VIEW_NAME)
+    except Exception:
+        return False
+    return FEAST_MID_ANCHOR_COLUMN in cols
+
+
+PRODUCTION_FEAST_SCHEMA_REQUIREMENTS: dict[str, tuple[str, ...]] = {
+    MID_SPIKE_FEATURE_VIEW_NAME: (
+        FEAST_MID_ANCHOR_COLUMN,
+        *PRODUCTION_MID_TERM_FEATURE_COLUMNS,
+    ),
+    LONG_SPIKE_FEATURE_VIEW_NAME: PRODUCTION_LONG_TERM_FEATURE_COLUMNS,
+}
+
+
+@dataclass(frozen=True)
+class FeastSchemaEnsureResult:
+    """Outcome of :func:`ensure_feast_schema_ready`."""
+
+    feast_repo: Path
+    registry_path: Path
+    feast_registry_ready: bool
+    feast_schema_drift_issues: tuple[str, ...]
+    feast_auto_apply_requested: bool
+    feast_auto_apply_attempted: bool
+    feast_auto_apply_succeeded: bool | None
+    feast_apply_wall_sec: float | None
+
+
+def feast_schema_drift_issues(feast_repo: Path | str) -> list[str]:
+    """Return human-readable schema drift issues (empty when production FVs match SSOT)."""
+    repo = Path(feast_repo).resolve()
+    reg = _feast_registry_db_path(repo)
+    if not reg.is_file():
+        return [f"Feast registry missing at {reg}"]
+    issues: list[str] = []
+    for view_name, required_cols in PRODUCTION_FEAST_SCHEMA_REQUIREMENTS.items():
+        try:
+            registered = feast_registry_feature_view_columns(repo, view_name)
+        except Exception as exc:
+            issues.append(f"feature view {view_name!r} unreadable in registry: {exc}")
+            continue
+        missing = [c for c in required_cols if c not in registered]
+        if missing:
+            preview = ", ".join(missing[:8])
+            ellipsis = "" if len(missing) <= 8 else ", …"
+            issues.append(
+                f"feature view {view_name!r} missing {len(missing)} column(s): "
+                f"[{preview}{ellipsis}]",
+            )
+    return issues
+
+
+def ensure_feast_schema_ready(
+    feast_repo: Path | str,
+    *,
+    auto_apply: bool,
+    force_apply: bool = False,
+    reset_runtime: bool = False,
+) -> FeastSchemaEnsureResult:
+    """Ensure production Feast registry schema matches ``definitions.py`` (conditional apply).
+
+    Runs ``feast apply`` when ``registry.db`` is missing, registered feature views lack
+    required scorer v2 columns, or ``force_apply`` is True (bootstrap / explicit schema refresh).
+    """
+    repo = Path(feast_repo).resolve()
+    reg = _feast_registry_db_path(repo)
+    drift = tuple(feast_schema_drift_issues(repo))
+    if not drift and not force_apply:
+        return FeastSchemaEnsureResult(
+            feast_repo=repo,
+            registry_path=reg,
+            feast_registry_ready=reg.is_file(),
+            feast_schema_drift_issues=(),
+            feast_auto_apply_requested=auto_apply,
+            feast_auto_apply_attempted=False,
+            feast_auto_apply_succeeded=None,
+            feast_apply_wall_sec=None,
+        )
+    if not auto_apply:
+        detail = "; ".join(drift) if drift else "force_apply requested"
+        raise FileNotFoundError(
+            f"Feast schema not ready at {repo}: {detail}. "
+            f"Run `feast apply` from {repo} or enable auto_apply.",
+        )
+    from trainer_hightier.serving.feast_online_refresh import run_feast_apply
+
+    if drift:
+        logger.warning(
+            "[feast_schema] drift detected (%d issue(s)); running feast apply under %s: %s",
+            len(drift),
+            repo,
+            "; ".join(drift),
+        )
+    elif force_apply:
+        logger.info("[feast_schema] force_apply; running feast apply under %s", repo)
+    wall = run_feast_apply(repo, reset_runtime=reset_runtime)
+    remaining = tuple(feast_schema_drift_issues(repo))
+    if remaining:
+        raise RuntimeError(
+            f"Feast schema drift remains after apply under {repo}: "
+            f"{'; '.join(remaining)}. Check trainer_hightier/feast_repo/definitions.py",
+        )
+    if not reg.is_file():
+        raise RuntimeError(
+            f"`feast apply` finished ({wall}s) but registry still missing at {reg}",
+        )
+    logger.info("[feast_schema] apply OK in %ss; registry schema ready at %s", wall, reg)
+    return FeastSchemaEnsureResult(
+        feast_repo=repo,
+        registry_path=reg,
+        feast_registry_ready=True,
+        feast_schema_drift_issues=drift,
+        feast_auto_apply_requested=True,
+        feast_auto_apply_attempted=True,
+        feast_auto_apply_succeeded=True,
+        feast_apply_wall_sec=wall,
+    )
+
+
 def resolve_online_feature_refs(
     mid_columns: tuple[str, ...],
     slow_columns: tuple[str, ...],
+    *,
+    feast_repo: Path | None = None,
 ) -> tuple[str, ...]:
     """Map model Feast columns to ``feature_view:column`` online refs."""
     mid_by_col = {r.split(":", 1)[-1]: r for r in MID_TERM_ONLINE_FEATURE_REFS}
@@ -421,7 +562,13 @@ def resolve_online_feature_refs(
             f"[{tip}{ellipsis}]"
         )
     if mid_columns:
-        refs.append(f"{MID_TERM_FEATURE_VIEW_NAME}:{FEAST_MID_ANCHOR_COLUMN}")
+        include_anchor = (
+            mid_anchor_column_in_feast_registry(Path(feast_repo).resolve())
+            if feast_repo is not None
+            else False
+        )
+        if include_anchor:
+            refs.append(f"{MID_TERM_FEATURE_VIEW_NAME}:{FEAST_MID_ANCHOR_COLUMN}")
     return tuple(dict.fromkeys(refs))
 
 
@@ -560,6 +707,12 @@ def run_feast_scorer_schema_smoke_check(
             view_name=MID_SPIKE_FEATURE_VIEW_NAME,
             required_columns=mid_columns,
         )
+        if FEAST_MID_ANCHOR_COLUMN in feast_registry_feature_view_columns(repo, MID_SPIKE_FEATURE_VIEW_NAME):
+            _check_feast_feature_view_columns(
+                store,
+                view_name=MID_SPIKE_FEATURE_VIEW_NAME,
+                required_columns=(FEAST_MID_ANCHOR_COLUMN,),
+            )
         _check_feast_feature_service(store, MID_SPIKE_FEATURE_SERVICE_NAME)
     if slow_columns:
         _check_feast_feature_view_columns(
@@ -568,7 +721,7 @@ def run_feast_scorer_schema_smoke_check(
             required_columns=slow_columns,
         )
         _check_feast_feature_service(store, FEAST_LONG_TERM_FEATURE_SERVICE_NAME)
-    feature_refs = resolve_online_feature_refs(mid_columns, slow_columns)
+    feature_refs = resolve_online_feature_refs(mid_columns, slow_columns, feast_repo=repo)
     online_probe_ok = False
     if run_online_probe and feature_refs:
         probe_id = str(probe_canonical_id).strip() or "__feast_scorer_smoke_probe__"

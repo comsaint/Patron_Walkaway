@@ -81,6 +81,7 @@ class FeastRegistryEnsureResult:
     feast_auto_apply_attempted: bool
     feast_auto_apply_succeeded: bool | None
     feast_apply_wall_sec: float | None
+    feast_schema_drift_issues: tuple[str, ...] = ()
 
 
 def feast_registry_ensure_result_to_metrics(result: FeastRegistryEnsureResult) -> dict[str, Any]:
@@ -94,84 +95,28 @@ def feast_registry_ensure_result_to_metrics(result: FeastRegistryEnsureResult) -
         "feast_auto_apply_attempted": bool(result.feast_auto_apply_attempted),
         "feast_auto_apply_succeeded": result.feast_auto_apply_succeeded,
         "feast_apply_wall_sec": result.feast_apply_wall_sec,
+        "feast_schema_drift_issues": list(result.feast_schema_drift_issues),
     }
 
 
 def ensure_feast_registry_ready(feast_repo: Path | str, *, auto_apply: bool) -> FeastRegistryEnsureResult:
-    """Ensure ``feast_repo/data/registry.db`` exists, optionally via ``feast apply``.
+    """Ensure Feast registry exists and matches production scorer v2 schema (conditional apply).
 
-    When ``registry.db`` is missing and ``auto_apply`` is True, runs ``feast apply``
-    with ``cwd=feast_repo``. Any failure raises with stderr/stdout context (fail-fast).
-
-    Args:
-        feast_repo: Feast feature repo root (contains ``feature_store.yaml``).
-        auto_apply: If False and registry is missing, raise ``FileNotFoundError``.
-
-    Returns:
-        :class:`FeastRegistryEnsureResult` describing readiness and whether apply ran.
-
-    Raises:
-        FileNotFoundError: Registry missing and ``auto_apply`` is False.
-        RuntimeError: ``feast`` CLI missing, ``feast apply`` failed, or registry still missing after apply.
+    Delegates to :func:`trainer_hightier.serving.feast_online_adapter.ensure_feast_schema_ready`.
     """
+    from trainer_hightier.serving.feast_online_adapter import ensure_feast_schema_ready
 
-    rp = Path(feast_repo).resolve()
-    reg = rp / "data" / "registry.db"
-    if reg.is_file():
-        return FeastRegistryEnsureResult(
-            feast_repo=rp,
-            registry_path=reg,
-            feast_registry_ready=True,
-            feast_auto_apply_requested=auto_apply,
-            feast_auto_apply_attempted=False,
-            feast_auto_apply_succeeded=None,
-            feast_apply_wall_sec=None,
-        )
-    if not auto_apply:
-        raise FileNotFoundError(
-            f"Feast registry missing at {reg}; run `feast apply` from {rp} "
-            "or omit --disable-auto-feast-apply to apply automatically.",
-        )
-    feast_bin = shutil.which("feast")
-    if feast_bin is None:
-        raise RuntimeError(
-            "Feast registry missing and `feast` CLI not found on PATH. "
-            f"Install Feast CLI or run manually: cd {rp} && feast apply. "
-            "Alternatively pass --disable-auto-feast-apply only after pre-applying.",
-        )
-    logger.info("[Feast] registry.db missing; running `feast apply` in %s", rp)
-    t0 = time.perf_counter()
-    proc = subprocess.run(
-        [feast_bin, "apply"],
-        cwd=str(rp),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    wall = round(time.perf_counter() - t0, 3)
-    if proc.returncode != 0:
-        err_tail = (proc.stderr or proc.stdout or "").strip()
-        if len(err_tail) > 4000:
-            err_tail = err_tail[:4000] + "...(truncated)"
-        raise RuntimeError(
-            f"`feast apply` failed in {rp} (exit={proc.returncode}, {wall}s). stderr/stdout tail:\n{err_tail}",
-        )
-    if not reg.is_file():
-        raise RuntimeError(
-            f"`feast apply` finished (exit=0) but registry still missing at {reg}. "
-            "Check Feast logs and feast_repo/feature_store.yaml.",
-        )
-    logger.info("[Feast] apply OK in %ss; registry at %s", wall, reg)
+    schema_res = ensure_feast_schema_ready(feast_repo, auto_apply=auto_apply)
     return FeastRegistryEnsureResult(
-        feast_repo=rp,
-        registry_path=reg,
-        feast_registry_ready=True,
-        feast_auto_apply_requested=True,
-        feast_auto_apply_attempted=True,
-        feast_auto_apply_succeeded=True,
-        feast_apply_wall_sec=wall,
+        feast_repo=schema_res.feast_repo,
+        registry_path=schema_res.registry_path,
+        feast_registry_ready=schema_res.feast_registry_ready,
+        feast_auto_apply_requested=schema_res.feast_auto_apply_requested,
+        feast_auto_apply_attempted=schema_res.feast_auto_apply_attempted,
+        feast_auto_apply_succeeded=schema_res.feast_auto_apply_succeeded,
+        feast_apply_wall_sec=schema_res.feast_apply_wall_sec,
+        feast_schema_drift_issues=schema_res.feast_schema_drift_issues,
     )
-
 
 _DEFAULT_RUN_PROFILE = "default"
 

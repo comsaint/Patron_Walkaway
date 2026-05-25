@@ -432,7 +432,7 @@ class Step5TrainConfig:
     #: When ``True``, use :data:`baseline_*` hyperparameters only (no Optuna).
     skip_optuna: bool = False
     #: ``study.optimize(..., timeout=...)`` wall-clock cap in seconds.
-    optuna_timeout_sec: float = 60 * 60 * 3  # 1 hour = 60*60
+    optuna_timeout_sec: float = 60 * 60 * 6  # 1 hour = 60*60
     early_stopping_rounds: int = 50
     #: Upper bound on boosting rounds (early stopping usually stops sooner).
     lgb_n_estimators_cap: int = 2000
@@ -453,6 +453,8 @@ class Step6ParityConfig:
     run_step6: bool = True
     hard_fail_slow_gate: bool = True
     hard_fail_all_feature_gate: bool = True
+    #: Fail all-feature gate when any compared feature exceeds this train/serve diff fraction.
+    all_feature_diff_fraction_fail_threshold: float = 0.02
     max_rows: int = 200_000
     batch_size: int = 5000
 

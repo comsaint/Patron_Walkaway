@@ -1628,19 +1628,59 @@ def _freeze_deploy_inputs(
     metrics["deploy_inputs_active_manifest"] = str(mf.resolve())
 
 
-def _sync_feast_slow_online_for_step6(
+def _sync_feast_online_for_step6(
     repo: Path,
     metrics: dict[str, Any],
+    *,
+    bundle_dir: Path,
 ) -> None:
-    """Materialize training slow Parquet into Feast online before Step 6 replay."""
-    slow_p = default_slow_patron_180d_monthly_parquet_path().resolve()
+    """Materialize training slow/mid Parquet into Feast online before Step 6 replay."""
     feast_repo = repo / "trainer_hightier" / "feast_repo"
+    from trainer_hightier.serving.feature_supply import (
+        build_scorer_supplier_plan,
+        load_frozen_registry_for_bundle,
+    )
+    from trainer_hightier.serving.feast_online_refresh import (
+        sync_training_mid_snapshot_to_feast_online,
+        sync_training_slow_parquet_to_feast_online,
+    )
+    from trainer_hightier.serving.model_bundle import load_hightier_model_bundle
+
+    bundle = load_hightier_model_bundle(Path(bundle_dir).resolve())
+    snap = load_frozen_registry_for_bundle(Path(bundle_dir).resolve())
+    plan = build_scorer_supplier_plan(snap, bundle.feature_columns)
+    needs_mid_feast = bool(plan.feast_mid_cols or plan.mid_composite_cols)
+    default_mid = (
+        repo / "trainer_hightier" / "artifacts" / "training_data" / "_main_trainer_mid_term_daily_snapshot.parquet"
+    )
+    if needs_mid_feast:
+        mid_metric = metrics.get("main_trainer_mid_term_snapshot_parquet")
+        mid_p: Path | None = None
+        if isinstance(mid_metric, str) and mid_metric.strip():
+            mid_p = Path(mid_metric.strip()).expanduser().resolve()
+        if mid_p is None or not mid_p.is_file():
+            if default_mid.is_file():
+                mid_p = default_mid
+        if mid_p is None or not mid_p.is_file():
+            raise FileNotFoundError(
+                "[Step 6] cannot sync Feast mid online: training mid snapshot missing "
+                f"(checked metrics and {default_mid})",
+            )
+        t0_mid = time.perf_counter()
+        mid_sync = sync_training_mid_snapshot_to_feast_online(feast_repo, mid_snapshot=mid_p)
+        metrics["step6_feast_mid_online_sync_seconds"] = round(time.perf_counter() - t0_mid, 3)
+        metrics["step6_feast_mid_online_sync"] = mid_sync
+        logger.info(
+            "[Step 6] synced training mid snapshot to Feast online (rows=%s, %.3fs)",
+            mid_sync.get("feast_rows"),
+            metrics["step6_feast_mid_online_sync_seconds"],
+        )
+
+    slow_p = default_slow_patron_180d_monthly_parquet_path().resolve()
     if not slow_p.is_file():
         raise FileNotFoundError(
             f"[Step 6] cannot sync Feast slow online: training artifact missing at {slow_p}",
         )
-    from trainer_hightier.serving.feast_online_refresh import sync_training_slow_parquet_to_feast_online
-
     t0 = time.perf_counter()
     sync_meta = sync_training_slow_parquet_to_feast_online(feast_repo, slow_parquet=slow_p)
     metrics["step6_feast_slow_online_sync_seconds"] = round(time.perf_counter() - t0, 3)
@@ -1667,7 +1707,7 @@ def _run_step6_parity_verification(
     import importlib.util
 
     repo = _repo_root()
-    _sync_feast_slow_online_for_step6(repo, metrics)
+    _sync_feast_online_for_step6(repo, metrics, bundle_dir=bundle_dir)
 
     step06_path = Path(__file__).resolve().parent / "06_verify_training_serving_parity.py"
     spec = importlib.util.spec_from_file_location("trainer_hightier_step06_verify", step06_path)

@@ -30,7 +30,9 @@ from trainer_hightier.serving.adt_allowlist import load_adt_allowlist_ids, resol
 from trainer_hightier.serving.ch_adapter import get_clickhouse_client
 from trainer_hightier.serving.feast_online_adapter import (
     default_feast_repo_path,
+    ensure_feast_schema_ready,
     feast_registry_missing,
+    feast_schema_drift_issues,
     reset_feast_repo_runtime_state,
     resolve_feast_artifacts_dir,
 )
@@ -576,17 +578,32 @@ def write_slow_feast_parquet(full_snap: Path, feast_out: Path) -> int:
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst_esc = str(dst).replace("\\", "/").replace("'", "''")
     feat_cols = ", ".join(f'"{c}"' for c in PRODUCTION_LONG_TERM_FEATURE_COLUMNS)
+    import pyarrow.parquet as pq
+
+    schema_names = set(pq.read_schema(str(Path(full_snap).resolve())).names)
+    if "anchor_gaming_day" in schema_names:
+        ts_expr = (
+            "CAST((CAST(anchor_gaming_day AS TIMESTAMP) + INTERVAL '1' DAY "
+            "- INTERVAL '1' SECOND) AS TIMESTAMPTZ)"
+        )
+    elif "event_timestamp" in schema_names:
+        ts_expr = "CAST(event_timestamp AS TIMESTAMPTZ)"
+    else:
+        raise ValueError(
+            f"slow snapshot must include anchor_gaming_day or event_timestamp: {full_snap}",
+        )
     sql = f"""
 COPY (
   SELECT canonical_id, {feat_cols},
-    CAST((CAST(anchor_gaming_day AS TIMESTAMP) + INTERVAL '1' DAY - INTERVAL '1' SECOND) AS TIMESTAMPTZ)
-      AS event_timestamp
+    {ts_expr} AS event_timestamp
   FROM (
     SELECT TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id,
-      CAST(anchor_gaming_day AS DATE) AS anchor_gaming_day, {feat_cols},
+      {feat_cols},
+      {"CAST(anchor_gaming_day AS DATE) AS anchor_gaming_day," if "anchor_gaming_day" in schema_names else ""}
+      {"CAST(event_timestamp AS TIMESTAMPTZ) AS event_timestamp," if "event_timestamp" in schema_names else ""}
       ROW_NUMBER() OVER (
         PARTITION BY TRIM(CAST(canonical_id AS VARCHAR))
-        ORDER BY CAST(anchor_gaming_day AS DATE) DESC
+        ORDER BY {"CAST(anchor_gaming_day AS DATE) DESC" if "anchor_gaming_day" in schema_names else "event_timestamp DESC"}
       ) AS rn
     FROM read_parquet('{src}')
   ) AS ranked
@@ -639,6 +656,54 @@ def _materialize_window_from_feast_parquet(feast_parquet: Path) -> tuple[datetim
     if end_dt.tzinfo is None:
         end_dt = end_dt.replace(tzinfo=timezone.utc)
     return start_dt - timedelta(hours=1), end_dt + timedelta(hours=1)
+
+
+def ensure_feast_mid_anchor_column_ready(feast_repo: Path) -> None:
+    """Ensure production Feast schema is ready (includes ``anchor_gaming_day`` on mid FV)."""
+    from trainer_hightier.serving.feast_online_adapter import ensure_feast_schema_ready
+
+    ensure_feast_schema_ready(Path(feast_repo).resolve(), auto_apply=True)
+
+
+def sync_training_mid_snapshot_to_feast_online(
+    feast_repo: Path,
+    *,
+    mid_snapshot: Path,
+) -> dict[str, Any]:
+    """Publish training mid-term daily snapshot into Feast online (Step 6 / parity replay).
+
+    Collapses to latest anchor per ``canonical_id`` and materializes ``mid_term_daily_spike_features``
+    including ``anchor_gaming_day`` for Option B bounded ASOF.
+    """
+    src = Path(mid_snapshot).resolve()
+    if not src.is_file():
+        raise FileNotFoundError(f"training mid snapshot not found: {src}")
+    repo = Path(feast_repo).resolve()
+    ensure_feast_mid_anchor_column_ready(repo)
+    feast_art = resolve_feast_artifacts_dir(repo)
+    feast_art.mkdir(parents=True, exist_ok=True)
+    feast_path = feast_art / "mid_term_spike_canonical.parquet"
+    t0 = time.perf_counter()
+    feast_rows = write_mid_feast_parquet(src, feast_path)
+    materialize_seconds = run_feast_materialize_views(
+        repo,
+        feature_views=(MID_SPIKE_FEATURE_VIEW_NAME,),
+        feast_parquets=(feast_path,),
+    )
+    elapsed = round(time.perf_counter() - t0, 3)
+    logger.info(
+        "[feast_online_refresh] synced training mid snapshot rows=%d feast_path=%s materialize_s=%.3f",
+        feast_rows,
+        feast_path,
+        materialize_seconds,
+    )
+    return {
+        "mid_source_parquet": str(src),
+        "feast_parquet": str(feast_path),
+        "feast_rows": int(feast_rows),
+        "materialize_seconds": float(materialize_seconds),
+        "elapsed_seconds": elapsed,
+    }
 
 
 def sync_training_slow_parquet_to_feast_online(
@@ -999,14 +1064,16 @@ def run_feast_online_refresh(opts: RefreshOptions) -> dict[str, Any]:
             if "slow" in opts.layers:
                 layer_outcomes.append(_refresh_slow_layer(opts=opts, staging_dir=staging_dir, player_ids=player_ids))
             registry_missing = feast_registry_missing(opts.feast_repo)
-            do_apply = registry_missing or (
-                (opts.bootstrap_mid or opts.apply_schema) and not opts.skip_apply
-            )
-            if do_apply:
-                apply_seconds = run_feast_apply(
+            drift_issues = feast_schema_drift_issues(opts.feast_repo)
+            want_bootstrap_apply = opts.bootstrap_mid or opts.apply_schema
+            if not opts.skip_apply and (drift_issues or want_bootstrap_apply):
+                apply_res = ensure_feast_schema_ready(
                     opts.feast_repo,
-                    reset_runtime=(opts.bootstrap_mid or opts.apply_schema) and not registry_missing,
+                    auto_apply=True,
+                    force_apply=want_bootstrap_apply,
+                    reset_runtime=want_bootstrap_apply and not registry_missing,
                 )
+                apply_seconds = apply_res.feast_apply_wall_sec
             if not opts.skip_materialize:
                 views: list[str] = []
                 parquets: list[Path] = []

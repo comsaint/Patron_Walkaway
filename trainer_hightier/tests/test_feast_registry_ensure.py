@@ -1,4 +1,4 @@
-"""Tests for Feast registry ``ensure_feast_registry_ready`` and trainer wiring."""
+"""Tests for Feast schema gate ``ensure_feast_schema_ready`` and Step 3 wiring."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 b3 = importlib.import_module("trainer_hightier.03_build_training_data")
+from trainer_hightier.serving import feast_online_adapter as adapter
 
 
 def _touch_registry(feast_repo: Path) -> Path:
@@ -21,81 +22,137 @@ def _touch_registry(feast_repo: Path) -> Path:
 
 
 def test_ensure_existing_registry_skips_apply(tmp_path: Path) -> None:
-    """registry.db exists → never spawn ``feast apply``."""
+    """No drift → never spawn ``feast apply``."""
 
     fr = tmp_path / "feast_repo"
     _touch_registry(fr)
-    with patch.object(b3.subprocess, "run", autospec=True) as mock_run:
+    with patch.object(adapter, "feast_schema_drift_issues", return_value=[]), patch(
+        "trainer_hightier.serving.feast_online_refresh.run_feast_apply",
+    ) as mock_apply:
         r = b3.ensure_feast_registry_ready(fr, auto_apply=True)
-    mock_run.assert_not_called()
+    mock_apply.assert_not_called()
     assert r.feast_registry_ready is True
     assert r.feast_auto_apply_attempted is False
+    assert r.feast_schema_drift_issues == ()
 
 
 def test_ensure_missing_registry_runs_apply_and_succeeds(tmp_path: Path) -> None:
-    """Missing registry + auto_apply spawns feast apply then sees registry file."""
+    """Missing registry (drift) + auto_apply runs feast apply then sees registry file."""
 
     fr = tmp_path / "feast_repo"
     fr.mkdir(parents=True, exist_ok=True)
     reg = fr / "data" / "registry.db"
-    proc_ok = MagicMock(returncode=0, stderr="", stdout="")
 
-    def run_side_effect(*_a: object, **kwargs: object) -> MagicMock:
-        assert kwargs.get("cwd") == str(fr.resolve())
-        dr = fr / "data"
-        dr.mkdir(parents=True, exist_ok=True)
-        reg.write_bytes(b"x")
-        return proc_ok
+    def apply_side_effect(repo: Path, *, reset_runtime: bool = False) -> float:
+        _touch_registry(repo)
+        return 1.23
 
-    with patch.object(b3.shutil, "which", return_value="/fake/feast"), patch.object(
-        b3.subprocess, "run", side_effect=run_side_effect,
-    ) as mock_run:
+    with patch.object(
+        adapter,
+        "feast_schema_drift_issues",
+        side_effect=[["Feast registry missing"], []],
+    ), patch(
+        "trainer_hightier.serving.feast_online_refresh.run_feast_apply",
+        side_effect=apply_side_effect,
+    ) as mock_apply:
         r = b3.ensure_feast_registry_ready(fr, auto_apply=True)
 
-    mock_run.assert_called_once()
+    mock_apply.assert_called_once()
     assert reg.is_file()
     assert r.feast_auto_apply_attempted is True
     assert r.feast_auto_apply_succeeded is True
     assert r.feast_registry_ready is True
 
 
+def test_ensure_schema_drift_on_existing_registry_triggers_apply(tmp_path: Path) -> None:
+    """Registry file present but schema drift → conditional apply."""
+
+    fr = tmp_path / "feast_repo"
+    _touch_registry(fr)
+    drift_msg = (
+        "feature view 'mid_term_daily_spike_features' missing 1 column(s): "
+        "[anchor_gaming_day]"
+    )
+    with patch.object(
+        adapter,
+        "feast_schema_drift_issues",
+        side_effect=[[drift_msg], []],
+    ), patch(
+        "trainer_hightier.serving.feast_online_refresh.run_feast_apply",
+        return_value=0.42,
+    ) as mock_apply:
+        r = b3.ensure_feast_registry_ready(fr, auto_apply=True)
+
+    mock_apply.assert_called_once()
+    assert r.feast_auto_apply_attempted is True
+    assert drift_msg in r.feast_schema_drift_issues
+
+
 def test_ensure_apply_failure_raises_with_context(tmp_path: Path) -> None:
-    """Non-zero feast apply → RuntimeError with tail message."""
+    """Failed feast apply → RuntimeError propagated."""
 
     fr = tmp_path / "feast_repo"
     fr.mkdir(parents=True, exist_ok=True)
-    proc_bad = MagicMock(returncode=2, stderr="boom", stdout="")
-    with patch.object(b3.shutil, "which", return_value="/x/feast"), patch.object(
-        b3.subprocess, "run", return_value=proc_bad,
+    with patch.object(adapter, "feast_schema_drift_issues", return_value=["missing registry"]), patch(
+        "trainer_hightier.serving.feast_online_refresh.run_feast_apply",
+        side_effect=RuntimeError("feast apply failed (exit 2): boom"),
     ):
-        with pytest.raises(RuntimeError, match="`feast apply` failed"):
+        with pytest.raises(RuntimeError, match="feast apply failed"):
             b3.ensure_feast_registry_ready(fr, auto_apply=True)
 
 
-def test_ensure_zero_exit_but_registry_still_missing_raises(tmp_path: Path) -> None:
+def test_ensure_drift_remains_after_apply_raises(tmp_path: Path) -> None:
     fr = tmp_path / "feast_repo"
-    fr.mkdir(parents=True, exist_ok=True)
-    proc_ok = MagicMock(returncode=0, stderr="", stdout="")
-    with patch.object(b3.shutil, "which", return_value="/x/feast"), patch.object(
-        b3.subprocess, "run", return_value=proc_ok,
+    _touch_registry(fr)
+    drift = ["feature view 'mid_term_daily_spike_features' missing 1 column(s): [anchor_gaming_day]"]
+    with patch.object(adapter, "feast_schema_drift_issues", return_value=drift), patch(
+        "trainer_hightier.serving.feast_online_refresh.run_feast_apply",
+        return_value=0.1,
     ):
-        with pytest.raises(RuntimeError, match="registry still missing"):
+        with pytest.raises(RuntimeError, match="drift remains after apply"):
             b3.ensure_feast_registry_ready(fr, auto_apply=True)
 
 
 def test_ensure_no_cli_raises(tmp_path: Path) -> None:
     fr = tmp_path / "feast_repo"
     fr.mkdir(parents=True, exist_ok=True)
-    with patch.object(b3.shutil, "which", return_value=None):
-        with pytest.raises(RuntimeError, match="feast.*CLI not found"):
+    with patch.object(adapter, "feast_schema_drift_issues", return_value=["missing registry"]), patch(
+        "trainer_hightier.serving.feast_online_refresh.run_feast_apply",
+        side_effect=RuntimeError("feast CLI not found on PATH"),
+    ):
+        with pytest.raises(RuntimeError, match="feast CLI not found"):
             b3.ensure_feast_registry_ready(fr, auto_apply=True)
 
 
 def test_ensure_disabled_raises_file_not_found(tmp_path: Path) -> None:
     fr = tmp_path / "feast_repo"
     fr.mkdir(parents=True, exist_ok=True)
-    with pytest.raises(FileNotFoundError, match="registry missing"):
-        b3.ensure_feast_registry_ready(fr, auto_apply=False)
+    with patch.object(adapter, "feast_schema_drift_issues", return_value=["Feast registry missing at x"]):
+        with pytest.raises(FileNotFoundError, match="Feast schema not ready"):
+            b3.ensure_feast_registry_ready(fr, auto_apply=False)
+
+
+def test_feast_schema_drift_issues_missing_registry(tmp_path: Path) -> None:
+    repo = tmp_path / "feast_repo"
+    issues = adapter.feast_schema_drift_issues(repo)
+    assert len(issues) == 1
+    assert "registry missing" in issues[0].lower()
+
+
+def test_feast_schema_drift_issues_missing_columns(tmp_path: Path) -> None:
+    fr = tmp_path / "feast_repo"
+    _touch_registry(fr)
+    with patch.object(
+        adapter,
+        "feast_registry_feature_view_columns",
+        side_effect=[
+            frozenset({"canonical_id", "event_timestamp"}),
+            frozenset({"canonical_id", "event_timestamp", "slow_col_a"}),
+        ],
+    ):
+        issues = adapter.feast_schema_drift_issues(fr)
+    assert any("mid_term_daily_spike_features" in i for i in issues)
+    assert any("anchor_gaming_day" in i for i in issues)
 
 
 def test_feast_registry_ensure_result_to_metrics_roundtrip() -> None:
@@ -109,11 +166,13 @@ def test_feast_registry_ensure_result_to_metrics_roundtrip() -> None:
         feast_auto_apply_attempted=True,
         feast_auto_apply_succeeded=True,
         feast_apply_wall_sec=1.23,
+        feast_schema_drift_issues=("missing anchor_gaming_day",),
     )
     d = b3.feast_registry_ensure_result_to_metrics(r)
     assert d["feast_auto_apply_attempted"] is True
     assert d["feast_auto_apply_succeeded"] is True
     assert abs(float(d["feast_apply_wall_sec"] or 0) - 1.23) < 1e-6
+    assert d["feast_schema_drift_issues"] == ["missing anchor_gaming_day"]
 
 
 @patch("trainer_hightier.trainer._b3.ensure_feast_registry_ready")

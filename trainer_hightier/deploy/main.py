@@ -602,7 +602,7 @@ def _mid_feast_needs_bootstrap(
     if force:
         return True
     from trainer_hightier.serving import feast_online_refresh as refresh_mod
-    from trainer_hightier.serving.feast_online_adapter import feast_registry_missing
+    from trainer_hightier.serving.feast_online_adapter import feast_registry_missing, feast_schema_drift_issues
     from trainer_hightier.serving.feast_readiness import (
         load_feast_online_readiness,
         resolve_feast_readiness_path,
@@ -691,7 +691,7 @@ def _startup_feast_refresh_or_raise(
 ) -> None:
     """Run startup Feast refresh + smoke for scorer-capable deploy modes."""
     from trainer_hightier.serving import feast_online_refresh as refresh_mod
-    from trainer_hightier.serving.feast_online_adapter import feast_registry_missing
+    from trainer_hightier.serving.feast_online_adapter import feast_registry_missing, feast_schema_drift_issues
     from trainer_hightier.serving.feature_supply import (
         assert_scorer_supplier_plan_or_raise,
         build_scorer_supplier_plan,
@@ -751,11 +751,12 @@ def _startup_feast_refresh_or_raise(
             force=force,
         )
         registry_missing = feast_registry_missing(feast_repo)
+        schema_drift = bool(feast_schema_drift_issues(feast_repo))
         try:
             opts = refresh_mod._resolve_refresh_options(
                 layers=",".join(layers),
                 source="clickhouse",
-                skip_apply=(not bootstrap_mid) and not registry_missing,
+                skip_apply=(not bootstrap_mid) and not registry_missing and not schema_drift,
                 skip_materialize=False,
                 smoke_only=False,
                 dry_run=False,
@@ -901,7 +902,7 @@ def _feast_refresh_supervisor_once(
 ) -> None:
     """Run one post-startup Feast refresh supervisor poll."""
     from trainer_hightier.serving import feast_online_refresh as refresh_mod
-    from trainer_hightier.serving.feast_online_adapter import feast_registry_missing
+    from trainer_hightier.serving.feast_online_adapter import feast_registry_missing, feast_schema_drift_issues
     from trainer_hightier.serving.feast_readiness import (
         load_feast_online_readiness,
         resolve_feast_readiness_path,
@@ -956,10 +957,11 @@ def _feast_refresh_supervisor_once(
     )
     try:
         registry_missing = feast_registry_missing(feast_repo)
+        schema_drift = bool(feast_schema_drift_issues(feast_repo))
         opts = refresh_mod._resolve_refresh_options(
             layers=",".join(layers),
             source="clickhouse",
-            skip_apply=not registry_missing,
+            skip_apply=not registry_missing and not schema_drift,
             skip_materialize=False,
             smoke_only=False,
             dry_run=False,
