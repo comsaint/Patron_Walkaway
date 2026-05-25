@@ -565,6 +565,7 @@ def run_supplier_root_cause_audit(
             bets,
             cleaned_root=Path(local_cleaned_bet).resolve(),
             cfg=cfg,
+            mapping_parquet=mapping,
         )
     else:
         pool = _build_scoring_pool(bets, cfg=cfg)

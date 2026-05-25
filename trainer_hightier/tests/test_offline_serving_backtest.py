@@ -197,3 +197,18 @@ def test_run_offline_serving_backtest_monkeypatched(
     )
     assert report["n_scored"] >= 1
     assert default_hightier_serving_config().adt_allowed_players_parquet is not None
+
+
+def test_resolve_hot_pool_player_ids_expands_canonical_aliases(tmp_path: Path) -> None:
+    """Batch player B must pull alias player A into the hot pool (training pid CTE)."""
+    from trainer_hightier.serving.offline_serving_backtest import resolve_hot_pool_player_ids
+
+    mapping = tmp_path / "canonical_player_mapping.parquet"
+    pd.DataFrame(
+        [
+            {"player_id": 1, "canonical_id": "patron_x"},
+            {"player_id": 2, "canonical_id": "patron_x"},
+        ],
+    ).to_parquet(mapping, index=False)
+    bets = pd.DataFrame({"player_id": [2]})
+    assert resolve_hot_pool_player_ids(bets, mapping) == [1, 2]

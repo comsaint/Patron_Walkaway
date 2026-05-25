@@ -104,7 +104,9 @@ def _run_prod_features(
 
     for batch_df in _iter_test_batches(test, batch_size=8000, max_rows=None):
         bets = _bets_frame_from_test_batch(batch_df)
-        pool = build_pool_from_cleaned_parquet(bets, cleaned_root=cleaned_root, cfg=cfg)
+        pool = build_pool_from_cleaned_parquet(
+            bets, cleaned_root=cleaned_root, cfg=cfg, mapping_parquet=mapping,
+        )
         if expand_canonical_pool:
             pool = _expand_pool_canonical_aliases(
                 bets,
@@ -176,7 +178,6 @@ def _expand_pool_canonical_aliases(
             INNER JOIN allow_pids AS p ON b.player_id = p.player_id
             WHERE b.payout_complete_dtm >= ?
               AND b.payout_complete_dtm <= ?
-              AND b.wager > 0
         """
         wide = conn.execute(q, [pool_start, pool_end]).fetchdf()
     finally:
@@ -261,7 +262,9 @@ def _fe_today_from_pool_batches(
     chunks: list[pd.DataFrame] = []
     for batch_df in _iter_test_batches(test, batch_size=8000, max_rows=None):
         bets = _bets_frame_from_test_batch(batch_df)
-        pool = build_pool_from_cleaned_parquet(bets, cleaned_root=cleaned_root, cfg=cfg)
+        pool = build_pool_from_cleaned_parquet(
+            bets, cleaned_root=cleaned_root, cfg=cfg, mapping_parquet=mapping_parquet,
+        )
         if expand_canonical_pool:
             pool = _expand_pool_canonical_aliases(
                 bets,
@@ -358,8 +361,8 @@ def _canonical_alias_study(
         "n_rows": len(m),
         "pool_duplicate_canonical_pcd": pool_dup,
         "note": (
-            "PIT SQL uses ORDER BY pcd only; duplicate (canonical_id, pcd) in pool "
-            "makes window results non-deterministic across runs."
+            "Duplicate (canonical_id, pcd) with distinct bet_id requires ORDER BY pcd, bet_id "
+            "for deterministic LAG/ROWS windows."
         ),
         "n_fe_today_diff_std_pool": n_diff,
         "pct_diff_that_are_multi_card": multi_rate,
@@ -384,7 +387,10 @@ def _pool_duplicate_pcd_stats(
     batch = next(iter(_iter_test_batches(test, batch_size=8000, max_rows=8000)))
     bets = _bets_frame_from_test_batch(batch)
     pool = build_pool_from_cleaned_parquet(
-        bets, cleaned_root=cleaned_root, cfg=ctx.cfg,
+        bets,
+        cleaned_root=cleaned_root,
+        cfg=ctx.cfg,
+        mapping_parquet=ctx.mapping_parquet,
     )
     pool = attach_canonical_id(pool, mapping_parquet=ctx.mapping_parquet)
     pool["pcd"] = pd.to_datetime(pool["payout_complete_dtm"], errors="coerce")

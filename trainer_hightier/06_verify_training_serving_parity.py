@@ -491,7 +491,12 @@ def run_feature_replay_batch(
 ) -> pd.DataFrame:
     """Replay production feature suppliers for one test batch."""
     bets = _bets_frame_from_test_batch(batch_df)
-    pool = build_pool_from_cleaned_parquet(bets, cleaned_root=cleaned_bet_root, cfg=cfg)
+    pool = build_pool_from_cleaned_parquet(
+        bets,
+        cleaned_root=cleaned_bet_root,
+        cfg=cfg,
+        mapping_parquet=ctx.mapping_parquet,
+    )
     scoring_batch = _ScoringBatch(
         bets=bets.reset_index(drop=True),
         cursor=pd.to_datetime(bets["__etl_insert_Dtm"], errors="coerce"),

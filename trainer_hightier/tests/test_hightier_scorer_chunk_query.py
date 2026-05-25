@@ -315,6 +315,10 @@ def test_append_hightier_prediction_log_writes_rows(tmp_path) -> None:
             "canonical_id": ["c1", "c2"],
             "casino_player_id": ["x", None],
             "table_id": [1, 2],
+            "payout_complete_dtm": [
+                "2025-01-01T10:00:00+08:00",
+                "2025-01-01T11:00:00+08:00",
+            ],
         }
     )
     features = pd.DataFrame(
@@ -338,7 +342,7 @@ def test_append_hightier_prediction_log_writes_rows(tmp_path) -> None:
         rows = conn.execute(
             """
             SELECT bet_id, is_alert, is_rated_obs, margin, threshold,
-                   features_json, fe_features_missing
+                   features_json, fe_features_missing, bet_ts
             FROM prediction_log ORDER BY bet_id
             """
         ).fetchall()
@@ -348,6 +352,8 @@ def test_append_hightier_prediction_log_writes_rows(tmp_path) -> None:
     assert rows[1][:2] == ("2", 0)
     assert rows[1][2] == 0
     assert rows[0][4] == 0.5
+    assert rows[0][7] is not None
+    assert "+08:00" in str(rows[0][7])
     feat0 = json.loads(rows[0][5])
     assert feat0["wager"] == 100.0
     assert feat0["fe__bets_cnt__w15m"] == 3.0
@@ -386,8 +392,13 @@ def test_init_prediction_log_db_idempotent(tmp_path) -> None:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(prediction_log)").fetchall()]
     assert n == 0
     assert "scored_at" in cols
+    assert "bet_ts" in cols
     assert "features_json" in cols
     assert "fe_features_missing" in cols
+    tables = {
+        r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    assert "prediction_validation_results" in tables
     assert init_prediction_log_db(None) is None
 
 

@@ -546,11 +546,55 @@ def _bets_frame_from_test_batch(batch: pd.DataFrame) -> pd.DataFrame:
     return bets
 
 
+def resolve_hot_pool_player_ids(
+    bets: pd.DataFrame,
+    mapping_parquet: Path,
+) -> list[int]:
+    """Expand batch ``player_id`` values to all canonical alias ids (training ``pid`` CTE).
+
+    Mirrors ``materialize_fe_derived_parquet``:
+
+    - ``pid_from_train``: distinct ``player_id`` on the scoring batch
+    - ``cid_from_train``: canonical ids for those players
+    - ``pid``: batch player ids UNION all alias player ids per canonical
+    """
+    base = sorted(
+        {
+            int(x)
+            for x in pd.to_numeric(bets["player_id"], errors="coerce").dropna().astype(int).tolist()
+        },
+    )
+    if not base:
+        return []
+    cmap = pd.read_parquet(
+        Path(mapping_parquet).resolve(),
+        columns=["player_id", "canonical_id"],
+    )
+    cmap["player_id"] = pd.to_numeric(cmap["player_id"], errors="coerce")
+    cmap["canonical_id"] = cmap["canonical_id"].astype(str).str.strip()
+    cmap = cmap.dropna(subset=["player_id"])
+    cmap = cmap.loc[cmap["canonical_id"] != ""]
+    if cmap.empty:
+        return base
+    pid_to_cid = cmap.drop_duplicates("player_id").set_index("player_id")["canonical_id"]
+    canonical_ids: set[str] = set()
+    for pid in base:
+        cid = pid_to_cid.get(pid)
+        if cid:
+            canonical_ids.add(str(cid))
+    alias_pids = set(base)
+    if canonical_ids:
+        alias = cmap.loc[cmap["canonical_id"].isin(canonical_ids), "player_id"].astype(int)
+        alias_pids.update(alias.tolist())
+    return sorted(alias_pids)
+
+
 def build_pool_from_cleaned_parquet(
     bets: pd.DataFrame,
     *,
     cleaned_root: Path,
     cfg: HightierServingConfig,
+    mapping_parquet: Path,
 ) -> pd.DataFrame:
     """Bounded hot pool from local cleaned bet hive (no ClickHouse)."""
     import duckdb
@@ -563,7 +607,7 @@ def build_pool_from_cleaned_parquet(
     glob_path = str((root / "**" / "*.parquet").as_posix())
     pool_start = compute_hot_pool_window_start(bets, cfg=cfg)
     pool_end = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce").max().to_pydatetime()
-    pids = sorted({int(x) for x in bets["player_id"].dropna().unique().tolist()})
+    pids = resolve_hot_pool_player_ids(bets, mapping_parquet)
     fan_cap = int(cfg.hightier_scorer_pool_player_fanout_cap)
     if len(pids) > fan_cap:
         logger.warning("[offline_backtest] pool fanout %d -> %d", len(pids), fan_cap)
@@ -592,7 +636,6 @@ def build_pool_from_cleaned_parquet(
             INNER JOIN allow_pids AS p ON b.player_id = p.player_id
             WHERE b.payout_complete_dtm >= ?
               AND b.payout_complete_dtm <= ?
-              AND b.wager > 0
         """
         pool = conn.execute(q, [pool_start, pool_end]).fetchdf()
     finally:
@@ -909,6 +952,7 @@ def evaluate_production_pipeline_on_test_split(
             bets,
             cleaned_root=cleaned_bet_root,
             cfg=ctx.cfg,
+            mapping_parquet=ctx.mapping_parquet,
         )
         scoring_batch = _ScoringBatch(
             bets=bets.reset_index(drop=True),
@@ -1068,6 +1112,7 @@ def run_offline_serving_backtest(
             bets,
             cleaned_root=Path(local_cleaned_bet).resolve(),
             cfg=ctx.cfg,
+            mapping_parquet=ctx.mapping_parquet,
         )
         batch = _ScoringBatch(
             bets=bets.reset_index(drop=True),

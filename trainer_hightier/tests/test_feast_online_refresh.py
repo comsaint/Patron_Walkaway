@@ -122,6 +122,27 @@ def test_materialize_training_mid_feast_seed_filters_allowlist(tmp_path: Path) -
     assert len(seeded) == 3
 
 
+def test_evaluate_feast_lookup_smoke_gate_skips_mid_when_plan_empty() -> None:
+    """Slow-only deploy must not fail mid smoke when mid_columns=()."""
+    cfg = default_hightier_serving_config()
+    smoke = {
+        "entity_missing_rate": 0.0,
+        "mid_cell_null_rate": 1.0,
+    }
+    ok, reason = evaluate_feast_lookup_smoke_gate(
+        smoke,
+        mid_columns=(),
+        entity_missing_fail_fraction=float(cfg.scorer_feast_entity_missing_fail_fraction),
+        mid_cell_null_fail_fraction=float(cfg.scorer_feast_mid_cell_null_fail_fraction),
+        feast_spike_rows=None,
+        allowlist_canonical_count=None,
+        min_canonical_coverage_fraction=float(cfg.scorer_feast_mid_min_canonical_coverage_fraction),
+        mid_smoke_columns=cfg.scorer_feast_mid_smoke_columns,
+    )
+    assert ok
+    assert reason is None
+
+
 def test_evaluate_feast_lookup_smoke_gate_fails_on_mid_cell_null_only() -> None:
     cfg = default_hightier_serving_config()
     smoke = {

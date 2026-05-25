@@ -739,8 +739,10 @@ def evaluate_feast_lookup_smoke_gate(
             "[feast_readiness] allowlist lookup smoke entity missing rate "
             f"{entity_rate} exceeds fail_fraction={entity_missing_fail_fraction}",
         )
-    null_cols = mid_smoke_columns if mid_smoke_columns is not None else mid_columns
-    if null_cols:
+    # Slow-only models pass mid_columns=(); do not enforce mid smoke cols in that case.
+    if mid_columns:
+        extra = mid_smoke_columns if mid_smoke_columns is not None else mid_columns
+        null_cols = tuple(dict.fromkeys([*mid_columns, *extra]))
         raw_mid = smoke.get("mid_cell_null_rate")
         mid_rate = float(raw_mid if raw_mid is not None else 1.0)
         if mid_rate > float(mid_cell_null_fail_fraction):
@@ -781,8 +783,14 @@ def run_allowlist_feast_lookup_smoke(
     from feast import FeatureStore
 
     cfg = default_hightier_serving_config()
-    smoke_cols = mid_smoke_columns if mid_smoke_columns is not None else cfg.scorer_feast_mid_smoke_columns
-    lookup_mid = tuple(dict.fromkeys([*mid_columns, *smoke_cols]))
+    if mid_columns:
+        smoke_cols = (
+            mid_smoke_columns if mid_smoke_columns is not None else cfg.scorer_feast_mid_smoke_columns
+        )
+        lookup_mid = tuple(dict.fromkeys([*mid_columns, *smoke_cols]))
+    else:
+        smoke_cols = ()
+        lookup_mid = ()
     cids = _sample_canonical_ids_from_allowlist(
         allowlist_parquet,
         canonical_mapping_parquet,

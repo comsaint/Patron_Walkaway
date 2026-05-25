@@ -637,7 +637,6 @@ def fetch_bet_pool_window(
               AND payout_complete_dtm <= %(we)s
               AND payout_complete_dtm IS NOT NULL
               AND gaming_day IS NOT NULL
-              AND wager > 0
               AND player_id IS NOT NULL
               AND player_id != {placeholder}
               AND player_id IN ({in_list})

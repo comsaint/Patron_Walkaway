@@ -430,7 +430,7 @@ class Step5TrainConfig:
     #: When ``True``, use :data:`baseline_*` hyperparameters only (no Optuna).
     skip_optuna: bool = False
     #: ``study.optimize(..., timeout=...)`` wall-clock cap in seconds.
-    optuna_timeout_sec: float = 5 * 60 * 1  # 1 hour = 60*60
+    optuna_timeout_sec: float = 60 * 60 * 5  # 1 hour = 60*60
     early_stopping_rounds: int = 50
     #: Upper bound on boosting rounds (early stopping usually stops sooner).
     lgb_n_estimators_cap: int = 2000
@@ -495,6 +495,10 @@ class HightierServingConfig:
     validator_no_bet_retry_max_window_minutes: int = 240
     validator_no_bet_bet_id_chunk_size: int = 500
     validator_no_bet_retry_max_alerts: int = 50
+    prediction_validation_enabled: bool = True
+    prediction_validation_max_rows_per_cycle: int = 200
+    prediction_validation_cycle_budget_seconds: float = 20.0
+    prediction_validation_retention_days: int = 180
     scorer_state_retention_hours: int = 24
     bet_avail_delay_min: int = 1
     session_avail_delay_min: int = 15

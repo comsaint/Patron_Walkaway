@@ -1420,8 +1420,300 @@ def validate_alert_row(
     return res_base
 
 
+validate_observation_row = validate_alert_row
+
+
+def _prediction_row_to_validator_series(row: pd.Series) -> pd.Series:
+    """Map a ``prediction_log`` row to the shape expected by ``validate_observation_row``."""
+    return pd.Series(
+        {
+            "ts": row.get("scored_at"),
+            "bet_ts": row.get("bet_ts"),
+            "bet_id": row.get("bet_id"),
+            "player_id": row.get("player_id"),
+            "canonical_id": row.get("canonical_id"),
+            "casino_player_id": row.get("casino_player_id"),
+            "score": row.get("score"),
+            "session_id": row.get("session_id"),
+            "table_id": row.get("table_id"),
+            "model_version": row.get("model_version"),
+            "scored_at": row.get("scored_at"),
+            "position_idx": row.get("position_idx"),
+            "is_alert": row.get("is_alert"),
+        }
+    )
+
+
+def _load_existing_prediction_results(conn: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
+    """Load ``prediction_validation_results`` keyed by ``bet_id``."""
+    existing: Dict[str, Dict[str, Any]] = {}
+    try:
+        df = pd.read_sql_query("SELECT * FROM prediction_validation_results", conn)
+        if df.empty:
+            return existing
+        for _, row in df.iterrows():
+            bid = row.get("bet_id")
+            if bid is None or pd.isna(bid):
+                continue
+            existing[str(bid)] = row.to_dict()
+    except Exception:
+        pass
+    return existing
+
+
+def _fetch_prediction_bet_cache_extension(
+    pending: pd.DataFrame,
+    bet_cache: Dict[str, List[datetime]],
+    *,
+    now_hk: datetime,
+    freshness_buffer_min: int,
+) -> None:
+    """Extend ``bet_cache`` in-place for pending prediction canonical_ids not yet loaded."""
+    if pending.empty or get_clickhouse_client is None:
+        return
+    cid_to_pids = _build_cid_to_player_ids(pending)
+    missing = {cid: pids for cid, pids in cid_to_pids.items() if cid not in bet_cache}
+    if not missing:
+        return
+    pre_context_min = _safe_int_config("VALIDATOR_FETCH_PRE_CONTEXT_MINUTES", 60, min_value=0)
+    max_lookback_min = _safe_int_config("VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES", 180, min_value=1)
+    cap_min = _safe_int_config("VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES_CAP", 24 * 60, min_value=1)
+    max_lookback_min = min(max_lookback_min, cap_min)
+    bet_ts = pd.to_datetime(pending["bet_ts"], errors="coerce")
+    if bet_ts.dt.tz is None:
+        bet_ts = bet_ts.dt.tz_localize(HK_TZ)
+    else:
+        bet_ts = bet_ts.dt.tz_convert(HK_TZ)
+    pending_min_ts = bet_ts.min()
+    if pd.isna(pending_min_ts):
+        return
+    fetch_start = max(
+        pending_min_ts - timedelta(minutes=pre_context_min),
+        now_hk - timedelta(minutes=max_lookback_min),
+    )
+    try:
+        extra = fetch_bets_by_canonical_id(missing, fetch_start, now_hk)
+    except Exception as exc:
+        logger.warning("[validator][prediction] CH fetch extension failed: %s", exc)
+        return
+    for cid, vals in extra.items():
+        bet_cache.setdefault(cid, [])
+        bet_cache[cid].extend(vals)
+        bet_cache[cid] = sorted(set(bet_cache[cid]))
+
+
+def validate_predictions_once(
+    *,
+    bet_cache: Dict[str, List[datetime]],
+    force_finalize: bool = False,
+    cycle_start_mono: float,
+    budget_seconds: float,
+) -> None:
+    """Best-effort ground-truth validation for rows in ``prediction_log`` (Phase B)."""
+    if not getattr(config, "PREDICTION_VALIDATION_ENABLED", True):
+        return
+    pl_path = getattr(config, "PREDICTION_LOG_DB_PATH", None)
+    if pl_path is None or not str(pl_path).strip():
+        return
+    elapsed = time.perf_counter() - cycle_start_mono
+    remaining = float(budget_seconds) - elapsed
+    if remaining <= 1.0:
+        logger.debug("[validator][prediction] skip cycle (budget exhausted %.2fs left)", remaining)
+        return
+
+    from trainer_hightier.serving.prediction_log import (
+        ensure_prediction_validation_tables,
+        load_processed_predictions,
+        mark_processed_predictions,
+        prune_prediction_validation_retention,
+        save_prediction_validation_results,
+    )
+
+    now_hk = datetime.now(HK_TZ)
+    freshness_buffer_min = getattr(config, "VALIDATOR_FRESHNESS_BUFFER_MINUTES", 2)
+    wait_minutes = config.LABEL_LOOKAHEAD_MIN + max(0, freshness_buffer_min)
+    cutoff = now_hk - timedelta(minutes=wait_minutes)
+    finality_cutoff = now_hk - timedelta(hours=getattr(config, "VALIDATOR_FINALITY_HOURS", 1))
+    max_rows = _safe_int_config(
+        "PREDICTION_VALIDATION_MAX_ROWS_PER_CYCLE",
+        200,
+        min_value=1,
+    )
+    retention_days = _safe_int_config("PREDICTION_VALIDATION_RETENTION_DAYS", 180, min_value=0)
+
+    pl_conn = sqlite3.connect(str(Path(pl_path).resolve()))
+    try:
+        pl_conn.execute("PRAGMA journal_mode=WAL;")
+        ensure_prediction_validation_tables(pl_conn)
+        prune_prediction_validation_retention(pl_conn, now_hk, retention_days=retention_days)
+
+        pending_df = pd.read_sql_query(
+            """
+            SELECT p.*
+            FROM prediction_log p
+            WHERE p.scoring_status = 'scored'
+              AND p.bet_ts IS NOT NULL
+              AND TRIM(p.bet_ts) != ''
+              AND p.bet_id IS NOT NULL
+              AND p.bet_id NOT IN (SELECT bet_id FROM processed_predictions)
+              AND p.bet_ts <= ?
+            ORDER BY p.bet_ts ASC
+            LIMIT ?
+            """,
+            pl_conn,
+            params=(cutoff.isoformat(), int(max_rows)),
+        )
+        if pending_df.empty:
+            logger.debug("[validator][prediction] no pending scored rows")
+            return
+
+        processed = load_processed_predictions(pl_conn)
+        existing_results = _load_existing_prediction_results(pl_conn)
+        session_cache_disabled: Dict[str, List[Dict]] = {}
+
+        _fetch_prediction_bet_cache_extension(
+            pending_df,
+            bet_cache,
+            now_hk=now_hk,
+            freshness_buffer_min=max(0, int(freshness_buffer_min)),
+        )
+
+        new_processed_ids: List[Any] = []
+        updated_count = 0
+
+        for _, prow in pending_df.iterrows():
+            if time.perf_counter() - cycle_start_mono >= float(budget_seconds):
+                logger.debug("[validator][prediction] budget exhausted mid-batch")
+                break
+            vrow = _prediction_row_to_validator_series(prow)
+            res = validate_observation_row(
+                vrow,
+                bet_cache,
+                session_cache_disabled,
+                force_finalize=force_finalize,
+            )
+            if res.get("result") is None:
+                continue
+            res["scored_at"] = prow.get("scored_at")
+            res["bet_ts"] = prow.get("bet_ts")
+            res["is_alert"] = prow.get("is_alert")
+            updated_delta, processed_added = _apply_pending_validation_result(
+                row=vrow,
+                res=res,
+                existing_results=existing_results,
+                processed=processed,
+                finality_cutoff=finality_cutoff,
+            )
+            updated_count += updated_delta
+            if processed_added:
+                new_processed_ids.append(prow["bet_id"])
+
+        for key, saved_row in list(existing_results.items()):
+            if saved_row.get("reason") != "PENDING":
+                continue
+            if time.perf_counter() - cycle_start_mono >= float(budget_seconds):
+                break
+            bid = saved_row.get("bet_id")
+            match = pending_df[pending_df["bet_id"].astype(str) == str(bid)]
+            if match.empty:
+                continue
+            vrow = _prediction_row_to_validator_series(match.iloc[0])
+            newr = validate_observation_row(
+                vrow,
+                bet_cache,
+                session_cache_disabled,
+                force_finalize=force_finalize,
+            )
+            if newr.get("result") is None or newr.get("reason") == "PENDING":
+                continue
+            newr["scored_at"] = match.iloc[0].get("scored_at")
+            newr["bet_ts"] = match.iloc[0].get("bet_ts")
+            newr["is_alert"] = match.iloc[0].get("is_alert")
+            existing_results[key] = newr
+            updated_count += 1
+            processed.add(str(bid))
+            new_processed_ids.append(bid)
+
+        if existing_results:
+            out_rows = []
+            for rec in existing_results.values():
+                out_rows.append(
+                    {
+                        "bet_id": rec.get("bet_id"),
+                        "scored_at": rec.get("scored_at"),
+                        "bet_ts": rec.get("bet_ts"),
+                        "validated_at": rec.get("validated_at"),
+                        "player_id": rec.get("player_id"),
+                        "canonical_id": rec.get("canonical_id"),
+                        "casino_player_id": rec.get("casino_player_id"),
+                        "model_version": rec.get("model_version"),
+                        "score": rec.get("score"),
+                        "is_alert": rec.get("is_alert"),
+                        "result": rec.get("result"),
+                        "gap_start": rec.get("gap_start"),
+                        "gap_minutes": rec.get("gap_minutes"),
+                        "reason": rec.get("reason"),
+                    }
+                )
+            save_prediction_validation_results(pl_conn, pd.DataFrame(out_rows))
+
+        mark_processed_predictions(pl_conn, new_processed_ids)
+        if new_processed_ids or updated_count:
+            logger.debug(
+                "[validator][prediction] finalized=%d updated=%d pending_batch=%d",
+                len(new_processed_ids),
+                updated_count,
+                len(pending_df),
+            )
+    finally:
+        pl_conn.close()
+
+
+def _try_validate_predictions_once(
+    *,
+    bet_cache: Dict[str, List[datetime]],
+    force_finalize: bool,
+    cycle_start_mono: float,
+) -> None:
+    """Run Phase B without affecting alert validation."""
+    budget = float(getattr(config, "PREDICTION_VALIDATION_CYCLE_BUDGET_SECONDS", 20.0))
+    try:
+        validate_predictions_once(
+            bet_cache=bet_cache,
+            force_finalize=force_finalize,
+            cycle_start_mono=cycle_start_mono,
+            budget_seconds=budget,
+        )
+    except Exception as exc:
+        logger.warning("[validator][prediction] cycle failed (non-blocking): %s", exc)
+
+
 # ------------------ Main loop ------------------
 def validate_once(conn: sqlite3.Connection, force_finalize: bool = False, existing_results_cache: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
+    cycle_start_mono = time.perf_counter()
+    bet_cache: Dict[str, List[datetime]] = {}
+    try:
+        _validate_alerts_once(
+            conn,
+            force_finalize=force_finalize,
+            existing_results_cache=existing_results_cache,
+            bet_cache=bet_cache,
+        )
+    finally:
+        _try_validate_predictions_once(
+            bet_cache=bet_cache,
+            force_finalize=force_finalize,
+            cycle_start_mono=cycle_start_mono,
+        )
+
+
+def _validate_alerts_once(
+    conn: sqlite3.Connection,
+    *,
+    force_finalize: bool,
+    existing_results_cache: Optional[Dict[str, Dict[str, Any]]],
+    bet_cache: Dict[str, List[datetime]],
+) -> None:
     cycle_stage_seconds: Dict[str, float] = {}
     now_hk = datetime.now(HK_TZ)
     t_sqlite = time.perf_counter()
@@ -1538,7 +1830,7 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False, existi
     except Exception:
         pass
 
-    bet_cache: Dict[str, List[datetime]] = {}
+    bet_cache.clear()
     # Phase 1 (Task 3): keep validate_alert_row signature compatibility, but
     # disable session fetch/query path in validator cycle to cut ClickHouse load.
     session_cache_disabled: Dict[str, List[Dict]] = {}
@@ -1600,10 +1892,11 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False, existi
         try:
             t_clickhouse = time.perf_counter()
             # R41: errors propagate so the cycle aborts rather than producing false MISSes
-            bet_cache = fetch_bets_by_canonical_id(cid_to_pids, fetch_start, fetch_end)
+            fetched = fetch_bets_by_canonical_id(cid_to_pids, fetch_start, fetch_end)
+            bet_cache.update(fetched)
             cycle_stage_seconds["clickhouse"] = time.perf_counter() - t_clickhouse
         except Exception as exc:
-            logger.warning("[validator] DB fetch error — skipping this validation cycle: %s", exc)
+            logger.warning("[validator] DB fetch error — skipping alert validation this cycle: %s", exc)
             _emit_validator_perf_summary(cycle_stage_seconds)
             return
 
@@ -1813,7 +2106,6 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False, existi
         existing_results_cache.clear()
         existing_results_cache.update(existing_results)
     _emit_validator_perf_summary(cycle_stage_seconds)
-    return
 
 
 def run_validator_loop(
@@ -1861,7 +2153,22 @@ def main():
     parser.add_argument("--interval", type=int, default=60, help="Polling interval in seconds")
     parser.add_argument("--once", action="store_true", help="Run a single validation pass and exit")
     parser.add_argument("--force-finalize", action="store_true", help="Force-finalize PENDING candidates immediately (for manual runs)")
+    parser.add_argument(
+        "--backfill-prediction-log-bet-ts",
+        action="store_true",
+        help="One-shot: backfill prediction_log.bet_ts from ClickHouse and exit",
+    )
     args = parser.parse_args()
+
+    if args.backfill_prediction_log_bet_ts:
+        from trainer_hightier.serving.prediction_log import backfill_prediction_log_bet_ts
+
+        pl_path = getattr(config, "PREDICTION_LOG_DB_PATH", None)
+        if pl_path is None:
+            raise SystemExit("prediction_log_db_path is disabled (None)")
+        stats = backfill_prediction_log_bet_ts(pl_path)
+        logger.info("[validator] backfill complete: %s", stats)
+        return
 
     try:
         run_cross_entry_data_preflight(

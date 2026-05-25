@@ -5,17 +5,27 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
 
+from trainer_hightier.config import HK_TZ
 from trainer_hightier.serving.feast_online_adapter import RowMissingAudit
 
 logger = logging.getLogger(__name__)
 
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    from backports.zoneinfo import ZoneInfo  # type: ignore
+
+_HK_TZ_INFO = ZoneInfo(HK_TZ)
+
 _PREDICTION_LOG_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("bet_ts", "TEXT"),
     ("threshold", "REAL"),
     ("features_json", "TEXT"),
     ("fe_features_missing", "INTEGER"),
@@ -51,6 +61,7 @@ def init_prediction_log_db(db_path: Path | str | None) -> Path | None:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         ensure_prediction_log_table(conn)
+        ensure_prediction_validation_tables(conn)
     logger.info("[prediction_log] initialized %s", p)
     return p
 
@@ -75,6 +86,7 @@ def ensure_prediction_log_table(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS prediction_log (
             prediction_id INTEGER PRIMARY KEY AUTOINCREMENT,
             scored_at TEXT NOT NULL,
+            bet_ts TEXT,
             bet_id TEXT,
             session_id TEXT,
             player_id TEXT,
@@ -99,6 +111,66 @@ def ensure_prediction_log_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_prediction_log_model_version ON prediction_log(model_version)"
     )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prediction_log_bet_ts ON prediction_log(bet_ts)"
+    )
+
+
+def ensure_prediction_validation_tables(conn: sqlite3.Connection) -> None:
+    """Create ground-truth validation tables in ``prediction_log.db`` (idempotent)."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS prediction_validation_results (
+            bet_id TEXT PRIMARY KEY,
+            scored_at TEXT,
+            bet_ts TEXT,
+            validated_at TEXT,
+            player_id INTEGER,
+            canonical_id TEXT,
+            casino_player_id TEXT,
+            model_version TEXT,
+            score REAL,
+            is_alert INTEGER,
+            result INTEGER,
+            gap_start TEXT,
+            gap_minutes REAL,
+            reason TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS processed_predictions (
+            bet_id TEXT PRIMARY KEY,
+            processed_ts TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pvr_bet_ts ON prediction_validation_results(bet_ts)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pvr_result ON prediction_validation_results(result)"
+    )
+
+
+def format_bet_ts_iso(value: Any) -> str | None:
+    """Serialize ``payout_complete_dtm`` as HK isoformat for ``prediction_log.bet_ts``."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return None
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(_HK_TZ_INFO)
+    else:
+        ts = ts.tz_convert(_HK_TZ_INFO)
+    return ts.isoformat()
 
 
 def _json_safe_scalar(v: Any) -> Any:
@@ -248,6 +320,7 @@ def append_hightier_prediction_log(
         rows.append(
             (
                 scored_at,
+                format_bet_ts_iso(row.get("payout_complete_dtm")),
                 _str_or_none(row.get("bet_id")),
                 _str_or_none(row.get("session_id")),
                 _str_or_none(row.get("player_id")),
@@ -282,17 +355,18 @@ def append_hightier_prediction_log(
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         ensure_prediction_log_table(conn)
+        ensure_prediction_validation_tables(conn)
         conn.executemany(
             """
             INSERT INTO prediction_log (
-                scored_at, bet_id, session_id, player_id, canonical_id,
+                scored_at, bet_ts, bet_id, session_id, player_id, canonical_id,
                 casino_player_id, table_id, model_version, score, margin,
                 is_alert, is_rated_obs, threshold, features_json, fe_features_missing,
                 snapshot_version, mid_term_freshness_status, slow_freshness_status,
                 snapshot_scoring_degraded, scoring_status, model_features_missing,
                 missing_family_json, mid_term_anchor_gaming_day_max,
                 mid_term_snapshot_age_days, mid_null_top_features_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -343,3 +417,228 @@ def append_skipped_entity_missing_log(
         scoring_status="skipped_entity_missing",
         snapshot_version=snapshot_version,
     )
+
+
+def load_processed_predictions(conn: sqlite3.Connection) -> set[str]:
+    """Return ``bet_id`` values already finalized in ``processed_predictions``."""
+    try:
+        rows = conn.execute("SELECT bet_id FROM processed_predictions").fetchall()
+        return {str(r[0]) for r in rows if r[0] is not None}
+    except Exception:
+        return set()
+
+
+def mark_processed_predictions(conn: sqlite3.Connection, bet_ids: list[Any]) -> None:
+    """Mark prediction rows as processed (idempotent upsert)."""
+    if not bet_ids:
+        return
+    ts = datetime.now(_HK_TZ_INFO).isoformat()
+    rows = [(str(bid), ts) for bid in bet_ids if bid is not None and not pd.isna(bid)]
+    if not rows:
+        return
+    conn.executemany(
+        """
+        INSERT INTO processed_predictions(bet_id, processed_ts)
+        VALUES (?, ?)
+        ON CONFLICT(bet_id) DO UPDATE SET processed_ts=excluded.processed_ts
+        """,
+        rows,
+    )
+    conn.commit()
+
+
+def save_prediction_validation_results(conn: sqlite3.Connection, final_df: pd.DataFrame) -> None:
+    """Upsert rows into ``prediction_validation_results``."""
+    if final_df.empty:
+        return
+
+    def _s(v: object) -> str | None:
+        try:
+            return None if pd.isna(v) else str(v)
+        except (TypeError, ValueError):
+            return str(v) if v is not None else None
+
+    rows = [
+        (
+            _s(r.bet_id),
+            getattr(r, "scored_at", None),
+            getattr(r, "bet_ts", None),
+            getattr(r, "validated_at", None),
+            None if pd.isna(getattr(r, "player_id", None)) else int(r.player_id),
+            _s(getattr(r, "canonical_id", None)),
+            _s(getattr(r, "casino_player_id", None)),
+            _s(getattr(r, "model_version", None)),
+            getattr(r, "score", None),
+            None if pd.isna(getattr(r, "is_alert", None)) else int(r.is_alert),
+            None if pd.isna(getattr(r, "result", None)) else int(bool(r.result)),
+            getattr(r, "gap_start", None),
+            getattr(r, "gap_minutes", None),
+            getattr(r, "reason", None),
+        )
+        for r in final_df.itertuples(index=False)
+    ]
+    conn.executemany(
+        """
+        INSERT INTO prediction_validation_results(
+            bet_id, scored_at, bet_ts, validated_at, player_id, canonical_id,
+            casino_player_id, model_version, score, is_alert, result,
+            gap_start, gap_minutes, reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(bet_id) DO UPDATE SET
+            scored_at=excluded.scored_at,
+            bet_ts=excluded.bet_ts,
+            validated_at=excluded.validated_at,
+            player_id=excluded.player_id,
+            canonical_id=excluded.canonical_id,
+            casino_player_id=excluded.casino_player_id,
+            model_version=excluded.model_version,
+            score=excluded.score,
+            is_alert=excluded.is_alert,
+            result=excluded.result,
+            gap_start=excluded.gap_start,
+            gap_minutes=excluded.gap_minutes,
+            reason=excluded.reason
+        """,
+        rows,
+    )
+    conn.commit()
+
+
+def prune_prediction_validation_retention(
+    conn: sqlite3.Connection,
+    now_hk: datetime,
+    *,
+    retention_days: int,
+) -> None:
+    """Delete old ``prediction_validation_results`` / ``processed_predictions`` rows."""
+    if retention_days <= 0:
+        return
+    cutoff = now_hk - timedelta(days=retention_days)
+    cut_s = cutoff.isoformat()
+    conn.execute(
+        """
+        DELETE FROM prediction_validation_results
+        WHERE (
+            COALESCE(validated_at, bet_ts, scored_at) < ?
+        )
+        """,
+        (cut_s,),
+    )
+    conn.execute("DELETE FROM processed_predictions WHERE processed_ts < ?", (cut_s,))
+    conn.commit()
+
+
+def record_missing_bet_ts_poison(
+    conn: sqlite3.Connection,
+    *,
+    bet_id: str,
+    scored_at: str | None,
+    now_hk: datetime,
+) -> None:
+    """Mark a prediction row whose ``bet_ts`` cannot be resolved (no retry)."""
+    validated_at = now_hk.isoformat()
+    conn.execute(
+        """
+        INSERT INTO prediction_validation_results(
+            bet_id, scored_at, bet_ts, validated_at, result, reason
+        ) VALUES (?, ?, NULL, ?, NULL, 'missing_bet_ts')
+        ON CONFLICT(bet_id) DO UPDATE SET
+            validated_at=excluded.validated_at,
+            reason=excluded.reason
+        """,
+        (str(bet_id), scored_at, validated_at),
+    )
+    mark_processed_predictions(conn, [bet_id])
+
+
+def backfill_prediction_log_bet_ts(
+    db_path: Path | str,
+    *,
+    chunk_size: int = 500,
+    fetch_by_bet_ids: Callable[..., Any] | None = None,
+) -> dict[str, int]:
+    """Backfill ``prediction_log.bet_ts`` from ClickHouse by ``bet_id``.
+
+    Rows still missing after lookup are poison-pilled (``missing_bet_ts``).
+    """
+    p = Path(db_path).resolve()
+    if fetch_by_bet_ids is None:
+        from trainer_hightier.serving.validator import fetch_bet_payout_times_by_bet_ids
+
+        fetch_by_bet_ids = fetch_bet_payout_times_by_bet_ids
+
+    stats = {"candidates": 0, "updated": 0, "missing": 0}
+    with sqlite3.connect(str(p)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        ensure_prediction_log_table(conn)
+        ensure_prediction_validation_tables(conn)
+        rows = conn.execute(
+            """
+            SELECT bet_id, scored_at
+            FROM prediction_log
+            WHERE bet_ts IS NULL AND bet_id IS NOT NULL
+            ORDER BY prediction_id ASC
+            """
+        ).fetchall()
+    if not rows:
+        return stats
+
+    stats["candidates"] = len(rows)
+    now_hk = datetime.now(_HK_TZ_INFO)
+    chunk_size = max(1, int(chunk_size))
+
+    for i in range(0, len(rows), chunk_size):
+        chunk = rows[i : i + chunk_size]
+        bet_ids: list[int] = []
+        meta: dict[str, str | None] = {}
+        unparseable: list[tuple[str, str | None]] = []
+        for bid_raw, scored_at in chunk:
+            try:
+                bid_int = int(str(bid_raw).strip())
+            except (TypeError, ValueError):
+                unparseable.append((str(bid_raw), scored_at))
+                continue
+            bet_ids.append(bid_int)
+            meta[str(bid_int)] = scored_at
+
+        bid_map: dict[str, Any] = {}
+        if bet_ids:
+            bid_map, _, _, _ = fetch_by_bet_ids(bet_ids, chunk_size=chunk_size)
+        with sqlite3.connect(str(p)) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            ensure_prediction_validation_tables(conn)
+            for bid_str, scored_at in unparseable:
+                record_missing_bet_ts_poison(
+                    conn,
+                    bet_id=bid_str,
+                    scored_at=scored_at,
+                    now_hk=now_hk,
+                )
+                stats["missing"] += 1
+            for bid_str, scored_at in meta.items():
+                hit = bid_map.get(bid_str)
+                if hit is not None:
+                    payout_hk, _pid = hit
+                    conn.execute(
+                        "UPDATE prediction_log SET bet_ts = ? WHERE bet_id = ?",
+                        (payout_hk.isoformat(), bid_str),
+                    )
+                    stats["updated"] += 1
+                else:
+                    record_missing_bet_ts_poison(
+                        conn,
+                        bet_id=bid_str,
+                        scored_at=scored_at,
+                        now_hk=now_hk,
+                    )
+                    stats["missing"] += 1
+            conn.commit()
+
+    logger.info(
+        "[prediction_log] backfill bet_ts: candidates=%s updated=%s missing=%s path=%s",
+        stats["candidates"],
+        stats["updated"],
+        stats["missing"],
+        p,
+    )
+    return stats

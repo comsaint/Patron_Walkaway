@@ -159,18 +159,18 @@ src_lagged AS (
     MIN(pcd) OVER w_canon_day_inclusive AS first_pcd_today
   FROM src AS s
   WINDOW
-    w_canonical AS (PARTITION BY canonical_id ORDER BY pcd),
-    w_session AS (PARTITION BY session_id ORDER BY pcd),
+    w_canonical AS (PARTITION BY canonical_id ORDER BY pcd, bet_id),
+    w_session AS (PARTITION BY session_id ORDER BY pcd, bet_id),
     w_session_prior AS (
-      PARTITION BY session_id ORDER BY pcd
+      PARTITION BY session_id ORDER BY pcd, bet_id
       ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
     ),
     w_canon_day_prior AS (
-      PARTITION BY canonical_id, gaming_day ORDER BY pcd
+      PARTITION BY canonical_id, gaming_day ORDER BY pcd, bet_id
       ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
     ),
     w_canon_day_inclusive AS (
-      PARTITION BY canonical_id, gaming_day ORDER BY pcd
+      PARTITION BY canonical_id, gaming_day ORDER BY pcd, bet_id
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     )
 ),
@@ -253,7 +253,7 @@ ordered AS (
       RANGE BETWEEN INTERVAL '30 DAY' PRECEDING AND INTERVAL '1 MICROSECOND' PRECEDING
     ),
     w_5_prior_rows AS (
-      PARTITION BY canonical_id ORDER BY pcd
+      PARTITION BY canonical_id ORDER BY pcd, bet_id
       ROWS BETWEEN 4 PRECEDING AND 1 PRECEDING
     )
 )
@@ -547,13 +547,13 @@ src_lagged AS (
     MIN(pcd) OVER w_canon_day_inclusive AS first_pcd_today
   FROM src AS s
   WINDOW
-    w_canonical AS (PARTITION BY canonical_id ORDER BY pcd),
+    w_canonical AS (PARTITION BY canonical_id ORDER BY pcd, bet_id),
     w_canon_day_prior AS (
-      PARTITION BY canonical_id, gaming_day ORDER BY pcd
+      PARTITION BY canonical_id, gaming_day ORDER BY pcd, bet_id
       ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
     ),
     w_canon_day_inclusive AS (
-      PARTITION BY canonical_id, gaming_day ORDER BY pcd
+      PARTITION BY canonical_id, gaming_day ORDER BY pcd, bet_id
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     )
 ),

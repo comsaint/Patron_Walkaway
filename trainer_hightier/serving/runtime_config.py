@@ -42,6 +42,11 @@ VALIDATOR_NO_BET_RETRY_MAX_WINDOW_MINUTES: int = _cfg.validator_no_bet_retry_max
 VALIDATOR_NO_BET_BET_ID_CHUNK_SIZE: int = _cfg.validator_no_bet_bet_id_chunk_size
 VALIDATOR_NO_BET_RETRY_MAX_ALERTS: int = _cfg.validator_no_bet_retry_max_alerts
 
+PREDICTION_VALIDATION_ENABLED: bool = _cfg.prediction_validation_enabled
+PREDICTION_VALIDATION_MAX_ROWS_PER_CYCLE: int = _cfg.prediction_validation_max_rows_per_cycle
+PREDICTION_VALIDATION_CYCLE_BUDGET_SECONDS: float = _cfg.prediction_validation_cycle_budget_seconds
+PREDICTION_VALIDATION_RETENTION_DAYS: int = _cfg.prediction_validation_retention_days
+
 # --- scorer-ish retention (optional reads in shared state tooling) ---
 SCORER_STATE_RETENTION_HOURS: int = _cfg.scorer_state_retention_hours
 

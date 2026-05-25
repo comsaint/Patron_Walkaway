@@ -86,6 +86,33 @@ def test_materialize_fe_derived_prior_15m_includes_sibling_player_id(tmp_path: P
     assert float(r["fe__session__bet_idx_in_session"]) == 1.0
 
 
+def test_compute_fe_derived_same_pcd_tie_break_by_bet_id() -> None:
+    """Same ``pcd`` for two bets: ``ORDER BY pcd, bet_id`` makes LAG/window counts deterministic."""
+    hk = "Asia/Hong_Kong"
+    t0 = pd.Timestamp("2025-06-01 10:00:00", tz=hk)
+    pool = pd.DataFrame(
+        {
+            "bet_id": [100.0, 200.0, 300.0],
+            "player_id": [10, 10, 10],
+            "canonical_id": ["c10", "c10", "c10"],
+            "session_id": [1, 1, 1],
+            "table_id": [1, 1, 1],
+            "gaming_day": pd.to_datetime(["2025-06-01"] * 3),
+            "payout_complete_dtm": [t0, t0, t0 + pd.Timedelta(minutes=5)],
+            "wager": [10.0, 20.0, 30.0],
+            "payout_odds": [2.0, 2.0, 2.0],
+            "casino_win": [0.0, 0.0, 0.0],
+        }
+    )
+    got = compute_fe_derived_features_from_pool(pool, pool["bet_id"])
+    by_id = got.set_index("bet_id")
+    # bet 200 is second at t0; prior count should include bet 100 only.
+    assert float(by_id.loc[200.0, "fe__canonical__bets_cnt__today"]) == 1.0
+    assert float(by_id.loc[200.0, "fe__canonical__wager_sum__today"]) == pytest.approx(10.0)
+    assert float(by_id.loc[300.0, "fe__canonical__bets_cnt__today"]) == 2.0
+    assert float(by_id.loc[300.0, "fe__canonical__wager_sum__today"]) == pytest.approx(30.0)
+
+
 def test_compute_fe_derived_from_pool_schema_max_payout_odds() -> None:
     """``t_bet.payout_odds`` is Decimal(19,4) with metadata max 100.0000 (schema §4)."""
     hk = "Asia/Hong_Kong"
