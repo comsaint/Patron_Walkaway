@@ -358,9 +358,10 @@ def materialize_training_mid_feast_seed(
     allowlist_parquet: Path,
     canonical_mapping_parquet: Path,
     anchor_end: date,
+    anchor_start: date | None = None,
     out_parquet: Path,
 ) -> dict[str, Any]:
-    """Filter training mid snapshot to allowlist canonicals with anchors <= ``anchor_end``."""
+    """Filter training mid snapshot to allowlist canonicals within the bootstrap anchor window."""
     import pyarrow.parquet as pq
 
     src = Path(training_mid_snapshot).resolve()
@@ -395,6 +396,11 @@ COPY (
   ) AS allow
     ON TRIM(CAST(s.canonical_id AS VARCHAR)) = allow.canonical_id
   WHERE CAST(s.anchor_gaming_day AS DATE) <= CAST('{anchor_end.isoformat()}' AS DATE)
+    {
+        f"AND CAST(s.anchor_gaming_day AS DATE) >= CAST('{anchor_start.isoformat()}' AS DATE)"
+        if anchor_start is not None
+        else ""
+    }
 ) TO '{dst_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)
 """.strip()
     con = duckdb.connect(database=":memory:")
@@ -538,7 +544,9 @@ def write_mid_feast_parquet(full_snap: Path, feast_out: Path) -> int:
     feat_cols = ", ".join(f'"{c}"' for c in PRODUCTION_MID_TERM_FEATURE_COLUMNS)
     sql = f"""
 COPY (
-  SELECT canonical_id, {feat_cols},
+  SELECT canonical_id,
+    CAST(anchor_gaming_day AS VARCHAR) AS anchor_gaming_day,
+    {feat_cols},
     CAST((CAST(anchor_gaming_day AS TIMESTAMP) + INTERVAL '1' DAY - INTERVAL '1' SECOND) AS TIMESTAMPTZ)
       AS event_timestamp
   FROM (
@@ -812,6 +820,7 @@ def _refresh_mid_layer(
                 allowlist_parquet=opts.adt_allowlist,
                 canonical_mapping_parquet=opts.canonical_mapping,
                 anchor_end=anchor_end,
+                anchor_start=anchor_start,
                 out_parquet=seed_staging,
             )
             seed_feast = staging_dir / "mid_training_seed_feast.parquet"

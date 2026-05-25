@@ -404,11 +404,15 @@ def join_production_fe_suppliers(
     if mid_term_columns and mid_term_snapshot_parquet is None:
         raise ValueError("[feature_builder] mid_term_columns require mid_term_snapshot_parquet")
 
-    from trainer_hightier.config import DuckDbRuntimeConfig
+    from trainer_hightier.config import DuckDbRuntimeConfig, PRODUCTION_MID_ASOF_BACKFILL_DAYS
     from trainer_hightier.feature_experiment.dataset_enrich import (
         _MID_TERM_DERIVED_EXPRS,
         _MID_TERM_STAGING_SQL,
         _mid_term_staging_aliases,
+    )
+    from trainer_hightier.serving.mid_term_bounded_asof import (
+        mid_asof_lateral_lower_bound_sql,
+        resolve_mid_asof_backfill_days,
     )
 
     con = duckdb.connect(database=":memory:")
@@ -439,6 +443,8 @@ LEFT JOIN read_parquet('{esc}') AS s
             staging_select = ",\n    ".join(_MID_TERM_STAGING_SQL[a] for a in staging_aliases)
             if staging_select:
                 staging_select = f",\n    {staging_select}"
+            backfill_n = resolve_mid_asof_backfill_days(PRODUCTION_MID_ASOF_BACKFILL_DAYS)
+            lateral_lb = mid_asof_lateral_lower_bound_sql("bw._gday", n_days=backfill_n)
             mid_cte = f"""
 mid_snap AS (
   SELECT * FROM read_parquet('{mesc}')
@@ -459,6 +465,7 @@ mid_asof AS (
     FROM mid_snap AS s
     WHERE TRIM(CAST(s.canonical_id AS VARCHAR)) = bw._cid
       AND CAST(s.anchor_gaming_day AS DATE) < bw._gday
+      {lateral_lb}
     ORDER BY CAST(s.anchor_gaming_day AS DATE) DESC
     LIMIT 1
   ) AS lst ON TRUE

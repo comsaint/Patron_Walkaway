@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Final
 
+FEAST_MID_ANCHOR_COLUMN: Final[str] = "anchor_gaming_day"
+
 PRODUCTION_MID_TERM_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     "fe__bets_cnt__w1d",
     "fe__wager_sum__w1d",
@@ -37,7 +39,8 @@ LONG_TERM_FEATURE_VIEW_NAME: Final[str] = "long_term_slow_spike_features"
 LONG_TERM_FEATURE_SERVICE_NAME: Final[str] = "walkaway_canonical_long_term_spike_v1"
 
 MID_TERM_ONLINE_FEATURE_REFS: Final[tuple[str, ...]] = tuple(
-    f"{MID_TERM_FEATURE_VIEW_NAME}:{c}" for c in PRODUCTION_MID_TERM_FEATURE_COLUMNS
+    f"{MID_TERM_FEATURE_VIEW_NAME}:{c}"
+    for c in (FEAST_MID_ANCHOR_COLUMN, *PRODUCTION_MID_TERM_FEATURE_COLUMNS)
 )
 LONG_TERM_ONLINE_FEATURE_REFS: Final[tuple[str, ...]] = tuple(
     f"{LONG_TERM_FEATURE_VIEW_NAME}:{c}" for c in PRODUCTION_LONG_TERM_FEATURE_COLUMNS

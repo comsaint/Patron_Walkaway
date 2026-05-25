@@ -802,6 +802,13 @@ def run_offline_production_pipeline(
             n_slow_present=0,
             n_entity_missing=0,
         )
+    from trainer_hightier.serving.mid_term_bounded_asof import apply_mid_term_bounded_asof
+
+    staged = apply_mid_term_bounded_asof(
+        staged,
+        mid_primitive_columns=plan.feast_mid_cols,
+        n_days=int(ctx.cfg.production_mid_asof_backfill_days),
+    )
     staged = attach_mid_term_composite_columns(staged, plan.mid_composite_cols)
     mid_cols = tuple(
         dict.fromkeys([*plan.feast_mid_cols, *plan.mid_composite_cols]),

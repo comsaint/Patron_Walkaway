@@ -180,17 +180,72 @@ features:
   note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass.'
   time_horizon: short_term
   max_lookback: PT15M
+- feature_id: mid_term_anchor_gaming_day
+  group_id: group_a_velocity_ratios
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/dataset_enrich.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: option_b_20260525
+  note: 'Option B audit: per-row mid-term anchor gaming day (bounded ASOF).'
+  time_horizon: mid_term
+  max_lookback: P30D
+  cadence: daily_gaming_day
+  anchor_rule: prior_gaming_day_end
+  grain: canonical_id + anchor_gaming_day
+  allowed_training_supplier: mid_term_daily_snapshot
+- feature_id: mid_term_snapshot_age_days
+  group_id: group_a_velocity_ratios
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/dataset_enrich.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: option_b_20260525
+  note: 'Option B audit: gaming_day minus anchor (days).'
+  time_horizon: mid_term
+  max_lookback: P30D
+  cadence: daily_gaming_day
+  anchor_rule: prior_gaming_day_end
+  grain: canonical_id + anchor_gaming_day
+  allowed_training_supplier: mid_term_daily_snapshot
+- feature_id: mid_term_snapshot_missing_flag
+  group_id: group_a_velocity_ratios
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/dataset_enrich.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: option_b_20260525
+  note: 'Option B audit: 1 when anchor outside bounded window or absent.'
+  time_horizon: mid_term
+  max_lookback: P30D
+  cadence: daily_gaming_day
+  anchor_rule: prior_gaming_day_end
+  grain: canonical_id + anchor_gaming_day
+  allowed_training_supplier: mid_term_daily_snapshot
 - feature_id: fe__bets_cnt__w1d
   group_id: group_a_velocity_ratios
   source: fe_derived
   semantic_owner: trainer_hightier/feature_experiment/materialize_mid_term_daily_snapshot.py
-  status: disabled
+  status: active
   enabled_for:
+  - baseline
   - candidate
   - ablation
-  drop_reason_code: train_serve_mid_term_parity_removed
-  last_updated_experiment: run_20260515T175157Z
-  note: 'Removed from baseline for simpler retrain: mid-term Feast/daily snapshot train-serve parity risk.'
+  drop_reason_code: null
+  last_updated_experiment: option_b_20260525
+  note: 'Option B baseline: mid-term daily snapshot primitive (N=30 bounded ASOF).'
   time_horizon: mid_term
   max_lookback: P1D
   cadence: daily_gaming_day
@@ -202,13 +257,14 @@ features:
   group_id: group_a_velocity_ratios
   source: fe_derived
   semantic_owner: trainer_hightier/feature_experiment/dataset_enrich.py
-  status: disabled
+  status: active
   enabled_for:
+  - baseline
   - candidate
   - ablation
-  drop_reason_code: train_serve_mid_term_parity_removed
-  last_updated_experiment: run_20260515T175157Z
-  note: 'Composite depends on mid-term fe__wager_sum__w1d; disabled for simpler retrain.'
+  drop_reason_code: null
+  last_updated_experiment: option_b_20260525
+  note: 'Option B baseline: composite over bounded mid-term ASOF.'
   time_horizon: mid_term
   max_lookback: P1D
   cadence: daily_gaming_day
@@ -353,13 +409,14 @@ features:
   group_id: group_c_burstiness
   source: fe_derived
   semantic_owner: trainer_hightier/feature_experiment/materialize_mid_term_daily_snapshot.py
-  status: disabled
+  status: active
   enabled_for:
+  - baseline
   - candidate
   - ablation
-  drop_reason_code: train_serve_mid_term_parity_removed
-  last_updated_experiment: run_20260515T175157Z
-  note: 'Mid-term composite (std/avg_abs wager w7d); disabled for simpler retrain.'
+  drop_reason_code: null
+  last_updated_experiment: option_b_20260525
+  note: 'Option B baseline: mid-term composite (std/avg_abs wager w7d).'
   time_horizon: mid_term
   max_lookback: P7D
   cadence: daily_gaming_day
@@ -389,13 +446,14 @@ features:
   group_id: group_d_personal_z
   source: fe_derived
   semantic_owner: trainer_hightier/feature_experiment/dataset_enrich.py
-  status: disabled
+  status: active
   enabled_for:
+  - baseline
   - candidate
   - ablation
-  drop_reason_code: train_serve_mid_term_parity_removed
-  last_updated_experiment: run_20260515T175157Z
-  note: 'Mid-term composite (prior odds w30d); disabled for simpler retrain.'
+  drop_reason_code: null
+  last_updated_experiment: option_b_20260525
+  note: 'Option B baseline: mid-term composite (prior odds w30d).'
   time_horizon: mid_term
   max_lookback: P30D
   cadence: daily_gaming_day
@@ -824,13 +882,14 @@ features:
   group_id: group_g_interarrival_dynamics
   source: fe_derived
   semantic_owner: trainer_hightier/feature_experiment/dataset_enrich.py
-  status: disabled
+  status: active
   enabled_for:
+  - baseline
   - candidate
   - ablation
-  drop_reason_code: train_serve_mid_term_parity_removed
-  last_updated_experiment: run_20260515T175157Z
-  note: 'Mid-term composite (interarrival w7d); disabled for simpler retrain.'
+  drop_reason_code: null
+  last_updated_experiment: option_b_20260525
+  note: 'Option B baseline: mid-term composite (interarrival w7d).'
   time_horizon: mid_term
   max_lookback: P7D
   cadence: daily_gaming_day
@@ -952,13 +1011,14 @@ features:
   group_id: group_q_payout_odds_dynamics
   source: fe_derived
   semantic_owner: trainer_hightier/feature_experiment/dataset_enrich.py
-  status: disabled
+  status: active
   enabled_for:
+  - baseline
   - candidate
   - ablation
-  drop_reason_code: train_serve_mid_term_parity_removed
-  last_updated_experiment: run_20260515T175157Z
-  note: 'Mid-term composite (payout odds z w7d); disabled for simpler retrain.'
+  drop_reason_code: null
+  last_updated_experiment: option_b_20260525
+  note: 'Option B baseline: mid-term composite (payout odds z w7d).'
   time_horizon: mid_term
   max_lookback: P7D
   cadence: daily_gaming_day

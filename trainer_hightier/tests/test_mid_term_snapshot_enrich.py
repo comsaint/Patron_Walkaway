@@ -435,6 +435,42 @@ def test_enrich_training_payout_odds_z_w7d_from_mid_snapshot(tmp_path: Path) -> 
     assert float(got.iloc[0]["fe__odds__payout_odds_z__w7d"]) == pytest.approx((2.5 - avg) / std)
 
 
+def test_asof_enrich_nulls_anchor_older_than_backfill_window(tmp_path: Path) -> None:
+    """Anchor older than N=30 gaming days must not satisfy bounded ASOF join."""
+
+    base = tmp_path / "base_old.parquet"
+    mid = tmp_path / "mid_old.parquet"
+    out = tmp_path / "enriched_old.parquet"
+    pd.DataFrame(
+        {
+            "bet_id": [20.0],
+            "canonical_id": ["c_old"],
+            "gaming_day": pd.Timestamp("2026-05-19"),
+            "payout_odds": [2.0],
+        }
+    ).to_parquet(base, index=False)
+    pd.DataFrame(
+        {
+            "canonical_id": ["c_old"],
+            "anchor_gaming_day": pd.to_datetime(["2026-03-01"]),
+            "fe__bets_cnt__w1d": [7],
+            "fe__wager_sum__w1d": [70.0],
+        }
+    ).to_parquet(mid, index=False)
+    enrich_training_parquet_with_cadence_suppliers(
+        base_training_parquet=base,
+        fe_short_term_parquet=None,
+        mid_term_snapshot_parquet=mid,
+        out_parquet=out,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        short_term_columns=(),
+        mid_term_columns=("fe__bets_cnt__w1d",),
+    )
+    got = pd.read_parquet(out)
+    assert pd.isna(got.iloc[0]["fe__bets_cnt__w1d"])
+    assert int(got.iloc[0]["mid_term_snapshot_missing_flag"]) == 1
+
+
 def test_train_serve_mid_term_asof_parity(tmp_path: Path) -> None:
     """Training enrich and production ASOF join must pick the same mid-term anchor/value."""
 

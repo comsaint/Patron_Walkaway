@@ -308,8 +308,17 @@ def _run_supplier_pipeline(
         slow_columns=(),
     )
     after_join = lookup.values
-    after_composite = attach_mid_term_composite_columns(
+    from trainer_hightier.config import default_hightier_serving_config
+    from trainer_hightier.serving.mid_term_bounded_asof import apply_mid_term_bounded_asof
+
+    cfg = default_hightier_serving_config()
+    after_bounded = apply_mid_term_bounded_asof(
         after_join,
+        mid_primitive_columns=plan.feast_mid_cols,
+        n_days=int(cfg.production_mid_asof_backfill_days),
+    )
+    after_composite = attach_mid_term_composite_columns(
+        after_bounded,
         plan.mid_composite_cols,
     )
     present: set[str] = set()

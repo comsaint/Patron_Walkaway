@@ -218,4 +218,4 @@ Production scorer v2 **不得** fallback 至 `fe_derived_parquet`、`fe_short_te
 | 2026-05-22 | Option A carry-forward 修復 unlimited-ASOF **已部署** 模型之 serving（事故閉環） |
 | 2026-05（本 SSOT） | **未來模型預設 Option B**：N=30、Feast + scorer 窗檢查、六 mid + 三 audit 進 baseline、營運 stale hard cap 維持 3 天與 N 分離 |
 
-**待實作（程式尚未完全對齊本 SSOT）**：training bounded ASOF SQL、scorer `apply_mid_term_bounded_asof`、Feast `anchor_gaming_day` 暴露、`config` 中 N=30／bootstrap=30 常數、registry baseline 啟用 mid 欄位。實作完成前以本文件為目標契約。
+**程式對齊狀態（Option B）**：`config` 常數 N=30／bootstrap=30、`dataset_enrich` bounded ASOF、`apply_mid_term_bounded_asof`（scorer／offline replay）、Feast FV `anchor_gaming_day`、registry baseline 六 mid + 三 audit、Step 6 `hard_fail_all_feature_gate` 預設為 true。Promotion 前仍需新一輪 retrain 與 `deploy_e2e_gate` 驗收。

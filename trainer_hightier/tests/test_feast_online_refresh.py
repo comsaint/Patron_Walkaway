@@ -59,10 +59,10 @@ def test_mid_export_bounds_bootstrap_spans_anchor_window(monkeypatch: pytest.Mon
     anchor_start, anchor_end, bets_start, _bets_end = refresh_mod._mid_export_bounds(
         close_hour=6,
         bootstrap_mid=True,
-        bootstrap_anchor_days=60,
+        bootstrap_anchor_days=30,
     )
     assert anchor_end == date(2025, 6, 1)
-    assert anchor_start == date(2025, 4, 3)
+    assert anchor_start == date(2025, 5, 3)
     assert bets_start == anchor_start - timedelta(days=int(refresh_mod.MID_TERM_SNAPSHOT_MAX_LOOKBACK_DAYS) - 1)
 
 

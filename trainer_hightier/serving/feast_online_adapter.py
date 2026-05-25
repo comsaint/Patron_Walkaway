@@ -12,11 +12,13 @@ import pandas as pd
 
 from trainer_hightier.config import TRAINER_HIGHTIER_PACKAGE_DIR, default_hightier_serving_config
 from trainer_hightier.serving.feast_production_constants import (
+    FEAST_MID_ANCHOR_COLUMN,
     LONG_SPIKE_FEATURE_VIEW_NAME,
     LONG_TERM_FEATURE_SERVICE_NAME,
     LONG_TERM_ONLINE_FEATURE_REFS,
     MID_SPIKE_FEATURE_SERVICE_NAME,
     MID_SPIKE_FEATURE_VIEW_NAME,
+    MID_TERM_FEATURE_VIEW_NAME,
     MID_TERM_ONLINE_FEATURE_REFS,
     PRODUCTION_LONG_TERM_FEATURE_COLUMNS,
     PRODUCTION_MID_TERM_FEATURE_COLUMNS,
@@ -351,8 +353,10 @@ class FeastSdkOnlineAdapter:
             return pd.DataFrame(columns=["canonical_id", *wanted])
         if "canonical_id" not in out.columns:
             raise ValueError("[feast_adapter] Feast response missing canonical_id column")
-        keep = ["canonical_id", *[c for c in wanted if c in out.columns]]
-        slim = out[keep].copy()
+        extra = [FEAST_MID_ANCHOR_COLUMN] if mid_columns else []
+        keep = ["canonical_id", *extra, *[c for c in wanted if c in out.columns]]
+        keep = list(dict.fromkeys(keep))
+        slim = out[[c for c in keep if c in out.columns]].copy()
         return _dedupe_lookup_by_canonical_id(slim)
 
 
@@ -416,6 +420,8 @@ def resolve_online_feature_refs(
             "[feast_smoke] model Feast columns have no spike online feature ref: "
             f"[{tip}{ellipsis}]"
         )
+    if mid_columns:
+        refs.append(f"{MID_TERM_FEATURE_VIEW_NAME}:{FEAST_MID_ANCHOR_COLUMN}")
     return tuple(dict.fromkeys(refs))
 
 

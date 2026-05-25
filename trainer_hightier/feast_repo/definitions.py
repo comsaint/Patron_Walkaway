@@ -216,6 +216,7 @@ mid_term_daily_spike_features = FeatureView(
     entities=[canonical_patron],
     ttl=timedelta(days=40),
     schema=[
+        Field(name="anchor_gaming_day", dtype=String),
         Field(name="fe__bets_cnt__w1d", dtype=Int64),
         Field(name="fe__wager_sum__w1d", dtype=Float64),
         Field(name="fe__bets_cnt__w7d", dtype=Int64),

@@ -113,8 +113,10 @@ SCORER_FEAST_DEPLOY_LOOKUP_SMOKE_SAMPLE_SIZE: Final[int] = 20
 FEAST_STARTUP_REFRESH_LOCK_WAIT_SECONDS: Final[int] = 30
 FEAST_REFRESH_SUPERVISOR_POLL_SECONDS: Final[int] = 300
 FEAST_BACKGROUND_REFRESH_LOCK_WAIT_SECONDS: Final[int] = 0
-#: Bootstrap mid-term Feast refresh: anchor days materialized (carry-forward ASOF parity).
-PRODUCTION_MID_FEAST_BOOTSTRAP_ANCHOR_DAYS: Final[int] = 60
+#: Option B bounded ASOF: max gaming-day age of mid-term anchor vs bet ``gaming_day`` (inclusive 1..N).
+PRODUCTION_MID_ASOF_BACKFILL_DAYS: Final[int] = 30
+#: Bootstrap mid-term Feast refresh: anchor days materialized (Option B N-day window).
+PRODUCTION_MID_FEAST_BOOTSTRAP_ANCHOR_DAYS: Final[int] = PRODUCTION_MID_ASOF_BACKFILL_DAYS
 #: Hard-fail when sampled mid Feast columns exceed this null fraction (aligns with training ~5%).
 SCORER_FEAST_MID_CELL_NULL_FAIL_FRACTION: Final[float] = 0.05
 #: Minimum fraction of allowlist canonical ids present in mid Feast online store after refresh.
@@ -430,7 +432,7 @@ class Step5TrainConfig:
     #: When ``True``, use :data:`baseline_*` hyperparameters only (no Optuna).
     skip_optuna: bool = False
     #: ``study.optimize(..., timeout=...)`` wall-clock cap in seconds.
-    optuna_timeout_sec: float = 60 * 60 * 5  # 1 hour = 60*60
+    optuna_timeout_sec: float = 60 * 60 * 3  # 1 hour = 60*60
     early_stopping_rounds: int = 50
     #: Upper bound on boosting rounds (early stopping usually stops sooner).
     lgb_n_estimators_cap: int = 2000
@@ -450,7 +452,7 @@ class Step6ParityConfig:
 
     run_step6: bool = True
     hard_fail_slow_gate: bool = True
-    hard_fail_all_feature_gate: bool = False
+    hard_fail_all_feature_gate: bool = True
     max_rows: int = 200_000
     batch_size: int = 5000
 
@@ -583,7 +585,9 @@ class HightierServingConfig:
     feast_background_refresh_lock_wait_seconds: int = FEAST_BACKGROUND_REFRESH_LOCK_WAIT_SECONDS
     #: Deploy / dry-run allowlist sample size for Feast online lookup smoke.
     scorer_feast_deploy_lookup_smoke_sample_size: int = SCORER_FEAST_DEPLOY_LOOKUP_SMOKE_SAMPLE_SIZE
-    #: Bootstrap anchor-day span for mid-term Feast online refresh (Option A carry-forward).
+    #: Bounded ASOF window (gaming days) for mid-term train/serve parity (Option B).
+    production_mid_asof_backfill_days: int = PRODUCTION_MID_ASOF_BACKFILL_DAYS
+    #: Bootstrap anchor-day span for mid-term Feast online refresh (Option B N-day window).
     production_mid_feast_bootstrap_anchor_days: int = PRODUCTION_MID_FEAST_BOOTSTRAP_ANCHOR_DAYS
     #: Hard-fail smoke when mid Feast cell null rate exceeds this fraction.
     scorer_feast_mid_cell_null_fail_fraction: float = SCORER_FEAST_MID_CELL_NULL_FAIL_FRACTION

@@ -954,6 +954,13 @@ def score_once(
         slow_columns=supplier_plan.feast_slow_cols,
         fail_fraction=fail_frac,
     )
+    from trainer_hightier.serving.mid_term_bounded_asof import apply_mid_term_bounded_asof
+
+    staged = apply_mid_term_bounded_asof(
+        staged,
+        mid_primitive_columns=supplier_plan.feast_mid_cols,
+        n_days=int(cfg.production_mid_asof_backfill_days),
+    )
     staged = attach_mid_term_composite_columns(staged, supplier_plan.mid_composite_cols)
     cycle_summary = build_cycle_readiness_summary(
         supplier_routes=scorer_supplier_route_counts(supplier_plan),

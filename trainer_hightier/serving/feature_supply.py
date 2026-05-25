@@ -22,8 +22,11 @@ from trainer_hightier.config import (
     MANIFEST_KEY_MID_TERM_GRAIN,
     MANIFEST_KEY_MID_TERM_SNAPSHOT,
     MANIFEST_KEY_SLOW_PATRON_GRAIN,
+    MID_TERM_ANCHOR_AUDIT_COLUMN,
     MID_TERM_FRESHNESS_SLA_ISO8601,
     MID_TERM_GRAIN_CANONICAL_DAILY_ASOF,
+    MID_TERM_SNAPSHOT_AGE_AUDIT_COLUMN,
+    MID_TERM_SNAPSHOT_MISSING_AUDIT_COLUMN,
     SLOW_PATRON_GRAIN_CANONICAL_ASOF,
 )
 from trainer_hightier.feature_experiment.feature_cadence import (
@@ -31,6 +34,14 @@ from trainer_hightier.feature_experiment.feature_cadence import (
     classify_model_fe_features,
     runtime_inputs_from_registry,
     short_term_enrich_columns_with_dependencies,
+)
+
+_MID_TERM_AUDIT_MODEL_COLUMNS: frozenset[str] = frozenset(
+    {
+        MID_TERM_ANCHOR_AUDIT_COLUMN,
+        MID_TERM_SNAPSHOT_AGE_AUDIT_COLUMN,
+        MID_TERM_SNAPSHOT_MISSING_AUDIT_COLUMN,
+    }
 )
 from trainer_hightier.feature_experiment.materialize_mid_term_daily_snapshot import (
     MID_TERM_SNAPSHOT_OUTPUT_COLUMNS,
@@ -822,6 +833,8 @@ def build_runtime_dependency_closure(
         row = by_id.get(fid)
         supplier = _infer_runtime_supplier(row, fid, mid_set=mid_set, short_set=short_set)
         if supplier is None:
+            if is_model_output and fid in _MID_TERM_AUDIT_MODEL_COLUMNS:
+                return
             if is_model_output:
                 unknown.append(fid)
             return

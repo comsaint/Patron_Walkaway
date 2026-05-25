@@ -11,6 +11,12 @@ from trainer_hightier.config import (
     MID_TERM_ANCHOR_AUDIT_COLUMN,
     MID_TERM_SNAPSHOT_AGE_AUDIT_COLUMN,
     MID_TERM_SNAPSHOT_MISSING_AUDIT_COLUMN,
+    PRODUCTION_MID_ASOF_BACKFILL_DAYS,
+)
+from trainer_hightier.serving.mid_term_bounded_asof import (
+    mid_asof_lateral_lower_bound_sql,
+    mid_snapshot_missing_flag_sql,
+    resolve_mid_asof_backfill_days,
 )
 import trainer_hightier.feature_experiment.feature_registry as _feature_registry
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
@@ -133,11 +139,17 @@ def enrich_training_parquet_with_cadence_suppliers(
     short_term_columns: tuple[str, ...],
     mid_term_columns: tuple[str, ...],
     include_audit_columns: bool = True,
+    mid_asof_backfill_days: int | None = None,
 ) -> Path:
     """Join short-term bet-grain features and mid-term daily snapshot ASOF features."""
 
     if not short_term_columns and not mid_term_columns:
         raise ValueError("enrich requires at least one short-term or mid-term fe__ column")
+    backfill_n = (
+        resolve_mid_asof_backfill_days(mid_asof_backfill_days)
+        if mid_term_columns
+        else PRODUCTION_MID_ASOF_BACKFILL_DAYS
+    )
     composite_mid = {"fe__wager_sum__w15m_over_w1d", "fe__interarrival__last_gap_z__w7d"}
     if composite_mid.intersection(mid_term_columns) and not short_term_columns:
         raise ValueError(
@@ -168,6 +180,12 @@ LEFT JOIN read_parquet('{fq}') AS s
         staging_select = ",\n    ".join(_MID_TERM_STAGING_SQL[a] for a in staging_aliases)
         if staging_select:
             staging_select = f",\n    {staging_select}"
+        lateral_lb = mid_asof_lateral_lower_bound_sql("bw._gday", n_days=backfill_n)
+        missing_expr = mid_snapshot_missing_flag_sql(
+            "lst.anchor_gaming_day",
+            "bw._gday",
+            n_days=backfill_n,
+        )
         mid_cte = f"""
 mid_snap AS (
   SELECT * FROM read_parquet('{mq}')
@@ -187,13 +205,14 @@ mid_asof AS (
       WHEN lst.anchor_gaming_day IS NULL OR bw._gday IS NULL THEN CAST(NULL AS BIGINT)
       ELSE DATE_DIFF('day', CAST(lst.anchor_gaming_day AS DATE), bw._gday)
     END AS {MID_TERM_SNAPSHOT_AGE_AUDIT_COLUMN},
-    CASE WHEN lst.anchor_gaming_day IS NULL THEN 1 ELSE 0 END AS {MID_TERM_SNAPSHOT_MISSING_AUDIT_COLUMN}{staging_select}
+    {missing_expr} AS {MID_TERM_SNAPSHOT_MISSING_AUDIT_COLUMN}{staging_select}
   FROM b_with_day AS bw
   LEFT JOIN LATERAL (
     SELECT *
     FROM mid_snap AS s
     WHERE TRIM(CAST(s.canonical_id AS VARCHAR)) = bw._cid
       AND CAST(s.anchor_gaming_day AS DATE) < bw._gday
+      {lateral_lb}
     ORDER BY CAST(s.anchor_gaming_day AS DATE) DESC
     LIMIT 1
   ) AS lst ON TRUE
