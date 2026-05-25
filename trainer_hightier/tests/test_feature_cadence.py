@@ -87,4 +87,4 @@ def test_build_feature_cadence_audit_counts_terms() -> None:
     audit = build_feature_cadence_audit(snap, snap.model_feature_columns)
     assert audit["model_feature_count"] == len(snap.model_feature_columns)
     assert audit["term_counts"]["short_term"] >= 1
-    assert audit["term_counts"].get("mid_term", 0) >= 9
+    assert audit["term_counts"].get("mid_term", 0) >= 8

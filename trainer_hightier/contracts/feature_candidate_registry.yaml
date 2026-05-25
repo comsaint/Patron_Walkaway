@@ -186,12 +186,11 @@ features:
   semantic_owner: trainer_hightier/feature_experiment/dataset_enrich.py
   status: active
   enabled_for:
-  - baseline
   - candidate
   - ablation
   drop_reason_code: null
   last_updated_experiment: option_b_20260525
-  note: 'Option B audit: per-row mid-term anchor gaming day (bounded ASOF).'
+  note: 'Option B audit-only (not model input): per-row mid-term anchor gaming day for enrich/log; use mid_term_snapshot_age_days in baseline.'
   time_horizon: mid_term
   max_lookback: P30D
   cadence: daily_gaming_day
