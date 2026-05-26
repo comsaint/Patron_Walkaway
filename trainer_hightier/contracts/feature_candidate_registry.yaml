@@ -74,6 +74,7 @@ features:
   note: null
   time_horizon: short_term
   max_lookback: PT1H
+  allowed_training_supplier: short_term_pit_builder
 - feature_id: bet__wager_sum__w1h
   group_id: existing_trial_1h
   source: feast_trial_1h
@@ -87,6 +88,7 @@ features:
   note: null
   time_horizon: short_term
   max_lookback: PT1H
+  allowed_training_supplier: short_term_pit_builder
 - feature_id: bet__back_bet_ratio__w1h
   group_id: existing_trial_1h
   source: feast_trial_1h
@@ -100,6 +102,7 @@ features:
   note: null
   time_horizon: short_term
   max_lookback: PT1H
+  allowed_training_supplier: short_term_pit_builder
 - feature_id: bet__payout_odds_avg__w1h
   group_id: existing_trial_1h
   source: feast_trial_1h
@@ -113,6 +116,7 @@ features:
   note: null
   time_horizon: short_term
   max_lookback: PT1H
+  allowed_training_supplier: short_term_pit_builder
 - feature_id: patron__theo_win_sum__w180d_m1snap
   group_id: existing_slow_patron_180d_m1snap
   source: feast_slow_180d

@@ -16,20 +16,48 @@ Time-zone convention (verified against cleaned bet Parquet):
 
 from __future__ import annotations
 
+import logging
+import shutil
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Final
 
 import duckdb
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
-from trainer_hightier.config import DuckDbRuntimeConfig, default_hightier_serving_config
+from trainer_hightier.config import (
+    DuckDbRuntimeConfig,
+    HightierServingConfig,
+    SHORT_TERM_TRIAL_BET_COLUMNS,
+    default_hightier_serving_config,
+)
 from trainer_hightier.utils.bet_l0_preprocess import (
     cleaned_bet_dataset_has_any_parquet,
     resolved_cleaned_bet_read_parquet_sql,
 )
 from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_parquet_path
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
+
+logger = logging.getLogger(__name__)
+
+BOUNDED_SHORT_TERM_MATERIALIZER_VERSION: Final[str] = "bounded_hot_pool_v1"
+
+_TRAINING_BET_STAGING_COLUMNS: Final[tuple[str, ...]] = (
+    "bet_id",
+    "player_id",
+    "payout_complete_dtm",
+    "wager",
+    "is_back_bet",
+    "payout_odds",
+    "casino_win",
+    "bet_type",
+    "type_of_bet",
+    "session_id",
+    "table_id",
+    "gaming_day",
+)
 
 
 def _path_esc(path: Path) -> str:
@@ -487,6 +515,127 @@ LEGACY_MID_TERM_FEATURE_COLUMNS: tuple[str, ...] = (
 )
 
 
+def _iter_training_bet_batches(
+    training_parquet: Path,
+    *,
+    batch_size: int,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> Iterator[pd.DataFrame]:
+    """Yield chronological training bet slices without loading the full table into memory."""
+
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1; got {batch_size}")
+    t_esc = _path_esc(training_parquet)
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        schema_cols = {c.lower() for c in pq.read_schema(Path(training_parquet).resolve()).names}
+        need = {c.lower() for c in _TRAINING_BET_STAGING_COLUMNS}
+        missing = sorted(need - schema_cols)
+        if missing:
+            raise ValueError(
+                f"training parquet missing columns for bounded short-term staging: {missing}; "
+                f"path={training_parquet.resolve()}",
+            )
+        total_row = con.execute(
+            f"""
+            SELECT COUNT(*)::BIGINT AS n
+            FROM read_parquet('{t_esc}')
+            WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
+              AND payout_complete_dtm IS NOT NULL
+              AND TRY_CAST(player_id AS BIGINT) IS NOT NULL
+            """,
+        ).fetchone()
+        total = int(total_row[0]) if total_row else 0
+        for start in range(0, total, batch_size):
+            end = min(start + batch_size, total)
+            df = con.execute(
+                f"""
+                WITH ordered AS (
+                  SELECT
+                    TRY_CAST(bet_id AS DOUBLE) AS bet_id,
+                    TRY_CAST(player_id AS BIGINT) AS player_id,
+                    CAST(payout_complete_dtm AS TIMESTAMPTZ) AS payout_complete_dtm,
+                    TRY_CAST(wager AS DOUBLE) AS wager,
+                    TRY_CAST(is_back_bet AS INTEGER) AS is_back_bet,
+                    TRY_CAST(payout_odds AS DOUBLE) AS payout_odds,
+                    TRY_CAST(casino_win AS DOUBLE) AS casino_win,
+                    CAST(bet_type AS VARCHAR) AS bet_type,
+                    CAST(type_of_bet AS VARCHAR) AS type_of_bet,
+                    TRY_CAST(session_id AS BIGINT) AS session_id,
+                    TRY_CAST(table_id AS BIGINT) AS table_id,
+                    CAST(gaming_day AS TIMESTAMP) AS gaming_day,
+                    ROW_NUMBER() OVER (
+                      ORDER BY CAST(payout_complete_dtm AS TIMESTAMPTZ) ASC,
+                               TRY_CAST(bet_id AS DOUBLE) ASC
+                    ) AS rn
+                  FROM read_parquet('{t_esc}')
+                  WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
+                    AND payout_complete_dtm IS NOT NULL
+                    AND TRY_CAST(player_id AS BIGINT) IS NOT NULL
+                )
+                SELECT * EXCLUDE (rn)
+                FROM ordered
+                WHERE rn > {start} AND rn <= {end}
+                """,
+            ).fetchdf()
+            if not df.empty:
+                yield df
+    finally:
+        con.close()
+
+
+def _short_term_features_for_batch(
+    bets_batch: pd.DataFrame,
+    *,
+    cleaned_bet_parquet: Path,
+    mapping_parquet: Path,
+    serving_cfg: HightierServingConfig,
+    duckdb_runtime: DuckDbRuntimeConfig,
+    fe_columns: tuple[str, ...],
+    trial_columns: tuple[str, ...],
+) -> pd.DataFrame:
+    """Compute production-aligned short-term ``bet__*`` and ``fe__*`` for one scoring batch."""
+
+    from trainer_hightier.serving.feature_builder import (
+        attach_canonical_id,
+        attach_synthetic_etl_and_prediction_visible,
+        attach_trial_bet_behavior_1h,
+    )
+    from trainer_hightier.serving.offline_serving_backtest import build_pool_from_cleaned_parquet
+
+    if bets_batch.empty:
+        return pd.DataFrame(columns=["bet_id", *trial_columns, *fe_columns])
+    work = bets_batch.copy()
+    work["__etl_insert_Dtm"] = pd.to_datetime(work["payout_complete_dtm"], errors="coerce")
+    pool = build_pool_from_cleaned_parquet(
+        work,
+        cleaned_root=cleaned_bet_parquet,
+        cfg=serving_cfg,
+        mapping_parquet=mapping_parquet,
+        expand_canonical_aliases=False,
+    )
+    pool = attach_canonical_id(pool, mapping_parquet=mapping_parquet)
+    staged = attach_synthetic_etl_and_prediction_visible(work)
+    staged = attach_canonical_id(staged, mapping_parquet=mapping_parquet)
+    staged = attach_trial_bet_behavior_1h(staged, pool, duckdb_runtime=duckdb_runtime)
+    fe_part = (
+        compute_fe_derived_features_from_pool(pool, staged["bet_id"], duckdb_runtime=duckdb_runtime)
+        if fe_columns
+        else pd.DataFrame({"bet_id": staged["bet_id"]})
+    )
+    out = pd.DataFrame({"bet_id": pd.to_numeric(staged["bet_id"], errors="coerce")})
+    for col in trial_columns:
+        out[col] = staged[col].to_numpy()
+    for col in fe_columns:
+        if col not in fe_part.columns:
+            raise ValueError(
+                f"bounded fe__ materialization missing column {col!r}; got {list(fe_part.columns)}",
+            )
+        out[col] = fe_part[col].to_numpy()
+    return out
+
+
 def materialize_fe_derived_short_term_parquet(
     *,
     cleaned_bet_parquet: Path,
@@ -495,41 +644,102 @@ def materialize_fe_derived_short_term_parquet(
     duckdb_runtime: DuckDbRuntimeConfig,
     canonical_mapping_parquet: Path | None = None,
     short_term_columns: tuple[str, ...] | None = None,
+    trial_columns: tuple[str, ...] | None = None,
 ) -> Path:
-    """Materialize bet-grain short-term PIT ``fe__*`` columns only.
+    """Materialize bounded hot-pool short-term ``bet__*`` and ``fe__*`` (train–serve aligned).
 
-    Mid-term model columns must be supplied by
-    :func:`~trainer_hightier.feature_experiment.materialize_mid_term_daily_snapshot.materialize_mid_term_daily_snapshot`
-    and joined via ASOF enrich. Legacy mid-term rolling values in
-    :func:`materialize_fe_derived_parquet` are intentionally excluded here.
+    Uses the same pool window and batch size as scorer v2; does not scan full bet history.
+    Mid-term model columns are supplied separately via daily snapshot ASOF enrich.
     """
+
+    fe_cols = tuple(short_term_columns or ())
+    trial_cols = tuple(trial_columns if trial_columns is not None else SHORT_TERM_TRIAL_BET_COLUMNS)
+    if not fe_cols and not trial_cols:
+        raise ValueError("short_term materialization requires at least one fe__ or bet__ column")
+    out_cols = tuple(dict.fromkeys(("bet_id", *trial_cols, *fe_cols)))
+
+    serving_cfg = default_hightier_serving_config()
+    batch_size = int(serving_cfg.hightier_scorer_max_bets_per_cycle)
+    cmap = (
+        Path(canonical_mapping_parquet).resolve()
+        if canonical_mapping_parquet is not None
+        else default_canonical_mapping_parquet_path().resolve()
+    )
+    if not cmap.is_file():
+        raise FileNotFoundError(f"canonical_player_mapping parquet missing: {cmap}")
 
     dst = Path(out_parquet).resolve()
     dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.parent / f"{dst.stem}__legacy_full_tmp.parquet"
-    materialize_fe_derived_parquet(
-        cleaned_bet_parquet=cleaned_bet_parquet,
-        training_parquet_for_bet_ids=training_parquet_for_bet_ids,
-        out_parquet=tmp,
+    batch_dir = dst.parent / f"{dst.stem}__{BOUNDED_SHORT_TERM_MATERIALIZER_VERSION}_batches"
+    if batch_dir.is_dir():
+        shutil.rmtree(batch_dir)
+    batch_dir.mkdir(parents=True, exist_ok=True)
+
+    batch_paths: list[Path] = []
+    batch_idx = 0
+    for bets_batch in _iter_training_bet_batches(
+        Path(training_parquet_for_bet_ids).resolve(),
+        batch_size=batch_size,
         duckdb_runtime=duckdb_runtime,
-        canonical_mapping_parquet=canonical_mapping_parquet,
-    )
-    cols = tuple(dict.fromkeys(("bet_id", *(short_term_columns or ()))))
-    if len(cols) <= 1:
-        raise ValueError("short_term_columns must include at least one fe__ column")
-    col_sql = ", ".join(f'"{c}"' for c in cols)
-    dst_esc = _path_esc(dst)
-    tmp_esc = _path_esc(tmp)
-    con = duckdb.connect(database=":memory:")
-    try:
-        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
-        con.execute(
-            f"COPY (SELECT {col_sql} FROM read_parquet('{tmp_esc}')) "
-            f"TO '{dst_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
+    ):
+        features = _short_term_features_for_batch(
+            bets_batch,
+            cleaned_bet_parquet=Path(cleaned_bet_parquet).resolve(),
+            mapping_parquet=cmap,
+            serving_cfg=serving_cfg,
+            duckdb_runtime=duckdb_runtime,
+            fe_columns=fe_cols,
+            trial_columns=trial_cols,
         )
-    finally:
-        con.close()
-    tmp.unlink(missing_ok=True)
+        part = batch_dir / f"part_{batch_idx:06d}.parquet"
+        features[list(out_cols)].to_parquet(part, index=False)
+        batch_paths.append(part)
+        batch_idx += 1
+        if batch_idx % 10 == 0:
+            logger.info(
+                "[bounded_short_term] materialized %d batches (last_part=%s rows=%d)",
+                batch_idx,
+                part.name,
+                len(features),
+            )
+
+    if not batch_paths:
+        raise ValueError(
+            f"bounded short-term materialization produced no rows from {training_parquet_for_bet_ids}",
+        )
+
+    col_sql = ", ".join(f'"{c}"' for c in out_cols)
+    dst_esc = _path_esc(dst)
+    if len(batch_paths) == 1:
+        single_esc = _path_esc(batch_paths[0])
+        con = duckdb.connect(database=":memory:")
+        try:
+            apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+            con.execute(
+                f"COPY (SELECT {col_sql} FROM read_parquet('{single_esc}')) "
+                f"TO '{dst_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
+            )
+        finally:
+            con.close()
+    else:
+        paths_esc = "[" + ",".join(f"'{_path_esc(p)}'" for p in batch_paths) + "]"
+        con = duckdb.connect(database=":memory:")
+        try:
+            apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+            con.execute(
+                f"COPY (SELECT {col_sql} FROM read_parquet({paths_esc})) "
+                f"TO '{dst_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
+            )
+        finally:
+            con.close()
+    shutil.rmtree(batch_dir, ignore_errors=True)
+    logger.info(
+        "[bounded_short_term] wrote %s (%d batches, lookback_h=%d, batch_size=%d)",
+        dst.name,
+        len(batch_paths),
+        int(serving_cfg.hot_feature_pool_lookback_hours),
+        batch_size,
+    )
     return dst
 
 

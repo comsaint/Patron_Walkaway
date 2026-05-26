@@ -45,20 +45,25 @@ def test_dirty_dates_none_without_prev_and_empty_when_stable() -> None:
     assert _bt3._dirty_shard_calendar_dates(prev, cur) == frozenset()
 
 
-def test_affected_slow_group_spans_farther_than_trial_group() -> None:
-    """180d expansion should touch distant months unlike 2-day trial windows."""
+def test_affected_slow_group_spans_farther_than_cleaned_group() -> None:
+    """180d slow expansion should touch distant months unlike 31-day cleaned windows."""
 
     months = [date(2025, 1, 1), date(2025, 6, 1), date(2025, 7, 1), date(2025, 12, 1)]
     dirt = frozenset({date(2025, 7, 3)})
     plan = (
         ("cleaned", "walkaway_bet_v1", 31),
-        ("trial_clock", "walkaway_bet_trial_clock_v1", 2),
         ("slow_snap", "walkaway_canonical_slow_snap_v1", 180),
     )
     aff = _bt3._affected_month_indices_by_group(months, dirt, plan)
-    assert aff["trial_clock"] == {2}
-    assert aff["trial_clock"] <= aff["slow_snap"]
+    assert 2 in aff["cleaned"]
+    assert aff["cleaned"] <= aff["slow_snap"]
     assert 0 in aff["slow_snap"]
+
+
+def test_feast_group_plan_excludes_trial_clock() -> None:
+    plan = _bt3._feast_group_plan("walkaway_bet_trial_v1")
+    gids = {g[0] for g in plan}
+    assert gids == {"cleaned", "slow_snap"}
 
 
 def test_slow_parquet_grain_canonical_vs_bet(tmp_path: Path) -> None:

@@ -182,3 +182,35 @@ FROM ordered
     finally:
         con.close()
     return dst
+
+
+def _main() -> None:
+    """CLI entrypoint for manual Feast offline trial Parquet (not used on the training path)."""
+
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Materialize full-history trial 1h Parquet for Feast FileSource / diagnostics.",
+    )
+    parser.add_argument(
+        "--cleaned-bet-parquet",
+        type=Path,
+        default=None,
+        help="Cleaned bet hive root (default: trainer_hightier artifacts cleaned bet).",
+    )
+    parser.add_argument(
+        "--out-parquet",
+        type=Path,
+        default=None,
+        help="Output path (default: artifacts/feast/trial_bet_behavior_1h.parquet).",
+    )
+    ns = parser.parse_args()
+    out = materialize_trial_bet_behavior_1h(
+        cleaned_bet_parquet=ns.cleaned_bet_parquet,
+        out_parquet=ns.out_parquet,
+    )
+    print(out.resolve())
+
+
+if __name__ == "__main__":
+    _main()

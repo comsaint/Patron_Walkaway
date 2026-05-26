@@ -13,7 +13,7 @@ prefix matches steps 1–2; use :func:`importlib.import_module` if importing fro
 
 Steps (see :func:`build_training_data`):
 
-1. Optional: materialize derived feature Parquets (1h trial + 180d monthly slow).
+1. Optional: materialize derived slow patron 180d monthly Parquet (short-term ``bet__*`` / ``fe__*`` come from Step 3.5 bounded hot pool).
 2. Write entity Parquet (``bet_id``, ``event_timestamp``) from cleaned bet.
 3. ``get_historical_features`` + ``persist`` → staging feature Parquet (Ibis/DuckDB).
 4. DuckDB left-join labels on ``bet_id`` + ``gaming_day`` from cleaned bet → ``artifacts/training_data/training_set.parquet``.
@@ -50,7 +50,12 @@ from typing import Any
 import duckdb
 import pyarrow.parquet as pq
 
-from trainer_hightier.config import DuckDbRuntimeConfig, configs_from_run_profile, get_run_profile
+from trainer_hightier.config import (
+    DuckDbRuntimeConfig,
+    SHORT_TERM_TRIAL_BET_COLUMNS,
+    configs_from_run_profile,
+    get_run_profile,
+)
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
 from trainer_hightier.utils.bet_l0_preprocess import (
     cleaned_bet_artifact_fingerprint_block,
@@ -61,10 +66,6 @@ from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_p
 from trainer_hightier.utils.slow_patron_180d_monthly import (
     default_slow_patron_180d_monthly_parquet_path,
     materialize_slow_patron_180d_monthly,
-)
-from trainer_hightier.utils.trial_bet_behavior_1h import (
-    default_trial_bet_behavior_1h_parquet_path,
-    materialize_trial_bet_behavior_1h,
 )
 
 logger = logging.getLogger(__name__)
@@ -136,12 +137,7 @@ SERVICES_WITH_DECOMPOSED_MONTH_CACHE = frozenset({"walkaway_bet_trial_v1", "walk
 
 _RE_GAMING_DAY_KEY = re.compile(r"gaming_day_key=(\d{4}-\d{2}-\d{2})")
 
-_TRIAL_MERGE_COLS = (
-    "bet__bets_cnt__w1h",
-    "bet__wager_sum__w1h",
-    "bet__back_bet_ratio__w1h",
-    "bet__payout_odds_avg__w1h",
-)
+_TRIAL_MERGE_COLS = SHORT_TERM_TRIAL_BET_COLUMNS
 _SLOW_MERGE_COLS = (
     "patron__theo_win_sum__w180d_m1snap",
     "patron__gaming_days_cnt__w180d_m1snap",
@@ -262,7 +258,6 @@ def _feast_group_plan(aggregate_feature_service: str) -> tuple[tuple[str, str, i
     if s == "walkaway_bet_trial_v1":
         return (
             ("cleaned", "walkaway_bet_v1", 31),
-            ("trial_clock", "walkaway_bet_trial_clock_v1", 2),
             ("slow_snap", "walkaway_canonical_slow_snap_v1", 180),
         )
     if s == "walkaway_bet_v1":
@@ -326,12 +321,8 @@ def _group_cache_manifest_path(parquet_cache_file: Path) -> Path:
 
 
 def _derived_dependency_stat(repo_root: Path, group_id: str) -> dict[str, Any] | None:
-    if group_id in ("trial_clock", "slow_snap"):
-        p = (
-            default_trial_bet_behavior_1h_parquet_path(repo_root=repo_root)
-            if group_id == "trial_clock"
-            else default_slow_patron_180d_monthly_parquet_path(repo_root=repo_root)
-        )
+    if group_id == "slow_snap":
+        p = default_slow_patron_180d_monthly_parquet_path(repo_root=repo_root)
         if not p.is_file():
             raise FileNotFoundError(f"group {group_id} requires derived Parquet at {p}")
         return _parquet_quick_stat(p)
@@ -575,14 +566,12 @@ def _validate_prereqs(
         )
     needs_derived = feature_service_name.strip() == DEFAULT_FEATURE_SERVICE
     if needs_derived and not materialize_derived:
-        trial = default_trial_bet_behavior_1h_parquet_path(repo_root=REPO_ROOT)
         slow = default_slow_patron_180d_monthly_parquet_path(repo_root=REPO_ROOT)
-        missing = [p for p in (trial, slow) if not p.is_file()]
-        if missing:
+        if not slow.is_file():
             raise FileNotFoundError(
-                "Derived Feast Parquet(s) missing (trial 1h and/or slow 180d). "
-                f"Missing: {[str(m) for m in missing]}. "
-                "Pass --materialize-derived to build them, use --feature-service walkaway_bet_v1 "
+                "Derived slow patron 180d Parquet missing. "
+                f"Missing: {slow}. "
+                "Pass --materialize-derived to build it, use --feature-service walkaway_bet_v1 "
                 "for cleaned bet features only, or materialize manually."
             )
 
@@ -597,12 +586,7 @@ def _maybe_materialize_derived(cfg: BuildTrainingDataArgs) -> None:
             DEFAULT_FEATURE_SERVICE,
         )
         return
-    logger.info("Materializing trial 1h behavior Parquet …")
-    materialize_trial_bet_behavior_1h(
-        cleaned_bet_parquet=cfg.cleaned_bet_parquet,
-        duckdb_runtime=cfg.duckdb_runtime,
-    )
-    logger.info("Materializing slow patron 180d monthly Parquet …")
+    logger.info("Materializing slow patron 180d monthly Parquet (training derived; trial 1h skipped) …")
     materialize_slow_patron_180d_monthly(duckdb_runtime=cfg.duckdb_runtime)
 
 
@@ -888,6 +872,13 @@ def build_training_data(cfg: BuildTrainingDataArgs) -> Path:
         and cfg.feast_retrieval_cache_enabled
         and cfg.feature_service_name.strip() in SERVICES_WITH_DECOMPOSED_MONTH_CACHE
     )
+    aggregate_name = cfg.feature_service_name.strip()
+    if aggregate_name == DEFAULT_FEATURE_SERVICE and not use_group_cache:
+        raise ValueError(
+            f"feature_service {aggregate_name!r} requires month-batch decomposed Feast cache "
+            "(feast_entity_batch_by_calendar_month=True and feast_retrieval_cache_enabled=True). "
+            "Short-term bet__* features are supplied in Step 3.5 via bounded hot pool, not Feast trial_clock.",
+        )
     n_rows: int | None = None
     code_fp = _build_training_data_module_sha256_hex()
     cleaned_fp_root = cleaned_bet_artifact_fingerprint_block(Path(cfg.cleaned_bet_parquet).resolve())
@@ -930,8 +921,6 @@ def build_training_data(cfg: BuildTrainingDataArgs) -> Path:
                 if use_group_cache and groups_plan
                 else {}
             )
-
-            aggregate_name = cfg.feature_service_name.strip()
 
             for mi, ms in enumerate(months):
                 me = _add_one_month_calendar(ms)
@@ -1031,12 +1020,11 @@ def build_training_data(cfg: BuildTrainingDataArgs) -> Path:
                         paths_by_gid[gid] = cache_p
 
                     cleaned_only = paths_by_gid["cleaned"]
-                    tp = paths_by_gid.get("trial_clock")
                     sp = paths_by_gid.get("slow_snap")
 
                     _duckdb_join_decomposed_month_features(
                         cleaned_p=cleaned_only,
-                        trial_p=tp,
+                        trial_p=None,
                         slow_p=sp,
                         merged_out=f_fp,
                         duckdb_runtime=cfg.duckdb_runtime,

@@ -137,6 +137,14 @@ DEFAULT_TRAINING_MID_SNAPSHOT_PARQUET: Final[str] = (
     "trainer_hightier/artifacts/training_data/_main_trainer_mid_term_daily_snapshot.parquet"
 )
 
+#: Short-term trial bet behavior columns (bounded PIT in Step 3.5; not Feast trial_clock join).
+SHORT_TERM_TRIAL_BET_COLUMNS: Final[tuple[str, ...]] = (
+    "bet__bets_cnt__w1h",
+    "bet__wager_sum__w1h",
+    "bet__back_bet_ratio__w1h",
+    "bet__payout_odds_avg__w1h",
+)
+
 # Baseline MODEL columns: softer FQG (high PSI → WARN; unique-constant under sample → WARN; WARN auto-allowlist).
 _FQG_BASELINE_MODEL_SOFT_COLUMNS: tuple[str, ...] = (
     "wager",
@@ -432,7 +440,7 @@ class Step5TrainConfig:
     #: When ``True``, use :data:`baseline_*` hyperparameters only (no Optuna).
     skip_optuna: bool = False
     #: ``study.optimize(..., timeout=...)`` wall-clock cap in seconds.
-    optuna_timeout_sec: float = 60 * 60 * 6  # 1 hour = 60*60
+    optuna_timeout_sec: float = 60 * 10  # 10-minute Optuna wall-clock budget
     early_stopping_rounds: int = 50
     #: Upper bound on boosting rounds (early stopping usually stops sooner).
     lgb_n_estimators_cap: int = 2000

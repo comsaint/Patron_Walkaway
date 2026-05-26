@@ -115,6 +115,8 @@ def default_training_supplier_for_row(row: FeatureRegistryEntryRow) -> str:
     if src == "baseline_model":
         return SUPPLIER_RAW
     if src == "feast_trial_1h":
+        if h == "short_term":
+            return SUPPLIER_SHORT_TERM_PIT
         return SUPPLIER_FEAST_TRIAL
     if src == "feast_slow_180d":
         return SUPPLIER_LONG_TERM_MONTHLY

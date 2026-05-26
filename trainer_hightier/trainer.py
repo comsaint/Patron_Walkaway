@@ -42,6 +42,7 @@ from trainer_hightier.config import (
     FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME,
     DEFAULT_RUN_PROFILE_NAME,
     DEFAULT_TRAINING_FEATURE_SERVICE,
+    SHORT_TERM_TRIAL_BET_COLUMNS,
     DuckDbRuntimeConfig,
     HighTierObjectiveConfig,
     MLFLOW_EXPERIMENT_TRAIN_HIGHTIER,
@@ -196,7 +197,7 @@ class HighTierTrainArgs:
     materialize_walkaway_labels: bool = True
     # Step 3: Feast historical features + labels → ``artifacts/training_data/training_set.parquet`` (default on).
     build_training_dataset: bool = True
-    # When ``build_training_dataset``: materialize trial 1h + slow 180d Parquets before Feast (default on; very heavy).
+    # When ``build_training_dataset``: materialize slow 180d Parquet before Feast (default on; trial 1h skipped).
     training_materialize_derived: bool = True
     # Feast feature service for Step 3 (default matches ``03_build_training_data``).
     training_feature_service: str = DEFAULT_TRAINING_FEATURE_SERVICE
@@ -1061,6 +1062,27 @@ def _resolve_features_parquet(args: HighTierTrainArgs) -> Path:
     return _b3.DEFAULT_OUTPUT.resolve()
 
 
+def _assert_training_parquet_has_short_term_pit_columns(
+    parquet_path: Path,
+    *,
+    required_columns: tuple[str, ...],
+) -> None:
+    """Fail closed when Step 4/5 input lacks bounded short-term PIT columns."""
+
+    import pyarrow.parquet as pq
+
+    if not required_columns:
+        return
+    have = set(pq.read_schema(Path(parquet_path).resolve()).names)
+    missing = [c for c in required_columns if c not in have]
+    if missing:
+        raise ValueError(
+            f"training features parquet missing bounded short-term columns {missing}; "
+            f"path={parquet_path.resolve()}. Use training_set_fe_enriched.parquet from Step 3.5, "
+            "not raw training_set.parquet (bet__* are not joined in Step 3).",
+        )
+
+
 def _ensure_fe_enriched_training_parquet_for_step4(
     args: HighTierTrainArgs,
     base_training_parquet: Path,
@@ -1073,7 +1095,8 @@ def _ensure_fe_enriched_training_parquet_for_step4(
     snap = load_candidate_registry(reg_p)
     baseline = baseline_features_for_main_trainer(snap)
     fe_baseline = tuple(c for c in baseline if str(c).startswith("fe__"))
-    if not fe_baseline:
+    trial_baseline = tuple(c for c in SHORT_TERM_TRIAL_BET_COLUMNS if c in baseline)
+    if not fe_baseline and not trial_baseline:
         return base_training_parquet
 
     raw_rows = load_registry_raw_feature_dicts(reg_p)
@@ -1086,10 +1109,11 @@ def _ensure_fe_enriched_training_parquet_for_step4(
 
     audit = cadence_mod.build_feature_cadence_audit(snap, baseline, raw_rows=raw_rows)
     fe_split = cadence_mod.classify_model_fe_features(snap, fe_baseline, raw_rows=raw_rows)
-    short_cols = cadence_mod.short_term_enrich_columns_with_dependencies(
+    short_fe_cols = cadence_mod.short_term_enrich_columns_with_dependencies(
         fe_split["short_term"],
         fe_split["mid_term"],
     )
+    short_cols = tuple(dict.fromkeys([*trial_baseline, *short_fe_cols]))
     mid_cols = fe_split["mid_term"]
 
     cleaned = _hpre.default_cleaned_bet_parquet_path().resolve()
@@ -1102,13 +1126,15 @@ def _ensure_fe_enriched_training_parquet_for_step4(
     enriched = out_dir / "training_set_fe_enriched.parquet"
 
     t_m0 = time.perf_counter()
+    short_fe_only = tuple(c for c in short_cols if str(c).startswith("fe__"))
     if short_cols:
         fe_mod.materialize_fe_derived_short_term_parquet(
             cleaned_bet_parquet=cleaned,
             training_parquet_for_bet_ids=base_training_parquet,
             out_parquet=fe_short_out,
             duckdb_runtime=args.duckdb_runtime,
-            short_term_columns=short_cols,
+            short_term_columns=short_fe_only,
+            trial_columns=trial_baseline,
         )
     mat_short_sec = round(time.perf_counter() - t_m0, 3)
 
@@ -1199,8 +1225,11 @@ def _ensure_fe_enriched_training_parquet_for_step4(
         if mid_meta:
             metrics["main_trainer_mid_term_snapshot_meta"] = mid_meta
     logger.info(
-        "[Step 3.5] cadence enrich: short=%d mid=%d -> %s (short %.3fs, mid %.3fs, enrich %.3fs)",
+        "[Step 3.5] cadence enrich: short_pit=%d (bet__=%d fe__=%d) mid=%d -> %s "
+        "(short %.3fs, mid %.3fs, enrich %.3fs)",
         len(short_cols),
+        len(trial_baseline),
+        len(short_fe_only),
         len(mid_cols),
         enriched.name,
         mat_short_sec,
@@ -1227,6 +1256,18 @@ def _maybe_run_step4(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None)
         return
     logger.info("[Step 4] starting from features parquet %s", fp.resolve())
     fp_eff = _ensure_fe_enriched_training_parquet_for_step4(args, fp, metrics=metrics)
+    reg_p = Path(args.feature_candidate_registry).resolve() if args.feature_candidate_registry else None
+    snap = load_candidate_registry(reg_p)
+    baseline = baseline_features_for_main_trainer(snap)
+    pit_required = tuple(
+        dict.fromkeys(
+            [
+                *(c for c in SHORT_TERM_TRIAL_BET_COLUMNS if c in baseline),
+                *(c for c in baseline if str(c).startswith("fe__")),
+            ],
+        ),
+    )
+    _assert_training_parquet_has_short_term_pit_columns(fp_eff, required_columns=pit_required)
     logger.info(
         "[Step 4] calling arrange_and_split_training_data (input %s → splits dir %s)",
         fp_eff.resolve(),
@@ -1920,8 +1961,8 @@ def _build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         dest="skip_training_materialize_derived",
         help=(
-            "With Step 3 enabled: do not re-materialize trial 1h + slow 180d Parquets before Feast "
-            "(faster when those files are already up to date)."
+            "With Step 3 enabled: do not re-materialize slow 180d Parquet before Feast "
+            "(faster when that file is already up to date; trial 1h is not materialized on the training path)."
         ),
     )
     p.add_argument(

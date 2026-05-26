@@ -583,14 +583,14 @@ def _bets_frame_from_test_batch(batch: pd.DataFrame) -> pd.DataFrame:
 def resolve_hot_pool_player_ids(
     bets: pd.DataFrame,
     mapping_parquet: Path,
+    *,
+    expand_canonical_aliases: bool = True,
 ) -> list[int]:
-    """Expand batch ``player_id`` values to all canonical alias ids (training ``pid`` CTE).
+    """Resolve ``player_id`` list for hot-pool fetch.
 
-    Mirrors ``materialize_fe_derived_parquet``:
-
-    - ``pid_from_train``: distinct ``player_id`` on the scoring batch
-    - ``cid_from_train``: canonical ids for those players
-    - ``pid``: batch player ids UNION all alias player ids per canonical
+    When ``expand_canonical_aliases`` is True (production / offline backtest default),
+    include all ``player_id`` rows sharing a ``canonical_id`` with any batch player.
+    Training bounded PIT uses ``False`` to match live scorer window fanout.
     """
     base = sorted(
         {
@@ -608,7 +608,7 @@ def resolve_hot_pool_player_ids(
     cmap["canonical_id"] = cmap["canonical_id"].astype(str).str.strip()
     cmap = cmap.dropna(subset=["player_id"])
     cmap = cmap.loc[cmap["canonical_id"] != ""]
-    if cmap.empty:
+    if cmap.empty or not expand_canonical_aliases:
         return base
     pid_to_cid = cmap.drop_duplicates("player_id").set_index("player_id")["canonical_id"]
     canonical_ids: set[str] = set()
@@ -629,6 +629,7 @@ def build_pool_from_cleaned_parquet(
     cleaned_root: Path,
     cfg: HightierServingConfig,
     mapping_parquet: Path,
+    expand_canonical_aliases: bool = True,
 ) -> pd.DataFrame:
     """Bounded hot pool from local cleaned bet hive (no ClickHouse)."""
     import duckdb
@@ -641,7 +642,11 @@ def build_pool_from_cleaned_parquet(
     glob_path = str((root / "**" / "*.parquet").as_posix())
     pool_start = compute_hot_pool_window_start(bets, cfg=cfg)
     pool_end = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce").max().to_pydatetime()
-    pids = resolve_hot_pool_player_ids(bets, mapping_parquet)
+    pids = resolve_hot_pool_player_ids(
+        bets,
+        mapping_parquet,
+        expand_canonical_aliases=expand_canonical_aliases,
+    )
     fan_cap = int(cfg.hightier_scorer_pool_player_fanout_cap)
     if len(pids) > fan_cap:
         logger.warning("[offline_backtest] pool fanout %d -> %d", len(pids), fan_cap)
@@ -665,7 +670,9 @@ def build_pool_from_cleaned_parquet(
                 b.table_id,
                 b.wager,
                 b.casino_win,
-                b.payout_odds
+                b.payout_odds,
+                b.theo_win,
+                b.base_ha
             FROM read_parquet('{glob_path}', hive_partitioning=true) AS b
             INNER JOIN allow_pids AS p ON b.player_id = p.player_id
             WHERE b.payout_complete_dtm >= ?
