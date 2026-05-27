@@ -271,9 +271,9 @@ def parse_gate_args(argv: list[str] | None = None) -> DeployE2EGateOptions:
         pr.error("provide both --gaming-day-start and --gaming-day-end, or neither")
     return DeployE2EGateOptions(
         bundle_dir=Path(args.bundle_dir).resolve(),
-        local_cleaned_bet=Path(args.local_cleaned_bet).resolve(),
-        local_cleaned_session=Path(args.local_cleaned_session).resolve(),
-        output_json=Path(args.output_json).resolve() if args.output_json else None,
+        local_cleaned_bet=_resolve_cli_data_path(args.local_cleaned_bet),
+        local_cleaned_session=_resolve_cli_data_path(args.local_cleaned_session),
+        output_json=_resolve_cli_data_path(args.output_json) if args.output_json else None,
         gaming_day_start=g_start,
         gaming_day_end=g_end,
         gaming_day_source="cli" if g_start is not None else None,
@@ -331,6 +331,17 @@ def reset_bundle_feast_runtime(bundle_root: Path, rel: dict[str, Any]) -> dict[s
     }
 
 
+def _host_workspace_editable_target() -> Path | None:
+    """Return the editable ``trainer_hightier`` tree when the host runs from a source checkout."""
+    init = Path(trainer_hightier.__file__).resolve()
+    if "site-packages" in init.parts:
+        return None
+    pkg_dir = init.parent
+    if (pkg_dir / "pyproject.toml").is_file():
+        return pkg_dir
+    return None
+
+
 def provision_bundle_venv(bundle_root: Path, *, recreate: bool) -> GateStepResult:
     """Create ``bundle_root/.venv`` and ``pip install -r requirements.txt`` (production-like)."""
     root = Path(bundle_root).resolve()
@@ -380,6 +391,29 @@ def provision_bundle_venv(bundle_root: Path, *, recreate: bool) -> GateStepResul
                 detail=detail,
                 error=f"pip install failed (exit {proc.returncode}): {tail}",
             )
+        editable = _host_workspace_editable_target()
+        if editable is not None:
+            logger.info(
+                "[deploy_e2e_gate] host runs from workspace; pip install -e %s into bundle venv",
+                editable,
+            )
+            ed_proc = subprocess.run(
+                [str(pip), "install", "-e", str(editable)],
+                cwd=str(root),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            detail["workspace_editable_install"] = str(editable)
+            detail["workspace_editable_exit_code"] = ed_proc.returncode
+            if ed_proc.returncode != 0:
+                tail = (ed_proc.stderr or ed_proc.stdout or "")[-2000:]
+                return GateStepResult(
+                    name="venv_provision",
+                    ok=False,
+                    detail=detail,
+                    error=f"pip install -e workspace failed (exit {ed_proc.returncode}): {tail}",
+                )
         verify = subprocess.run(
             [
                 str(venv_py),
@@ -415,26 +449,60 @@ def provision_bundle_venv(bundle_root: Path, *, recreate: bool) -> GateStepResul
         return GateStepResult(name="venv_provision", ok=False, detail=detail, error=str(exc))
 
 
-def _argv_for_venv_reexec(argv: list[str] | None) -> list[str]:
-    """Copy argv and ensure re-invoked child skips venv provisioning."""
-    out = list(argv or sys.argv[1:])
-    if "--skip-venv-provision" not in out:
-        out.append("--skip-venv-provision")
-    return out
+def _repo_root_from_gate_module() -> Path:
+    """Repository root (parent of ``trainer_hightier`` package directory)."""
+    return Path(__file__).resolve().parents[2]
 
 
-def _argv_with_absolute_bundle_dir(argv: list[str] | None, bundle_dir: Path) -> list[str]:
-    """Normalize ``--bundle-dir`` to an absolute path for venv re-exec (cwd becomes bundle root)."""
-    out = list(argv or sys.argv[1:])
-    bundle_abs = str(Path(bundle_dir).resolve())
-    for i, tok in enumerate(out):
-        if tok == "--bundle-dir" and i + 1 < len(out):
-            out[i + 1] = bundle_abs
-            return out
-        if tok.startswith("--bundle-dir="):
-            out[i] = f"--bundle-dir={bundle_abs}"
-            return out
-    return out
+def _resolve_cli_data_path(path: Path | str) -> Path:
+    """Resolve CLI path to absolute; prefer cwd then repo root when relative."""
+    p = Path(path).expanduser()
+    if p.is_absolute():
+        return p.resolve()
+    from_cwd = (Path.cwd() / p).resolve()
+    if from_cwd.exists():
+        return from_cwd
+    from_repo = (_repo_root_from_gate_module() / p).resolve()
+    if from_repo.exists():
+        return from_repo
+    return from_cwd
+
+
+def _argv_for_bundle_venv_reexec(opts: DeployE2EGateOptions) -> list[str]:
+    """Build child argv with absolute paths (child ``cwd`` is the deploy bundle root)."""
+    argv: list[str] = [
+        "--bundle-dir",
+        str(opts.bundle_dir.resolve()),
+        "--local-cleaned-bet",
+        str(_resolve_cli_data_path(opts.local_cleaned_bet)),
+        "--local-cleaned-session",
+        str(_resolve_cli_data_path(opts.local_cleaned_session)),
+        "--max-bets",
+        str(int(opts.max_bets)),
+        "--skip-venv-provision",
+    ]
+    if opts.output_json is not None:
+        argv.extend(["--output-json", str(_resolve_cli_data_path(opts.output_json))])
+    if opts.gaming_day_start is not None and opts.gaming_day_end is not None:
+        argv.extend(
+            [
+                "--gaming-day-start",
+                opts.gaming_day_start.isoformat(),
+                "--gaming-day-end",
+                opts.gaming_day_end.isoformat(),
+            ],
+        )
+    if not opts.force_feast_refresh:
+        argv.append("--no-force-feast-refresh")
+    if opts.reuse_readiness:
+        argv.append("--reuse-readiness")
+    if not opts.strict_smoke:
+        argv.append("--no-strict-smoke")
+    if opts.warn_only:
+        argv.append("--warn-only")
+    if not opts.reset_feast_runtime:
+        argv.append("--no-reset-feast-runtime")
+    return argv
 
 
 def validate_bundle_contract(bundle_root: Path) -> dict[str, Any]:
@@ -832,7 +900,7 @@ def run_cli(argv: list[str] | None = None) -> int:
         child_argv = [
             "-m",
             "trainer_hightier.serving.deploy_e2e_gate",
-            *_argv_for_venv_reexec(_argv_with_absolute_bundle_dir(argv, opts.bundle_dir)),
+            *_argv_for_bundle_venv_reexec(opts),
         ]
         logger.info("[deploy_e2e_gate] re-exec gate with bundle venv: %s", child)
         proc = subprocess.run(

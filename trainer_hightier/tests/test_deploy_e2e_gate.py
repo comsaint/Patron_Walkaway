@@ -7,6 +7,7 @@ import pickle
 import shutil
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
@@ -394,3 +395,82 @@ def test_provision_bundle_venv_requires_requirements(tmp_path: Path) -> None:
     step = provision_bundle_venv(deploy, recreate=True)
     assert not step.ok
     assert "requirements.txt" in (step.error or "")
+
+
+def test_host_workspace_editable_target_from_pytest() -> None:
+    from trainer_hightier.serving.deploy_e2e_gate import _host_workspace_editable_target
+
+    target = _host_workspace_editable_target()
+    assert target is not None
+    assert (target / "pyproject.toml").is_file()
+
+
+def test_run_cli_provisions_venv_and_reexecs_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parent process provisions bundle venv then re-execs gate under bundle python."""
+    import sys
+
+    deploy = _deploy_layout(tmp_path)
+    bet = tmp_path / "bet"
+    bet.mkdir()
+    sess = tmp_path / "session.parquet"
+    pd.DataFrame({"player_id": [1], "gaming_day": ["2026-05-01"]}).to_parquet(sess, index=False)
+    (deploy / "requirements.txt").write_text("trainer-hightier\n", encoding="utf-8")
+
+    reexec_argv: list[str] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> MagicMock:
+        reexec_argv.extend(cmd)
+        return MagicMock(returncode=0)
+
+    def _fake_provision(_root: Path, *, recreate: bool) -> GateStepResult:
+        vpy = bundle_venv_python(deploy)
+        vpy.parent.mkdir(parents=True, exist_ok=True)
+        vpy.write_text("", encoding="utf-8")
+        return GateStepResult(name="venv_provision", ok=True, detail={"recreate": recreate})
+
+    monkeypatch.setattr(
+        "trainer_hightier.serving.deploy_e2e_gate.running_in_bundle_venv",
+        lambda _b: False,
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.serving.deploy_e2e_gate.provision_bundle_venv",
+        _fake_provision,
+    )
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr(sys, "executable", "/usr/bin/python3")
+
+    from trainer_hightier.serving.deploy_e2e_gate import run_cli
+
+    argv = [
+        "--bundle-dir",
+        str(deploy),
+        "--local-cleaned-bet",
+        str(bet),
+        "--local-cleaned-session",
+        str(sess),
+    ]
+    code = run_cli(argv)
+    assert code == 0
+    assert str(bundle_venv_python(deploy)) in reexec_argv[0]
+    assert "trainer_hightier.serving.deploy_e2e_gate" in reexec_argv
+    bet_idx = reexec_argv.index("--local-cleaned-bet") + 1
+    assert Path(reexec_argv[bet_idx]).is_absolute()
+    assert Path(reexec_argv[bet_idx]) == bet.resolve()
+
+
+def test_resolve_cli_data_path_prefers_repo_root_when_cwd_is_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from trainer_hightier.serving.deploy_e2e_gate import _resolve_cli_data_path
+
+    repo = Path(__file__).resolve().parents[2]
+    rel = Path("trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet")
+    bundle = tmp_path / "deploy_bundle"
+    bundle.mkdir()
+    monkeypatch.chdir(bundle)
+    resolved = _resolve_cli_data_path(rel)
+    assert resolved == (repo / rel).resolve()

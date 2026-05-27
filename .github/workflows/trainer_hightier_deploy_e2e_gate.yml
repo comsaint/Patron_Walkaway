@@ -1,0 +1,29 @@
+# Deploy E2E gate orchestration tests (local_cleaned startup path regression).
+name: trainer-hightier-deploy-e2e-gate
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "trainer_hightier/**"
+      - ".github/workflows/trainer_hightier_deploy_e2e_gate.yml"
+      - "Makefile"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "trainer_hightier/**"
+      - ".github/workflows/trainer_hightier_deploy_e2e_gate.yml"
+      - "Makefile"
+
+jobs:
+  deploy-e2e-gate-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install trainer_hightier test deps
+        run: pip install ./trainer_hightier pytest pandas pyarrow scikit-learn pyyaml duckdb python-dotenv clickhouse-connect lightgbm feast "ibis-framework[duckdb]>=11.0.0,<12"
+      - name: Deploy E2E gate unit/integration tests
+        run: make check-trainer-hightier-deploy-e2e-gate

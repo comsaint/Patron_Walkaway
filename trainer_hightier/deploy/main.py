@@ -132,6 +132,93 @@ def _resolve_log_level() -> int:
     return int(getattr(logging, key, logging.INFO))
 
 
+_DEPLOY_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+_DEPLOY_LOG_FILENAME = "deploy_main.log"
+_DEPLOY_LOG_SUBDIR = "logs"
+
+
+def _deploy_log_file_path(bundle_root: Path, rel: dict[str, Any]) -> Path:
+    """Return bundle-local deploy log path under ``local_state/logs/``."""
+    ls = str(rel.get("local_state_dir", "local_state"))
+    return (bundle_root.resolve() / ls / _DEPLOY_LOG_SUBDIR / _DEPLOY_LOG_FILENAME).resolve()
+
+
+def _root_has_stream_handler(root: logging.Logger, stream: Any) -> bool:
+    """Return True when *root* already logs to *stream* via a non-file StreamHandler."""
+    for handler in root.handlers:
+        if isinstance(handler, logging.FileHandler):
+            continue
+        if isinstance(handler, logging.StreamHandler) and getattr(handler, "stream", None) is stream:
+            return True
+    return False
+
+
+def _root_has_file_handler(root: logging.Logger, path: Path) -> bool:
+    """Return True when *root* already has a FileHandler for *path*."""
+    target = str(path.resolve())
+    for handler in root.handlers:
+        if not isinstance(handler, logging.FileHandler):
+            continue
+        try:
+            if str(Path(handler.baseFilename).resolve()) == target:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _init_deploy_logging(
+    bundle_root: Path,
+    rel: dict[str, Any],
+    *,
+    level: int,
+) -> Path | None:
+    """Configure root logger with stderr + bundle-local file handlers (idempotent).
+
+    File handler creation failures are fail-open: console logging remains active.
+
+    Returns
+    -------
+    Path | None
+        Resolved log file path when file logging is active, else ``None``.
+    """
+    formatter = logging.Formatter(_DEPLOY_LOG_FORMAT)
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    if not _root_has_stream_handler(root, sys.stderr):
+        stream_handler = logging.StreamHandler(sys.stderr)
+        stream_handler.setFormatter(formatter)
+        stream_handler.setLevel(level)
+        root.addHandler(stream_handler)
+
+    log_path = _deploy_log_file_path(bundle_root, rel)
+    file_path: Path | None = None
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if not _root_has_file_handler(root, log_path):
+            file_handler = logging.FileHandler(log_path, encoding="utf-8")
+            file_handler.setFormatter(formatter)
+            file_handler.setLevel(level)
+            root.addHandler(file_handler)
+        file_path = log_path
+    except OSError as exc:
+        logging.getLogger(__name__).warning(
+            "[deploy] file logging disabled for %s: %s: %s",
+            log_path,
+            type(exc).__name__,
+            exc,
+        )
+
+    logging.getLogger(__name__).info(
+        "[deploy] logging initialized level=%s file=%s handlers=%d",
+        logging.getLevelName(level),
+        file_path if file_path is not None else "disabled",
+        len(root.handlers),
+    )
+    return file_path
+
+
 def _preflight_frozen_artifacts(bundle_root: Path, rel: dict[str, Any]) -> None:
     """Fail fast when frozen manifest layers or core bundle files are missing."""
     model_bundle = bundle_root / str(rel.get("model_bundle_dir", "models"))
@@ -597,12 +684,15 @@ def _mid_feast_needs_bootstrap(
     force: bool,
 ) -> bool:
     """Return whether startup mid refresh should use multi-anchor bootstrap."""
+    del allowlist, mapping  # bootstrap is driven by readiness + on-disk artifacts, not coverage %
     if not require_mid:
         return False
     if force:
         return True
-    from trainer_hightier.serving import feast_online_refresh as refresh_mod
-    from trainer_hightier.serving.feast_online_adapter import feast_registry_missing, feast_schema_drift_issues
+    from trainer_hightier.serving.feast_online_adapter import (
+        feast_registry_missing,
+        resolve_feast_artifacts_dir,
+    )
     from trainer_hightier.serving.feast_readiness import (
         load_feast_online_readiness,
         resolve_feast_readiness_path,
@@ -615,11 +705,13 @@ def _mid_feast_needs_bootstrap(
     rows = int(readiness.mid_term.row_count or 0)
     if rows <= 0:
         return True
-    allow_cnt = refresh_mod.count_allowlist_canonical_ids(allowlist, mapping)
-    if allow_cnt <= 0:
+    feast_repo = Path(cfg.scorer_feast_repo_path).resolve()
+    feast_path = resolve_feast_artifacts_dir(feast_repo) / "mid_term_spike_canonical.parquet"
+    if not feast_path.is_file():
         return True
-    min_rows = int(allow_cnt * float(cfg.scorer_feast_mid_min_canonical_coverage_fraction))
-    return rows < min_rows
+    if feast_registry_missing(feast_repo):
+        return True
+    return False
 
 
 def _needs_feast_startup_refresh(
@@ -752,6 +844,20 @@ def _startup_feast_refresh_or_raise(
         )
         registry_missing = feast_registry_missing(feast_repo)
         schema_drift = bool(feast_schema_drift_issues(feast_repo))
+        metrics_path = model_bundle / "training_metrics.json"
+        metrics: dict[str, Any] = {}
+        if metrics_path.is_file():
+            try:
+                raw = json.loads(metrics_path.read_text(encoding="utf-8"))
+                metrics = raw if isinstance(raw, dict) else {}
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                metrics = {}
+        training_mid_seed = refresh_mod.resolve_bootstrap_mid_seed_parquet(
+            bundle_root,
+            metrics=metrics,
+        )
+        if training_mid_seed is not None:
+            logging.info("[deploy] Feast bootstrap mid seed: %s", training_mid_seed)
         try:
             opts = refresh_mod._resolve_refresh_options(
                 layers=",".join(layers),
@@ -770,6 +876,7 @@ def _startup_feast_refresh_or_raise(
                 summary_path=(Path(cfg.scorer_feast_readiness_path).parent / "feast_online_refresh_report.json"),
                 bootstrap_mid=bootstrap_mid,
                 apply_schema=bootstrap_mid,
+                training_mid_snapshot_parquet=training_mid_seed,
             )
             refresh_mod.run_feast_online_refresh(opts)
         finally:
@@ -1077,11 +1184,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_deploy_args(argv)
     br = Path(args.bundle_dir).expanduser().resolve()
     _load_dotenv_if_present(br)
-    logging.basicConfig(
-        level=_resolve_log_level(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
     rel = _load_rel_paths(br)
+    _init_deploy_logging(br, rel, level=_resolve_log_level())
     cfg = _serving_config_for_bundle(br, rel)
     cfg = apply_hightier_serving_environ_overrides(cfg)
     set_hightier_serving_deploy_override(cfg)

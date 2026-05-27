@@ -31,13 +31,18 @@ import hashlib
 
 import pyarrow.parquet as pq
 
-from trainer_hightier.core.model_bundle_paths import resolve_model_bundle_dir
+from trainer_hightier.core.model_bundle_paths import (
+    DEPLOY_E2E_GATE_REPORT_FILENAME,
+    resolve_model_bundle_dir,
+)
 
 from trainer_hightier import config as th_config
 from trainer_hightier.config import (
     FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME,
     MANIFEST_KEY_FE_SHORT_TERM,
     MANIFEST_KEY_MID_TERM_SNAPSHOT,
+    MID_TERM_BOOTSTRAP_SEED_PARQUET_BASENAME,
+    MID_TERM_SNAPSHOT_DEPLOY_PARQUET_BASENAME,
     Step6ParityConfig,
     default_hightier_serving_config,
 )
@@ -130,10 +135,16 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Deploy bundle output directory (must be absent or empty). "
+            "Deploy bundle output directory (replaced when non-empty unless --no-overwrite). "
             "Default: trainer_hightier.config.DEFAULT_DEPLOY_OUTPUT_ROOT / <model_version> "
             "(repo default: out/deploy_hightier/<run-id>/)."
         ),
+    )
+    pr.add_argument(
+        "--overwrite",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Remove existing output directory before packing (default: overwrite).",
     )
     pr.add_argument("--archive", action="store_true", help="Also write <output-dir-name>.zip beside output-dir.")
     pr.add_argument(
@@ -146,6 +157,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--skip-step6-gate",
         action="store_true",
         help="Skip Step 6 train/serve parity gate (default: require passing gate in strict mode).",
+    )
+    pr.add_argument(
+        "--skip-deploy-e2e-gate",
+        action="store_true",
+        help="Skip deploy E2E gate report check (default: require pass in strict mode).",
     )
     return pr.parse_args(argv)
 
@@ -712,7 +728,21 @@ def _write_readme(path: Path) -> None:
 - `snapshots/` — metadata-only `active_manifest.json` (audit; **no** snapshot parquet layers)
 - `feast_repo/` — Feast definitions + bundle-local online store / registry paths (required for scorer v2)
 - `artifacts/feast/` — writable Feast readiness + refresh reports (bundle-local paths)
-- `local_state/` — `state.db`, `feature_state.db`, `prediction_log.db`
+- `local_state/` — `state.db`, `feature_state.db`, `prediction_log.db`, `logs/deploy_main.log`
+
+## Logging
+
+`python main.py` writes logs to **both** the current CMD window and a bundle-local file. No shell redirect (`> file 2>&1`) is required.
+
+- Default log file: `local_state/logs/deploy_main.log` (append mode)
+- Format: `%(asctime)s %(levelname)s %(name)s: %(message)s`
+- If the log file cannot be created (permissions/disk), deploy continues with console logging only
+
+Tail the log on Windows (PowerShell, separate window):
+
+```powershell
+Get-Content -Path local_state\\logs\\deploy_main.log -Wait -Tail 50
+```
 
 ## Prerequisites
 
@@ -964,6 +994,65 @@ def _assert_step6_parity_gate_or_raise(
     )
 
 
+def _assert_step6_deploy_e2e_gate_or_raise(
+    model_bundle: Path,
+    *,
+    strict: bool,
+    skip_deploy_e2e_gate: bool,
+) -> None:
+    """Require deploy E2E report with ``verdict=pass`` beside the model bundle."""
+    if skip_deploy_e2e_gate or not strict:
+        if skip_deploy_e2e_gate:
+            logger.warning("[pack-step6] skipping deploy E2E gate (--skip-deploy-e2e-gate)")
+        return
+    report_path = Path(model_bundle) / DEPLOY_E2E_GATE_REPORT_FILENAME
+    if not report_path.is_file():
+        raise FileNotFoundError(
+            f"[pack-step6] missing {DEPLOY_E2E_GATE_REPORT_FILENAME} under {model_bundle}; "
+            "retrain with Step 6 deploy E2E enabled or pass --skip-deploy-e2e-gate (non-production only)."
+        )
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"[pack-step6] invalid {DEPLOY_E2E_GATE_REPORT_FILENAME}: {report_path}") from exc
+    if not isinstance(report, dict):
+        raise ValueError(f"[pack-step6] expected JSON object in {report_path}")
+    verdict = str(report.get("verdict") or "fail")
+    if verdict != "pass":
+        raise ValueError(
+            f"[pack-step6] deploy E2E gate failed (verdict={verdict!r}); see {report_path}",
+        )
+    logger.info("[pack-step6] deploy E2E gate passed (verdict=pass)")
+
+
+def _copy_bootstrap_mid_seed(
+    model_bundle: Path,
+    feast_art_dir: Path,
+    metrics: dict[str, Any],
+) -> Path | None:
+    """Best-effort copy training mid snapshot for Feast bootstrap seed."""
+    mb = Path(model_bundle).resolve()
+    candidates: list[Path] = []
+    metric_path = metrics.get("main_trainer_mid_term_snapshot_parquet")
+    if isinstance(metric_path, str) and metric_path.strip():
+        candidates.append(Path(metric_path.strip()).expanduser())
+    candidates.extend(
+        [
+            mb / "_main_trainer_mid_term_daily_snapshot.parquet",
+            mb / "deploy_inputs" / MID_TERM_SNAPSHOT_DEPLOY_PARQUET_BASENAME,
+        ]
+    )
+    for src in candidates:
+        resolved = src.resolve()
+        if resolved.is_file():
+            dest = feast_art_dir / MID_TERM_BOOTSTRAP_SEED_PARQUET_BASENAME
+            shutil.copy2(resolved, dest)
+            logger.info("[pack] copied mid bootstrap seed -> %s", dest.name)
+            return dest
+    logger.warning("[pack] no training mid snapshot found for Feast bootstrap seed")
+    return None
+
+
 def build_deploy_package(argv: list[str] | None = None) -> Path:
     """Build deploy tree at resolved ``--output-dir`` (or default); return resolved output path."""
 
@@ -978,6 +1067,11 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
         strict=strict,
         skip_step6_gate=bool(args.skip_step6_gate),
     )
+    _assert_step6_deploy_e2e_gate_or_raise(
+        model_bundle,
+        strict=strict,
+        skip_deploy_e2e_gate=bool(args.skip_deploy_e2e_gate),
+    )
     map_src = _canonical_mapping_origin(args, model_bundle=model_bundle)
     if not map_src.is_file():
         raise FileNotFoundError(f"mapping parquet missing: {map_src}")
@@ -989,7 +1083,11 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
     root = _resolve_output_dir(args, model_bundle=model_bundle)
 
     if root.exists() and any(root.iterdir()):
-        raise FileExistsError(f"output dir must be empty or absent: {root}")
+        if not args.overwrite:
+            raise FileExistsError(
+                f"output dir must be empty or absent (or pass --overwrite): {root}"
+            )
+        shutil.rmtree(root)
     root.mkdir(parents=True, exist_ok=True)
     _copy_feast_repo_to_bundle(root)
     wheels_dir = root / "wheels"
@@ -1008,6 +1106,7 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
 
     mver = _ensure_model_bundle(model_bundle, models_dir, strict=strict)
     metrics = _read_training_metrics(models_dir)
+    _copy_bootstrap_mid_seed(model_bundle, feast_art_dir, metrics)
 
     allow_src = _resolve_allowlist_source_for_pack(
         man,

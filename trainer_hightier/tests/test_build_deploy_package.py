@@ -16,6 +16,7 @@ from sklearn.dummy import DummyClassifier
 
 from trainer_hightier.build_deploy_package import build_deploy_package
 from trainer_hightier.config import FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME
+from trainer_hightier.core.model_bundle_paths import DEPLOY_E2E_GATE_REPORT_FILENAME
 from trainer_hightier.serving.adt_allowlist import sha256_file
 
 
@@ -105,8 +106,22 @@ features:
 """
 
 
+def _write_step6_deploy_e2e_pass_fixture(model_bundle: Path) -> None:
+    """Write a minimal passing deploy E2E report for strict pack gate tests."""
+    payload = {
+        "schema_version": "deploy_e2e_gate_v1",
+        "verdict": "pass",
+        "failure_reason": None,
+        "steps": [{"name": "startup_refresh", "ok": True}],
+    }
+    (Path(model_bundle) / DEPLOY_E2E_GATE_REPORT_FILENAME).write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+
 def _write_step6_parity_pass_fixture(model_bundle: Path) -> None:
-    """Write a minimal passing Step 6 parity report for pack gate tests."""
+    """Write minimal passing Step 6 parity + deploy E2E reports for pack gate tests."""
     payload = {
         "schema_version": "feature_parity_verification_v2",
         "n_failed_slow_gate": 0,
@@ -126,6 +141,7 @@ def _write_step6_parity_pass_fixture(model_bundle: Path) -> None:
         json.dumps(payload),
         encoding="utf-8",
     )
+    _write_step6_deploy_e2e_pass_fixture(model_bundle)
 
 
 def _write_frozen_registry_abc_fixture(
@@ -252,6 +268,77 @@ def _write_parquet(path: Path) -> None:
     pd.DataFrame({"player_id": [1, 2], "canonical_id": [901, 902]}).to_parquet(path, index=False)
 
 
+def test_strict_missing_deploy_e2e_report_fails(tmp_path: Path) -> None:
+    """Strict pack requires passing deploy E2E report beside the model bundle."""
+
+    model_src = tmp_path / "model_no_e2e"
+    snap_src = tmp_path / "snap_no_e2e"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_slow_bet_fixture(slow)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    _write_frozen_registry_abc_fixture(model_src)
+    _write_step6_parity_pass_fixture(model_src)
+    (model_src / DEPLOY_E2E_GATE_REPORT_FILENAME).unlink(missing_ok=True)
+    man = {"version": "mv", "slow_patron_parquet": str(slow.resolve()), "adt_allowlist_parquet": str(allow.resolve())}
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-no-e2e.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "bundle-no-e2e"
+    with pytest.raises(FileNotFoundError, match=DEPLOY_E2E_GATE_REPORT_FILENAME):
+        build_deploy_package(
+            [
+                "--model-source",
+                str(model_src),
+                "--snapshot-manifest-source",
+                str(snap_src),
+                "--mapping-source",
+                str(mapping),
+                "--output-dir",
+                str(out),
+            ],
+        )
+
+
+def test_strict_deploy_e2e_fail_verdict_raises(tmp_path: Path) -> None:
+    model_src = tmp_path / "model_e2e_fail"
+    snap_src = tmp_path / "snap_e2e_fail"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_slow_bet_fixture(slow)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    _write_frozen_registry_abc_fixture(model_src)
+    _write_step6_parity_pass_fixture(model_src)
+    (model_src / DEPLOY_E2E_GATE_REPORT_FILENAME).write_text(
+        json.dumps({"schema_version": "deploy_e2e_gate_v1", "verdict": "fail"}),
+        encoding="utf-8",
+    )
+    man = {"version": "mv", "slow_patron_parquet": str(slow.resolve()), "adt_allowlist_parquet": str(allow.resolve())}
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-e2e-fail.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "bundle-e2e-fail"
+    with pytest.raises(ValueError, match="deploy E2E gate failed"):
+        build_deploy_package(
+            [
+                "--model-source",
+                str(model_src),
+                "--snapshot-manifest-source",
+                str(snap_src),
+                "--mapping-source",
+                str(mapping),
+                "--output-dir",
+                str(out),
+            ],
+        )
+
+
 def test_strict_missing_step6_parity_fails(tmp_path: Path) -> None:
     """Strict pack requires passing Step 6 parity artifact beside the model bundle."""
 
@@ -286,6 +373,78 @@ def test_strict_missing_step6_parity_fails(tmp_path: Path) -> None:
         )
 
 
+def test_overwrite_repacks_non_empty_output_dir(tmp_path: Path) -> None:
+    """Default pack replaces an existing non-empty output directory."""
+
+    model_src = tmp_path / "model_repack"
+    snap_src = tmp_path / "snap_repack"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_slow_bet_fixture(slow)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    _write_frozen_registry_abc_fixture(model_src)
+    (model_src / "feature_parity_verification.json").unlink(missing_ok=True)
+    man = {"version": "mv", "slow_patron_parquet": str(slow.resolve()), "adt_allowlist_parquet": str(allow.resolve())}
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-repack.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "bundle-repack"
+    base_argv = [
+        "--model-source",
+        str(model_src),
+        "--snapshot-manifest-source",
+        str(snap_src),
+        "--mapping-source",
+        str(mapping),
+        "--output-dir",
+        str(out),
+        "--skip-step6-gate",
+        "--skip-deploy-e2e-gate",
+    ]
+    build_deploy_package(base_argv)
+    (out / "stale_marker.txt").write_text("old", encoding="utf-8")
+    build_deploy_package(base_argv)
+    assert (out / "models" / "model.pkl").is_file()
+    assert not (out / "stale_marker.txt").exists()
+
+
+def test_no_overwrite_refuses_non_empty_output_dir(tmp_path: Path) -> None:
+    model_src = tmp_path / "model_no_overwrite"
+    snap_src = tmp_path / "snap_no_overwrite"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_slow_bet_fixture(slow)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    _write_frozen_registry_abc_fixture(model_src)
+    (model_src / "feature_parity_verification.json").unlink(missing_ok=True)
+    man = {"version": "mv", "slow_patron_parquet": str(slow.resolve()), "adt_allowlist_parquet": str(allow.resolve())}
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-no-overwrite.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "bundle-no-overwrite"
+    argv = [
+        "--model-source",
+        str(model_src),
+        "--snapshot-manifest-source",
+        str(snap_src),
+        "--mapping-source",
+        str(mapping),
+        "--output-dir",
+        str(out),
+        "--skip-step6-gate",
+        "--skip-deploy-e2e-gate",
+    ]
+    build_deploy_package(argv)
+    with pytest.raises(FileExistsError, match="output dir must be empty or absent"):
+        build_deploy_package([*argv, "--no-overwrite"])
+
+
 def test_skip_step6_gate_allows_missing_parity(tmp_path: Path) -> None:
     model_src = tmp_path / "model_skip_step6"
     snap_src = tmp_path / "snap_skip_step6"
@@ -314,6 +473,7 @@ def test_skip_step6_gate_allows_missing_parity(tmp_path: Path) -> None:
             "--output-dir",
             str(out),
             "--skip-step6-gate",
+            "--skip-deploy-e2e-gate",
         ]
     )
     assert (out / "models" / "model.pkl").is_file()
@@ -369,7 +529,8 @@ def test_strict_missing_frozen_registry_snapshot_fails(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match=r"feature_candidate_registry\.snapshot\.yaml"):
         build_deploy_package(
             ["--model-source", str(model_src), "--snapshot-manifest-source", str(snap_src),
-             "--mapping-source", str(mapping), "--output-dir", str(out), "--skip-step6-gate"]
+             "--mapping-source", str(mapping), "--output-dir", str(out),
+             "--skip-step6-gate", "--skip-deploy-e2e-gate"]
         )
 
 
