@@ -1,4 +1,9 @@
-"""Join baseline Step-3 training Parquet with ``fe__*`` DuckDB-derived columns."""
+"""Join Step-3 training Parquet with cadence suppliers (short PIT cache, mid snapshot ASOF).
+
+Short-term columns come from an **offline PIT cache** parquet (legacy basename
+``_main_trainer_fe_short_term.parquet``; manifest key ``fe_short_term_parquet``)—per-row
+PIT values for training ``bet_id`` only, not a reusable global feature table.
+"""
 
 from __future__ import annotations
 

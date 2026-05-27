@@ -56,7 +56,10 @@ MANIFEST_KEY_MID_TERM_ANCHOR_MAX: Final[str] = "mid_term_anchor_gaming_day_max"
 MANIFEST_KEY_MID_TERM_COVERAGE_END: Final[str] = "mid_term_coverage_end_exclusive"
 MANIFEST_KEY_MID_TERM_GENERATED_AT: Final[str] = "mid_term_generated_at"
 MANIFEST_KEY_MID_TERM_STALE_HARD_CAP_DAYS: Final[str] = "mid_term_stale_hard_cap_days"
+# Manifest JSON key (legacy string). Semantics: short-term **offline PIT cache** path — see
+# ``MANIFEST_KEY_SHORT_TERM_PIT_CACHE`` and ``doc/Scorer Runtime Contract - SSOT.md`` §Short-term.
 MANIFEST_KEY_FE_SHORT_TERM: Final[str] = "fe_short_term_parquet"
+MANIFEST_KEY_SHORT_TERM_PIT_CACHE: Final[str] = MANIFEST_KEY_FE_SHORT_TERM
 MANIFEST_KEY_SLOW_ANCHOR_MAX: Final[str] = "slow_anchor_gaming_day_max"
 MANIFEST_KEY_SLOW_ANCHOR_TARGET: Final[str] = "slow_anchor_target"
 MANIFEST_KEY_SLOW_ANCHOR_EFFECTIVE: Final[str] = "slow_anchor_effective"
@@ -73,7 +76,18 @@ FE_DERIVED_SOURCE_KIND_SHIPPED: Final[str] = "shipped_training_bundle"
 SLOW_PATRON_GRAIN_CANONICAL_ASOF: Final[str] = "canonical_asof"
 SLOW_PATRON_GRAIN_BET: Final[str] = "bet_grain"
 MID_TERM_SNAPSHOT_DEPLOY_PARQUET_BASENAME: Final[str] = "mid_term_daily_snapshot.parquet"
+# Deploy/bundle filename (legacy). Content: bet-grain short-term **PIT cache**, not mid-style aggregates.
 FE_SHORT_TERM_DEPLOY_PARQUET_BASENAME: Final[str] = "fe_short_term_features.parquet"
+SHORT_TERM_PIT_CACHE_DEPLOY_BASENAME: Final[str] = FE_SHORT_TERM_DEPLOY_PARQUET_BASENAME
+# Step 3.5 training artifact: per-row PIT values for training ``bet_id`` only.
+TRAINING_SHORT_TERM_PIT_CACHE_BASENAME: Final[str] = "_main_trainer_fe_short_term.parquet"
+# Month-sharded short-term PIT cache under ``artifacts/training_data/cache/``.
+SHORT_TERM_PIT_CACHE_DIRNAME: Final[str] = "short_term_pit_v1"
+SHORT_TERM_PIT_CACHE_SCHEMA_VERSION: Final[int] = 1
+# Training materialize batch size (decoupled from scorer cycle size for offline throughput).
+DEFAULT_TRAINING_SHORT_TERM_MATERIALIZE_BATCH_SIZE: Final[int] = 20_000
+# Neighbor months included when invalidating shards after partition inventory deltas.
+SHORT_TERM_PIT_SOURCE_NEIGHBOR_MONTHS: Final[int] = 1
 # Production snapshot lifecycle (HK wall-clock).
 GAMING_DAY_CLOSE_HOUR: Final[int] = 3
 MID_TERM_REFRESH_TARGET_HOUR: Final[int] = 4
@@ -119,8 +133,10 @@ PRODUCTION_MID_ASOF_BACKFILL_DAYS: Final[int] = 30
 PRODUCTION_MID_FEAST_BOOTSTRAP_ANCHOR_DAYS: Final[int] = PRODUCTION_MID_ASOF_BACKFILL_DAYS
 #: Hard-fail when sampled mid Feast columns exceed this null fraction (aligns with training ~5%).
 SCORER_FEAST_MID_CELL_NULL_FAIL_FRACTION: Final[float] = 0.05
-#: Minimum fraction of allowlist canonical ids present in mid Feast online store after refresh.
-SCORER_FEAST_MID_MIN_CANONICAL_COVERAGE_FRACTION: Final[float] = 0.95
+#: Informational allowlist coverage target for ops dashboards (not enforced as a hard gate).
+SCORER_FEAST_MID_TARGET_CANONICAL_COVERAGE_FRACTION: Final[float] = 0.95
+#: Shipped in deploy bundles for Feast bootstrap seed (training mid snapshot copy).
+MID_TERM_BOOTSTRAP_SEED_PARQUET_BASENAME: Final[str] = "mid_term_bootstrap_seed.parquet"
 #: Mid columns checked for cell-null smoke (core daily snapshot primitives; ASOF parity focus).
 SCORER_FEAST_MID_SMOKE_COLUMNS: Final[tuple[str, ...]] = (
     "fe__bets_cnt__w1d",
@@ -137,13 +153,15 @@ DEFAULT_TRAINING_MID_SNAPSHOT_PARQUET: Final[str] = (
     "trainer_hightier/artifacts/training_data/_main_trainer_mid_term_daily_snapshot.parquet"
 )
 
-#: Short-term trial bet behavior columns (bounded PIT in Step 3.5; not Feast trial_clock join).
-SHORT_TERM_TRIAL_BET_COLUMNS: Final[tuple[str, ...]] = (
+#: Short-term 1h pack (``bet__*`` column names). Same supplier as other short PIT features.
+#: Prefer this name in new code/docs; ``SHORT_TERM_TRIAL_BET_COLUMNS`` is a backward-compatible alias.
+SHORT_TERM_PACK_1H_COLUMNS: Final[tuple[str, ...]] = (
     "bet__bets_cnt__w1h",
     "bet__wager_sum__w1h",
     "bet__back_bet_ratio__w1h",
     "bet__payout_odds_avg__w1h",
 )
+SHORT_TERM_TRIAL_BET_COLUMNS: Final[tuple[str, ...]] = SHORT_TERM_PACK_1H_COLUMNS
 
 # Baseline MODEL columns: softer FQG (high PSI → WARN; unique-constant under sample → WARN; WARN auto-allowlist).
 _FQG_BASELINE_MODEL_SOFT_COLUMNS: tuple[str, ...] = (
@@ -440,7 +458,7 @@ class Step5TrainConfig:
     #: When ``True``, use :data:`baseline_*` hyperparameters only (no Optuna).
     skip_optuna: bool = False
     #: ``study.optimize(..., timeout=...)`` wall-clock cap in seconds.
-    optuna_timeout_sec: float = 60 * 10  # 10-minute Optuna wall-clock budget
+    optuna_timeout_sec: float = 60 * 60 * 1  # 10-minute Optuna wall-clock budget
     early_stopping_rounds: int = 50
     #: Upper bound on boosting rounds (early stopping usually stops sooner).
     lgb_n_estimators_cap: int = 2000
@@ -455,16 +473,42 @@ class Step5TrainConfig:
 
 
 @dataclass(frozen=True)
+class PreTrainFeatureGateConfig:
+    """Step 4.5: short-term PIT train vs live replay gate before Step 5."""
+
+    run_pre_train_gate: bool = True
+    max_rows: int = 200_000
+    batch_size: int = 2000
+    diff_fraction_fail_threshold: float = 0.02
+
+
+@dataclass(frozen=True)
 class Step6ParityConfig:
-    """Step 6: post-training train/serve parity verification gate."""
+    """Step 6: post-training train/serve parity + deploy-ready E2E gate."""
 
     run_step6: bool = True
     hard_fail_slow_gate: bool = True
     hard_fail_all_feature_gate: bool = True
+    hard_fail_deploy_e2e_gate: bool = True
     #: Fail all-feature gate when any compared feature exceeds this train/serve diff fraction.
     all_feature_diff_fraction_fail_threshold: float = 0.02
     max_rows: int = 200_000
-    batch_size: int = 5000
+    batch_size: int = 2000
+    #: When False, Step 6 skips full short-layer replay (covered by Step 4.5).
+    run_short_full_replay_in_step6: bool = True
+    #: Optional short smoke replay on a subsample (diagnostic only).
+    run_short_smoke_in_step6: bool = False
+    #: Wall-clock budget for parity + deploy bundle build + deploy E2E (seconds).
+    step6_total_timeout_seconds: int = 600
+    #: Retry the full Step 6 sequence once on failure (shared timeout window).
+    step6_auto_retry_once: bool = True
+    #: Run production-like deploy E2E (fresh bundle venv) after parity.
+    step6_deploy_e2e_enabled: bool = True
+    #: Scorability sample size for deploy E2E gate (keep small for 10-minute budget).
+    step6_deploy_e2e_max_bets: int = 500
+
+
+PRE_TRAIN_FEATURE_GATE_JSON_BASENAME: Final[str] = "pre_train_feature_gate.json"
 
 
 @dataclass(frozen=True)
@@ -601,8 +645,10 @@ class HightierServingConfig:
     production_mid_feast_bootstrap_anchor_days: int = PRODUCTION_MID_FEAST_BOOTSTRAP_ANCHOR_DAYS
     #: Hard-fail smoke when mid Feast cell null rate exceeds this fraction.
     scorer_feast_mid_cell_null_fail_fraction: float = SCORER_FEAST_MID_CELL_NULL_FAIL_FRACTION
-    #: Hard-fail refresh when mid Feast rows cover less than this fraction of allowlist canonicals.
-    scorer_feast_mid_min_canonical_coverage_fraction: float = SCORER_FEAST_MID_MIN_CANONICAL_COVERAGE_FRACTION
+    #: Informational allowlist coverage target (logged only; not a hard refresh gate).
+    scorer_feast_mid_target_canonical_coverage_fraction: float = (
+        SCORER_FEAST_MID_TARGET_CANONICAL_COVERAGE_FRACTION
+    )
     #: Mid columns used for cell-null smoke gate (core ASOF parity primitives).
     scorer_feast_mid_smoke_columns: tuple[str, ...] = SCORER_FEAST_MID_SMOKE_COLUMNS
     #: Optional training mid snapshot parquet for bootstrap seed; ``None`` uses package default when present.

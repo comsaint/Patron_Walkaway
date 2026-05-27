@@ -1,4 +1,9 @@
-"""Feature cadence contract defaults, audit, and training-time gates."""
+"""Feature cadence contract defaults, audit, and training-time gates.
+
+Short-term: all ``bet__*`` and short-horizon ``fe__*`` share ``SUPPLIER_SHORT_TERM_PIT``
+(point-in-time per ``bet_id``). Training may persist an offline PIT cache parquet; serving
+uses live bounded PIT (see ``doc/Scorer Runtime Contract - SSOT.md``).
+"""
 
 from __future__ import annotations
 
@@ -22,6 +27,7 @@ GRAIN_BET_ID: Final[str] = "bet_id"
 GRAIN_CANONICAL_ANCHOR_DAY: Final[str] = "canonical_id + anchor_gaming_day"
 GRAIN_CANONICAL_ANCHOR_MONTH: Final[str] = "canonical_id + anchor_month"
 
+# Single short-layer supplier id (``bet__*`` + short ``fe__*``; live PIT or offline PIT cache).
 SUPPLIER_SHORT_TERM_PIT: Final[str] = "short_term_pit_builder"
 SUPPLIER_MID_TERM_DAILY: Final[str] = "mid_term_daily_snapshot"
 SUPPLIER_LONG_TERM_MONTHLY: Final[str] = "long_term_monthly_snapshot"

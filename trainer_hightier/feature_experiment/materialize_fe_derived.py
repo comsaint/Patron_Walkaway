@@ -520,12 +520,24 @@ def _iter_training_bet_batches(
     *,
     batch_size: int,
     duckdb_runtime: DuckDbRuntimeConfig,
+    payout_yyyymm: str | None = None,
 ) -> Iterator[pd.DataFrame]:
     """Yield chronological training bet slices without loading the full table into memory."""
 
     if batch_size < 1:
         raise ValueError(f"batch_size must be >= 1; got {batch_size}")
     t_esc = _path_esc(training_parquet)
+    month_filter = ""
+    if payout_yyyymm is not None:
+        ym = str(payout_yyyymm).strip()
+        if len(ym) != 6 or not ym.isdigit():
+            raise ValueError(f"payout_yyyymm must be six digits, got {payout_yyyymm!r}")
+        month_filter = f" AND strftime(CAST(payout_complete_dtm AS TIMESTAMPTZ), '%Y%m') = '{ym}'"
+    base_where = f"""
+            WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
+              AND payout_complete_dtm IS NOT NULL
+              AND TRY_CAST(player_id AS BIGINT) IS NOT NULL{month_filter}
+    """.strip()
     con = duckdb.connect(database=":memory:")
     try:
         apply_duckdb_runtime_pragmas(con, duckdb_runtime)
@@ -537,49 +549,47 @@ def _iter_training_bet_batches(
                 f"training parquet missing columns for bounded short-term staging: {missing}; "
                 f"path={training_parquet.resolve()}",
             )
-        total_row = con.execute(
+        con.execute(
             f"""
-            SELECT COUNT(*)::BIGINT AS n
+            CREATE TEMP TABLE _training_bets_ordered AS
+            SELECT
+              TRY_CAST(bet_id AS DOUBLE) AS bet_id,
+              TRY_CAST(player_id AS BIGINT) AS player_id,
+              CAST(payout_complete_dtm AS TIMESTAMPTZ) AS payout_complete_dtm,
+              TRY_CAST(wager AS DOUBLE) AS wager,
+              TRY_CAST(is_back_bet AS INTEGER) AS is_back_bet,
+              TRY_CAST(payout_odds AS DOUBLE) AS payout_odds,
+              TRY_CAST(casino_win AS DOUBLE) AS casino_win,
+              CAST(bet_type AS VARCHAR) AS bet_type,
+              CAST(type_of_bet AS VARCHAR) AS type_of_bet,
+              TRY_CAST(session_id AS BIGINT) AS session_id,
+              TRY_CAST(table_id AS BIGINT) AS table_id,
+              CAST(gaming_day AS TIMESTAMP) AS gaming_day,
+              ROW_NUMBER() OVER (
+                ORDER BY CAST(payout_complete_dtm AS TIMESTAMPTZ) ASC,
+                         TRY_CAST(bet_id AS DOUBLE) ASC
+              ) AS rn
             FROM read_parquet('{t_esc}')
-            WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
-              AND payout_complete_dtm IS NOT NULL
-              AND TRY_CAST(player_id AS BIGINT) IS NOT NULL
+            {base_where}
             """,
-        ).fetchone()
+        )
+        total_row = con.execute("SELECT COALESCE(MAX(rn), 0)::BIGINT FROM _training_bets_ordered").fetchone()
         total = int(total_row[0]) if total_row else 0
         for start in range(0, total, batch_size):
             end = min(start + batch_size, total)
             df = con.execute(
                 f"""
-                WITH ordered AS (
-                  SELECT
-                    TRY_CAST(bet_id AS DOUBLE) AS bet_id,
-                    TRY_CAST(player_id AS BIGINT) AS player_id,
-                    CAST(payout_complete_dtm AS TIMESTAMPTZ) AS payout_complete_dtm,
-                    TRY_CAST(wager AS DOUBLE) AS wager,
-                    TRY_CAST(is_back_bet AS INTEGER) AS is_back_bet,
-                    TRY_CAST(payout_odds AS DOUBLE) AS payout_odds,
-                    TRY_CAST(casino_win AS DOUBLE) AS casino_win,
-                    CAST(bet_type AS VARCHAR) AS bet_type,
-                    CAST(type_of_bet AS VARCHAR) AS type_of_bet,
-                    TRY_CAST(session_id AS BIGINT) AS session_id,
-                    TRY_CAST(table_id AS BIGINT) AS table_id,
-                    CAST(gaming_day AS TIMESTAMP) AS gaming_day,
-                    ROW_NUMBER() OVER (
-                      ORDER BY CAST(payout_complete_dtm AS TIMESTAMPTZ) ASC,
-                               TRY_CAST(bet_id AS DOUBLE) ASC
-                    ) AS rn
-                  FROM read_parquet('{t_esc}')
-                  WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
-                    AND payout_complete_dtm IS NOT NULL
-                    AND TRY_CAST(player_id AS BIGINT) IS NOT NULL
-                )
                 SELECT * EXCLUDE (rn)
-                FROM ordered
+                FROM _training_bets_ordered
                 WHERE rn > {start} AND rn <= {end}
                 """,
             ).fetchdf()
             if not df.empty:
+                df["payout_complete_dtm"] = pd.to_datetime(
+                    df["payout_complete_dtm"],
+                    errors="coerce",
+                    utc=True,
+                )
                 yield df
     finally:
         con.close()
@@ -595,45 +605,22 @@ def _short_term_features_for_batch(
     fe_columns: tuple[str, ...],
     trial_columns: tuple[str, ...],
 ) -> pd.DataFrame:
-    """Compute production-aligned short-term ``bet__*`` and ``fe__*`` for one scoring batch."""
-
-    from trainer_hightier.serving.feature_builder import (
-        attach_canonical_id,
-        attach_synthetic_etl_and_prediction_visible,
-        attach_trial_bet_behavior_1h,
+    """Compute short-layer PIT ``bet__*`` and ``fe__*`` for one training/scoring batch."""
+    from trainer_hightier.serving.short_term_scoring_context import (
+        build_short_term_features_for_batch,
+        default_short_term_scoring_context,
     )
-    from trainer_hightier.serving.offline_serving_backtest import build_pool_from_cleaned_parquet
 
-    if bets_batch.empty:
-        return pd.DataFrame(columns=["bet_id", *trial_columns, *fe_columns])
-    work = bets_batch.copy()
-    work["__etl_insert_Dtm"] = pd.to_datetime(work["payout_complete_dtm"], errors="coerce")
-    pool = build_pool_from_cleaned_parquet(
-        work,
-        cleaned_root=cleaned_bet_parquet,
-        cfg=serving_cfg,
+    return build_short_term_features_for_batch(
+        bets_batch,
+        cleaned_bet_parquet=cleaned_bet_parquet,
         mapping_parquet=mapping_parquet,
-        expand_canonical_aliases=False,
+        serving_cfg=serving_cfg,
+        duckdb_runtime=duckdb_runtime,
+        fe_columns=fe_columns,
+        trial_columns=trial_columns,
+        context=default_short_term_scoring_context(serving_cfg),
     )
-    pool = attach_canonical_id(pool, mapping_parquet=mapping_parquet)
-    staged = attach_synthetic_etl_and_prediction_visible(work)
-    staged = attach_canonical_id(staged, mapping_parquet=mapping_parquet)
-    staged = attach_trial_bet_behavior_1h(staged, pool, duckdb_runtime=duckdb_runtime)
-    fe_part = (
-        compute_fe_derived_features_from_pool(pool, staged["bet_id"], duckdb_runtime=duckdb_runtime)
-        if fe_columns
-        else pd.DataFrame({"bet_id": staged["bet_id"]})
-    )
-    out = pd.DataFrame({"bet_id": pd.to_numeric(staged["bet_id"], errors="coerce")})
-    for col in trial_columns:
-        out[col] = staged[col].to_numpy()
-    for col in fe_columns:
-        if col not in fe_part.columns:
-            raise ValueError(
-                f"bounded fe__ materialization missing column {col!r}; got {list(fe_part.columns)}",
-            )
-        out[col] = fe_part[col].to_numpy()
-    return out
 
 
 def materialize_fe_derived_short_term_parquet(
@@ -645,11 +632,15 @@ def materialize_fe_derived_short_term_parquet(
     canonical_mapping_parquet: Path | None = None,
     short_term_columns: tuple[str, ...] | None = None,
     trial_columns: tuple[str, ...] | None = None,
+    batch_size: int | None = None,
+    payout_yyyymm: str | None = None,
 ) -> Path:
-    """Materialize bounded hot-pool short-term ``bet__*`` and ``fe__*`` (train–serve aligned).
+    """Write **offline short-term PIT cache** (``bet__*`` + short ``fe__*``) for training rows.
 
-    Uses the same pool window and batch size as scorer v2; does not scan full bet history.
-    Mid-term model columns are supplied separately via daily snapshot ASOF enrich.
+    Each output row is point-in-time for that ``bet_id`` (bounded hot pool, same batch size
+    as scorer v2). This is an acceleration artifact for Step 4/5—not a mid-style daily
+    snapshot and not used as production lookup for unseen bets. Mid-term columns are joined
+    separately via ``dataset_enrich`` + daily snapshot ASOF.
     """
 
     fe_cols = tuple(short_term_columns or ())
@@ -659,7 +650,11 @@ def materialize_fe_derived_short_term_parquet(
     out_cols = tuple(dict.fromkeys(("bet_id", *trial_cols, *fe_cols)))
 
     serving_cfg = default_hightier_serving_config()
-    batch_size = int(serving_cfg.hightier_scorer_max_bets_per_cycle)
+    effective_batch_size = int(
+        batch_size if batch_size is not None else serving_cfg.hightier_scorer_max_bets_per_cycle,
+    )
+    if effective_batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {effective_batch_size}")
     cmap = (
         Path(canonical_mapping_parquet).resolve()
         if canonical_mapping_parquet is not None
@@ -679,8 +674,9 @@ def materialize_fe_derived_short_term_parquet(
     batch_idx = 0
     for bets_batch in _iter_training_bet_batches(
         Path(training_parquet_for_bet_ids).resolve(),
-        batch_size=batch_size,
+        batch_size=effective_batch_size,
         duckdb_runtime=duckdb_runtime,
+        payout_yyyymm=payout_yyyymm,
     ):
         features = _short_term_features_for_batch(
             bets_batch,
@@ -738,7 +734,7 @@ def materialize_fe_derived_short_term_parquet(
         dst.name,
         len(batch_paths),
         int(serving_cfg.hot_feature_pool_lookback_hours),
-        batch_size,
+        effective_batch_size,
     )
     return dst
 
@@ -851,6 +847,206 @@ FROM ordered
 WHERE bet_id IN (SELECT bet_id FROM tid)
 """.strip()
 
+# Per-target-bet pool slice: windows partition by ``target_bet_id`` so co-batch neighbors
+# cannot widen another bet's PIT history.
+_FE_DERIVED_BOUNDED_SRC: Final[str] = """
+scoring_bounds AS (
+  SELECT
+    TRY_CAST(bet_id AS DOUBLE) AS target_bet_id,
+    TRY_CAST(player_id AS BIGINT) AS player_id,
+    TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id,
+    CAST(pool_start AS TIMESTAMPTZ) AS pool_start,
+    CAST(scoring_pcd AS TIMESTAMPTZ) AS scoring_pcd
+  FROM staged_bounds
+  WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
+    AND TRY_CAST(player_id AS BIGINT) IS NOT NULL
+    AND TRIM(CAST(canonical_id AS VARCHAR)) <> ''
+),
+src AS (
+  SELECT
+    sb.target_bet_id,
+    TRY_CAST(b."bet_id" AS DOUBLE) AS bet_id,
+    TRY_CAST(b."player_id" AS BIGINT) AS player_id,
+    TRIM(CAST(b."canonical_id" AS VARCHAR)) AS canonical_id,
+    TRY_CAST(b."session_id" AS BIGINT) AS session_id,
+    TRY_CAST(b."table_id" AS BIGINT) AS table_id,
+    TRY_CAST(b."gaming_day" AS DATE) AS gaming_day,
+    CAST(b."payout_complete_dtm" AS TIMESTAMPTZ) AS pcd,
+    TRY_CAST(b."wager" AS DOUBLE) AS wager,
+    TRY_CAST(b."payout_odds" AS DOUBLE) AS payout_odds,
+    TRY_CAST(b."casino_win" AS DOUBLE) AS casino_win,
+    TRY_CAST(b."theo_win" AS DOUBLE) AS theo_win,
+    TRY_CAST(b."base_ha" AS DOUBLE) AS base_ha
+  FROM pool_src AS b
+  INNER JOIN scoring_bounds AS sb
+    ON TRIM(CAST(b."canonical_id" AS VARCHAR)) = sb.canonical_id
+   AND TRY_CAST(b."player_id" AS BIGINT) = sb.player_id
+  WHERE TRY_CAST(b."bet_id" AS DOUBLE) IS NOT NULL
+    AND TRY_CAST(b."player_id" AS BIGINT) IS NOT NULL
+    AND b."payout_complete_dtm" IS NOT NULL
+    AND TRIM(CAST(b."canonical_id" AS VARCHAR)) <> ''
+    AND CAST(b."payout_complete_dtm" AS TIMESTAMPTZ) >= sb.pool_start
+    AND CAST(b."payout_complete_dtm" AS TIMESTAMPTZ) <= sb.scoring_pcd
+),
+""".strip()
+
+_FE_DERIVED_PIPELINE_BOUNDED_AFTER_SRC: Final[str] = """
+src_lagged AS (
+  SELECT s.*,
+    LAG(pcd) OVER w_target AS lag1_pcd,
+    LAG(pcd, 2) OVER w_target AS lag2_pcd,
+    LAG(table_id) OVER w_target AS lag1_table_id,
+    LAG(payout_odds) OVER w_target AS lag1_payout_odds,
+    LAG(wager) OVER w_target AS lag1_wager,
+    COUNT(*) OVER w_target_day_prior AS bets_today_so_far,
+    SUM(wager) OVER w_target_day_prior AS wager_today_so_far,
+    MIN(pcd) OVER w_target_day_inclusive AS first_pcd_today
+  FROM src AS s
+  WINDOW
+    w_target AS (PARTITION BY target_bet_id ORDER BY pcd, bet_id),
+    w_target_day_prior AS (
+      PARTITION BY target_bet_id, gaming_day ORDER BY pcd, bet_id
+      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+    ),
+    w_target_day_inclusive AS (
+      PARTITION BY target_bet_id, gaming_day ORDER BY pcd, bet_id
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    )
+),
+src_with_iv AS (
+  SELECT s.*,
+    EXTRACT(epoch FROM (pcd - lag1_pcd)) AS interarrival_sec
+  FROM src_lagged AS s
+),
+ordered AS (
+  SELECT s.*,
+    COUNT(*) OVER w15 AS fe__bets_cnt__w15m_raw,
+    COALESCE(SUM(wager) OVER w15, 0.0) AS fe__wager_sum__w15m_raw,
+    AVG(payout_odds) OVER w1h AS payout_odds_avg_w1h,
+    STDDEV_POP(payout_odds) OVER w1h AS payout_odds_std_w1h,
+    AVG(interarrival_sec) OVER w1h AS interarrival_avg_w1h,
+    STDDEV_POP(interarrival_sec) OVER w1h AS interarrival_std_w1h,
+    AVG(payout_odds) OVER w7d AS payout_odds_avg_w7d,
+    STDDEV_POP(payout_odds) OVER w7d AS payout_odds_std_w7d,
+    MAX(payout_odds) OVER w1h AS max_payout_odds_w1h
+  FROM src_with_iv AS s
+  WINDOW
+    w15 AS (
+      PARTITION BY target_bet_id ORDER BY pcd
+      RANGE BETWEEN INTERVAL '15 MINUTE' PRECEDING AND INTERVAL '1 MICROSECOND' PRECEDING
+    ),
+    w1h AS (
+      PARTITION BY target_bet_id ORDER BY pcd
+      RANGE BETWEEN INTERVAL '1 HOUR' PRECEDING AND INTERVAL '1 MICROSECOND' PRECEDING
+    ),
+    w7d AS (
+      PARTITION BY target_bet_id ORDER BY pcd
+      RANGE BETWEEN INTERVAL '7 DAY' PRECEDING AND INTERVAL '1 MICROSECOND' PRECEDING
+    )
+)
+SELECT
+  target_bet_id AS bet_id,
+  CAST(interarrival_sec AS DOUBLE) AS fe__time_since_last_bet_sec,
+  CAST(fe__bets_cnt__w15m_raw AS DOUBLE) AS fe__bets_cnt__w15m,
+  CAST(fe__wager_sum__w15m_raw AS DOUBLE) AS fe__wager_sum__w15m,
+  CAST(COALESCE(bets_today_so_far, 0) AS DOUBLE) AS fe__canonical__bets_cnt__today,
+  CAST(COALESCE(wager_today_so_far, 0.0) AS DOUBLE) AS fe__canonical__wager_sum__today,
+  CASE
+    WHEN bets_today_so_far IS NOT NULL AND bets_today_so_far > 0 AND wager_today_so_far IS NOT NULL
+    THEN CAST(wager_today_so_far / bets_today_so_far AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__canonical__avg_wager__today,
+  CAST(EXTRACT(epoch FROM (pcd - first_pcd_today)) AS DOUBLE)
+    AS fe__canonical__elapsed_sec_since_first_bet__today,
+  CAST(EXTRACT(epoch FROM (lag1_pcd - lag2_pcd)) AS DOUBLE) AS fe__interarrival__lag2_sec,
+  CASE
+    WHEN interarrival_avg_w1h IS NOT NULL AND interarrival_avg_w1h > 1e-9
+       AND interarrival_sec IS NOT NULL
+    THEN CAST(interarrival_sec / interarrival_avg_w1h AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__interarrival__last_gap_to_recent_mean_ratio__w1h,
+  CASE
+    WHEN interarrival_avg_w1h IS NOT NULL AND interarrival_avg_w1h > 1e-9
+       AND interarrival_std_w1h IS NOT NULL
+    THEN CAST(interarrival_std_w1h / interarrival_avg_w1h AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__interarrival__cv__w1h,
+  CASE
+    WHEN payout_odds_std_w1h IS NOT NULL AND payout_odds_std_w1h > 1e-12
+       AND payout_odds_avg_w1h IS NOT NULL AND payout_odds IS NOT NULL
+    THEN CAST((payout_odds - payout_odds_avg_w1h) / payout_odds_std_w1h AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__odds__payout_odds_z__w1h,
+  CASE
+    WHEN payout_odds_std_w7d IS NOT NULL AND payout_odds_std_w7d > 1e-12
+       AND payout_odds_avg_w7d IS NOT NULL AND payout_odds IS NOT NULL
+    THEN CAST((payout_odds - payout_odds_avg_w7d) / payout_odds_std_w7d AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__odds__payout_odds_z__w7d,
+  CASE
+    WHEN max_payout_odds_w1h IS NOT NULL AND max_payout_odds_w1h > 1e-9 AND payout_odds IS NOT NULL
+    THEN CAST(payout_odds / max_payout_odds_w1h AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__odds__payout_odds_to_recent_max_ratio__w1h,
+  CASE
+    WHEN lag1_payout_odds IS NOT NULL AND lag1_payout_odds > 1e-9 AND payout_odds IS NOT NULL
+    THEN CAST(payout_odds / lag1_payout_odds AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__odds__payout_odds_step_ratio
+FROM ordered
+WHERE target_bet_id IN (SELECT bet_id FROM tid)
+  AND bet_id = target_bet_id
+""".strip()
+
+
+def _infer_scoring_bounds_from_pool(
+    pool: pd.DataFrame,
+    target_bet_ids: pd.Series,
+    *,
+    cfg: HightierServingConfig,
+) -> pd.DataFrame:
+    """Build per-bet bounds from pool rows matching target ``bet_id`` values."""
+    from trainer_hightier.serving.scorer import compute_scoring_bounds_for_bets
+
+    targets = pd.to_numeric(target_bet_ids, errors="coerce").dropna().unique()
+    if len(targets) == 0:
+        return pd.DataFrame(columns=["bet_id", "canonical_id", "pool_start", "scoring_pcd"])
+    work = pool.copy()
+    work["bet_id"] = pd.to_numeric(work["bet_id"], errors="coerce")
+    staged = work.loc[work["bet_id"].isin(targets)]
+    if staged.empty:
+        raise ValueError(
+            "scoring_bounds inference found no pool rows for target bet_id(s); "
+            f"targets={targets[:8].tolist()}",
+        )
+    cols = ["bet_id", "player_id", "payout_complete_dtm"]
+    if "canonical_id" in staged.columns:
+        cols.append("canonical_id")
+    if "gaming_day" in staged.columns:
+        cols.append("gaming_day")
+    return compute_scoring_bounds_for_bets(staged.loc[:, cols], cfg=cfg)
+
+
+def _prepare_scoring_bounds(bounds: pd.DataFrame) -> pd.DataFrame:
+    """Validate and normalize scoring-bound rows for DuckDB registration."""
+    need = ("bet_id", "player_id", "canonical_id", "pool_start", "scoring_pcd")
+    missing = [c for c in need if c not in bounds.columns]
+    if missing:
+        raise ValueError(
+            f"scoring_bounds missing columns {missing}; got {list(bounds.columns)}",
+        )
+    out = bounds.loc[:, list(need)].copy()
+    out["bet_id"] = pd.to_numeric(out["bet_id"], errors="coerce")
+    out["player_id"] = pd.to_numeric(out["player_id"], errors="coerce")
+    out["canonical_id"] = out["canonical_id"].astype(str).str.strip()
+    out["pool_start"] = pd.to_datetime(out["pool_start"], errors="coerce")
+    out["scoring_pcd"] = pd.to_datetime(out["scoring_pcd"], errors="coerce")
+    out = out.dropna(subset=["bet_id", "player_id", "canonical_id", "pool_start", "scoring_pcd"])
+    out = out.loc[out["canonical_id"] != ""]
+    if out.empty:
+        raise ValueError("scoring_bounds has no valid rows after normalization")
+    return out.reset_index(drop=True)
+
 
 def _prepare_pool_for_fe_derived(pool: pd.DataFrame) -> pd.DataFrame:
     """Normalize bounded bet pool columns for in-memory fe derived PIT.
@@ -904,6 +1100,7 @@ def compute_fe_derived_features_from_pool(
     pool: pd.DataFrame,
     target_bet_ids: pd.Series,
     *,
+    scoring_bounds: pd.DataFrame | None = None,
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
 ) -> pd.DataFrame:
     """Compute bet-grain short-term ``fe__*`` for ``target_bet_ids`` from a bounded pool."""
@@ -915,39 +1112,31 @@ def compute_fe_derived_features_from_pool(
     if tid.empty:
         return pd.DataFrame(columns=["bet_id"])
     runtime = duckdb_runtime or DuckDbRuntimeConfig()
+    from trainer_hightier.config import default_hightier_serving_config
+
+    bounds = scoring_bounds
+    if bounds is None:
+        bounds = _infer_scoring_bounds_from_pool(
+            work_pool,
+            tid["bet_id"],
+            cfg=default_hightier_serving_config(),
+        )
+    bounds = _prepare_scoring_bounds(bounds)
     sql = f"""
 WITH tid AS (
   SELECT DISTINCT TRY_CAST(bet_id AS DOUBLE) AS bet_id
   FROM staged_tid
   WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
 ),
-src AS (
-  SELECT
-    TRY_CAST(b."bet_id" AS DOUBLE) AS bet_id,
-    TRY_CAST(b."player_id" AS BIGINT) AS player_id,
-    TRIM(CAST(b."canonical_id" AS VARCHAR)) AS canonical_id,
-    TRY_CAST(b."session_id" AS BIGINT) AS session_id,
-    TRY_CAST(b."table_id" AS BIGINT) AS table_id,
-    TRY_CAST(b."gaming_day" AS DATE) AS gaming_day,
-    CAST(b."payout_complete_dtm" AS TIMESTAMPTZ) AS pcd,
-    TRY_CAST(b."wager" AS DOUBLE) AS wager,
-    TRY_CAST(b."payout_odds" AS DOUBLE) AS payout_odds,
-    TRY_CAST(b."casino_win" AS DOUBLE) AS casino_win,
-    TRY_CAST(b."theo_win" AS DOUBLE) AS theo_win,
-    TRY_CAST(b."base_ha" AS DOUBLE) AS base_ha
-  FROM pool_src AS b
-  WHERE TRY_CAST(b."bet_id" AS DOUBLE) IS NOT NULL
-    AND TRY_CAST(b."player_id" AS BIGINT) IS NOT NULL
-    AND b."payout_complete_dtm" IS NOT NULL
-    AND TRIM(CAST(b."canonical_id" AS VARCHAR)) <> ''
-),
-{_FE_DERIVED_PIPELINE_AFTER_SRC}
+{_FE_DERIVED_BOUNDED_SRC}
+{_FE_DERIVED_PIPELINE_BOUNDED_AFTER_SRC}
 """.strip()
     con = duckdb.connect(database=":memory:")
     try:
         apply_duckdb_runtime_pragmas(con, runtime)
         con.register("pool_src", work_pool)
         con.register("staged_tid", tid)
+        con.register("staged_bounds", bounds)
         return con.execute(sql).df()
     finally:
         con.close()
