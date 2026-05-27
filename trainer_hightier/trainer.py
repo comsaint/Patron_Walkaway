@@ -14,12 +14,14 @@ Use ``--start-from-features`` to run only Step 4 on an existing training parquet
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import importlib
 import json
 import logging
 import shutil
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Any, Final
@@ -34,15 +36,19 @@ from trainer_hightier.feature_experiment.candidate_registry_loader import (
     load_candidate_registry,
     load_registry_raw_feature_dicts,
 )
+from trainer_hightier.feature_experiment.feature_cadence import classify_model_fe_features
 from trainer_hightier.config import (
     BetPreprocessConfig,
     CanonicalMappingConfig,
+    DEFAULT_DEPLOY_OUTPUT_ROOT,
     DEFAULT_MODEL_DIR,
     DEFAULT_RANDOM_SEED,
     FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME,
     DEFAULT_RUN_PROFILE_NAME,
     DEFAULT_TRAINING_FEATURE_SERVICE,
+    DEFAULT_TRAINING_SHORT_TERM_MATERIALIZE_BATCH_SIZE,
     SHORT_TERM_TRIAL_BET_COLUMNS,
+    TRAINING_SHORT_TERM_PIT_CACHE_BASENAME,
     DuckDbRuntimeConfig,
     HighTierObjectiveConfig,
     MLFLOW_EXPERIMENT_TRAIN_HIGHTIER,
@@ -50,6 +56,8 @@ from trainer_hightier.config import (
     MID_TERM_SNAPSHOT_MAX_LOOKBACK_DAYS,
     MID_TERM_SNAPSHOT_SCOPE_TRAINING,
     PartitionIngressConfig,
+    PreTrainFeatureGateConfig,
+    PreTrainFeatureGateConfig,
     Step5TrainConfig,
     Step6ParityConfig,
     SessionPreprocessConfig,
@@ -66,7 +74,12 @@ from trainer_hightier.core.mlflow_adapter import (
     safe_start_run,
     warm_up_mlflow_run_safe,
 )
-from trainer_hightier.core.model_bundle_paths import safe_version_subdirectory, write_latest_model_manifest
+from trainer_hightier.core.model_bundle_paths import (
+    DEPLOY_E2E_GATE_REPORT_FILENAME,
+    model_bundle_report_path,
+    safe_version_subdirectory,
+    write_latest_model_manifest,
+)
 from trainer_hightier.utils.canonical_mapping import (
     build_canonical_mapping_from_cleaned_session_parquet,
     default_canonical_mapping_parquet_path,
@@ -107,6 +120,8 @@ SPLIT_REPORT_FILENAME: Final[str] = "split_report.json"
 
 _STEP5_CONFIG_DEFAULTS = Step5TrainConfig()
 _STEP6_CONFIG_DEFAULTS = Step6ParityConfig()
+_PRE_TRAIN_GATE_DEFAULTS = PreTrainFeatureGateConfig()
+_PRE_TRAIN_GATE_DEFAULTS = PreTrainFeatureGateConfig()
 _PARTITION_INGRESS_DEFAULTS = PartitionIngressConfig()
 
 
@@ -220,10 +235,16 @@ class HighTierTrainArgs:
     features_input_parquet: Path | None = None
     # Step 5: LightGBM + optional Optuna on Step 4 split Parquets.
     step5: Step5TrainConfig = field(default_factory=Step5TrainConfig)
+    # Step 4.5: short-term PIT train/serve gate before Step 5 (after Step 4 splits).
+    pre_train_gate: PreTrainFeatureGateConfig = field(default_factory=PreTrainFeatureGateConfig)
     # Step 6: train/serve parity verification after Step 5 bundle materialization.
     step6: Step6ParityConfig = field(default_factory=Step6ParityConfig)
     # Feature ledger for Step 5 baseline columns; ``None`` uses default contracts YAML path.
     feature_candidate_registry: Path | None = None
+    #: When True: bypass short-term PIT month-shard cache and recompute all shards.
+    force_refresh_short_term_pit: bool = False
+    #: Offline Step 3.5 batch size (decoupled from scorer ``hightier_scorer_max_bets_per_cycle``).
+    training_short_term_materialize_batch_size: int = DEFAULT_TRAINING_SHORT_TERM_MATERIALIZE_BATCH_SIZE
     #: ``--run-profile`` CLI name (MLflow param); programmatic callers default to :data:`DEFAULT_RUN_PROFILE_NAME`.
     run_profile_name: str = DEFAULT_RUN_PROFILE_NAME
     #: Explicit patron sampling ratio for logs (e.g. ``0.01`` vs ``0.10``). When ``None`` and ADT bet filter is on,
@@ -1101,7 +1122,6 @@ def _ensure_fe_enriched_training_parquet_for_step4(
 
     raw_rows = load_registry_raw_feature_dicts(reg_p)
     cadence_mod = importlib.import_module("trainer_hightier.feature_experiment.feature_cadence")
-    fe_mod = importlib.import_module("trainer_hightier.feature_experiment.materialize_fe_derived")
     mid_mod = importlib.import_module("trainer_hightier.feature_experiment.materialize_mid_term_daily_snapshot")
     en_mod = importlib.import_module("trainer_hightier.feature_experiment.dataset_enrich")
     freg = importlib.import_module("trainer_hightier.feature_experiment.feature_registry")
@@ -1121,20 +1141,40 @@ def _ensure_fe_enriched_training_parquet_for_step4(
     audit_path = out_dir / "feature_cadence_audit.json"
     audit_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
 
-    fe_short_out = out_dir / "_main_trainer_fe_short_term.parquet"
+    fe_short_out = out_dir / TRAINING_SHORT_TERM_PIT_CACHE_BASENAME
     mid_snap_out = out_dir / "_main_trainer_mid_term_daily_snapshot.parquet"
     enriched = out_dir / "training_set_fe_enriched.parquet"
 
     t_m0 = time.perf_counter()
     short_fe_only = tuple(c for c in short_cols if str(c).startswith("fe__"))
+    short_cache_meta: dict[str, Any] = {}
     if short_cols:
-        fe_mod.materialize_fe_derived_short_term_parquet(
+        cache_mod = importlib.import_module("trainer_hightier.feature_experiment.short_term_pit_cache")
+        from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_parquet_path
+
+        cmap_path = default_canonical_mapping_parquet_path().resolve()
+        inv_fp: str | None = None
+        recompute_months: tuple[str, ...] = ()
+        if metrics is not None:
+            inv_fp_raw = metrics.get("partition_inventory_fingerprint_sha256_hex")
+            if inv_fp_raw is not None and str(inv_fp_raw).strip():
+                inv_fp = str(inv_fp_raw).strip()
+            rem = metrics.get("partition_recompute_months")
+            if isinstance(rem, list):
+                recompute_months = tuple(str(m).strip() for m in rem if str(m).strip())
+        force_short_refresh = bool(args.force_refresh_short_term_pit) or bool(args.ignore_caches)
+        _, short_cache_meta = cache_mod.materialize_fe_derived_short_term_parquet_with_cache(
             cleaned_bet_parquet=cleaned,
             training_parquet_for_bet_ids=base_training_parquet,
             out_parquet=fe_short_out,
             duckdb_runtime=args.duckdb_runtime,
+            canonical_mapping_parquet=cmap_path,
             short_term_columns=short_fe_only,
             trial_columns=trial_baseline,
+            batch_size=int(args.training_short_term_materialize_batch_size),
+            partition_inventory_fingerprint_sha256=inv_fp,
+            recompute_months=recompute_months,
+            force_refresh=force_short_refresh,
         )
     mat_short_sec = round(time.perf_counter() - t_m0, 3)
 
@@ -1219,6 +1259,8 @@ def _ensure_fe_enriched_training_parquet_for_step4(
         metrics["main_trainer_fe_enrich_sec"] = enr_sec
         metrics["main_trainer_training_parquet_for_step4"] = str(enriched.resolve())
         metrics["main_trainer_fe_short_term_parquet"] = str(fe_short_out.resolve()) if short_cols else None
+        if short_cache_meta:
+            metrics["main_trainer_fe_short_term_cache"] = short_cache_meta
         metrics["main_trainer_mid_term_snapshot_parquet"] = str(mid_snap_out.resolve()) if mid_cols else None
         metrics["feature_cadence_audit"] = audit
         metrics["feature_cadence_audit_path"] = str(audit_path.resolve())
@@ -1226,7 +1268,7 @@ def _ensure_fe_enriched_training_parquet_for_step4(
             metrics["main_trainer_mid_term_snapshot_meta"] = mid_meta
     logger.info(
         "[Step 3.5] cadence enrich: short_pit=%d (bet__=%d fe__=%d) mid=%d -> %s "
-        "(short %.3fs, mid %.3fs, enrich %.3fs)",
+        "(short %.3fs, mid %.3fs, enrich %.3fs%s)",
         len(short_cols),
         len(trial_baseline),
         len(short_fe_only),
@@ -1235,6 +1277,12 @@ def _ensure_fe_enriched_training_parquet_for_step4(
         mat_short_sec,
         mat_mid_sec,
         enr_sec,
+        (
+            f", short_cache_hit={short_cache_meta.get('cache_hit')}"
+            f" ratio={short_cache_meta.get('cache_hit_ratio')}"
+            if short_cache_meta
+            else ""
+        ),
     )
     return enriched
 
@@ -1581,7 +1629,7 @@ def _freeze_deploy_inputs(
     if isinstance(fe_short_metric, str) and fe_short_metric.strip():
         fe_short_src = Path(fe_short_metric.strip()).expanduser().resolve()
     if fe_short_src is None or not fe_short_src.is_file():
-        alt_short = bd / "_main_trainer_fe_short_term.parquet"
+        alt_short = bd / TRAINING_SHORT_TERM_PIT_CACHE_BASENAME
         if alt_short.is_file():
             fe_short_src = alt_short
     if fe_short_src is not None and fe_short_src.is_file():
@@ -1733,22 +1781,9 @@ def _sync_feast_online_for_step6(
     )
 
 
-def _run_step6_parity_verification(
-    args: HighTierTrainArgs,
-    metrics: dict[str, Any],
-    *,
-    bundle_dir: Path,
-) -> None:
-    """Run Step 6 parity gate and persist JSON beside the model bundle."""
-    if not args.step6.run_step6:
-        logger.info("[Step 6] skipped (step6.run_step6=False)")
-        return
-    from datetime import date as _date_cls
-
+def _load_step06_verify_module() -> Any:
+    """Load ``06_verify_training_serving_parity`` (non-importable module name)."""
     import importlib.util
-
-    repo = _repo_root()
-    _sync_feast_online_for_step6(repo, metrics, bundle_dir=bundle_dir)
 
     step06_path = Path(__file__).resolve().parent / "06_verify_training_serving_parity.py"
     spec = importlib.util.spec_from_file_location("trainer_hightier_step06_verify", step06_path)
@@ -1756,12 +1791,101 @@ def _run_step6_parity_verification(
         raise ImportError(f"cannot load Step 6 module from {step06_path}")
     step06_mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(step06_mod)
+    return step06_mod
 
+
+def _pre_train_gate_columns(args: HighTierTrainArgs) -> tuple[str, ...]:
+    """Short-layer baseline columns for Step 4.5 (``bet__*`` + short ``fe__*``)."""
+    reg_p = Path(args.feature_candidate_registry).resolve() if args.feature_candidate_registry else None
+    snap = load_candidate_registry(reg_p)
+    baseline = baseline_features_for_main_trainer(snap)
+    fe_split = classify_model_fe_features(snap, baseline)
+    return tuple(
+        dict.fromkeys(
+            [
+                *(c for c in SHORT_TERM_TRIAL_BET_COLUMNS if c in baseline),
+                *fe_split["short_term"],
+            ],
+        ),
+    )
+
+
+def _maybe_run_pre_train_feature_gate(args: HighTierTrainArgs, metrics: dict[str, Any]) -> None:
+    """Step 4.5: short-term train vs live PIT replay before Step 5."""
+    if not args.pre_train_gate.run_pre_train_gate:
+        logger.info("[Step 4.5] skipped (pre_train_gate.run_pre_train_gate=False)")
+        return
+    if not args.run_step4:
+        logger.info("[Step 4.5] skipped (Step 4 not run; no test split)")
+        return
+    gate_cols = _pre_train_gate_columns(args)
+    if not gate_cols:
+        logger.info("[Step 4.5] skipped (no short-layer baseline columns in registry)")
+        return
+    step06_mod = _load_step06_verify_module()
+    repo = _repo_root()
     splits_dir = args.step4_split.splits_output_dir
     if splits_dir is None:
         test_parquet = repo / "trainer_hightier" / "artifacts" / "training_data" / "splits" / "test.parquet"
     else:
         test_parquet = Path(splits_dir).resolve() / "test.parquet"
+    if not test_parquet.is_file():
+        raise FileNotFoundError(f"[Step 4.5] test split missing at {test_parquet}")
+    cleaned_bet = repo / "trainer_hightier" / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet"
+    mapping = default_canonical_mapping_parquet_path().resolve()
+    out_json = step06_mod.default_pre_train_gate_json_path()
+    report = step06_mod.run_pre_train_feature_gate(
+        test_parquet,
+        columns=gate_cols,
+        cleaned_bet_root=cleaned_bet,
+        mapping_parquet=mapping,
+        gate_cfg=args.pre_train_gate,
+        duckdb_runtime=args.duckdb_runtime,
+        output_json=out_json,
+    )
+    metrics["pre_train_feature_gate_json"] = str(out_json.resolve())
+    metrics["pre_train_feature_gate_verdict"] = report.get("verdict")
+    logger.info("[Step 4.5] wrote %s verdict=%s", out_json.name, report.get("verdict"))
+    if report.get("verdict") != "pass":
+        raise RuntimeError(f"[Step 4.5] pre-train feature gate failed; see {out_json}")
+
+
+class _Step6GateTimeout(RuntimeError):
+    """Raised when Step 6 exceeds the configured wall-clock budget."""
+
+
+def _step6_remaining_seconds(deadline: float) -> float:
+    """Seconds left before Step 6 deadline (minimum 1s for subprocess timeout)."""
+    return max(1.0, deadline - time.perf_counter())
+
+
+def _step6_assert_within_budget(deadline: float, *, phase: str) -> None:
+    """Fail fast when Step 6 has exceeded ``step6_total_timeout_seconds``."""
+    if time.perf_counter() > deadline:
+        raise _Step6GateTimeout(f"[Step 6] timed out before {phase}")
+
+
+def _resolve_step6_test_parquet(args: HighTierTrainArgs, repo: Path) -> Path:
+    """Resolve test split parquet for Step 6 parity replay."""
+    splits_dir = args.step4_split.splits_output_dir
+    if splits_dir is None:
+        return repo / "trainer_hightier" / "artifacts" / "training_data" / "splits" / "test.parquet"
+    return Path(splits_dir).resolve() / "test.parquet"
+
+
+def _run_step6_parity_gate(
+    args: HighTierTrainArgs,
+    metrics: dict[str, Any],
+    *,
+    bundle_dir: Path,
+    repo: Path,
+    step06_mod: Any,
+) -> None:
+    """Run train/serve parity gate and write ``feature_parity_verification.json``."""
+    from datetime import date as _date_cls
+
+    _sync_feast_online_for_step6(repo, metrics, bundle_dir=bundle_dir)
+    test_parquet = _resolve_step6_test_parquet(args, repo)
     cleaned_bet = repo / "trainer_hightier" / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet"
     feast_repo = repo / "trainer_hightier" / "feast_repo"
     out_json = Path(bundle_dir).resolve() / "feature_parity_verification.json"
@@ -1793,6 +1917,148 @@ def _run_step6_parity_verification(
         )
 
 
+def _run_step6_deploy_e2e_gate(
+    args: HighTierTrainArgs,
+    metrics: dict[str, Any],
+    *,
+    bundle_dir: Path,
+    repo: Path,
+    deadline: float,
+) -> None:
+    """Build deploy bundle, run fresh-venv deploy E2E, write report beside model bundle."""
+    from trainer_hightier.build_deploy_package import build_deploy_package
+    from trainer_hightier.utils.session_l0_preprocess import default_cleaned_session_parquet_path
+
+    _step6_assert_within_budget(deadline, phase="deploy_e2e")
+    bundle = Path(bundle_dir).resolve()
+    ver_path = bundle / "model_version"
+    model_version = ver_path.read_text(encoding="utf-8").strip() if ver_path.is_file() else bundle.name
+    deploy_out = (DEFAULT_DEPLOY_OUTPUT_ROOT / model_version).resolve()
+    metrics["step6_deploy_bundle_dir"] = str(deploy_out)
+    t_pack = time.perf_counter()
+    build_deploy_package(
+        [
+            "--model-source",
+            str(bundle),
+            "--output-dir",
+            str(deploy_out),
+            "--overwrite",
+            "--skip-deploy-e2e-gate",
+        ],
+    )
+    metrics["step6_deploy_package_seconds"] = round(time.perf_counter() - t_pack, 3)
+
+    _step6_assert_within_budget(deadline, phase="deploy_e2e_gate")
+    cleaned_bet = repo / "trainer_hightier" / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet"
+    cleaned_session = default_cleaned_session_parquet_path()
+    e2e_report_path = model_bundle_report_path(bundle, DEPLOY_E2E_GATE_REPORT_FILENAME)
+    from trainer_hightier.serving.deploy_e2e_gate import run_cli
+
+    gate_argv = [
+        "--bundle-dir",
+        str(deploy_out),
+        "--local-cleaned-bet",
+        str(cleaned_bet.resolve()),
+        "--local-cleaned-session",
+        str(cleaned_session.resolve()),
+        "--output-json",
+        str(e2e_report_path.resolve()),
+        "--max-bets",
+        str(int(args.step6.step6_deploy_e2e_max_bets)),
+    ]
+    t_e2e = time.perf_counter()
+    remaining = _step6_remaining_seconds(deadline)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            exit_code = int(
+                pool.submit(run_cli, gate_argv).result(timeout=remaining),
+            )
+    except concurrent.futures.TimeoutError as exc:
+        raise _Step6GateTimeout(
+            f"[Step 6] deploy E2E gate exceeded remaining budget ({remaining:.0f}s)",
+        ) from exc
+    metrics["step6_deploy_e2e_seconds"] = round(time.perf_counter() - t_e2e, 3)
+    metrics["step6_deploy_e2e_exit_code"] = exit_code
+    metrics["deploy_e2e_gate_report_json"] = str(e2e_report_path.resolve())
+
+    verdict = "fail"
+    if e2e_report_path.is_file():
+        try:
+            raw = json.loads(e2e_report_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                verdict = str(raw.get("verdict") or "fail")
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            verdict = "fail"
+    metrics["step6_deploy_e2e_verdict"] = verdict
+    logger.info("[Step 6] deploy_e2e verdict=%s report=%s", verdict, e2e_report_path.name)
+
+    if exit_code != 0 or (args.step6.hard_fail_deploy_e2e_gate and verdict != "pass"):
+        raise RuntimeError(
+            f"[Step 6] deploy E2E gate failed (exit={exit_code}, verdict={verdict}); "
+            f"see {e2e_report_path}",
+        )
+
+
+def _run_step6_single_attempt(
+    args: HighTierTrainArgs,
+    metrics: dict[str, Any],
+    *,
+    bundle_dir: Path,
+    deadline: float,
+) -> None:
+    """One Step 6 attempt: parity then optional deploy E2E."""
+    repo = _repo_root()
+    step06_mod = _load_step06_verify_module()
+    _step6_assert_within_budget(deadline, phase="parity")
+    _run_step6_parity_gate(
+        args,
+        metrics,
+        bundle_dir=bundle_dir,
+        repo=repo,
+        step06_mod=step06_mod,
+    )
+    if args.step6.step6_deploy_e2e_enabled:
+        _run_step6_deploy_e2e_gate(args, metrics, bundle_dir=bundle_dir, repo=repo, deadline=deadline)
+
+
+def _run_step6_parity_verification(
+    args: HighTierTrainArgs,
+    metrics: dict[str, Any],
+    *,
+    bundle_dir: Path,
+) -> None:
+    """Run Step 6 parity + deploy E2E gates with shared timeout and one retry."""
+    if not args.step6.run_step6:
+        logger.info("[Step 6] skipped (step6.run_step6=False)")
+        return
+
+    deadline = time.perf_counter() + float(args.step6.step6_total_timeout_seconds)
+    max_attempts = 2 if args.step6.step6_auto_retry_once else 1
+    metrics["step6_total_timeout_seconds"] = int(args.step6.step6_total_timeout_seconds)
+    metrics["step6_auto_retry_once"] = bool(args.step6.step6_auto_retry_once)
+    metrics["step6_deploy_e2e_enabled"] = bool(args.step6.step6_deploy_e2e_enabled)
+
+    last_error: BaseException | None = None
+    for attempt in range(1, max_attempts + 1):
+        metrics["step6_attempt"] = attempt
+        try:
+            _run_step6_single_attempt(args, metrics, bundle_dir=bundle_dir, deadline=deadline)
+            metrics["step6_verdict"] = "pass"
+            logger.info("[Step 6] passed on attempt %s", attempt)
+            return
+        except _Step6GateTimeout as exc:
+            last_error = exc
+            logger.warning("[Step 6] attempt %s timed out: %s", attempt, exc)
+        except Exception as exc:
+            last_error = exc
+            logger.warning("[Step 6] attempt %s failed: %s", attempt, exc)
+        if attempt < max_attempts:
+            logger.info("[Step 6] retrying (%s/%s)", attempt + 1, max_attempts)
+
+    metrics["step6_verdict"] = "fail"
+    raise RuntimeError(f"[Step 6] failed after {max_attempts} attempt(s)") from last_error
+
+
 def _run_training_execute_steps(args: HighTierTrainArgs, metrics: dict[str, Any]) -> _b5.Step5Result | None:
     """Run preprocess → dataset → split → Step 5; mutate ``metrics``; return Step 5 result if any."""
 
@@ -1812,6 +2078,8 @@ def _run_training_execute_steps(args: HighTierTrainArgs, metrics: dict[str, Any]
             float(metrics["build_training_dataset_seconds"]),
         )
         _maybe_run_step4(args, metrics=metrics)
+
+    _maybe_run_pre_train_feature_gate(args, metrics=metrics)
 
     logger.info("[Pipeline] Step 4 finished or skipped; invoking Step 5 (fit_model) …")
     step5_result = fit_model(args, metrics=metrics)
@@ -1918,7 +2186,17 @@ def _build_argparser() -> argparse.ArgumentParser:
         dest="ignore_caches",
         help=(
             "Bypass preprocess disk caches (session-clean + bet-clean manifests) and recompute those steps. "
+            "Also forces short-term PIT cache refresh in Step 3.5. "
             "Heavy IO on large L0; --no-cache is an alternate spelling."
+        ),
+    )
+    p.add_argument(
+        "--force-refresh-short-term-pit",
+        action="store_true",
+        dest="force_refresh_short_term_pit",
+        help=(
+            "Force Step 3.5 short-term PIT month-shard cache rebuild even when shard manifests match. "
+            "Does not bypass session/bet preprocess caches unless combined with --ignore-caches."
         ),
     )
     p.add_argument(
@@ -1992,6 +2270,12 @@ def _build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         dest="skip_step5",
         help="Do not train Step 5 LightGBM on Step 4 split Parquets.",
+    )
+    p.add_argument(
+        "--skip-pre-train-feature-gate",
+        action="store_true",
+        dest="skip_pre_train_feature_gate",
+        help="Do not run Step 4.5 short-term PIT train vs live replay gate before Step 5.",
     )
     p.add_argument(
         "--skip-step6",
@@ -2121,6 +2405,7 @@ def _train_args_from_cli_namespace(ns: argparse.Namespace) -> HighTierTrainArgs:
     return HighTierTrainArgs(
         output_dir=DEFAULT_MODEL_DIR,
         ignore_caches=bool(ns.ignore_caches),
+        force_refresh_short_term_pit=bool(ns.force_refresh_short_term_pit),
         skip_bet_preprocess=bool(ns.skip_bet_preprocess),
         materialize_walkaway_labels=not bool(ns.skip_walkaway_labels),
         build_training_dataset=not bool(ns.skip_training_dataset),
@@ -2147,6 +2432,10 @@ def _train_args_from_cli_namespace(ns: argparse.Namespace) -> HighTierTrainArgs:
             run_step5=not bool(ns.skip_step5),
             skip_optuna=bool(ns.skip_optuna),
             optuna_timeout_sec=float(ns.optuna_timeout_sec),
+        ),
+        pre_train_gate=replace(
+            _PRE_TRAIN_GATE_DEFAULTS,
+            run_pre_train_gate=not bool(ns.skip_pre_train_feature_gate),
         ),
         step6=replace(
             _STEP6_CONFIG_DEFAULTS,

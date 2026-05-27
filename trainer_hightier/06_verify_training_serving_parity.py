@@ -34,7 +34,18 @@ if __package__ in (None, ""):
 import pandas as pd
 import pyarrow.parquet as pq
 
-from trainer_hightier.config import HightierServingConfig, Step6ParityConfig
+from trainer_hightier.config import (
+    DuckDbRuntimeConfig,
+    HightierServingConfig,
+    PRE_TRAIN_FEATURE_GATE_JSON_BASENAME,
+    PreTrainFeatureGateConfig,
+    SHORT_TERM_TRIAL_BET_COLUMNS,
+    Step6ParityConfig,
+    default_hightier_serving_config,
+)
+from trainer_hightier.feature_experiment.candidate_registry_loader import load_candidate_registry
+from trainer_hightier.feature_experiment.feature_cadence import classify_model_fe_features
+from trainer_hightier.feature_experiment.feast_mid_term_spike import SPIKE_MID_TERM_FEATURE_COLUMNS
 from trainer_hightier.core.model_bundle_paths import (
     FEATURE_PARITY_REPORT_FILENAME,
     model_bundle_report_path,
@@ -205,6 +216,35 @@ def diff_mask(train: pd.Series, prod: pd.Series) -> pd.Series:
             != prod_both.loc[non_num_idx].astype(str).to_numpy()
         )
     return out
+
+
+def _mid_term_parity_both_non_null_columns(feature_cols: list[str]) -> frozenset[str]:
+    """Mid Feast columns: compare values only where train and serve are both non-null."""
+    mid = frozenset(SPIKE_MID_TERM_FEATURE_COLUMNS)
+    return frozenset(c for c in feature_cols if c in mid)
+
+
+def short_term_parity_column_names(
+    feature_cols: tuple[str, ...],
+    *,
+    registry_path: Path | None = None,
+) -> tuple[str, ...]:
+    """Resolve short-layer columns present in training split for Step 4.5 gate."""
+    snap = load_candidate_registry(registry_path)
+    fe_split = classify_model_fe_features(snap, feature_cols)
+    cols = [
+        *SHORT_TERM_TRIAL_BET_COLUMNS,
+        *fe_split["short_term"],
+    ]
+    present = set(feature_cols)
+    return tuple(dict.fromkeys(c for c in cols if c in present))
+
+
+def pre_train_gate_exit_code(report: dict[str, Any]) -> int:
+    """Non-zero when Step 4.5 short-term gate failed."""
+    if report.get("verdict") == "fail":
+        return 1
+    return 0
 
 
 def validate_slow_artifact(
@@ -378,6 +418,143 @@ def validate_training_split_static_slow(
     return result | summarize_static_slow_values(frame, slow_cols)
 
 
+def _replay_feature_columns(
+    model_features: tuple[str, ...],
+    *,
+    parity_cfg: Step6ParityConfig | None,
+    registry_path: Path | None,
+) -> tuple[list[str], frozenset[str] | None]:
+    """Columns for Step 6 replay (optionally excludes short layer covered by Step 4.5)."""
+    cols = list(model_features)
+    mid_cols: frozenset[str] | None = None
+    if registry_path is not None and registry_path.is_file():
+        snap = load_candidate_registry(registry_path)
+        fe_split = classify_model_fe_features(snap, model_features)
+        mid_cols = frozenset(fe_split["mid_term"])
+        if parity_cfg is not None and not parity_cfg.run_short_full_replay_in_step6:
+            short_ids = set(fe_split["short_term"]) | set(SHORT_TERM_TRIAL_BET_COLUMNS)
+            cols = [c for c in cols if c not in short_ids]
+    return cols, mid_cols
+
+
+def run_pre_train_feature_gate(
+    test_parquet: Path,
+    *,
+    columns: tuple[str, ...],
+    cleaned_bet_root: Path,
+    mapping_parquet: Path,
+    gate_cfg: PreTrainFeatureGateConfig,
+    duckdb_runtime: DuckDbRuntimeConfig | None = None,
+    output_json: Path | None = None,
+) -> dict[str, Any]:
+    """Step 4.5: compare training short-layer columns to live bounded PIT replay."""
+    if not gate_cfg.run_pre_train_gate:
+        report = {"schema_version": "pre_train_feature_gate_v1", "verdict": "skipped", "issues": []}
+        if output_json is not None:
+            out = Path(output_json).resolve()
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+        return report
+    from trainer_hightier.config import DuckDbRuntimeConfig
+    from trainer_hightier.serving.short_term_scoring_context import (
+        build_short_term_features_for_batch,
+        default_short_term_scoring_context,
+        split_short_term_column_names,
+    )
+
+    issues: list[str] = []
+    if not columns:
+        return {
+            "schema_version": "pre_train_feature_gate_v1",
+            "verdict": "pass",
+            "issues": [],
+            "n_rows_compared": 0,
+            "columns": [],
+        }
+    if not test_parquet.is_file():
+        issues.append(f"test parquet missing: {test_parquet}")
+        return {
+            "schema_version": "pre_train_feature_gate_v1",
+            "verdict": "fail",
+            "issues": issues,
+            "n_rows_compared": 0,
+            "columns": list(columns),
+        }
+    test = pd.read_parquet(test_parquet)
+    missing = [c for c in columns if c not in test.columns]
+    if missing:
+        issues.append(f"test split missing gate columns: {missing}")
+        return {
+            "schema_version": "pre_train_feature_gate_v1",
+            "verdict": "fail",
+            "issues": issues,
+            "n_rows_compared": 0,
+            "columns": list(columns),
+        }
+    if gate_cfg.max_rows and len(test) > gate_cfg.max_rows:
+        from trainer_hightier.serving.short_term_scoring_context import sort_bets_for_scoring_batch
+
+        test = sort_bets_for_scoring_batch(test).head(int(gate_cfg.max_rows)).reset_index(drop=True)
+    trial_cols, fe_cols = split_short_term_column_names(columns)
+    serving_cfg = default_hightier_serving_config()
+    ctx = default_short_term_scoring_context(serving_cfg)
+    runtime = duckdb_runtime or DuckDbRuntimeConfig()
+    prod_parts: list[pd.DataFrame] = []
+    for batch_df in _iter_test_batches(test, batch_size=gate_cfg.batch_size, max_rows=None):
+        bets = _bets_frame_from_test_batch(batch_df)
+        prod_parts.append(
+            build_short_term_features_for_batch(
+                bets,
+                cleaned_bet_parquet=cleaned_bet_root,
+                mapping_parquet=mapping_parquet,
+                serving_cfg=serving_cfg,
+                duckdb_runtime=runtime,
+                fe_columns=fe_cols,
+                trial_columns=trial_cols,
+                context=ctx,
+            ),
+        )
+    prod = pd.concat(prod_parts, ignore_index=True) if prod_parts else pd.DataFrame()
+    train = test[["bet_id", *columns]].copy()
+    merged = train.merge(prod, on="bet_id", suffixes=("_train", "_serve"), how="inner")
+    per_feature = summarize_feature_diffs(merged, list(columns))
+    fail_features = [
+        r
+        for r in per_feature
+        if r["n_diff"] > 0 and float(r["diff_fraction"]) > float(gate_cfg.diff_fraction_fail_threshold)
+    ]
+    if fail_features:
+        issues.append(
+            f"{len(fail_features)} short column(s) exceed diff fraction "
+            f"{gate_cfg.diff_fraction_fail_threshold}",
+        )
+    report = {
+        "schema_version": "pre_train_feature_gate_v1",
+        "verdict": "fail" if issues else "pass",
+        "issues": issues,
+        "test_parquet": str(test_parquet.resolve()),
+        "cleaned_bet_root": str(cleaned_bet_root.resolve()),
+        "n_rows_input": int(len(test)),
+        "n_rows_compared": int(len(merged)),
+        "columns": list(columns),
+        "expand_canonical_aliases": False,
+        "batch_size": int(gate_cfg.batch_size),
+        "features_all": per_feature,
+        "features_with_diff": [r for r in per_feature if r["n_diff"] > 0],
+    }
+    if output_json is not None:
+        out = Path(output_json).resolve()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    return report
+
+
+def default_pre_train_gate_json_path() -> Path:
+    """Default Step 4.5 report path under training_data artifacts."""
+    root = Path(__file__).resolve().parent
+    return (root / "artifacts" / "training_data" / PRE_TRAIN_FEATURE_GATE_JSON_BASENAME).resolve()
+
+
 def run_production_feature_replay(
     model_dir: Path,
     test_parquet: Path,
@@ -387,6 +564,7 @@ def run_production_feature_replay(
     max_rows: int,
     batch_size: int,
     diff_fraction_fail_threshold: float = 0.02,
+    parity_cfg: Step6ParityConfig | None = None,
 ) -> dict[str, Any]:
     """Replay production suppliers and compare every model feature to training split values."""
     ctx = resolve_offline_context(
@@ -400,9 +578,25 @@ def run_production_feature_replay(
     )
     needs_feast = bool(ctx.supplier_plan.feast_mid_cols or ctx.supplier_plan.feast_slow_cols)
     adapter = _build_feast_online_adapter(ctx) if needs_feast else None
+    registry_path = model_dir / "feature_candidate_registry.snapshot.yaml"
+    replay_cols, mid_cols = _replay_feature_columns(
+        ctx.bundle.feature_columns,
+        parity_cfg=parity_cfg,
+        registry_path=registry_path,
+    )
     test = pd.read_parquet(test_parquet)
     if max_rows and len(test) > max_rows:
-        test = test.sort_values("bet_id").head(max_rows).reset_index(drop=True)
+        from trainer_hightier.serving.short_term_scoring_context import sort_bets_for_scoring_batch
+
+        test = sort_bets_for_scoring_batch(test).head(int(max_rows)).reset_index(drop=True)
+    if not replay_cols:
+        return {
+            "mode": "all_model_features",
+            "issues": [],
+            "n_rows_compared": 0,
+            "feature_count": 0,
+            "skipped_short_full_replay": True,
+        }
     return compare_training_to_production_features(
         test,
         ctx=ctx,
@@ -410,6 +604,8 @@ def run_production_feature_replay(
         cleaned_bet_root=cleaned_bet_root,
         batch_size=batch_size,
         diff_fraction_fail_threshold=diff_fraction_fail_threshold,
+        feature_cols=replay_cols,
+        mid_columns=mid_cols,
     )
 
 
@@ -421,9 +617,11 @@ def compare_training_to_production_features(
     cleaned_bet_root: Path,
     batch_size: int,
     diff_fraction_fail_threshold: float = 0.02,
+    feature_cols: list[str] | None = None,
+    mid_columns: frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """Compare production-replayed model feature values against training parquet columns."""
-    feature_cols = list(ctx.bundle.feature_columns)
+    feature_cols = list(feature_cols if feature_cols is not None else ctx.bundle.feature_columns)
     missing_train = [c for c in feature_cols if c not in test.columns]
     issues = []
     if missing_train:
@@ -459,7 +657,7 @@ def compare_training_to_production_features(
     prod = pd.concat(prod_parts, ignore_index=True) if prod_parts else pd.DataFrame()
     train = test[["bet_id", *feature_cols]].copy()
     merged = train.merge(prod, on="bet_id", suffixes=("_train", "_serve"), how="inner")
-    per_feature = summarize_feature_diffs(merged, feature_cols)
+    per_feature = summarize_feature_diffs(merged, feature_cols, mid_columns=mid_columns)
     n_changed = sum(1 for r in per_feature if r["n_diff"] > 0)
     fail_features = [
         r
@@ -507,6 +705,7 @@ def run_feature_replay_batch(
         cleaned_root=cleaned_bet_root,
         cfg=cfg,
         mapping_parquet=ctx.mapping_parquet,
+        expand_canonical_aliases=False,
     )
     scoring_batch = _ScoringBatch(
         bets=bets.reset_index(drop=True),
@@ -531,8 +730,18 @@ def run_feature_replay_batch(
     return out
 
 
-def summarize_feature_diffs(merged: pd.DataFrame, feature_cols: list[str]) -> list[dict[str, Any]]:
-    """Build per-feature train/serve diff summaries."""
+def summarize_feature_diffs(
+    merged: pd.DataFrame,
+    feature_cols: list[str],
+    *,
+    compare_only_when_train_present: bool = False,
+    mid_columns: frozenset[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Build per-feature train/serve diff summaries.
+
+    When ``compare_only_when_train_present`` is True (mid structural nulls), rows with
+    null training values are excluded from the diff denominator.
+    """
     rows = []
     denom = max(len(merged), 1)
     for col in feature_cols:
@@ -541,7 +750,39 @@ def summarize_feature_diffs(merged: pd.DataFrame, feature_cols: list[str]) -> li
         if train_col not in merged.columns or serve_col not in merged.columns:
             rows.append({"feature": col, "n_diff": denom, "diff_fraction": 1.0, "issue": "missing comparison column"})
             continue
-        mask = diff_mask(merged[train_col], merged[serve_col])
+        train_s = merged[train_col]
+        serve_s = merged[serve_col]
+        use_train_present_only = compare_only_when_train_present or (
+            mid_columns is not None and col in mid_columns
+        )
+        if use_train_present_only:
+            eligible = train_s.notna()
+            n_eligible = int(eligible.sum())
+            if n_eligible == 0:
+                rows.append(
+                    {
+                        "feature": col,
+                        "n_diff": 0,
+                        "diff_fraction": 0.0,
+                        "train_null_fraction": float(train_s.isna().mean()) if len(merged) else 0.0,
+                        "serve_null_fraction": float(serve_s.isna().mean()) if len(merged) else 0.0,
+                        "n_rows_compared": 0,
+                    },
+                )
+                continue
+            mask = diff_mask(train_s.loc[eligible], serve_s.loc[eligible])
+            rows.append(
+                {
+                    "feature": col,
+                    "n_diff": int(mask.sum()),
+                    "diff_fraction": float(mask.mean()) if len(mask) else 0.0,
+                    "train_null_fraction": float(train_s.isna().mean()) if len(merged) else 0.0,
+                    "serve_null_fraction": float(serve_s.isna().mean()) if len(merged) else 0.0,
+                    "n_rows_compared": n_eligible,
+                },
+            )
+            continue
+        mask = diff_mask(train_s, serve_s)
         rows.append(
             {
                 "feature": col,
@@ -593,6 +834,7 @@ def validate_one_model(
     max_rows: int,
     batch_size: int,
     diff_fraction_fail_threshold: float = 0.02,
+    parity_cfg: Step6ParityConfig | None = None,
 ) -> dict[str, Any]:
     """Run all-feature parity checks for one trained model directory."""
     report: dict[str, Any] = {
@@ -632,6 +874,7 @@ def validate_one_model(
             max_rows=max_rows,
             batch_size=batch_size,
             diff_fraction_fail_threshold=diff_fraction_fail_threshold,
+            parity_cfg=parity_cfg,
         )
     except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:
         report["all_feature_replay"] = {
@@ -641,6 +884,15 @@ def validate_one_model(
     report["issues"].extend(report["slow_artifact"].get("issues", []))
     report["issues"].extend(report["training_split_static_slow"].get("issues", []))
     report["issues"].extend(report["all_feature_replay"].get("issues", []))
+
+    n_model_features = len(features)
+    replay = report.get("all_feature_replay") or {}
+    n_compared = int(replay.get("feature_count") or 0)
+    if n_model_features > 0 and n_compared < n_model_features:
+        report["issues"].append(
+            f"all_feature_replay compared {n_compared} of {n_model_features} model features; "
+            "enable run_short_full_replay_in_step6 or fix replay coverage",
+        )
 
     slow_issues = (
         report["slow_artifact"].get("issues", [])
@@ -703,6 +955,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             diff_fraction_fail_threshold=float(
                 getattr(args, "all_feature_diff_fraction_fail_threshold", 0.02),
             ),
+            parity_cfg=getattr(args, "parity_cfg", None),
         )
         for model_dir in model_dirs
     ]
@@ -762,6 +1015,7 @@ def build_report_from_config(
     args.all_feature_diff_fraction_fail_threshold = (
         parity_cfg.all_feature_diff_fraction_fail_threshold
     )
+    args.parity_cfg = parity_cfg
     return build_report(args)
 
 
@@ -806,7 +1060,7 @@ def run_cli(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument("--max-rows", type=int, default=200_000)
-    parser.add_argument("--batch-size", type=int, default=5000)
+    parser.add_argument("--batch-size", type=int, default=2000)
     parser.add_argument(
         "--hard-fail-slow-gate",
         action=argparse.BooleanOptionalAction,
@@ -835,12 +1089,16 @@ def run_cli(argv: list[str] | None = None) -> int:
         hard_fail_all_feature_gate=bool(args.hard_fail_all_feature_gate),
         max_rows=int(args.max_rows),
         batch_size=int(args.batch_size),
+        run_short_full_replay_in_step6=bool(
+            getattr(args, "run_short_full_replay_in_step6", False),
+        ),
     )
     model_dirs = resolve_model_dirs(args)
     try:
         out = resolve_output_json_path(args, model_dirs)
     except ValueError as exc:
         parser.error(str(exc))
+    args.parity_cfg = parity_cfg
     report = build_report(args)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
