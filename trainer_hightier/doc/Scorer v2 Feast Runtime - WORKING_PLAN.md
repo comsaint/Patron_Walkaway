@@ -2,11 +2,20 @@
 
 本文件是 **Working / execution plan 層**，承接：
 
-- SSOT：`Scorer Runtime Contract - SSOT.md`
-- Implementation plan：`Scorer v2 Feast Runtime - IMPLEMENTATION_PLAN.md`
+- SSOT：[`Scorer Runtime Contract - SSOT.md`](Scorer%20Runtime%20Contract%20-%20SSOT.md)（含特徵四層、short PIT、離線 PIT cache、hot pool）
+- Implementation plan：[`Scorer v2 Feast Runtime - IMPLEMENTATION_PLAN.md`](Scorer%20v2%20Feast%20Runtime%20-%20IMPLEMENTATION_PLAN.md)（含 **Follow-on P1+P2** 架構決策）
+- Data pipeline SSOT：[`Data pipeline - SSOT.md`](Data%20pipeline%20-%20SSOT.md) §5.1（訓練 Step 3.5 short cache）
 - Decision record：`Feast Production Feasibility Spike - DECISION_RECORD.md`
 
 本文件只拆解可執行工作、依賴、Definition of Done、建議順序與驗收證據；不重新定義 scorer v2 的產品範圍或架構。若本文件與 SSOT / implementation plan 衝突，先更新上層文件再執行。
+
+### 任務 ID 命名規則
+
+| 前綴 | 含義 |
+|------|------|
+| **`ST-*`** | **當前 follow-on**：Short-term alignment（對應 implementation plan 的 P1+P2） |
+| **`S1`–`S6`** | 已完成：Feast startup / no-repo bundle slice（背景） |
+| **`P0`–`P6`** | 廣域 scorer v2 路線圖（背景；與 `ST-P1` 的「Scorer Core P1-1」不同 ID） |
 
 ## 已定前置決策
 
@@ -24,7 +33,17 @@
 - Feast runtime paths 必須 bundle-local：`feast_repo/`、`artifacts/feast/`、`local_state/feature_state.db`、`mapping/adt_allowed_players_q0p99.parquet`。
 - Startup refresh lock 採短 timeout + fail-fast；freshness 判斷只讀 config / readiness metadata。
 - `feature_state.db` 保存 latest readiness payload/hash/run id/generated_at；`feast_online_readiness.json` 保留為 latest deploy/scorer gate snapshot。
-- Post-startup scheduled / daemon Feast refresh 是 future must-do，不混入 startup auto-refresh 第一版。
+- Post-startup scheduled / daemon Feast refresh 已採用 supervisor（見 deploy）；startup slice 第一版不包含 daemon 細節。
+
+### Follow-on 前置決策（2026-05，當前優先）
+
+- **Short 單層**：`bet__*` + short-horizon `fe__*` 皆為 `short_term_pit_builder`（live PIT）；**不**再區分 Short-T / Short-PIT 兩層時間語意。
+- **訓練 offline PIT cache**：`_main_trainer_fe_short_term.parquet`（manifest 鍵 `fe_short_term_parquet`）僅加速 Step 4/5；語意仍 PIT，**不可**供應 production 未見 `bet_id`。
+- **Production short = live PIT only（決策 A）**：scorer 僅 `attach_trial_bet_behavior_1h` + `attach_short_term_pit_features`；Route B `join_production_fe_suppliers` 的 short parquet **不作** scorer v2 主路徑／readiness。
+- **`expand_canonical_aliases=False`**：訓練物化、Step 4.5、Step 6 replay、production scorer（CH pool 路徑需 ST-P1-4 稽核）。
+- **Hot pool**：`compute_hot_pool_window_start`（6h + gaming day open）；baseline 維持 `fe__canonical__*__today`。
+- **Parity 兩段**：**Step 4.5** pre-train hard-fail（Step 5 前）；**Step 6** 瘦身（Feast / slow / bundle e2e）。
+- **`short__` 欄位改名**：defer（不列入本輪 DoD）。
 
 ## 執行護欄
 
@@ -34,30 +53,134 @@
 - 不把 ClickHouse credentials、Feast online store credentials 或環境差異塞進環境變數控制行為；runtime 行為設定應收斂在既有 config / Python config。
 - 不新增多餘架構層。第一輪只允許為 scorer v2 必要邊界新增小型 adapter / helper。
 
-## 本輪聚焦 slice（優先執行）
+## 本輪聚焦 slice（Current priority）
 
-**Next Slice: Startup Auto-refresh + No-repo Feast Bundle**
+**Follow-on: Short-term alignment (ST-P1 + ST-P2)**
 
-本輪只處理 deploy / package / refresh integration，使 production 可在 **無 repo checkout** 下以
-`python main.py --mode all` 啟動 scorer v2。**不**混入 post-startup scheduled / daemon Feast refresh（future must-do）。
+對齊 implementation plan §Follow-on：統一 **Scoring Context Contract**、**Step 4.5** pre-train gate、**Step 6** 瘦身、registry/supply 單一 short 故事。Feast startup slice（S1–S6）視為 **已完成背景**，不阻塞本輪。
+
+### 訓練管線（parity 插入點）
 
 ```mermaid
 flowchart TD
-    bundleBuild["Build deploy bundle"] --> installDeps["pip install requirements"]
-    installDeps --> deployStart["python main.py --mode all"]
-    deployStart --> preflight["Preflight model mapping allowlist feast_repo"]
-    preflight --> readinessCheck["Read config and readiness metadata"]
-    readinessCheck --> needsRefresh{"Needs refresh?"}
-    needsRefresh -->|"No"| smoke["Deploy Feast smoke"]
-    needsRefresh -->|"Yes"| lock["Acquire short-timeout lock"]
-    lock --> refresh["feast_online_refresh"]
-    refresh --> persistDb["Persist latest readiness in feature_state.db"]
-    persistDb --> publishJson["Atomic readiness JSON publish"]
-    publishJson --> smoke
-    smoke --> startRuntime["Start API validator scorer"]
+    s35[Step3.5_offline_PIT_cache]
+    s4[Step4_split]
+    s45[Step4.5_pre_train_gate]
+    s5[Step5_train]
+    s6[Step6_e2e_slim]
+
+    s35 --> s4 --> s45 --> s5 --> s6
 ```
 
-### Slice 建議執行順序
+### Follow-on 建議執行順序
+
+```mermaid
+flowchart TD
+    stp1["ST-P1 Contract and wiring"]
+    stgate["ST-GATE 4.5 and 6"]
+    stp2["ST-P2 Registry and supply"]
+    dod["ST-DoD local pipeline"]
+
+    stp1 --> stgate
+    stgate --> stp2
+    stp2 --> dod
+```
+
+1. ST-P1-1 → ST-P1-3 → ST-P1-5 → ST-P1-6（contract + parity 對齊）
+2. ST-GATE-1 → ST-GATE-3（4.5 先於長訓練）
+3. ST-P2-1 → ST-P2-3（supply 與 deploy preflight）
+4. ST-GATE-4 → ST-GATE-6（Step 6 瘦身）
+5. ST-P1-4（production CH pool / alias 稽核）
+6. ST-DoD 本機全 pipeline
+
+---
+
+## ST-P1: Scoring Context Contract + 接線
+
+目的：train materialize、scorer live PIT、Step 4.5 / Step 6 replay 共用同一 pool / batch / canonical 政策與計算入口。
+
+**建議新模組**：`trainer_hightier/serving/short_term_scoring_context.py`
+
+- `ShortTermScoringContext`（或模組常數）：`expand_canonical_aliases=False`、`batch_size` = `hightier_scorer_max_bets_per_cycle`（2000）、batch 排序 `payout_complete_dtm`, `bet_id`。
+- `build_short_term_features_for_batch(...)`：內部 `attach_trial_bet_behavior_1h` + `compute_fe_derived_features_from_pool` / `attach_short_term_pit_features` 子集；**不**合併 trial 與 derived SQL 檔。
+
+| ID | Task | Files | Dependencies | Definition of Done |
+|----|------|-------|--------------|-------------------|
+| ST-P1-1 | 新增 contract 模組 + 單元測試 | `serving/short_term_scoring_context.py`, `tests/test_scoring_context_contract.py` | Follow-on 決策 | pytest 綠；expand 預設 False；無全域狀態 |
+| ST-P1-2 | materialize 改呼叫 contract | `feature_experiment/materialize_fe_derived.py` | ST-P1-1 | `_short_term_features_for_batch` 行為不變；expand=False、時間序 batch |
+| ST-P1-3 | scorer 改呼叫 contract | `serving/scorer.py` | ST-P1-1 | `_build_staged_features` 單一 live PIT 入口 |
+| ST-P1-4 | Production CH pool 與 alias 政策對齊 | `serving/scorer.py`, `serving/offline_serving_backtest.py` | ST-P1-1 | player fanout 與 parity 一致；註解或程式與 `expand=False` 對齊 |
+| ST-P1-5 | Parity replay 對齊 contract | `06_verify_training_serving_parity.py`, `offline_serving_backtest.py` | ST-P1-1, ST-P1-6 | `expand_canonical_aliases=False`；test batch 時間序 |
+| ST-P1-6 | `Step6ParityConfig.batch_size` = 2000 | `config.py` | 無 | 與 materialize / scorer cycle 一致 |
+
+**Iteration ST-A exit**：`test_bounded_short_term_training` + `test_scoring_context_contract` 綠；`test.parquet` 子樣本 short replay diff 相對舊 Step 6 明顯下降。
+
+---
+
+## ST-GATE: Step 4.5（pre-train）與 Step 6（瘦身）
+
+目的：避免長時間 Step 5 後才在 Step 6 發現 short PIT context 錯誤；Step 6 專注 bundle + Feast e2e。
+
+| ID | Task | Files | Dependencies | Definition of Done |
+|----|------|-------|--------------|-------------------|
+| ST-GATE-1 | `PreTrainFeatureGateConfig`（或擴充 parity config） | `config.py` | 無 | 與 Step 6 共用 `max_rows`（200k）、`diff_fraction_fail_threshold`（0.02） |
+| ST-GATE-2 | `run_pre_train_feature_gate` | `06_verify_training_serving_parity.py` 或 `verify_short_term_parity.py` | ST-P1-5, ST-GATE-1 | 輸出 `artifacts/training_data/pre_train_feature_gate.json`；fail → exit 1 |
+| ST-GATE-3 | trainer Step 4 後、Step 5 前呼叫 gate | `trainer.py` | ST-GATE-2 | CLI `--skip-pre-train-feature-gate`；hard fail |
+| ST-GATE-4 | Step 6 預設跳過 short 全量 replay | `06_verify_training_serving_parity.py`, `trainer.py` | ST-GATE-2 | 保留 slow + Feast；仍寫 `feature_parity_verification.json` |
+| ST-GATE-5 | Step 6 可選 short smoke（子樣本） | 同上 | ST-GATE-4 | 與 4.5 分工文件化 |
+| ST-GATE-6 | Mid structural null 比對政策 | `06_verify` | 無 | 僅比非 null 列數值；Option B null 率不當 parity fail |
+
+**Iteration ST-GATE exit**：`--skip-step5` 或僅跑至 Step 4 後可單獨驗 4.5；全 pipeline 時 4.5 pass 才進 Optuna。
+
+---
+
+## ST-P2: Registry & feature_supply 單一 short
+
+目的：治理與 deploy preflight 只呈現一個 short 供應故事；`bet__*` 不再進 `feast_trial_cols`。
+
+| ID | Task | Files | Dependencies | Definition of Done |
+|----|------|-------|--------------|-------------------|
+| ST-P2-1 | `_infer_runtime_supplier` 優先 short PIT | `serving/feature_supply.py` | 無 | baseline 四 `bet__*` ∈ `short_term_cols` |
+| ST-P2-2 | `feast_trial_cols` deprecated / 恆空 | `feature_supply.py` | ST-P2-1 | `test_feature_supply.py` 更新 |
+| ST-P2-3 | preflight 不要求 `fe_short_term` 作 v2 readiness | `feature_supply.py`, `deploy/main.py` | ST-P2-1 | 決策 A；Route B diagnostic only |
+| ST-P2-4 | Registry `bet__*` 可選補 note | `contracts/feature_candidate_registry.yaml` | 無 | 與 SSOT 一致；無欄位改名 |
+
+**Iteration ST-B exit**：`pytest tests/test_feature_supply.py tests/test_feature_cadence.py` 綠。
+
+---
+
+## Follow-on Release Gate（ST-DoD）
+
+本輪完成時至少滿足（**與下方 Startup slice gate 分開**）：
+
+- **pytest**：ST-P1、ST-P2、ST-GATE 相關測試全綠。
+- **Step 4.5**：`pre_train_feature_gate.json` 存在且 short baseline `verdict=pass`（`diff_fraction ≤ 0.02`）。
+- **Step 5**：完成訓練並產出 bundle（Optuna 依 `Step5TrainConfig`）。
+- **Step 6**：`feature_parity_verification.json`；`hard_fail_slow_gate` / `hard_fail_all_feature_gate` 依 config；**short 全量 replay 失敗不應是主因**（已在 4.5 攔截）。
+- **禁止**：training `fe_short` parquet 作 production scorer 查表。
+
+### 本機驗收命令（建議）
+
+```bash
+export PYTHONUTF8=1
+# 全 pipeline（artifact 已齊時可 --start-from-features）
+python -m trainer_hightier.trainer --profile main_trainer
+# 或分段：Step 3.5+4 後僅驗 4.5（需實作 ST-GATE-3 後）
+# python -m trainer_hightier.trainer --start-from-features --skip-step5
+```
+
+驗證產物：
+
+- `trainer_hightier/artifacts/training_data/pre_train_feature_gate.json`
+- `out/models_high_tier_mvp/<bundle>/feature_parity_verification.json`
+
+---
+
+## 背景（已完成）：Startup Auto-refresh S1–S6
+
+**Status: completed / background.** 以下 task 供稽核；**當前優先執行 ST-P1 / ST-GATE / ST-P2**，不阻塞於 S1–S6。
+
+原 slice 目標：deploy / package / refresh，使 production 在 **無 repo checkout** 下以 `python main.py --mode all` 啟動 scorer v2。
 
 ```mermaid
 flowchart TD
@@ -68,11 +191,7 @@ flowchart TD
     s5["S5 Disable Legacy Snapshot Supervisor"]
     s6["S6 Tests and No-repo Smoke"]
 
-    s1 --> s2
-    s2 --> s3
-    s3 --> s4
-    s4 --> s5
-    s5 --> s6
+    s1 --> s2 --> s3 --> s4 --> s5 --> s6
 ```
 
 ## Slice S1: Package Dependency and Bundle Layout
@@ -275,9 +394,9 @@ flowchart TD
 - **Iteration D（S6）**：測試 + no-repo smoke + production dry run。
   - Exit：Release gate（見下）startup 相關項全勾。
 
-## Slice Release Gate
+## Slice Release Gate（Startup S1–S6，已完成）
 
-本 slice 完成時至少滿足：
+歷史 slice 完成時至少滿足：
 
 - Bundle：`feast_repo/`、`artifacts/feast/`、`local_state/`、`mapping/adt_allowed_players_q0p99.parquet` 存在且 path 可解析。
 - Install：`pip install -r requirements.txt` 從 PyPI / internal index 成功；`feast` import 成功。
@@ -287,9 +406,16 @@ flowchart TD
 - Legacy：Parquet snapshot supervisor 不作 scorer v2 mid/long path。
 - **Out of scope**：post-startup scheduled / daemon Feast refresh（future must-do，另開 slice）。
 
-## 背景：Scorer v2 廣域 Phases（非本輪）
+## 本輪 Out of scope（follow-on）
 
-以下 Phase 0–6 為 scorer runtime 整體路線圖；**本輪不重新執行或阻塞於此**，除非 task 明確依賴（例如 scorer 已具備 Feast adapter 才做 production dry run）。
+- 欄位前綴 `short__` / `mid__` / `long__`（P3）
+- 合併 trial + derived 為單一 SQL 檔
+- 移除 gaming day pool floor 或 baseline `canonical__*__today`
+- 以 `fe_short_term_parquet` 作 production 主供應
+
+## 背景：Scorer v2 廣域 Phases（非當前 follow-on）
+
+以下 Phase 0–6 為 scorer runtime 整體路線圖；**當前優先為 ST-P1 / ST-GATE / ST-P2**，不重新執行或阻塞於 P0–P6，除非 task 明確依賴（例如 scorer 已具備 Feast adapter 才做 production dry run）。
 
 ```mermaid
 flowchart TD
@@ -517,9 +643,9 @@ flowchart TD
   - 目標：替換前驗證。
   - Exit：bounded production dry run 可接受，validator / API 相容。
 
-## Release Gate
+## Release Gate（廣域 production-ready）
 
-Scorer v2 不應標記 production-ready，除非以下項目全數通過：
+Scorer v2 不應標記 production-ready，除非以下項目全數通過（**且** Follow-on Release Gate / ST-DoD 已 pass）：
 
 - CLI 相容：既有 scorer entrypoint 可啟動 v2。
 - Feature supplyability：每個 `model.pkl.feature_columns` 有唯一 runtime supplier。
@@ -533,11 +659,18 @@ Scorer v2 不應標記 production-ready，除非以下項目全數通過：
 
 ## Open Execution Risks
 
-- `feature_experiment` 仍被 serving import 但 wheel exclude 該 package → no-repo `ModuleNotFoundError`（`S1-5` 必須先解）。
-- ~~`build_deploy_package` / `deploy/main.py` 仍驗證 legacy snapshot parquet、仍跑 snapshot supervisor~~ → **已收斂**：Feast-only bundle（無 `snapshots/artifacts/*.parquet`）、metadata-only manifest、deploy preflight 不再 hard-require legacy parquet keys；snapshot supervisor 已停用（`S1-4`、`S5-1`）。
-- `feature_state.db` 尚未保存 latest readiness JSON/hash（`S3-1`）。
-- `pyproject.toml` 尚未宣告 `feast` dependency（`S1-1`）。
-- 真 Feast online store schema 與 spike definitions 可能尚未完全 production 化；production dry run 前確認 feature service 名稱與 entity key。
-- short-term `fe__*` 若出現在目前 model feature set，且 bounded PIT builder 尚未支援，會阻擋 scorer readiness；不得以 `fe_short_term_parquet` 解鎖 production。
-- `>10%` missing entity threshold 是第一版 operational guardrail；若 dry run 顯示正常業務 coverage 會超過此值，必須回到 SSOT/decision record 重新批准。
-- **Future must-do**：post-startup scheduled Feast refresh 未在本 slice；長期運行需手動 re-refresh 或重啟直至下一 slice。
+### Follow-on（ST-P1 / ST-GATE / ST-P2）
+
+- **Step 6 `batch_size=5000` vs materialize `2000`**：現況未對齊，為 short parity 失敗主因之一；**ST-P1-6** 必須修。
+- **`expand_canonical_aliases` 預設 True**（`offline_serving_backtest.build_pool_from_cleaned_parquet`）：與訓練 materialize 不一致；**ST-P1-5** 必須改 parity 路徑預設 False。
+- **Production CH `fetch_bet_pool_window`** 可能隱含與 cleaned-parquet pool 不同的 player 集合；**ST-P1-4** 需稽核並文件化。
+- Step 4.5 未實作前，長訓練後 Step 6 仍可能浪費時間；**ST-GATE-3** 為高優先。
+- Mid Option B structural null（~15%）若 parity 把 null vs non-null 混比，會誤報；**ST-GATE-6** 需釐清比對規則。
+
+### 背景（Startup / 廣域）
+
+- `feature_experiment` 被 wheel exclude 時 serving 需無 repo import（`S1-5`，多已解）。
+- Feast-only bundle、metadata-only manifest、停用 legacy snapshot supervisor（`S1-4`、`S5-1`，多已解）。
+- 真 Feast online schema 與 production feature service 名稱需在 dry run 前確認。
+- short-term 欄位若 bounded PIT 未支援會 fail fast；**不得**以 `fe_short_term_parquet` 解鎖 production（決策 A）。
+- `>10%` Feast entity-missing 為 operational guardrail；超過需回 SSOT 重批。

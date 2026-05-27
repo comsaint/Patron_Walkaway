@@ -68,6 +68,21 @@
 - P25 容忍（v0）：於上述子區間上，相對 benchmark baseline（預設 **all history** 訓練政策）之 **ΔAP**、**ΔR@Pmin** 的 **median 與第 25 百分位數**須滿足 `Feature experimentation - WORKING_PLAN.md` §1.4 之數值（其中 **ΔR@Pmin 相關門檻採嚴格上升**，即 **> 0**）；用以避免「中位數改善但尾部切片顯著劣化」之策略過關。
 - PIT correctness：每筆實體（entity）僅能看到當時可見的歷史特徵，避免資料洩漏。
 
+### 5.1) 特徵四層與 Short-term 離線 PIT cache（Step 3.5）
+
+與 [`Scorer Runtime Contract - SSOT.md`](Scorer%20Runtime%20Contract%20-%20SSOT.md) §「特徵四層與 Short-term PIT」對齊：
+
+| 層 | Step 3 / 3.5 產物 | 說明 |
+|----|-------------------|------|
+| **raw** | `training_set.parquet` 內 cleaned 欄位 | 當筆 passthrough |
+| **short** | `_main_trainer_fe_short_term.parquet` → enrich 後進 `training_set_fe_enriched.parquet` | **離線 PIT cache**：對訓練集每個 `bet_id` 用 bounded hot pool 算 PIT（含 `bet__*` 與 short `fe__*`），**語意仍為 PIT**，非 mid 式日聚合表 |
+| **mid** | `_main_trainer_mid_term_daily_snapshot.parquet` + enrich ASOF | 日快照 + composite |
+| **long** | Feast slow join（Step 3 month-batch） | 月快照 ASOF |
+
+- **勿**將 `fe_short_term` 檔名理解為「非 PIT 預計算特徵」；正確稱呼為 **short-term PIT cache**（manifest 鍵 `fe_short_term_parquet` 保留相容）。
+- **勿**用訓練 cache 供應 production 未見 `bet_id`；生產打分見 Scorer SSOT（live PIT 主路徑）。
+- `bet__*` 與 short `fe__*` 屬**同一 short 層**；registry `source: feast_trial_1h` 為歷史標籤，訓練供應為 `short_term_pit_builder`。
+
 ## 6) 架構真相（Architecture SSOT）
 
 - DuckDB：本地資料處理與查詢執行引擎（含 spill 與記憶體上限控制）。

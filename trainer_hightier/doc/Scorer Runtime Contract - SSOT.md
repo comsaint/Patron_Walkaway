@@ -36,7 +36,7 @@ Scorer v2 不再保留不必要的 legacy feature supplier 相容路徑。刻意
 - 不得接受 training-scoped artifact 為 production-safe snapshot。
 - `snapshots/active_manifest.json` 僅 **metadata**（版本、coverage、training cutoff、allowlist 稽核）；**不得**含 `*_parquet` 路徑鍵。
 - 缺 legacy snapshot 路徑（`slow_patron_parquet`、`mid_term_snapshot_parquet` 等）**不**阻擋建包。
-- `fe_short_term_parquet` 不入包、非 scorer v2 supplier。
+- Short-term **training PIT cache**（manifest 鍵 `fe_short_term_parquet`）不入包、非 scorer v2 supplier。
 
 目錄：`models/`、`mapping/`（含 `adt_allowed_players_q0p99.parquet`）、`feast_repo/`、`artifacts/feast/`、`local_state/`、metadata-only `snapshots/active_manifest.json`。
 
@@ -167,6 +167,47 @@ Scorer **不得**靜默補齊缺失的 model 特徵：
 
 ---
 
+## 特徵四層與 Short-term PIT（命名 SSOT）
+
+訓練與 serving 共用下列**語意層**（與欄位前綴 `wager` / `bet__` / `fe__` / `patron__` 可並存；未來可漸進改為 `raw__` / `short__` / `mid__` / `long__`）：
+
+| 層 | 代表欄位 | 時間語意 | 訓練供應 | Production scorer v2 |
+|----|----------|----------|----------|----------------------|
+| **raw** | `wager`, `bet_type`, … | 當筆注單 | Step 3 cleaned | ClickHouse／scoring 輸入 |
+| **short** | `bet__*__w1h` + short `fe__*`（15m/1h/today 等） | **Event-level PIT**：每筆 `bet_id` 僅用可見時間前歷史 | 見下「離線 PIT cache」 | **Bounded on-the-fly PIT**（主路徑） |
+| **mid** | `fe__bets_cnt__w1d`、composite `fe__*__w7d`、audit | Prior gaming day 日快照 ASOF | `mid_term_daily_snapshot` + enrich | Feast online + Option B 窗檢查 |
+| **long** | `patron__*__w180d_m1snap` | 月快照 ASOF | Feast slow | Feast online slow |
+
+### Short 只有一層（勿再分 Short-T / Short-PIT）
+
+- **`bet__*`** 與 short **`fe__*`** 皆為 **short-term PIT**；差異僅實作模組（1h 四聚合 vs derived SQL），**不是**兩個時間層。
+- 各欄位仍有各自的語意窗口（例如 15m、1h、當 gaming day 累計）；hot pool 邊界（預設 6h + 當日開盤）由 `compute_hot_pool_window_start` 決定，**不等於**「所有 short 共用同一個 lookback 小時數」。
+
+### 「離線 PIT cache」≠ 非 PIT、≠ 可給未見 bet 查表
+
+訓練 Step 3.5 產物（程式內常稱 `_main_trainer_fe_short_term.parquet`；manifest 鍵 **`fe_short_term_parquet`**，文件亦稱 **short-term PIT cache**）：
+
+| 問題 | 答案 |
+|------|------|
+| 是否 PIT？ | **是**。對訓練集內每個 `bet_id` 用 bounded hot pool **離線算一次**與 scorer 對齊的 PIT 值，再 join 進 `training_set_fe_enriched.parquet`。 |
+| 為何要 parquet？ | **效能**：上百萬列重跑 DuckDB 成本高；非因「可預先算一張與 bet 無關的全局表」。 |
+| Production 新 bet 能用嗎？ | **不能**用訓練 cache。新 `bet_id` 須 **即時 PIT**（scorer）或 **production 專用** rolling cache（Route B，僅含 mirror 內已存在列）。 |
+| 與 mid 日快照差異 | Mid 為 `canonical_id + anchor_gaming_day` **可重用聚合**；short cache 為 **bet_id → 該筆 PIT 結果** 之一對一。 |
+
+### Short-term 供應路徑（現行）
+
+| 路徑 | 用途 | 備註 |
+|------|------|------|
+| **A. Live PIT** | Production scorer v2 **主路徑** | `attach_trial_bet_behavior_1h` + `attach_short_term_pit_features`；不讀訓練 parquet |
+| **B. Training PIT cache** | Step 3.5 → Step 4/5 | `materialize_fe_derived_short_term_parquet`；禁止當 production supplier |
+| **C. Production rolling cache** | Route B／`join_production_fe_suppliers`（可選） | 對 mirror 近期 `bet_id` 物化 PIT；**不得**使用 training bundle 路徑（`is_training_fe_derived_artifact`） |
+
+**禁止**：將訓練 PIT cache 當 production 主供應；將「有 parquet」理解成 short 非 PIT。
+
+**後續工程（非本節範圍）**：統一 scoring context（batch 序、`expand_canonical_aliases`、Step 6 parity）；欄位前綴 `short__` v2 與 alias。
+
+---
+
 ## Scorer v2 Feast 缺失政策
 
 - **Cell-level NULL**（窗內 structural null、或 Option B 窗外刻意 null）：**允許** `predict_proba`；prediction log 須記錄 per-row missing／degraded。
@@ -180,12 +221,14 @@ Scorer **不得**靜默補齊缺失的 model 特徵：
 | 類型 | Production supplier |
 |------|---------------------|
 | `baseline_model` | ClickHouse／scoring 輸入原始欄位 |
-| `feast_trial_1h` | serving PIT builder（online）；trial parquet 不入包 |
-| short-term `fe__*` | scorer bounded on-the-fly PIT；`fe_short_term_parquet` 非 production supplier |
+| **short**（`bet__*` + short `fe__*`） | **Bounded on-the-fly PIT**（`short_term_pit_builder`）；registry `source: feast_trial_1h` 僅歷史分類，**與 short `fe__*` 同一 live 路徑** |
 | mid-term `fe__*` | **Feast online** + Option B scorer 窗檢查（見上） |
 | `patron__*__w180d_m1snap` | **Feast online** slow；Parquet slow 非 production substitute |
 
-Production scorer v2 **不得** fallback 至 `fe_derived_parquet`、`fe_short_term_parquet` 或 training Parquet（明示或靜默）。
+- **`fe_short_term_parquet` / training PIT cache**：僅訓練或 Route B production rolling cache；**不是** scorer v2 主供應。
+- **`trial_bet_behavior_1h.parquet`**：診斷／回歸 artifact；scorer **不讀** 此檔打分。
+
+Production scorer v2 **不得** fallback 至 `fe_derived_parquet`、`fe_short_term_parquet`（訓練 cache）或任何 training-scoped Parquet（明示或靜默）。
 
 ---
 
@@ -194,7 +237,7 @@ Production scorer v2 **不得** fallback 至 `fe_derived_parquet`、`fe_short_te
 - 開發建包不要求持有最新 production 資料。
 - Training snapshot 不能替代 production readiness。
 - 建包不負責重建 production snapshot 或把 snapshot Parquet 拷入 bundle。
-- Scorer v2 第一階段不要求 short-term `fe__*` 走 Feast online；short-term 由 bounded PIT 供應。
+- Scorer v2 第一階段不要求 short 走 Feast online；short 由 bounded **live PIT** 供應（訓練另用離線 PIT cache 加速）。
 
 ---
 
@@ -202,6 +245,7 @@ Production scorer v2 **不得** fallback 至 `fe_derived_parquet`、`fe_short_te
 
 | 層級 | 文件 |
 |------|------|
+| 離線訓練管線四層與 Step 3.5 cache | [`Data pipeline - SSOT.md`](Data%20pipeline%20-%20SSOT.md) §5.1 |
 | Mid-term 事故與 Option A/B 背景 | [`Mid-Term Feast Train-Serve Parity Incident - 20260522.md`](Mid-Term%20Feast%20Train-Serve%20Parity%20Incident%20-%2020260522.md) |
 | Serving 事故（2026-05-19） | [`Feature Serving Incident - 20260519.md`](Feature%20Serving%20Incident%20-%2020260519.md) |
 | Feast spike | [`Feast Production Feasibility Spike - DECISION_RECORD.md`](Feast%20Production%20Feasibility%20Spike%20-%20DECISION_RECORD.md) |

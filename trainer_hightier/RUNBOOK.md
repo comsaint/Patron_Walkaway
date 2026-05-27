@@ -165,7 +165,8 @@ python -m trainer_hightier.trainer --partition-snapshot-dir "D:/exports/my_snaps
 
 | 旗標 | 用途 |
 |------|------|
-| `--ignore-caches` / `--no-cache` | **強制**重跑 session / bet 預處理，略過 clean-cache manifest |
+| `--ignore-caches` / `--no-cache` | **強制**重跑 session / bet 預處理，略過 clean-cache manifest；**同時**強制 Step 3.5 short-term PIT month-shard cache 全量重算 |
+| `--force-refresh-short-term-pit` | 僅強制 Step 3.5 short-term PIT cache 重算（不影響 session/bet preprocess cache） |
 | `--skip-bet-preprocess` | 略過 Step 2b（不重算 cleaned t_bet；需 `artifacts/cleaned` 已有產物） |
 | `--disable-auto-feast-apply` | 缺 `feast_repo/data/registry.db` 時不自動跑 `feast apply`，立刻失敗（適用 CI／唯讀／已離線準備 registry） |
 | `--skip-walkaway-labels` | 不物化 `walkaway_labels.parquet`（大表時可省時間；Step 3 需標籤則勿用或自行準備） |
@@ -301,7 +302,16 @@ run_training(args)
 - **命中條件：**清洗目標 Parquet 已存在，且 sidecar JSON 與 `build_session_clean_cache_record()` 計出的指紋一致（含來源 `mtime`/`size`、列數 metadata、`session_l0_preprocess` 模組 hash、**合併後的 session shard 路徑清單** 與 **partition inventory fingerprint**）。Bet 清洗對應 `bet_l0_preprocess` 之 `build_bet_clean_cache_record()` / `build_bet_base_clean_cache_record()` 與側車（含 base vs segment、inventory fingerprint、**ADT allowlist 之 distinct `player_id` 集合 hash**，**不依** allowlist 檔案 mtime）。
 - **Bet 與 cleaned session：**bet 快取指紋**不**再綁定 `cleaned__gmwds_t_session.parquet` 的檔案統計。若磁碟上的舊 sidecar 仍含 `cleaned_session_dependency` 欄位，命中比對時會忽略該欄；`manifest_version` **8↔9** 在比對時會正規化為同一版本，以便升級後仍可回收舊 cache（其餘語義欄位須一致）。
 - **失效：**來源 Parquet 或 registry 變更、或 `bet_l0_preprocess` / `session_l0_preprocess` 模組內容變更（SHA-256）時通常會 miss；session 檔遺失**不應**單獨導致 bet cache miss。改 `DuckDbRuntimeConfig` **不一定**讓指紋變——若仍要強制重跑，請用 `--ignore-caches` 或手動刪除 cleaned 與對應 `.cache.json`。
-- **強制重算：**`--ignore-caches`（或 `--no-cache`）；大 L0 上可能耗時與 I/O 明顯；同一旗標同時作用於 session 與 bet preprocess cache。
+- **強制重算：**`--ignore-caches`（或 `--no-cache`）；大 L0 上可能耗時與 I/O 明顯；同一旗標同時作用於 session、bet preprocess cache 與 Step 3.5 short-term PIT month-shard cache。
+
+## 6.1 Short-term PIT cache（Step 3.5）
+
+- **位置：**`trainer_hightier/artifacts/training_data/cache/short_term_pit_v1/`（全域 `manifest.json` + `shards/yyyymm=YYYYMM/data.parquet`）。
+- **輸出：**仍彙整為 `_main_trainer_fe_short_term.parquet`，再 join 成 `training_set_fe_enriched.parquet`。
+- **命中條件：**分片 manifest 與 code / policy / mapping / partition inventory / training universe / 欄位 schema 指紋一致，且 cleaned bet 對應月份（含鄰月 backfill）未出現在 `partition_recompute_months`。
+- **僅改 baseline 欄位子集：**若 short 欄位已存在於 cache wide schema，通常只需重跑 enrich + Step 4/5。
+- **強制重算：**`--force-refresh-short-term-pit`（僅 short-term PIT）；或 `--ignore-caches`（含 preprocess + short-term PIT）。
+- **診斷：**run log / `run_report.json` 內 `main_trainer_fe_short_term_cache`（`cache_hit_ratio`、`cache_reason_counts`）。
 
 ## 7. 常見問題
 
