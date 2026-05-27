@@ -69,6 +69,69 @@ def test_backfill_missing_bet_ts_poison_pill(tmp_path) -> None:
     assert "999" in processed
 
 
+def test_prediction_validation_fetch_window_anchors_on_bet_ts() -> None:
+    """Phase B CH window must not use ``now - VALIDATOR_FETCH_MAX_LOOKBACK`` floor."""
+    hk = ZoneInfo("Asia/Hong_Kong")
+    now_hk = datetime(2026, 5, 27, 14, 0, tzinfo=hk)
+    old_bet = now_hk - timedelta(hours=8)
+    pending = pd.DataFrame(
+        {
+            "bet_ts": [old_bet.isoformat(), (old_bet + timedelta(hours=1)).isoformat()],
+            "canonical_id": ["10", "10"],
+            "player_id": [10, 10],
+        }
+    )
+    window = hv._prediction_validation_fetch_window(
+        pending,
+        now_hk=now_hk,
+        freshness_buffer_min=2,
+    )
+    assert window is not None
+    fetch_start, fetch_end = window
+    assert fetch_start == old_bet
+    assert fetch_start < now_hk - timedelta(minutes=180)
+    assert fetch_end >= now_hk
+
+
+def test_fetch_prediction_bet_cache_extension_bet_anchored_ch_window() -> None:
+    """Phase B must query CH from oldest pending ``bet_ts``, not ``now - 180min``."""
+    hk = ZoneInfo("Asia/Hong_Kong")
+    now_hk = datetime(2026, 5, 27, 14, 0, tzinfo=hk)
+    old_bet = now_hk - timedelta(hours=8)
+    pending = pd.DataFrame(
+        {
+            "bet_ts": [old_bet.isoformat()],
+            "canonical_id": ["10"],
+            "player_id": [10],
+        }
+    )
+    captured: dict = {}
+
+    def _fake_fetch(
+        cid_to_pids: dict,
+        start: datetime,
+        end: datetime,
+    ) -> dict:
+        captured["start"] = start
+        captured["end"] = end
+        return {"10": [old_bet]}
+
+    bet_cache: dict = {}
+    with patch.object(hv, "get_clickhouse_client", return_value=object()), patch.object(
+        hv, "fetch_bets_by_canonical_id", side_effect=_fake_fetch
+    ):
+        hv._fetch_prediction_bet_cache_extension(
+            pending,
+            bet_cache,
+            now_hk=now_hk,
+            freshness_buffer_min=2,
+        )
+    assert captured["start"] == old_bet
+    assert captured["start"] < now_hk - timedelta(minutes=180)
+    assert captured["end"] >= now_hk
+    assert "10" in bet_cache
+
+
 def test_validate_observation_row_matches_alert_row() -> None:
     hk = ZoneInfo("Asia/Hong_Kong")
     bet_ts = datetime(2024, 1, 1, 12, 0, tzinfo=hk)

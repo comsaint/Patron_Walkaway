@@ -1214,6 +1214,8 @@ def validate_alert_row(
     bet_cache: Dict[str, List[datetime]],
     session_cache: Dict[str, List[Dict]],
     force_finalize: bool = False,
+    *,
+    gap_base_at_bet_ts: bool = False,
 ) -> Dict:
     """Validate a single alert row.
 
@@ -1309,10 +1311,12 @@ def validate_alert_row(
         res_base["_no_bet_data"] = True
         return res_base
 
-    # Find last bet before bet_ts; keep as base_start context only.
     idx = bisect_left(bet_list, bet_ts)
-    last_bet_before = bet_list[idx - 1] if idx > 0 else None
-    base_start = last_bet_before or bet_ts
+    if gap_base_at_bet_ts:
+        base_start = bet_ts
+    else:
+        last_bet_before = bet_list[idx - 1] if idx > 0 else None
+        base_start = last_bet_before or bet_ts
 
     # Bets within LABEL_LOOKAHEAD_MIN horizon after bet_ts (bet-based only; session_cache not used for verdict)
     horizon_end = bet_ts + timedelta(minutes=config.LABEL_LOOKAHEAD_MIN)
@@ -1461,6 +1465,33 @@ def _load_existing_prediction_results(conn: sqlite3.Connection) -> Dict[str, Dic
     return existing
 
 
+def _prediction_validation_fetch_window(
+    pending: pd.DataFrame,
+    *,
+    now_hk: datetime,
+    freshness_buffer_min: int,
+) -> tuple[datetime, datetime] | None:
+    """Forward-only CH window for Phase B, anchored on pending ``bet_ts`` (no ``now`` lookback floor)."""
+    bet_ts = pd.to_datetime(pending["bet_ts"], errors="coerce")
+    if bet_ts.empty:
+        return None
+    if bet_ts.dt.tz is None:
+        bet_ts = bet_ts.dt.tz_localize(HK_TZ)
+    else:
+        bet_ts = bet_ts.dt.tz_convert(HK_TZ)
+    pending_min_ts = bet_ts.min()
+    pending_max_ts = bet_ts.max()
+    if pd.isna(pending_min_ts) or pd.isna(pending_max_ts):
+        return None
+
+    ext_wait_min = int(getattr(config, "VALIDATOR_EXTENDED_WAIT_MINUTES", 15))
+    policy_tail_min = int(config.LABEL_LOOKAHEAD_MIN) + max(0, int(freshness_buffer_min)) + ext_wait_min
+    min_ts = pending_min_ts.to_pydatetime() if isinstance(pending_min_ts, pd.Timestamp) else pending_min_ts
+    max_ts = pending_max_ts.to_pydatetime() if isinstance(pending_max_ts, pd.Timestamp) else pending_max_ts
+    fetch_end = max(now_hk, max_ts + timedelta(minutes=policy_tail_min))
+    return min_ts, fetch_end
+
+
 def _fetch_prediction_bet_cache_extension(
     pending: pd.DataFrame,
     bet_cache: Dict[str, List[datetime]],
@@ -1472,27 +1503,24 @@ def _fetch_prediction_bet_cache_extension(
     if pending.empty or get_clickhouse_client is None:
         return
     cid_to_pids = _build_cid_to_player_ids(pending)
-    missing = {cid: pids for cid, pids in cid_to_pids.items() if cid not in bet_cache}
-    if not missing:
+    if not cid_to_pids:
         return
-    pre_context_min = _safe_int_config("VALIDATOR_FETCH_PRE_CONTEXT_MINUTES", 60, min_value=0)
-    max_lookback_min = _safe_int_config("VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES", 180, min_value=1)
-    cap_min = _safe_int_config("VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES_CAP", 24 * 60, min_value=1)
-    max_lookback_min = min(max_lookback_min, cap_min)
-    bet_ts = pd.to_datetime(pending["bet_ts"], errors="coerce")
-    if bet_ts.dt.tz is None:
-        bet_ts = bet_ts.dt.tz_localize(HK_TZ)
-    else:
-        bet_ts = bet_ts.dt.tz_convert(HK_TZ)
-    pending_min_ts = bet_ts.min()
-    if pd.isna(pending_min_ts):
+    window = _prediction_validation_fetch_window(
+        pending,
+        now_hk=now_hk,
+        freshness_buffer_min=freshness_buffer_min,
+    )
+    if window is None:
         return
-    fetch_start = max(
-        pending_min_ts - timedelta(minutes=pre_context_min),
-        now_hk - timedelta(minutes=max_lookback_min),
+    fetch_start, fetch_end = window
+    logger.debug(
+        "[validator][prediction] CH bet fetch window: fetch_start=%s fetch_end=%s pending_rows=%s",
+        fetch_start,
+        fetch_end,
+        len(pending),
     )
     try:
-        extra = fetch_bets_by_canonical_id(missing, fetch_start, now_hk)
+        extra = fetch_bets_by_canonical_id(cid_to_pids, fetch_start, fetch_end)
     except Exception as exc:
         logger.warning("[validator][prediction] CH fetch extension failed: %s", exc)
         return
@@ -1580,19 +1608,27 @@ def validate_predictions_once(
 
         new_processed_ids: List[Any] = []
         updated_count = 0
+        no_bet_pending_rows: List[pd.Series] = []
+
+        def _validate_prediction_row(prow: pd.Series) -> Dict:
+            vrow = _prediction_row_to_validator_series(prow)
+            return validate_observation_row(
+                vrow,
+                bet_cache,
+                session_cache_disabled,
+                force_finalize=force_finalize,
+                gap_base_at_bet_ts=True,
+            )
 
         for _, prow in pending_df.iterrows():
             if time.perf_counter() - cycle_start_mono >= float(budget_seconds):
                 logger.debug("[validator][prediction] budget exhausted mid-batch")
                 break
             vrow = _prediction_row_to_validator_series(prow)
-            res = validate_observation_row(
-                vrow,
-                bet_cache,
-                session_cache_disabled,
-                force_finalize=force_finalize,
-            )
+            res = _validate_prediction_row(prow)
             if res.get("result") is None:
+                if bool(res.get("_no_bet_data")):
+                    no_bet_pending_rows.append(prow.copy())
                 continue
             res["scored_at"] = prow.get("scored_at")
             res["bet_ts"] = prow.get("bet_ts")
@@ -1607,6 +1643,49 @@ def validate_predictions_once(
             updated_count += updated_delta
             if processed_added:
                 new_processed_ids.append(prow["bet_id"])
+
+        retry_limit = _safe_int_config("VALIDATOR_NO_BET_RETRY_MAX_ALERTS", 50, min_value=1)
+        if no_bet_pending_rows and time.perf_counter() - cycle_start_mono < float(budget_seconds):
+            ext_wait_min = _safe_int_config("VALIDATOR_EXTENDED_WAIT_MINUTES", 15, min_value=0)
+            n_nb = len(no_bet_pending_rows)
+            retry_slice = no_bet_pending_rows[:retry_limit]
+            retry_cache, _retry_stats = _fetch_bets_for_no_bet_rows(
+                [_prediction_row_to_validator_series(r) for r in retry_slice],
+                pre_context_min=0,
+                freshness_buffer_min=max(0, int(freshness_buffer_min)),
+                extended_wait_min=ext_wait_min,
+                max_alerts=max(1, len(retry_slice)),
+            )
+            for cid, vals in retry_cache.items():
+                bet_cache.setdefault(cid, [])
+                bet_cache[cid].extend(vals)
+                bet_cache[cid] = sorted(set(bet_cache[cid]))
+            logger.debug(
+                "[validator][prediction] no-bet retry: before=%s selected=%s resolved_cids=%s",
+                n_nb,
+                len(retry_slice),
+                len(retry_cache),
+            )
+            for _, prow in retry_slice:
+                if time.perf_counter() - cycle_start_mono >= float(budget_seconds):
+                    break
+                vrow = _prediction_row_to_validator_series(prow)
+                res = _validate_prediction_row(prow)
+                if res.get("result") is None:
+                    continue
+                res["scored_at"] = prow.get("scored_at")
+                res["bet_ts"] = prow.get("bet_ts")
+                res["is_alert"] = prow.get("is_alert")
+                updated_delta, processed_added = _apply_pending_validation_result(
+                    row=vrow,
+                    res=res,
+                    existing_results=existing_results,
+                    processed=processed,
+                    finality_cutoff=finality_cutoff,
+                )
+                updated_count += updated_delta
+                if processed_added:
+                    new_processed_ids.append(prow["bet_id"])
 
         for key, saved_row in list(existing_results.items()):
             if saved_row.get("reason") != "PENDING":
@@ -1623,6 +1702,7 @@ def validate_predictions_once(
                 bet_cache,
                 session_cache_disabled,
                 force_finalize=force_finalize,
+                gap_base_at_bet_ts=True,
             )
             if newr.get("result") is None or newr.get("reason") == "PENDING":
                 continue
