@@ -25,7 +25,12 @@ from trainer_hightier.serving.adt_allowlist import (
     resolve_adt_allowlist_path,
     sha256_file,
 )
-from trainer_hightier.serving.ch_adapter import get_clickhouse_client
+from trainer_hightier.serving.ch_adapter import (
+    CH_TBET_CASINO_WIN_SELECT,
+    CH_TBET_PAYOUT_ODDS_SELECT,
+    CH_TBET_WAGER_SELECT,
+    get_clickhouse_client,
+)
 from trainer_hightier.serving.contracts import (
     META_KEY_ACTIVE_ADT_ALLOWLIST_SHA256,
     META_KEY_ACTIVE_ADT_ALLOWLIST_VERSION,
@@ -235,9 +240,9 @@ def _effective_etl_cursor(bets: pd.DataFrame) -> pd.Series:
 #: Cast at read time so clickhouse_connect / DuckDB never infer a narrow DECIMAL from a
 #: mostly-small sample (production crash: ``100.0000`` vs inferred ``DECIMAL(6,4)``).
 _TBET_CASINO_PLAYER_ID_SELECT = "CAST(NULL AS Nullable(String)) AS casino_player_id"
-_TBET_WAGER_SELECT = "CAST(wager AS Float64) AS wager"
-_TBET_CASINO_WIN_SELECT = "CAST(casino_win AS Float64) AS casino_win"
-_TBET_PAYOUT_ODDS_SELECT = "CAST(payout_odds AS Float64) AS payout_odds"
+_TBET_WAGER_SELECT = CH_TBET_WAGER_SELECT
+_TBET_CASINO_WIN_SELECT = CH_TBET_CASINO_WIN_SELECT
+_TBET_PAYOUT_ODDS_SELECT = CH_TBET_PAYOUT_ODDS_SELECT
 
 
 def _incremental_params_and_etl_filter(
@@ -709,6 +714,66 @@ def compute_hot_pool_window_start(
     return pool_start
 
 
+def compute_scoring_bounds_for_bets(
+    bets: pd.DataFrame,
+    *,
+    cfg: HightierServingConfig | None = None,
+) -> pd.DataFrame:
+    """Per-scoring-bet hot-pool bounds (batch-invariant PIT; production contract).
+
+    Each row defines ``[pool_start, scoring_pcd]`` for one target ``bet_id``. Co-batching
+    must not widen a bet's usable pool beyond its own lookback / gaming-day floor.
+    """
+    if bets.empty:
+        return pd.DataFrame(
+            columns=["bet_id", "player_id", "canonical_id", "pool_start", "scoring_pcd"],
+        )
+    if "payout_complete_dtm" not in bets.columns:
+        raise ValueError(
+            "bets missing payout_complete_dtm for scoring bounds; "
+            f"got columns={list(bets.columns)}",
+        )
+    if "bet_id" not in bets.columns:
+        raise ValueError(
+            f"bets missing bet_id for scoring bounds; got columns={list(bets.columns)}",
+        )
+    cfg = cfg or default_hightier_serving_config()
+    pcd = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce", utc=True)
+    lookback_h = int(cfg.hot_feature_pool_lookback_hours)
+    lookback_start = pcd - pd.Timedelta(hours=lookback_h)
+    pool_start = lookback_start.copy()
+    if "gaming_day" in bets.columns:
+        hk = ZoneInfo(cfg.hk_tz)
+        close_hour = int(cfg.gaming_day_close_hour)
+        day_starts: list[pd.Timestamp] = []
+        for raw_gday, p_row in zip(
+            pd.to_datetime(bets["gaming_day"], errors="coerce"),
+            pcd,
+            strict=True,
+        ):
+            if pd.isna(raw_gday) or pd.isna(p_row):
+                day_starts.append(pd.NaT)
+                continue
+            gday = pd.Timestamp(raw_gday).date()
+            day_open = datetime(gday.year, gday.month, gday.day, close_hour, 0, 0, tzinfo=hk)
+            if getattr(p_row, "tzinfo", None) is not None:
+                day_open = day_open.astimezone(p_row.tzinfo)
+            day_starts.append(pd.Timestamp(day_open))
+        day_start_s = pd.Series(day_starts, index=bets.index)
+        pool_start = pd.concat([lookback_start, day_start_s], axis=1).min(axis=1)
+    out = pd.DataFrame(
+        {
+            "bet_id": pd.to_numeric(bets["bet_id"], errors="coerce"),
+            "player_id": pd.to_numeric(bets["player_id"], errors="coerce"),
+            "pool_start": pool_start,
+            "scoring_pcd": pcd,
+        },
+    )
+    if "canonical_id" in bets.columns:
+        out["canonical_id"] = bets["canonical_id"].astype(str).str.strip()
+    return out.dropna(subset=["bet_id", "scoring_pcd"]).reset_index(drop=True)
+
+
 @dataclass(frozen=True)
 class _ScoringBatch:
     """Bounded incremental batch ready for feature build."""
@@ -779,6 +844,7 @@ def _fetch_scoring_batch(
     p_max = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce").max()
     pool_start = compute_hot_pool_window_start(bets, cfg=cfg)
     pool_end = p_max.to_pydatetime()
+    # Production hot pool uses batch player_ids only (no canonical alias fanout).
     pids = sorted({int(x) for x in bets["player_id"].dropna().unique().tolist()})
     fan_cap = int(cfg.hightier_scorer_pool_player_fanout_cap)
     if len(pids) > fan_cap:
@@ -799,18 +865,23 @@ def _build_staged_features(
     mapping_parquet: Path | None,
     supplier_plan: ScorerSupplierPlan,
 ) -> pd.DataFrame:
-    """Phase 2: hot PIT + short-term bounded PIT on the scoring batch."""
+    """Phase 2: hot PIT + short-term bounded PIT on the scoring batch.
+
+    ClickHouse ``fetch_bet_pool_window`` supplies the hot pool; player fanout is
+    capped by ``hightier_scorer_pool_player_fanout_cap`` with ``expand_canonical_aliases=False``
+    policy aligned to training materialize (see ``short_term_scoring_context``).
+    """
+    from trainer_hightier.serving.short_term_scoring_context import attach_live_short_term_pit
 
     pool = attach_canonical_id(batch.pool, mapping_parquet=mapping_parquet)
     staged = attach_synthetic_etl_and_prediction_visible(batch.bets)
     staged = attach_canonical_id(staged, mapping_parquet=mapping_parquet)
-    staged = attach_trial_bet_behavior_1h(staged, pool)
     mid_term_for_deps = supplier_plan.mid_composite_cols
     short_cols = short_term_enrich_columns_with_dependencies(
         supplier_plan.short_term_cols,
         mid_term_for_deps,
     )
-    return attach_short_term_pit_features(staged, pool, columns=short_cols)
+    return attach_live_short_term_pit(staged, pool, short_columns=short_cols)
 
 
 def _log_scorer_readiness_summary(

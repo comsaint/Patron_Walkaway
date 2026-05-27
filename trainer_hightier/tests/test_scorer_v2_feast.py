@@ -1307,6 +1307,62 @@ def test_feast_readiness_roundtrip_and_fresh_gate(tmp_path: Path) -> None:
     assert gate.mid_fresh.status == "fresh"
 
 
+def test_feast_readiness_gate_passes_data_bounded_mid_expected(tmp_path: Path) -> None:
+    """local_cleaned deploy E2E: expected anchor follows materialized max, not calendar D-1."""
+    from datetime import date
+
+    from trainer_hightier.serving.feast_readiness import (
+        evaluate_feast_readiness_gate,
+        layer_readiness_from_production_mid_meta,
+        load_feast_online_readiness,
+        write_feast_online_readiness,
+    )
+    from trainer_hightier.serving.snapshot_freshness import (
+        expected_mid_term_anchor,
+        serving_gaming_day,
+    )
+
+    data_anchor = date(2026, 5, 11)
+    serving = serving_gaming_day(close_hour=3)
+    calendar_expected = expected_mid_term_anchor(serving)
+    assert calendar_expected > data_anchor
+    mid_meta = {
+        "snapshot_scope": "production",
+        "feast_spike_rows": 498,
+        "distinct_canonical_count": 498,
+        "mid_term_anchor_gaming_day_max": data_anchor.isoformat(),
+        "mid_term_expected_anchor_gaming_day": data_anchor.isoformat(),
+        "materialize_source": "feast_online_refresh",
+    }
+    mid_layer = layer_readiness_from_production_mid_meta(mid_meta)
+    assert mid_layer.expected_anchor_gaming_day == data_anchor
+    out = tmp_path / "feast_online_readiness.json"
+    from trainer_hightier.serving.feast_readiness import FeastOnlineReadiness
+
+    hk = ZoneInfo("Asia/Hong_Kong")
+    doc = FeastOnlineReadiness(
+        schema_version=1,
+        generated_at=pd.Timestamp.now(tz=hk).to_pydatetime(),
+        feast_repo=str(tmp_path / "feast_repo"),
+        mid_term=mid_layer,
+        slow_patron=None,
+    )
+    write_feast_online_readiness(doc, out)
+    gate = evaluate_feast_readiness_gate(
+        load_feast_online_readiness(out),
+        require_mid=True,
+        require_slow=False,
+        readiness_path=out,
+        close_hour=3,
+        mid_hard_cap_days=3,
+        slow_hard_cap_days=3,
+        slow_grace_days=1,
+    )
+    assert gate.ok is True
+    assert gate.mid_fresh is not None
+    assert gate.mid_fresh.staleness_days == 0
+
+
 def test_feast_readiness_rejects_training_scope_mid() -> None:
     from trainer_hightier.serving.feast_readiness import (
         FeastLayerReadiness,

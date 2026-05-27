@@ -138,9 +138,10 @@ def attach_trial_bet_behavior_1h(
     *,
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
 ) -> pd.DataFrame:
-    """Compute 1h window features identical to ``trial_bet_behavior_1h`` materialization.
+    """Short-layer 1h pack (``bet__*``): PIT over ``pool`` (same SQL as trial materialization).
 
-    ``pool`` must include all prior rows needed for RANGE windows (HK-aware ``payout_complete_dtm``).
+    Part of unified short-term PIT with ``attach_short_term_pit_features``; not a separate
+    time horizon. ``pool`` must include prior rows for RANGE windows.
     """
     if bets.empty:
         return bets
@@ -392,7 +393,11 @@ def join_production_fe_suppliers(
     mid_term_columns: tuple[str, ...],
     include_audit_columns: bool = False,
 ) -> pd.DataFrame:
-    """Join short-term bet-grain and mid-term canonical ASOF ``fe__*`` suppliers."""
+    """Join short PIT cache parquet and mid snapshot ASOF (Route B / historical; not scorer v2 primary).
+
+    When ``fe_short_term_parquet`` is set, short columns are **looked up by bet_id** from a
+    rolling production PIT cache—not from training artifacts. Scorer v2 uses live PIT instead.
+    """
 
     if bets.empty:
         return bets
@@ -607,12 +612,26 @@ def attach_short_term_pit_features(
     *,
     columns: tuple[str, ...],
 ) -> pd.DataFrame:
-    """Attach short-term ``fe__*`` via bounded on-the-fly PIT over the scoring pool."""
+    """Attach short-layer ``fe__*`` via live PIT over the scoring pool (production primary path)."""
 
     if not columns or staged.empty:
         return staged
     assert_short_term_pit_columns_supported(columns)
-    feats = compute_fe_derived_features_from_pool(pool, staged["bet_id"])
+    from trainer_hightier.config import default_hightier_serving_config
+    from trainer_hightier.serving.scorer import compute_scoring_bounds_for_bets
+
+    bound_cols = ["bet_id", "player_id", "canonical_id", "payout_complete_dtm"]
+    if "gaming_day" in staged.columns:
+        bound_cols.append("gaming_day")
+    scoring_bounds = compute_scoring_bounds_for_bets(
+        staged.loc[:, bound_cols],
+        cfg=default_hightier_serving_config(),
+    )
+    feats = compute_fe_derived_features_from_pool(
+        pool,
+        staged["bet_id"],
+        scoring_bounds=scoring_bounds,
+    )
     if feats.empty:
         raise RuntimeError(
             "[feature_builder] short-term PIT produced no rows for staged bet_ids; "

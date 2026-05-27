@@ -253,7 +253,63 @@ features:
         fe_pack_path=None,
         manifest={"coverage_end_exclusive": "2099-01-01T00:00:00+00:00"},
     )
-    assert summary["features"][0]["supplier"] == "online_trial_builder"
+    assert summary["features"][0]["supplier"] == "short_term_pit_builder"
+
+
+def test_mid_term_audit_model_columns_pass_without_registry_rows(tmp_path: Path) -> None:
+    """Audit columns in model.pkl must not fail supplier plan when frozen snapshot omits them."""
+
+    from trainer_hightier.serving.feature_supply import (
+        assert_scorer_supplier_plan_or_raise,
+        build_scorer_supplier_plan,
+    )
+
+    reg = tmp_path / "registry.yaml"
+    reg.write_text(
+        """
+registry_version: t
+features:
+  - feature_id: wager
+    group_id: g
+    source: baseline_model
+    status: active
+    enabled_for: [baseline]
+    time_horizon: none
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    snap = load_candidate_registry(reg)
+    model_feats = (
+        "wager",
+        "mid_term_snapshot_age_days",
+        "mid_term_snapshot_missing_flag",
+    )
+    plan = build_scorer_supplier_plan(snap, model_feats)
+    assert plan.unknown_cols == ()
+    assert_scorer_supplier_plan_or_raise(plan)
+
+
+def test_bet_trial_pack_routes_to_short_term_pit_builder() -> None:
+    from trainer_hightier.serving.feature_supply import build_scorer_supplier_plan
+
+    snap = load_candidate_registry(None)
+    plan = build_scorer_supplier_plan(
+        snap,
+        (
+            "bet__bets_cnt__w1h",
+            "bet__wager_sum__w1h",
+            "bet__back_bet_ratio__w1h",
+            "bet__payout_odds_avg__w1h",
+        ),
+    )
+    assert plan.feast_trial_cols == ()
+    assert set(plan.short_term_cols) == {
+        "bet__bets_cnt__w1h",
+        "bet__wager_sum__w1h",
+        "bet__back_bet_ratio__w1h",
+        "bet__payout_odds_avg__w1h",
+    }
 
 
 def test_default_registry_feast_schema_supports_payout_odds_w7d_composite() -> None:

@@ -267,7 +267,7 @@ def audit_feature_supplier_routes(
         if src == "baseline_model":
             supplier = "clickhouse_raw"
         elif src == "feast_trial_1h":
-            supplier = "online_trial_builder"
+            supplier = "short_term_pit_builder"
         elif src == "feast_slow_180d":
             grain = (manifest or {}).get(MANIFEST_KEY_SLOW_PATRON_GRAIN, SLOW_PATRON_GRAIN_CANONICAL_ASOF)
             supplier = f"slow_parquet_{grain}"
@@ -472,7 +472,7 @@ def build_feature_supplier_summary(
         if src == "baseline_model":
             supplier = "clickhouse_raw"
         elif src == "feast_trial_1h":
-            supplier = "online_trial_builder"
+            supplier = "short_term_pit_builder"
         elif src == "feast_slow_180d":
             supplier = "bundled_slow_parquet"
         elif src == "fe_derived":
@@ -742,6 +742,20 @@ def _infer_runtime_supplier(
 
     if row is not None and row.runtime_supplier:
         return row.runtime_supplier
+    if row is not None:
+        from trainer_hightier.feature_experiment.feature_cadence import (
+            SUPPLIER_MID_TERM_DAILY,
+            SUPPLIER_SHORT_TERM_PIT,
+        )
+
+        ats = str(row.allowed_training_supplier or "").strip()
+        if ats == SUPPLIER_SHORT_TERM_PIT:
+            return "short_term_pit_builder"
+        if ats == SUPPLIER_MID_TERM_DAILY:
+            if feature_id in MID_TERM_COMPOSITE_FEATURE_COLUMNS:
+                return "composite"
+            if feature_id in mid_set and feature_id in _SPIKE_MID_TERM_COLUMN_SET:
+                return "feast_online_mid"
     if row is None:
         if feature_id in _SPIKE_MID_TERM_COLUMN_SET:
             return "feast_online_mid"
@@ -752,7 +766,7 @@ def _infer_runtime_supplier(
     if src == "baseline_model":
         return "clickhouse_raw"
     if src == "feast_trial_1h":
-        return "feast_trial_1h"
+        return "short_term_pit_builder"
     if src == "feast_slow_180d" or feature_id in DEFAULT_MODEL_SLOW_PATRON_COLUMNS:
         return "feast_online_slow"
     if src == "fe_derived":
@@ -786,6 +800,10 @@ def _collect_closure_feature_ids(
             continue
         row = by_id.get(fid)
         if row is None and fid not in _SPIKE_MID_TERM_COLUMN_SET and fid not in _SPIKE_SLOW_COLUMN_SET:
+            if fid in model_feats and fid in _MID_TERM_AUDIT_MODEL_COLUMNS:
+                seen.add(fid)
+                needed.append(fid)
+                continue
             if fid in model_feats:
                 unknown.append(fid)
             seen.add(fid)
@@ -840,8 +858,8 @@ def build_runtime_dependency_closure(
             return
         if supplier == "clickhouse_raw" and is_model_output:
             _append_unique(baseline, fid)
-        elif supplier == "feast_trial_1h" and is_model_output:
-            _append_unique(trial, fid)
+        elif supplier == "short_term_pit_builder" and is_model_output:
+            _append_unique(short, fid)
         elif supplier == "feast_online_mid":
             _append_unique(mid, fid)
         elif supplier == "feast_online_slow":
@@ -873,6 +891,10 @@ def build_runtime_dependency_closure(
     feast_slow = tuple(dict.fromkeys(c for c in slow if c in _SPIKE_SLOW_COLUMN_SET))
     short_out = tuple(dict.fromkeys(short))
     dep_only_out = tuple(c for c in all_feats if c not in model_set and c not in mid_comp)
+    audit_model_cols = _MID_TERM_AUDIT_MODEL_COLUMNS & model_set
+    unknown_out = tuple(
+        u for u in dict.fromkeys(unknown) if u not in audit_model_cols
+    )
     return RuntimeDependencyClosure(
         model_output_cols=tuple(model_feats),
         baseline_cols=tuple(dict.fromkeys(baseline)),
@@ -882,7 +904,7 @@ def build_runtime_dependency_closure(
         short_term_cols=short_out,
         mid_composite_cols=tuple(dict.fromkeys(mid_comp)),
         dependency_only_cols=dep_only_out,
-        unknown_cols=tuple(dict.fromkeys(unknown)),
+        unknown_cols=unknown_out,
     )
 
 

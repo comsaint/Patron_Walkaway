@@ -559,8 +559,10 @@ def _iter_test_batches(
     batch_size: int,
     max_rows: int | None,
 ) -> Iterator[pd.DataFrame]:
-    """Yield test-split batches in stable ``bet_id`` order."""
-    work = test_df.sort_values("bet_id").reset_index(drop=True)
+    """Yield test-split batches in payout-time order (training / parity contract)."""
+    from trainer_hightier.serving.short_term_scoring_context import sort_bets_for_scoring_batch
+
+    work = sort_bets_for_scoring_batch(test_df)
     if max_rows is not None:
         work = work.head(int(max_rows))
     bs = max(1, int(batch_size))
@@ -584,13 +586,13 @@ def resolve_hot_pool_player_ids(
     bets: pd.DataFrame,
     mapping_parquet: Path,
     *,
-    expand_canonical_aliases: bool = True,
+    expand_canonical_aliases: bool = False,
 ) -> list[int]:
     """Resolve ``player_id`` list for hot-pool fetch.
 
-    When ``expand_canonical_aliases`` is True (production / offline backtest default),
-    include all ``player_id`` rows sharing a ``canonical_id`` with any batch player.
-    Training bounded PIT uses ``False`` to match live scorer window fanout.
+    When ``expand_canonical_aliases`` is False (training / parity / production default),
+    use only ``player_id`` values on the scoring batch. Legacy ``True`` expands to all
+  cards sharing a ``canonical_id`` (diagnostic only).
     """
     base = sorted(
         {
@@ -629,19 +631,28 @@ def build_pool_from_cleaned_parquet(
     cleaned_root: Path,
     cfg: HightierServingConfig,
     mapping_parquet: Path,
-    expand_canonical_aliases: bool = True,
+    expand_canonical_aliases: bool = False,
 ) -> pd.DataFrame:
     """Bounded hot pool from local cleaned bet hive (no ClickHouse)."""
     import duckdb
 
-    from trainer_hightier.serving.scorer import compute_hot_pool_window_start
+    from trainer_hightier.serving.scorer import compute_scoring_bounds_for_bets
 
     if bets.empty:
         return bets
     root = Path(cleaned_root).resolve()
     glob_path = str((root / "**" / "*.parquet").as_posix())
-    pool_start = compute_hot_pool_window_start(bets, cfg=cfg)
-    pool_end = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce").max().to_pydatetime()
+    bounds = compute_scoring_bounds_for_bets(bets, cfg=cfg)
+    if bounds.empty:
+        raise ValueError("[offline_backtest] scoring bounds empty for non-empty bets batch")
+    pool_start = bounds["pool_start"].min()
+    if pd.isna(pool_start):
+        raise ValueError("[offline_backtest] scoring bounds produced null pool_start")
+    pool_start = pd.Timestamp(pool_start).to_pydatetime()
+    pool_end = bounds["scoring_pcd"].max()
+    if pd.isna(pool_end):
+        raise ValueError("[offline_backtest] scoring bounds produced null pool_end")
+    pool_end = pd.Timestamp(pool_end).to_pydatetime()
     pids = resolve_hot_pool_player_ids(
         bets,
         mapping_parquet,
