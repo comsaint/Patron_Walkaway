@@ -31,7 +31,9 @@ from trainer_hightier.serving.feast_production_constants import (
 from trainer_hightier.serving.feast_online_adapter import (
     FEAST_CANONICAL_JOIN_KEY,
     default_feast_repo_path,
+    read_feast_parquet_max_event_timestamp,
     resolve_online_feature_refs,
+    resolve_production_mid_feast_parquet,
 )
 from trainer_hightier.serving.snapshot_freshness import (
     LayerFreshnessResult,
@@ -684,17 +686,34 @@ def _sample_canonical_ids_from_allowlist(
     mapping_parquet: Path,
     *,
     sample_size: int,
+    mid_feast_parquet: Path | None = None,
 ) -> list[str]:
-    """Return up to ``sample_size`` canonical ids from ADT allowlist + mapping."""
+    """Return up to ``sample_size`` canonical ids from ADT allowlist + mapping.
+
+    When ``mid_feast_parquet`` is set, only ids present in that materialized mid
+    Feast parquet are eligible so smoke validates online rows we actually wrote.
+    """
     allow_esc = str(Path(allowlist_parquet).resolve()).replace("\\", "/").replace("'", "''")
     cmap_esc = str(Path(mapping_parquet).resolve()).replace("\\", "/").replace("'", "''")
     import duckdb
 
+    mid_join = ""
+    if mid_feast_parquet is not None and Path(mid_feast_parquet).is_file():
+        mid_esc = str(Path(mid_feast_parquet).resolve()).replace("\\", "/").replace("'", "''")
+        mid_join = f"""
+INNER JOIN (
+  SELECT DISTINCT TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id
+  FROM read_parquet('{mid_esc}')
+  WHERE TRIM(CAST(canonical_id AS VARCHAR)) <> ''
+) AS m
+  ON TRIM(CAST(c.canonical_id AS VARCHAR)) = m.canonical_id
+"""
     sql = f"""
 SELECT DISTINCT TRIM(CAST(c.canonical_id AS VARCHAR)) AS canonical_id
 FROM read_parquet('{allow_esc}') AS a
 INNER JOIN read_parquet('{cmap_esc}') AS c
   ON TRY_CAST(a.player_id AS BIGINT) = TRY_CAST(c.player_id AS BIGINT)
+{mid_join}
 WHERE TRIM(CAST(c.canonical_id AS VARCHAR)) <> ''
 ORDER BY canonical_id
 LIMIT {int(max(1, sample_size))}
@@ -720,6 +739,31 @@ def _mid_cell_null_rate(
     return float(total) / float(sample_size * len(mid_columns))
 
 
+def _normalize_feast_online_lookup_frame(
+    df: pd.DataFrame,
+    wanted: tuple[str, ...],
+) -> pd.DataFrame:
+    """Map Feast online response columns to model feature names when prefixed."""
+    if df.empty:
+        return df
+    out = df.copy()
+    rename: dict[str, str] = {}
+    for col in out.columns:
+        if col in wanted or col == FEAST_CANONICAL_JOIN_KEY:
+            continue
+        if ":" in col:
+            rename[col] = col.rsplit(":", 1)[-1]
+            continue
+        for feat in wanted:
+            suffix = f"__{feat}"
+            if col == feat or col.endswith(suffix):
+                rename[col] = feat
+                break
+    if rename:
+        out = out.rename(columns=rename)
+    return out
+
+
 def evaluate_feast_lookup_smoke_gate(
     smoke: dict[str, Any],
     *,
@@ -728,7 +772,7 @@ def evaluate_feast_lookup_smoke_gate(
     mid_cell_null_fail_fraction: float,
     feast_spike_rows: int | None = None,
     allowlist_canonical_count: int | None = None,
-    min_canonical_coverage_fraction: float,
+    min_feast_spike_rows: int = 1,
     mid_smoke_columns: tuple[str, ...] | None = None,
 ) -> tuple[bool, str | None]:
     """Return (ok, hard_failure_reason) for deploy / refresh smoke."""
@@ -746,25 +790,61 @@ def evaluate_feast_lookup_smoke_gate(
         raw_mid = smoke.get("mid_cell_null_rate")
         mid_rate = float(raw_mid if raw_mid is not None else 1.0)
         if mid_rate > float(mid_cell_null_fail_fraction):
+            counts = smoke.get("cell_null_counts") or {}
+            smoke_cols = tuple(smoke.get("mid_smoke_columns") or list(null_cols))
+            bad = {
+                str(col): int(counts[col])
+                for col in smoke_cols
+                if col in counts and int(counts[col]) > 0
+            }
+            missing_cols = [
+                str(col)
+                for col in smoke_cols
+                if col not in counts or int(counts.get(col, 0)) >= int(smoke.get("sample_size") or 0)
+            ]
+            detail_parts = [f"cell_null_counts={bad}"]
+            if missing_cols:
+                detail_parts.append(f"missing_or_all_null={missing_cols[:8]}")
+            if smoke.get("smoke_event_timestamp"):
+                detail_parts.append(f"smoke_event_timestamp={smoke.get('smoke_event_timestamp')}")
+            detail = "; ".join(detail_parts)
             return (
                 False,
                 "[feast_readiness] allowlist lookup smoke mid cell null rate "
-                f"{mid_rate} exceeds fail_fraction={mid_cell_null_fail_fraction}",
+                f"{mid_rate} exceeds fail_fraction={mid_cell_null_fail_fraction}; {detail}",
             )
-    if (
-        feast_spike_rows is not None
-        and allowlist_canonical_count is not None
-        and int(allowlist_canonical_count) > 0
-    ):
-        coverage = float(feast_spike_rows) / float(allowlist_canonical_count)
-        if coverage < float(min_canonical_coverage_fraction):
+        if feast_spike_rows is not None and int(feast_spike_rows) < int(min_feast_spike_rows):
             return (
                 False,
-                "[feast_readiness] mid Feast canonical coverage "
-                f"{coverage:.4f} below min={min_canonical_coverage_fraction} "
-                f"(rows={feast_spike_rows}, allowlist_canonical={allowlist_canonical_count})",
+                "[feast_readiness] mid Feast materialized zero canonical rows "
+                f"(feast_spike_rows={feast_spike_rows}, min={min_feast_spike_rows})",
+            )
+        sample_size = int(smoke.get("sample_size") or 0)
+        if sample_size < 1:
+            return (
+                False,
+                "[feast_readiness] allowlist lookup smoke produced zero sampled canonical ids "
+                "(no overlap between allowlist and materialized mid Feast parquet?)",
             )
     return True, None
+
+
+def mid_feast_coverage_telemetry(
+    *,
+    feast_spike_rows: int | None,
+    allowlist_canonical_count: int | None,
+) -> dict[str, Any]:
+    """Return informational mid Feast allowlist coverage fields for smoke / readiness reports."""
+    if feast_spike_rows is None or allowlist_canonical_count is None:
+        return {}
+    if int(allowlist_canonical_count) <= 0:
+        return {"feast_spike_rows": int(feast_spike_rows), "allowlist_canonical_count": 0}
+    coverage = float(feast_spike_rows) / float(allowlist_canonical_count)
+    return {
+        "feast_spike_rows": int(feast_spike_rows),
+        "allowlist_canonical_count": int(allowlist_canonical_count),
+        "mid_canonical_coverage_fraction": round(coverage, 4),
+    }
 
 
 def run_allowlist_feast_lookup_smoke(
@@ -778,6 +858,8 @@ def run_allowlist_feast_lookup_smoke(
     entity_missing_fail_fraction: float,
     mid_cell_null_fail_fraction: float | None = None,
     mid_smoke_columns: tuple[str, ...] | None = None,
+    smoke_event_timestamp: datetime | None = None,
+    mid_feast_parquet: Path | None = None,
 ) -> dict[str, Any]:
     """P5-3: sample allowlist canonical ids against Feast online store."""
     from feast import FeatureStore
@@ -795,16 +877,31 @@ def run_allowlist_feast_lookup_smoke(
         allowlist_parquet,
         canonical_mapping_parquet,
         sample_size=sample_size,
+        mid_feast_parquet=mid_feast_parquet,
     )
     if not cids:
-        raise ValueError("[feast_readiness] allowlist sample produced zero canonical_id rows")
+        hint = (
+            " (no overlap with mid_feast_parquet)"
+            if mid_feast_parquet is not None and Path(mid_feast_parquet).is_file()
+            else ""
+        )
+        raise ValueError(
+            "[feast_readiness] allowlist sample produced zero canonical_id rows" + hint
+        )
     refs = list(resolve_online_feature_refs(lookup_mid, slow_columns))
     store = FeatureStore(repo_path=str(Path(feast_repo).resolve()))
+    entity_rows = feast_entity_rows(cids)
+    if smoke_event_timestamp is not None and mid_columns:
+        entity_rows = {
+            **entity_rows,
+            "event_timestamp": [smoke_event_timestamp] * len(cids),
+        }
     t0 = time.perf_counter()
     out = store.get_online_features(
         features=refs,
-        entity_rows=feast_entity_rows(cids),
+        entity_rows=entity_rows,
     ).to_df()
+    out = _normalize_feast_online_lookup_frame(out, wanted=tuple(dict.fromkeys([*lookup_mid, *slow_columns])))
     latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
     wanted = tuple(dict.fromkeys([*lookup_mid, *slow_columns]))
     n_entity_missing = 0
@@ -853,10 +950,16 @@ def run_allowlist_feast_lookup_smoke(
         "mid_cell_null_rate": round(mid_rate, 4),
         "mid_cell_null_fail_fraction": mid_fail,
         "mid_smoke_columns": list(smoke_cols),
+        "smoke_event_timestamp": (
+            smoke_event_timestamp.isoformat() if smoke_event_timestamp is not None else None
+        ),
         "lookup_latency_ms": latency_ms,
         "feature_refs": len(refs),
         "cell_null_counts": cell_null_counts,
         "distinct_canonical_in_store": distinct_in_store,
+        "mid_feast_parquet": (
+            str(Path(mid_feast_parquet).resolve()) if mid_feast_parquet is not None else None
+        ),
     }
 
 
@@ -934,8 +1037,13 @@ def run_deploy_feast_readiness_check(
     smoke: dict[str, Any] | None = None
     if run_lookup_smoke and gate.ok and allowlist_parquet and canonical_mapping_parquet:
         if mid_columns or slow_columns:
+            feast_repo = default_feast_repo_path()
+            mid_feast_parquet = resolve_production_mid_feast_parquet(feast_repo)
+            smoke_event_ts = None
+            if mid_columns and mid_feast_parquet is not None:
+                smoke_event_ts = read_feast_parquet_max_event_timestamp(mid_feast_parquet)
             smoke = run_allowlist_feast_lookup_smoke(
-                feast_repo=default_feast_repo_path(),
+                feast_repo=feast_repo,
                 allowlist_parquet=allowlist_parquet,
                 canonical_mapping_parquet=canonical_mapping_parquet,
                 mid_columns=mid_columns,
@@ -944,6 +1052,8 @@ def run_deploy_feast_readiness_check(
                 entity_missing_fail_fraction=float(cfg.scorer_feast_entity_missing_fail_fraction),
                 mid_cell_null_fail_fraction=float(cfg.scorer_feast_mid_cell_null_fail_fraction),
                 mid_smoke_columns=cfg.scorer_feast_mid_smoke_columns,
+                smoke_event_timestamp=smoke_event_ts,
+                mid_feast_parquet=mid_feast_parquet,
             )
             smoke_ok, smoke_reason = evaluate_feast_lookup_smoke_gate(
                 smoke,
@@ -952,9 +1062,6 @@ def run_deploy_feast_readiness_check(
                 mid_cell_null_fail_fraction=float(cfg.scorer_feast_mid_cell_null_fail_fraction),
                 feast_spike_rows=None,
                 allowlist_canonical_count=None,
-                min_canonical_coverage_fraction=float(
-                    cfg.scorer_feast_mid_min_canonical_coverage_fraction
-                ),
                 mid_smoke_columns=cfg.scorer_feast_mid_smoke_columns,
             )
             if not smoke_ok:

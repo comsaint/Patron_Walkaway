@@ -142,6 +142,9 @@ def test_clickhouse_export_chunks_player_filter(tmp_path: Path) -> None:
     assert "player_id IN (1,2)" in fake_client.queries[0]
     assert "player_id IN (3,4)" in fake_client.queries[1]
     assert "player_id IN (5)" in fake_client.queries[2]
+    for q in fake_client.queries:
+        assert "CAST(wager AS Nullable(Float64))" in q
+        assert "CAST(payout_odds AS Nullable(Float64))" in q
 
 
 def test_add_event_timestamp_collapses_to_latest_anchor(tmp_path: Path) -> None:

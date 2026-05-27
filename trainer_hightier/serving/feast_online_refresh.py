@@ -12,11 +12,15 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Final
+from zoneinfo import ZoneInfo
 
 import duckdb
 import pandas as pd
 
 from trainer_hightier.config import (
+    HK_TZ,
+    MID_TERM_BOOTSTRAP_SEED_PARQUET_BASENAME,
+    MID_TERM_SNAPSHOT_DEPLOY_PARQUET_BASENAME,
     MID_TERM_SNAPSHOT_MAX_LOOKBACK_DAYS,
     default_hightier_serving_config,
 )
@@ -27,12 +31,18 @@ from trainer_hightier.serving.feast_production_constants import (
     PRODUCTION_MID_TERM_FEATURE_COLUMNS,
 )
 from trainer_hightier.serving.adt_allowlist import load_adt_allowlist_ids, resolve_adt_allowlist_path
-from trainer_hightier.serving.ch_adapter import get_clickhouse_client
+from trainer_hightier.serving.ch_adapter import (
+    CH_TBET_PAYOUT_ODDS_SELECT,
+    CH_TBET_WAGER_POSITIVE_PRED,
+    CH_TBET_WAGER_SELECT,
+    get_clickhouse_client,
+)
 from trainer_hightier.serving.feast_online_adapter import (
     default_feast_repo_path,
     ensure_feast_schema_ready,
     feast_registry_missing,
     feast_schema_drift_issues,
+    read_feast_parquet_max_event_timestamp,
     reset_feast_repo_runtime_state,
     resolve_feast_artifacts_dir,
 )
@@ -44,6 +54,7 @@ from trainer_hightier.serving.feast_readiness import (
     layer_readiness_from_production_slow_meta,
     load_feast_online_readiness,
     merge_layer_readiness,
+    mid_feast_coverage_telemetry,
     resolve_feast_readiness_path,
     run_allowlist_feast_lookup_smoke,
     evaluate_feast_lookup_smoke_gate,
@@ -61,7 +72,11 @@ from trainer_hightier.serving.production_materialize import (
     materialize_production_slow_canonical_asof,
     resolve_production_canonical_mapping,
 )
-from trainer_hightier.serving.snapshot_freshness import expected_mid_term_anchor, serving_gaming_day
+from trainer_hightier.serving.snapshot_freshness import (
+    expected_mid_term_anchor,
+    mid_feast_event_timestamp_for_anchor,
+    serving_gaming_day,
+)
 from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_parquet_path
 
 logger = logging.getLogger(__name__)
@@ -209,14 +224,14 @@ def export_clickhouse_bets_to_parquet(
             CAST(player_id AS Int64) AS player_id,
             CAST(gaming_day AS Date) AS gaming_day,
             CAST(payout_complete_dtm AS DateTime64(3, 'UTC')) AS payout_complete_dtm,
-            CAST(wager AS Float64) AS wager,
-            CAST(payout_odds AS Float64) AS payout_odds
+            {CH_TBET_WAGER_SELECT},
+            {CH_TBET_PAYOUT_ODDS_SELECT}
         FROM {cfg.source_db}.{cfg.tbet} FINAL
         WHERE gaming_day >= %(g_start)s
           AND gaming_day <= %(g_end)s
           AND payout_complete_dtm IS NOT NULL
           AND gaming_day IS NOT NULL
-          AND wager > 0
+          AND {CH_TBET_WAGER_POSITIVE_PRED}
           AND player_id IS NOT NULL
           AND player_id != {placeholder}
           {player_filter}
@@ -339,6 +354,27 @@ def default_training_mid_snapshot_parquet_path() -> Path:
     )
 
 
+def resolve_bootstrap_mid_seed_parquet(
+    bundle_root: Path,
+    *,
+    metrics: dict[str, Any] | None = None,
+) -> Path | None:
+    """Return bundled training mid snapshot for Feast bootstrap seed, if present."""
+    root = Path(bundle_root).resolve()
+    candidates: list[Path] = [
+        root / "artifacts" / "feast" / MID_TERM_BOOTSTRAP_SEED_PARQUET_BASENAME,
+        root / "models" / "deploy_inputs" / MID_TERM_SNAPSHOT_DEPLOY_PARQUET_BASENAME,
+    ]
+    if metrics is not None:
+        metric_path = metrics.get("main_trainer_mid_term_snapshot_parquet")
+        if isinstance(metric_path, str) and metric_path.strip():
+            candidates.append(Path(metric_path.strip()).expanduser())
+    for path in candidates:
+        if path.is_file():
+            return path.resolve()
+    return None
+
+
 def resolve_training_mid_snapshot_parquet(opts: RefreshOptions) -> Path | None:
     """Resolve training mid snapshot for bootstrap seed, or ``None`` when unavailable."""
     cfg = default_hightier_serving_config()
@@ -347,6 +383,8 @@ def resolve_training_mid_snapshot_parquet(opts: RefreshOptions) -> Path | None:
         candidates.append(Path(opts.training_mid_snapshot_parquet).resolve())
     if cfg.training_mid_snapshot_parquet is not None:
         candidates.append(Path(cfg.training_mid_snapshot_parquet).resolve())
+    feast_art = resolve_feast_artifacts_dir(opts.feast_repo)
+    candidates.append((feast_art / MID_TERM_BOOTSTRAP_SEED_PARQUET_BASENAME).resolve())
     candidates.append(default_training_mid_snapshot_parquet_path().resolve())
     for path in candidates:
         if path.is_file():
@@ -468,9 +506,13 @@ def merge_mid_feast_carry_forward(
         """
     sql = f"""
 COPY (
-  SELECT canonical_id, {feat_cols},
-    CAST((CAST(anchor_gaming_day AS TIMESTAMP) + INTERVAL '1' DAY - INTERVAL '1' SECOND) AS TIMESTAMPTZ)
-      AS event_timestamp
+  SELECT canonical_id,
+    CAST(anchor_gaming_day AS VARCHAR) AS anchor_gaming_day,
+    {feat_cols},
+    CAST(
+      timezone('Asia/Hong_Kong', CAST(anchor_gaming_day AS TIMESTAMP) + INTERVAL '1' DAY - INTERVAL '1' SECOND)
+      AS TIMESTAMPTZ
+    ) AS event_timestamp
   FROM (
     SELECT canonical_id, anchor_gaming_day, {feat_cols},
       ROW_NUMBER() OVER (
@@ -520,8 +562,13 @@ def enrich_mid_refresh_meta_from_feast(
     *,
     feast_path: Path,
     training_seed_meta: dict[str, Any] | None,
+    data_bounded_expected_anchor: bool = False,
 ) -> dict[str, Any]:
-    """Attach final Feast spike stats and data-bounded expected anchor to refresh meta."""
+    """Attach final Feast spike stats and optional data-bounded expected anchor to refresh meta.
+
+    When ``data_bounded_expected_anchor`` is true (e.g. ``local_cleaned`` deploy E2E),
+    freshness compares against the materialized max anchor instead of calendar ``D-1``.
+    """
     stats = read_feast_mid_spike_stats(feast_path)
     out = {
         **meta,
@@ -532,7 +579,8 @@ def enrich_mid_refresh_meta_from_feast(
         ),
         "materialize_source": "feast_online_refresh",
     }
-    if training_seed_meta is not None and stats["anchor_max"] is not None:
+    use_bounded = data_bounded_expected_anchor or training_seed_meta is not None
+    if use_bounded and stats["anchor_max"] is not None:
         out["mid_term_expected_anchor_gaming_day"] = stats["anchor_max"].isoformat()
     return out
 
@@ -549,8 +597,10 @@ COPY (
   SELECT canonical_id,
     CAST(anchor_gaming_day AS VARCHAR) AS anchor_gaming_day,
     {feat_cols},
-    CAST((CAST(anchor_gaming_day AS TIMESTAMP) + INTERVAL '1' DAY - INTERVAL '1' SECOND) AS TIMESTAMPTZ)
-      AS event_timestamp
+    CAST(
+      timezone('Asia/Hong_Kong', CAST(anchor_gaming_day AS TIMESTAMP) + INTERVAL '1' DAY - INTERVAL '1' SECOND)
+      AS TIMESTAMPTZ
+    ) AS event_timestamp
   FROM (
     SELECT TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id,
       CAST(anchor_gaming_day AS DATE) AS anchor_gaming_day, {feat_cols},
@@ -930,6 +980,7 @@ def _refresh_mid_layer(
         meta,
         feast_path=feast_path,
         training_seed_meta=training_seed_meta,
+        data_bounded_expected_anchor=export_meta.get("source") == "local_cleaned",
     )
     return LayerRefreshOutcome(
         layer="mid",
@@ -1090,6 +1141,19 @@ def run_feast_online_refresh(opts: RefreshOptions) -> dict[str, Any]:
                 )
         mid_cols = PRODUCTION_MID_TERM_FEATURE_COLUMNS if "mid" in opts.layers else ()
         slow_cols = PRODUCTION_LONG_TERM_FEATURE_COLUMNS if "slow" in opts.layers else ()
+        smoke_event_ts = None
+        mid_feast_for_smoke: Path | None = None
+        if mid_cols:
+            for outcome in layer_outcomes:
+                if outcome.layer == "mid" and outcome.feast_parquet_path.is_file():
+                    mid_feast_for_smoke = outcome.feast_parquet_path
+                    smoke_event_ts = read_feast_parquet_max_event_timestamp(outcome.feast_parquet_path)
+                    break
+            if smoke_event_ts is None:
+                anchor_end = expected_mid_term_anchor(
+                    serving_gaming_day(close_hour=int(cfg.gaming_day_close_hour))
+                )
+                smoke_event_ts = mid_feast_event_timestamp_for_anchor(anchor_end)
         smoke = run_allowlist_feast_lookup_smoke(
             feast_repo=opts.feast_repo,
             allowlist_parquet=opts.adt_allowlist,
@@ -1100,6 +1164,8 @@ def run_feast_online_refresh(opts: RefreshOptions) -> dict[str, Any]:
             entity_missing_fail_fraction=float(cfg.scorer_feast_entity_missing_fail_fraction),
             mid_cell_null_fail_fraction=float(cfg.scorer_feast_mid_cell_null_fail_fraction),
             mid_smoke_columns=cfg.scorer_feast_mid_smoke_columns,
+            smoke_event_timestamp=smoke_event_ts,
+            mid_feast_parquet=mid_feast_for_smoke,
         )
         feast_spike_rows: int | None = None
         allowlist_canonical_count: int | None = None
@@ -1113,6 +1179,13 @@ def run_feast_online_refresh(opts: RefreshOptions) -> dict[str, Any]:
                     opts.adt_allowlist,
                     opts.canonical_mapping,
                 )
+        smoke = {
+            **smoke,
+            **mid_feast_coverage_telemetry(
+                feast_spike_rows=feast_spike_rows,
+                allowlist_canonical_count=allowlist_canonical_count,
+            ),
+        }
         smoke_ok, smoke_reason = evaluate_feast_lookup_smoke_gate(
             smoke,
             mid_columns=mid_cols,
@@ -1120,11 +1193,16 @@ def run_feast_online_refresh(opts: RefreshOptions) -> dict[str, Any]:
             mid_cell_null_fail_fraction=float(cfg.scorer_feast_mid_cell_null_fail_fraction),
             feast_spike_rows=feast_spike_rows,
             allowlist_canonical_count=allowlist_canonical_count,
-            min_canonical_coverage_fraction=float(
-                cfg.scorer_feast_mid_min_canonical_coverage_fraction
-            ),
             mid_smoke_columns=cfg.scorer_feast_mid_smoke_columns,
         )
+        if smoke_ok and smoke.get("mid_canonical_coverage_fraction") is not None:
+            logger.info(
+                "[feast_online_refresh] mid Feast allowlist coverage telemetry: "
+                "coverage=%.4f rows=%s allowlist=%s (informational only)",
+                float(smoke["mid_canonical_coverage_fraction"]),
+                smoke.get("feast_spike_rows"),
+                smoke.get("allowlist_canonical_count"),
+            )
         if not smoke_ok:
             raise RuntimeError(smoke_reason or "Feast online smoke failed")
         readiness_doc: FeastOnlineReadiness | None = load_feast_online_readiness(opts.readiness_path)

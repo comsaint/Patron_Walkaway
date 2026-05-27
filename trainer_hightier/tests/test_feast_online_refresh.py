@@ -13,7 +13,10 @@ import pytest
 from trainer_hightier.config import default_hightier_serving_config
 from trainer_hightier.serving import feast_online_refresh as refresh_mod
 from trainer_hightier.serving.feast_production_constants import PRODUCTION_MID_TERM_FEATURE_COLUMNS
-from trainer_hightier.serving.feast_readiness import evaluate_feast_lookup_smoke_gate
+from trainer_hightier.serving.feast_readiness import (
+    evaluate_feast_lookup_smoke_gate,
+    mid_feast_coverage_telemetry,
+)
 from trainer_hightier.serving.feature_state_store import (
     feature_state_meta_get,
     init_feature_state_db,
@@ -89,6 +92,7 @@ def test_merge_mid_feast_carry_forward_keeps_latest_per_canonical(tmp_path: Path
     )
     assert rows == 3
     merged = pd.read_parquet(out)
+    assert "anchor_gaming_day" in merged.columns
     by_cid = merged.set_index("canonical_id")
     assert float(by_cid.loc["c1", "fe__wager_sum__w1d"]) == 99.0
     assert float(by_cid.loc["c2", "fe__wager_sum__w1d"]) == 20.0
@@ -136,11 +140,20 @@ def test_evaluate_feast_lookup_smoke_gate_skips_mid_when_plan_empty() -> None:
         mid_cell_null_fail_fraction=float(cfg.scorer_feast_mid_cell_null_fail_fraction),
         feast_spike_rows=None,
         allowlist_canonical_count=None,
-        min_canonical_coverage_fraction=float(cfg.scorer_feast_mid_min_canonical_coverage_fraction),
         mid_smoke_columns=cfg.scorer_feast_mid_smoke_columns,
     )
     assert ok
     assert reason is None
+
+
+def test_mid_feast_event_timestamp_is_end_of_anchor_day_hk() -> None:
+    from trainer_hightier.serving.snapshot_freshness import mid_feast_event_timestamp_for_anchor
+
+    ts = mid_feast_event_timestamp_for_anchor(date(2026, 5, 26))
+    assert ts.hour == 23
+    assert ts.minute == 59
+    assert ts.second == 59
+    assert ts.tzinfo is not None
 
 
 def test_evaluate_feast_lookup_smoke_gate_fails_on_mid_cell_null_only() -> None:
@@ -156,11 +169,82 @@ def test_evaluate_feast_lookup_smoke_gate_fails_on_mid_cell_null_only() -> None:
         mid_cell_null_fail_fraction=float(cfg.scorer_feast_mid_cell_null_fail_fraction),
         feast_spike_rows=None,
         allowlist_canonical_count=None,
-        min_canonical_coverage_fraction=float(cfg.scorer_feast_mid_min_canonical_coverage_fraction),
     )
     assert not ok
     assert reason is not None
     assert "mid cell null rate" in reason
+
+
+def test_sample_canonical_ids_prefers_mid_feast_overlap(tmp_path: Path) -> None:
+    from trainer_hightier.serving.feast_readiness import _sample_canonical_ids_from_allowlist
+
+    allow = tmp_path / "allow.parquet"
+    mapping = tmp_path / "map.parquet"
+    mid_feast = tmp_path / "mid_feast.parquet"
+    pd.DataFrame({"player_id": [1, 2, 3, 4]}).to_parquet(allow, index=False)
+    pd.DataFrame(
+        {
+            "player_id": [1, 2, 3, 4],
+            "canonical_id": ["c01", "c02", "c03", "c04"],
+        }
+    ).to_parquet(mapping, index=False)
+    pd.DataFrame(
+        [
+            _mid_feast_row("c02", "2025-05-01", wager=10.0),
+            _mid_feast_row("c04", "2025-05-01", wager=20.0),
+        ]
+    ).to_parquet(mid_feast, index=False)
+
+    all_ids = _sample_canonical_ids_from_allowlist(allow, mapping, sample_size=4)
+    assert all_ids == ["c01", "c02", "c03", "c04"]
+
+    overlap = _sample_canonical_ids_from_allowlist(
+        allow,
+        mapping,
+        sample_size=4,
+        mid_feast_parquet=mid_feast,
+    )
+    assert overlap == ["c02", "c04"]
+
+
+def test_evaluate_feast_lookup_smoke_gate_ignores_allowlist_coverage_fraction() -> None:
+    cfg = default_hightier_serving_config()
+    smoke = {
+        "entity_missing_rate": 0.0,
+        "mid_cell_null_rate": 0.0,
+        "sample_size": 20,
+    }
+    ok, reason = evaluate_feast_lookup_smoke_gate(
+        smoke,
+        mid_columns=("fe__wager_sum__w1d",),
+        entity_missing_fail_fraction=float(cfg.scorer_feast_entity_missing_fail_fraction),
+        mid_cell_null_fail_fraction=float(cfg.scorer_feast_mid_cell_null_fail_fraction),
+        feast_spike_rows=767,
+        allowlist_canonical_count=2561,
+    )
+    assert ok
+    assert reason is None
+
+
+def test_evaluate_feast_lookup_smoke_gate_fails_when_mid_materialization_empty() -> None:
+    cfg = default_hightier_serving_config()
+    smoke = {"entity_missing_rate": 0.0, "mid_cell_null_rate": 0.0, "sample_size": 0}
+    ok, reason = evaluate_feast_lookup_smoke_gate(
+        smoke,
+        mid_columns=("fe__wager_sum__w1d",),
+        entity_missing_fail_fraction=float(cfg.scorer_feast_entity_missing_fail_fraction),
+        mid_cell_null_fail_fraction=float(cfg.scorer_feast_mid_cell_null_fail_fraction),
+        feast_spike_rows=0,
+        allowlist_canonical_count=2561,
+    )
+    assert not ok
+    assert reason is not None
+    assert "zero canonical rows" in reason
+
+
+def test_mid_feast_coverage_telemetry_is_informational() -> None:
+    telemetry = mid_feast_coverage_telemetry(feast_spike_rows=767, allowlist_canonical_count=2561)
+    assert telemetry["mid_canonical_coverage_fraction"] == pytest.approx(0.2995, rel=1e-4)
 
 
 def test_parse_refresh_layers_rejects_unknown() -> None:
@@ -494,6 +578,32 @@ def test_slow_only_refresh_runs_feast_apply_when_registry_missing(
     report = refresh_mod.run_feast_online_refresh(opts)
     assert report["verdict"] == "ok"
     assert apply_calls == [False]
+
+
+def test_enrich_mid_refresh_meta_data_bounded_for_local_cleaned(tmp_path: Path) -> None:
+    feast_path = tmp_path / "mid_feast.parquet"
+    pd.DataFrame([_mid_feast_row("c1", "2026-05-11", wager=1.0)]).to_parquet(feast_path, index=False)
+    enriched = refresh_mod.enrich_mid_refresh_meta_from_feast(
+        {},
+        feast_path=feast_path,
+        training_seed_meta=None,
+        data_bounded_expected_anchor=True,
+    )
+    assert enriched["mid_term_anchor_gaming_day_max"] == "2026-05-11"
+    assert enriched["mid_term_expected_anchor_gaming_day"] == "2026-05-11"
+
+
+def test_enrich_mid_refresh_meta_calendar_expected_without_bounded_flag(tmp_path: Path) -> None:
+    feast_path = tmp_path / "mid_feast.parquet"
+    pd.DataFrame([_mid_feast_row("c1", "2026-05-11", wager=1.0)]).to_parquet(feast_path, index=False)
+    enriched = refresh_mod.enrich_mid_refresh_meta_from_feast(
+        {},
+        feast_path=feast_path,
+        training_seed_meta=None,
+        data_bounded_expected_anchor=False,
+    )
+    assert enriched["mid_term_anchor_gaming_day_max"] == "2026-05-11"
+    assert "mid_term_expected_anchor_gaming_day" not in enriched
 
 
 def test_init_feature_state_db_creates_feast_refresh_tables(tmp_path: Path) -> None:

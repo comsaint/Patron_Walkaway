@@ -430,7 +430,7 @@ def materialize_production_fe_short_term(
     coverage_hours: int | None = None,
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
 ) -> tuple[Path, dict[str, Any]]:
-    """Materialize bet-grain short-term ``fe__*`` for production allowlist universe."""
+    """Materialize production **short-term PIT cache** for mirror bet_ids (Route B; not training artifact)."""
 
     cfg = default_hightier_serving_config()
     hours = int(coverage_hours if coverage_hours is not None else cfg.production_fe_coverage_hours)

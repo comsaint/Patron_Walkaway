@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -377,6 +378,31 @@ def default_feast_repo_path() -> Path:
 def resolve_feast_artifacts_dir(feast_repo: Path) -> Path:
     """Return bundle-local ``artifacts/feast`` (sibling of ``feast_repo``, never site-packages)."""
     return Path(feast_repo).resolve().parent / "artifacts" / "feast"
+
+
+def resolve_production_mid_feast_parquet(feast_repo: Path) -> Path | None:
+    """Return production mid Feast spike parquet when materialized on disk."""
+    feast_path = resolve_feast_artifacts_dir(feast_repo) / "mid_term_spike_canonical.parquet"
+    return feast_path.resolve() if feast_path.is_file() else None
+
+
+def read_feast_parquet_max_event_timestamp(feast_parquet: Path) -> datetime:
+    """Return the latest ``event_timestamp`` stored in a Feast source parquet."""
+    import duckdb
+    from zoneinfo import ZoneInfo
+
+    from trainer_hightier.config import HK_TZ
+
+    esc = str(Path(feast_parquet).resolve()).replace("\\", "/").replace("'", "''")
+    row = duckdb.sql(f"SELECT MAX(event_timestamp) FROM read_parquet('{esc}')").fetchone()
+    if row is None or row[0] is None:
+        raise ValueError(f"feast parquet has no event_timestamp rows: {feast_parquet}")
+    ts = row[0].to_pydatetime() if hasattr(row[0], "to_pydatetime") else row[0]
+    if not isinstance(ts, datetime):
+        raise ValueError(f"unexpected event_timestamp type from {feast_parquet}: {type(ts)!r}")
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=ZoneInfo(HK_TZ))
+    return ts
 
 
 def reset_feast_repo_runtime_state(feast_repo: Path) -> None:

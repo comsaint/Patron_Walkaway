@@ -10,8 +10,10 @@ from typing import Any, Literal
 
 import pandas as pd
 import pyarrow.parquet as pq
+from zoneinfo import ZoneInfo
 
 from trainer_hightier.config import (
+    HK_TZ,
     MID_TERM_GRAIN_CANONICAL_DAILY_ASOF,
     MID_TERM_STALE_HARD_CAP_DAYS,
     SLOW_MONTHLY_GRACE_DAYS,
@@ -115,6 +117,16 @@ def serving_gaming_day(now: datetime | None = None, *, close_hour: int = 3) -> d
 def expected_mid_term_anchor(serving_day: date) -> date:
     """Mid-term ASOF anchor for serving ``gaming_day = D`` is ``D - 1``."""
     return serving_day - timedelta(days=1)
+
+
+def mid_feast_event_timestamp_for_anchor(anchor_gaming_day: date) -> datetime:
+    """Feast ``event_timestamp`` for mid-term online lookup (end of anchor gaming day, HK).
+
+    Must match ``write_mid_feast_parquet`` in ``feast_online_refresh``.
+    """
+    zone = ZoneInfo(HK_TZ)
+    day_start = datetime.combine(anchor_gaming_day, datetime.min.time(), tzinfo=zone)
+    return day_start + timedelta(days=1) - timedelta(seconds=1)
 
 
 def _staleness_days(anchor_max: date | None, expected_anchor: date) -> int | None:
