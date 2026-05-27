@@ -1,3 +1,6 @@
+# Feature layers (naming SSOT): raw | short (PIT per bet_id) | mid (daily snapshot ASOF) | long (monthly).
+# Short includes bet__* and short-horizon fe__*; allowed_training_supplier short_term_pit_builder.
+# source feast_trial_1h on bet__* is a legacy registry label—not a separate horizon from fe_derived short.
 registry_version: v0.6
 updated_at: '2026-05-16'
 features:
