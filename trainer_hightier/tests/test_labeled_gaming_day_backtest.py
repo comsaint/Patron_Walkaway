@@ -53,6 +53,17 @@ def test_label_payout_bounds_extends_lookahead() -> None:
     assert extended_end > window_end
 
 
+def test_payout_bound_hk_naive_mixed_tz_compare() -> None:
+    """Aware start and naive end must compare without TypeError."""
+    from zoneinfo import ZoneInfo
+
+    from trainer_hightier.serving.offline_serving_backtest import _payout_bound_hk_naive
+
+    start = datetime(2026, 5, 1, 10, 0, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+    end = datetime(2026, 5, 12, 5, 0)
+    assert _payout_bound_hk_naive(end) >= _payout_bound_hk_naive(start)
+
+
 def test_normalize_payout_hk_naive_matches_compute_labels() -> None:
     """Tz-aware CH payouts must not crash ``compute_labels`` boundary compare."""
     from trainer_hightier.serving.offline_serving_backtest import _normalize_payout_hk_naive

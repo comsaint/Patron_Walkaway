@@ -373,6 +373,14 @@ def fetch_bets_gaming_day_window(
     return bets
 
 
+def _payout_bound_hk_naive(value: datetime | pd.Timestamp) -> datetime:
+    """Normalize a payout bound to tz-naive HK (matches ``compute_labels``)."""
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert(HK_TZ).tz_localize(None)
+    return ts.to_pydatetime()
+
+
 def fetch_bets_payout_window(
     *,
     cfg: HightierServingConfig,
@@ -383,6 +391,8 @@ def fetch_bets_payout_window(
     """Fetch settled bets for *player_ids* with payout in ``[payout_start, payout_end]``."""
     if not player_ids:
         return pd.DataFrame()
+    payout_start = _payout_bound_hk_naive(payout_start)
+    payout_end = _payout_bound_hk_naive(payout_end)
     if payout_end < payout_start:
         raise ValueError(
             f"payout_end {payout_end!r} before payout_start {payout_start!r}",
@@ -454,9 +464,9 @@ def _attach_walkaway_labels_to_eval_bets(
     if eval_bets.empty:
         return eval_bets.copy()
     window_end, extended_end = _label_payout_bounds(eval_bets)
-    payout_start = pd.to_datetime(eval_bets["payout_complete_dtm"], errors="coerce").min()
-    if getattr(payout_start, "tzinfo", None) is not None:
-        payout_start = payout_start.tz_convert(HK_TZ)
+    payout_start = _payout_bound_hk_naive(
+        pd.to_datetime(eval_bets["payout_complete_dtm"], errors="coerce").min(),
+    )
     player_ids = frozenset(
         int(x)
         for x in pd.to_numeric(eval_bets["player_id"], errors="coerce").dropna().astype(int).tolist()
@@ -464,7 +474,7 @@ def _attach_walkaway_labels_to_eval_bets(
     corpus = fetch_bets_payout_window(
         cfg=cfg,
         player_ids=player_ids,
-        payout_start=payout_start.to_pydatetime(),
+        payout_start=payout_start,
         payout_end=extended_end,
     )
     if corpus.empty:
