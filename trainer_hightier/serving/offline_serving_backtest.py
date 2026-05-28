@@ -421,6 +421,15 @@ def fetch_bets_payout_window(
     return bets
 
 
+def _normalize_payout_hk_naive(bets: pd.DataFrame) -> pd.DataFrame:
+    """Align CH payout timestamps with ``compute_labels`` (tz-naive HK wall time)."""
+    out = bets.copy()
+    pc = pd.to_datetime(out["payout_complete_dtm"], errors="coerce")
+    if getattr(pc.dt, "tz", None) is not None:
+        out["payout_complete_dtm"] = pc.dt.tz_convert(HK_TZ).dt.tz_localize(None)
+    return out
+
+
 def _label_payout_bounds(eval_bets: pd.DataFrame) -> tuple[datetime, datetime]:
     """Return ``(window_end, extended_end)`` for walkaway label computation."""
     ts = pd.to_datetime(eval_bets["payout_complete_dtm"], errors="coerce").dropna()
@@ -428,8 +437,8 @@ def _label_payout_bounds(eval_bets: pd.DataFrame) -> tuple[datetime, datetime]:
         raise ValueError("eval bets have no valid payout_complete_dtm for label bounds")
     window_end = ts.max()
     if window_end.tzinfo is not None:
-        window_end = window_end.tz_convert(HK_TZ)
-    extended_end = window_end + timedelta(
+        window_end = window_end.tz_convert(HK_TZ).tz_localize(None)
+    extended_end = window_end + pd.Timedelta(
         minutes=float(LABEL_LOOKAHEAD_MIN + WALKAWAY_GAP_MIN),
     )
     return window_end.to_pydatetime(), extended_end.to_pydatetime()
@@ -446,7 +455,7 @@ def _attach_walkaway_labels_to_eval_bets(
         return eval_bets.copy()
     window_end, extended_end = _label_payout_bounds(eval_bets)
     payout_start = pd.to_datetime(eval_bets["payout_complete_dtm"], errors="coerce").min()
-    if payout_start.tzinfo is not None:
+    if getattr(payout_start, "tzinfo", None) is not None:
         payout_start = payout_start.tz_convert(HK_TZ)
     player_ids = frozenset(
         int(x)
@@ -461,6 +470,7 @@ def _attach_walkaway_labels_to_eval_bets(
     if corpus.empty:
         raise ValueError("label corpus fetch returned 0 rows from ClickHouse")
     corpus = attach_canonical_id(corpus, mapping_parquet=mapping_parquet)
+    corpus = _normalize_payout_hk_naive(corpus)
     labeled = compute_labels(corpus, window_end=window_end, extended_end=extended_end)
     labeled = labeled.loc[~labeled["censored"].astype(bool)].copy()
     if labeled.empty:

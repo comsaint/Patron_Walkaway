@@ -53,6 +53,22 @@ def test_label_payout_bounds_extends_lookahead() -> None:
     assert extended_end > window_end
 
 
+def test_normalize_payout_hk_naive_matches_compute_labels() -> None:
+    """Tz-aware CH payouts must not crash ``compute_labels`` boundary compare."""
+    from trainer_hightier.serving.offline_serving_backtest import _normalize_payout_hk_naive
+    from trainer_hightier.walkaway_compute_labels import compute_labels
+
+    bets = _fake_bets()
+    window_end, extended_end = _label_payout_bounds(bets)
+    corpus = bets.assign(canonical_id="c1")
+    labeled = compute_labels(
+        _normalize_payout_hk_naive(corpus),
+        window_end=window_end,
+        extended_end=extended_end,
+    )
+    assert "label" in labeled.columns
+
+
 def test_fetch_bets_gaming_day_no_max_bets_omits_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
