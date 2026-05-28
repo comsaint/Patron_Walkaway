@@ -25,6 +25,7 @@ from trainer_hightier.config import (
     default_hightier_serving_config,
 )
 from trainer_hightier.serving.feast_production_constants import (
+    FEAST_MID_ANCHOR_COLUMN,
     LONG_SPIKE_FEATURE_VIEW_NAME,
     MID_SPIKE_FEATURE_VIEW_NAME,
     PRODUCTION_LONG_TERM_FEATURE_COLUMNS,
@@ -106,6 +107,7 @@ class RefreshOptions:
     apply_schema: bool
     training_mid_snapshot_parquet: Path | None = None
     use_training_mid_seed: bool = True
+    serving_day: date | None = None
 
 
 @dataclass
@@ -175,10 +177,11 @@ def _mid_export_bounds(
     close_hour: int,
     bootstrap_mid: bool = False,
     bootstrap_anchor_days: int | None = None,
+    serving_day: date | None = None,
 ) -> tuple[date, date, date, date]:
     """Return anchor_start, anchor_end, bets_gday_start, bets_gday_end."""
     cfg = default_hightier_serving_config()
-    serving_day = serving_gaming_day(close_hour=close_hour)
+    serving_day = serving_day or serving_gaming_day(close_hour=close_hour)
     anchor_end = expected_mid_term_anchor(serving_day)
     if bootstrap_mid:
         days = int(
@@ -197,8 +200,13 @@ def _mid_export_bounds(
     return anchor_start, anchor_end, bets_gday_start, bets_gday_end
 
 
-def _slow_export_bounds(*, close_hour: int, lookback_days: int) -> tuple[date, date]:
-    serving_day = serving_gaming_day(close_hour=close_hour)
+def _slow_export_bounds(
+    *,
+    close_hour: int,
+    lookback_days: int,
+    serving_day: date | None = None,
+) -> tuple[date, date]:
+    serving_day = serving_day or serving_gaming_day(close_hour=close_hour)
     gaming_day_end = serving_day - timedelta(days=1)
     gaming_day_start = gaming_day_end - timedelta(days=int(lookback_days) - 1)
     return gaming_day_start, gaming_day_end
@@ -527,9 +535,11 @@ COPY (
     con = duckdb.connect(database=":memory:")
     try:
         con.execute(sql)
-        return int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{dst_esc}')").fetchone()[0])
+        nrows = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{dst_esc}')").fetchone()[0])
     finally:
         con.close()
+    ensure_mid_feast_parquet_has_anchor_column(dst)
+    return nrows
 
 
 def read_feast_mid_spike_stats(feast_parquet: Path) -> dict[str, Any]:
@@ -585,6 +595,52 @@ def enrich_mid_refresh_meta_from_feast(
     return out
 
 
+def ensure_mid_feast_parquet_has_anchor_column(feast_parquet: Path) -> None:
+    """Backfill ``anchor_gaming_day`` on legacy Feast mid spike parquets (pre-Option B)."""
+    import pyarrow.parquet as pq
+
+    dst = Path(feast_parquet).resolve()
+    if not dst.is_file():
+        raise FileNotFoundError(f"feast mid parquet missing: {dst}")
+    schema_names = set(pq.read_schema(str(dst)).names)
+    if FEAST_MID_ANCHOR_COLUMN in schema_names:
+        return
+    if "event_timestamp" not in schema_names:
+        raise ValueError(
+            f"feast mid parquet must include {FEAST_MID_ANCHOR_COLUMN!r} or event_timestamp; "
+            f"path={dst} columns={sorted(schema_names)}",
+        )
+    tmp = dst.parent / f"{dst.stem}__anchor_repair.parquet"
+    dst_esc = _path_esc(dst)
+    tmp_esc = _path_esc(tmp)
+    feat_cols = ", ".join(f'"{c}"' for c in PRODUCTION_MID_TERM_FEATURE_COLUMNS)
+    sql = f"""
+COPY (
+  SELECT TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id,
+    CAST(CAST(event_timestamp AS DATE) AS VARCHAR) AS {FEAST_MID_ANCHOR_COLUMN},
+    {feat_cols},
+    CAST(event_timestamp AS TIMESTAMPTZ) AS event_timestamp
+  FROM read_parquet('{dst_esc}')
+) TO '{tmp_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+""".strip()
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.execute(sql)
+        nrows = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{tmp_esc}')").fetchone()[0])
+    finally:
+        con.close()
+    if nrows <= 0:
+        tmp.unlink(missing_ok=True)
+        raise ValueError(f"anchor repair produced no rows for {dst}")
+    tmp.replace(dst)
+    logger.info(
+        "[feast_online_refresh] repaired missing %s on %s rows=%d",
+        FEAST_MID_ANCHOR_COLUMN,
+        dst.name,
+        nrows,
+    )
+
+
 def write_mid_feast_parquet(full_snap: Path, feast_out: Path) -> int:
     """Collapse to latest anchor per canonical_id and add ``event_timestamp``."""
     src = str(Path(full_snap).resolve()).replace("\\", "/").replace("'", "''")
@@ -616,9 +672,11 @@ COPY (
     con = duckdb.connect(database=":memory:")
     try:
         con.execute(sql)
-        return int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{dst_esc}')").fetchone()[0])
+        nrows = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{dst_esc}')").fetchone()[0])
     finally:
         con.close()
+    ensure_mid_feast_parquet_has_anchor_column(dst)
+    return nrows
 
 
 def write_slow_feast_parquet(full_snap: Path, feast_out: Path) -> int:
@@ -810,6 +868,8 @@ def run_feast_materialize_views(
     t0 = time.perf_counter()
     store = FeatureStore(repo_path=str(Path(feast_repo).resolve()))
     for view, parquet in zip(feature_views, feast_parquets, strict=True):
+        if view == MID_SPIKE_FEATURE_VIEW_NAME:
+            ensure_mid_feast_parquet_has_anchor_column(parquet)
         start_dt, end_dt = _materialize_window_from_feast_parquet(parquet)
         store.materialize(feature_views=[view], start_date=start_dt, end_date=end_dt)
     return round(time.perf_counter() - t0, 3)
@@ -896,6 +956,7 @@ def _refresh_mid_layer(
         close_hour=int(cfg.gaming_day_close_hour),
         bootstrap_mid=opts.bootstrap_mid,
         bootstrap_anchor_days=int(cfg.production_mid_feast_bootstrap_anchor_days),
+        serving_day=opts.serving_day,
     )
     if opts.source == "clickhouse":
         bet_path = staging_dir / "ch_bets_export.parquet"
@@ -1006,7 +1067,11 @@ def _refresh_slow_layer(
 ) -> LayerRefreshOutcome:
     cfg = default_hightier_serving_config()
     lb = int(cfg.production_slow_lookback_days)
-    g_start, g_end = _slow_export_bounds(close_hour=int(cfg.gaming_day_close_hour), lookback_days=lb)
+    g_start, g_end = _slow_export_bounds(
+        close_hour=int(cfg.gaming_day_close_hour),
+        lookback_days=lb,
+        serving_day=opts.serving_day,
+    )
     if opts.source == "clickhouse":
         sess_path = staging_dir / "ch_sessions_export.parquet"
         export_meta = export_clickhouse_sessions_to_parquet(
@@ -1022,12 +1087,14 @@ def _refresh_slow_layer(
         export_meta = {"source": "local_cleaned", "path": str(sess_path), "rows_exported": None}
     artifact_path = staging_dir / "slow_patron_production.parquet"
     t0 = time.perf_counter()
+    slow_context_day = opts.serving_day - timedelta(days=1) if opts.serving_day else date.today()
     artifact_path, meta = materialize_production_slow_canonical_asof(
         cleaned_session_parquet=sess_path,
         canonical_mapping_parquet=opts.canonical_mapping,
         out_parquet=artifact_path,
         lookback_days=lb,
         publish_readiness=False,
+        context_day=slow_context_day,
     )
     compute_seconds = round(time.perf_counter() - t0, 3)
     feast_art = resolve_feast_artifacts_dir(opts.feast_repo)
@@ -1150,9 +1217,8 @@ def run_feast_online_refresh(opts: RefreshOptions) -> dict[str, Any]:
                     smoke_event_ts = read_feast_parquet_max_event_timestamp(outcome.feast_parquet_path)
                     break
             if smoke_event_ts is None:
-                anchor_end = expected_mid_term_anchor(
-                    serving_gaming_day(close_hour=int(cfg.gaming_day_close_hour))
-                )
+                sd = opts.serving_day or serving_gaming_day(close_hour=int(cfg.gaming_day_close_hour))
+                anchor_end = expected_mid_term_anchor(sd)
                 smoke_event_ts = mid_feast_event_timestamp_for_anchor(anchor_end)
         smoke = run_allowlist_feast_lookup_smoke(
             feast_repo=opts.feast_repo,

@@ -211,4 +211,4 @@ def test_resolve_hot_pool_player_ids_expands_canonical_aliases(tmp_path: Path) -
         ],
     ).to_parquet(mapping, index=False)
     bets = pd.DataFrame({"player_id": [2]})
-    assert resolve_hot_pool_player_ids(bets, mapping) == [1, 2]
+    assert resolve_hot_pool_player_ids(bets, mapping, expand_canonical_aliases=True) == [1, 2]

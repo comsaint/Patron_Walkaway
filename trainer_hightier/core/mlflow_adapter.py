@@ -337,6 +337,82 @@ def log_artifact_safe(local_path: str | Path, artifact_path: Optional[str] = Non
         _log.warning("MLflow log_artifact failed for %s: %s", local_path, e)
 
 
+def resolve_mlflow_run_id_by_name(
+    experiment_name: str,
+    run_name: str,
+) -> Optional[str]:
+    """Return latest FINISHED run_id for *run_name* in *experiment_name*, else ``None``."""
+
+    if not is_mlflow_available():
+        return None
+    try:
+        from mlflow.tracking import MlflowClient  # type: ignore[import-not-found]
+
+        client = MlflowClient()
+        exp = client.get_experiment_by_name(experiment_name)
+        if exp is None:
+            _log.warning("MLflow experiment not found: %s", experiment_name)
+            return None
+        safe_name = str(run_name).replace("'", "''")
+        runs = client.search_runs(
+            experiment_ids=[exp.experiment_id],
+            filter_string=(
+                f"attributes.run_name = '{safe_name}' AND attributes.status = 'FINISHED'"
+            ),
+            order_by=["start_time DESC"],
+            max_results=1,
+        )
+        if not runs:
+            _log.warning(
+                "MLflow FINISHED run not found experiment=%s run_name=%s",
+                experiment_name,
+                run_name,
+            )
+            return None
+        return str(runs[0].info.run_id)
+    except Exception as e:
+        _log.warning(
+            "MLflow resolve run_id failed experiment=%s run_name=%s: %s",
+            experiment_name,
+            run_name,
+            e,
+        )
+        return None
+
+
+def log_artifact_to_run_safe(
+    run_id: str,
+    local_path: str | Path,
+    artifact_path: Optional[str] = None,
+) -> bool:
+    """Upload one artifact to an existing MLflow run without raising."""
+
+    if not is_mlflow_available():
+        return False
+    delay_sec = float(_MLFLOW_RETRY_INITIAL_DELAY_SEC)
+    last_exc: Optional[Exception] = None
+    for attempt in range(_MLFLOW_RETRY_MAX_RETRIES + 1):
+        try:
+            from mlflow.tracking import MlflowClient  # type: ignore[import-not-found]
+
+            MlflowClient().log_artifact(str(run_id), str(local_path), artifact_path=artifact_path)
+            return True
+        except Exception as e:
+            last_exc = e
+            if attempt < _MLFLOW_RETRY_MAX_RETRIES and _is_transient_mlflow_error(e):
+                time.sleep(delay_sec)
+                delay_sec *= _MLFLOW_RETRY_BACKOFF_MULTIPLIER
+            else:
+                break
+    _log.warning(
+        "MLflow log_artifact_to_run failed run_id=%s path=%s: %s",
+        run_id,
+        local_path,
+        type(last_exc).__name__ if last_exc is not None else "Unknown",
+    )
+    return False
+
+
 def log_artifacts_safe(local_dir: str | Path, artifact_path: Optional[str] = None) -> None:
     """Log directory tree."""
 

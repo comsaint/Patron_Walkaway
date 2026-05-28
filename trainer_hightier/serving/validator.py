@@ -493,11 +493,15 @@ def fetch_bet_payout_times_by_bet_ids(
         df = df.dropna(subset=["_payout_hk"])
         for bid_int, sub in df.groupby("bet_id", sort=False):
             bkey = str(int(bid_int))
-            best_idx = sub["_payout_hk"].idxmax()
-            row = sub.loc[best_idx]
+            row = sub.nlargest(1, "_payout_hk", keep="first").iloc[0]
             payout_hk = row["_payout_hk"]
             if pd.isna(payout_hk):
                 continue
+            payout_dt = (
+                payout_hk.to_pydatetime()
+                if isinstance(payout_hk, pd.Timestamp)
+                else payout_hk
+            )
             ch_pid: Optional[int] = None
             try:
                 if pd.notna(row.get("player_id")):
@@ -505,8 +509,8 @@ def fetch_bet_payout_times_by_bet_ids(
             except Exception:
                 ch_pid = None
             prev = acc.get(bkey)
-            if prev is None or payout_hk > prev[0]:
-                acc[bkey] = (payout_hk.to_pydatetime(), ch_pid)
+            if prev is None or payout_dt > prev[0]:
+                acc[bkey] = (payout_dt, ch_pid)
 
     return acc, chunks_attempted, rows_read, failed_queries
 

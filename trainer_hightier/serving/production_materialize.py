@@ -235,20 +235,22 @@ def materialize_production_slow_canonical_asof(
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
     lookback_days: int | None = None,
     publish_readiness: bool = True,
+    context_day: date | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Materialize canonical/player ASOF slow 180d snapshot for production serving."""
 
     cfg = default_hightier_serving_config()
     lb = int(lookback_days if lookback_days is not None else cfg.production_slow_lookback_days)
+    ctx_day = context_day if context_day is not None else date.today()
     out = materialize_slow_patron_180d_canonical_asof(
         cleaned_session_parquet=cleaned_session_parquet,
         canonical_mapping_parquet=canonical_mapping_parquet,
         out_parquet=out_parquet,
         lookback_days=lb,
         duckdb_runtime=duckdb_runtime,
-        context_day=date.today(),
+        context_day=ctx_day,
     )
-    ctx = resolve_slow_month_turn_context(date.today())
+    ctx = resolve_slow_month_turn_context(ctx_day)
     anchor_max = None
     pf = pq.ParquetFile(out)
     if pf.metadata and pf.metadata.num_rows > 0 and "anchor_gaming_day" in pf.schema_arrow.names:

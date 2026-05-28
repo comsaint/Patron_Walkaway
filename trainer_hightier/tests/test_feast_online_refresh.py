@@ -99,6 +99,21 @@ def test_merge_mid_feast_carry_forward_keeps_latest_per_canonical(tmp_path: Path
     assert float(by_cid.loc["c3", "fe__wager_sum__w1d"]) == 30.0
 
 
+def test_ensure_mid_feast_parquet_repairs_legacy_missing_anchor(tmp_path: Path) -> None:
+    """Legacy spike parquets only had event_timestamp; materialize needs anchor_gaming_day."""
+    legacy = tmp_path / "legacy_feast.parquet"
+    pd.DataFrame(
+        [
+            _mid_feast_row("c1", "2025-05-11", wager=42.0),
+        ]
+    ).to_parquet(legacy, index=False)
+    assert "anchor_gaming_day" not in pd.read_parquet(legacy).columns
+    refresh_mod.ensure_mid_feast_parquet_has_anchor_column(legacy)
+    repaired = pd.read_parquet(legacy)
+    assert "anchor_gaming_day" in repaired.columns
+    assert str(repaired.loc[0, "anchor_gaming_day"])[:10] == "2025-05-11"
+
+
 def test_materialize_training_mid_feast_seed_filters_allowlist(tmp_path: Path) -> None:
     train = tmp_path / "train_mid.parquet"
     allow = tmp_path / "allow.parquet"

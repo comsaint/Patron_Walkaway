@@ -424,6 +424,12 @@ DEFAULT_RUN_PROFILE_NAME: Final[str] = "default"
 MLFLOW_EXPERIMENT_TRAIN_HIGHTIER: Final[str] = "patron/patron_walkaway/prod/train_hightier"
 # Artifact subfolder within each MLflow run (avoid colliding with main trainer ``model_bundle`` layout).
 MLFLOW_HIGHTIER_ARTIFACT_PREFIX: Final[str] = "hightier_run"
+# Production incident debug bundle (``collect_diag.py``).
+DIAG_BUNDLE_SCHEMA_VERSION: Final[int] = 1
+DIAG_BUNDLE_RETENTION_COUNT: Final[int] = 3
+DIAG_BUNDLE_EXPORTS_SUBDIR: Final[str] = "diag_exports"
+MLFLOW_DIAG_ARTIFACT_PREFIX: Final[str] = "prod_diag"
+DIAG_SUPPLIER_RCA_MAX_BETS: Final[int] = 5000
 
 
 @dataclass(frozen=True)
@@ -458,7 +464,7 @@ class Step5TrainConfig:
     #: When ``True``, use :data:`baseline_*` hyperparameters only (no Optuna).
     skip_optuna: bool = False
     #: ``study.optimize(..., timeout=...)`` wall-clock cap in seconds.
-    optuna_timeout_sec: float = 60 * 60 * 1  # 10-minute Optuna wall-clock budget
+    optuna_timeout_sec: float = 60 * 60 * 5  # 10-minute Optuna wall-clock budget
     early_stopping_rounds: int = 50
     #: Upper bound on boosting rounds (early stopping usually stops sooner).
     lgb_n_estimators_cap: int = 2000

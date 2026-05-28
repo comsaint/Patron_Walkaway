@@ -132,6 +132,35 @@ def test_fetch_prediction_bet_cache_extension_bet_anchored_ch_window() -> None:
     assert "10" in bet_cache
 
 
+def test_fetch_bet_payout_times_by_bet_ids_handles_duplicate_index() -> None:
+    """Duplicate DataFrame index must not yield multi-value tuples in bid_map."""
+    hk = ZoneInfo("Asia/Hong_Kong")
+    dup_df = pd.DataFrame(
+        {
+            "bet_id": [99, 99],
+            "payout_complete_dtm": [
+                datetime(2025, 1, 1, 10, 0, tzinfo=hk),
+                datetime(2025, 1, 1, 11, 0, tzinfo=hk),
+            ],
+            "player_id": [10, 10],
+        },
+        index=[0, 0],
+    )
+
+    class _FakeClient:
+        def query_df(self, _query, *, parameters=None):
+            del parameters
+            return dup_df
+
+    with patch.object(hv, "get_clickhouse_client", return_value=_FakeClient()):
+        bid_map, *_rest = hv.fetch_bet_payout_times_by_bet_ids([99], chunk_size=10)
+
+    assert list(bid_map.keys()) == ["99"]
+    payout_hk, ch_pid = bid_map["99"]
+    assert payout_hk == datetime(2025, 1, 1, 11, 0, tzinfo=hk)
+    assert ch_pid == 10
+
+
 def test_validate_observation_row_matches_alert_row() -> None:
     hk = ZoneInfo("Asia/Hong_Kong")
     bet_ts = datetime(2024, 1, 1, 12, 0, tzinfo=hk)

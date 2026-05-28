@@ -119,6 +119,15 @@ def expected_mid_term_anchor(serving_day: date) -> date:
     return serving_day - timedelta(days=1)
 
 
+def serving_day_for_eval_gaming_day_end(eval_gaming_day_end: date) -> date:
+    """Serving gaming day for historical replay through *eval_gaming_day_end* (inclusive).
+
+    Production mid anchor for bets on gaming day ``E`` is ``E - 1``, which matches
+    ``expected_mid_term_anchor(serving_day=E)``.
+    """
+    return eval_gaming_day_end
+
+
 def mid_feast_event_timestamp_for_anchor(anchor_gaming_day: date) -> datetime:
     """Feast ``event_timestamp`` for mid-term online lookup (end of anchor gaming day, HK).
 

@@ -720,6 +720,7 @@ def _write_readme(path: Path) -> None:
 ## Layout (no repo checkout required)
 
 - `main.py` — unified entrypoint (`python main.py --mode all`)
+- `collect_diag.py` — incident debug bundle collector (`python collect_diag.py`)
 - `wheels/` — `trainer_hightier` wheel (install from this directory)
 - `requirements.txt` — local wheel + PyPI / internal-index deps (must install `feast` for refresh)
 - `.env.example` — copy to `.env`; set ClickHouse credentials
@@ -743,6 +744,20 @@ Tail the log on Windows (PowerShell, separate window):
 ```powershell
 Get-Content -Path local_state\\logs\\deploy_main.log -Wait -Tail 50
 ```
+
+## Incident debug bundle
+
+From **this bundle root** (requires ClickHouse for full audits; zip is still produced on partial failure):
+
+```cmd
+python collect_diag.py
+```
+
+Output: `local_state/diag_exports/prod_diag_<model_version>_<timestamp>.zip`
+
+The zip includes SQLite Parquet exports (`prediction_log`, `state`, `feature_state`), audit reports, identity/runtime files, and `deploy_main.log`. When MLflow credentials are configured under `local_state/mlflow.env`, the zip is uploaded to the training run matching `models/model_version` (upload failure does not block zip creation). Only the latest 3 zip files are kept locally.
+
+Optional flags: `--skip-mlflow-upload`, `--output-zip PATH`.
 
 ## Prerequisites
 
@@ -855,6 +870,33 @@ def _build_trainer_hightier_wheel(*, wheels_dir: Path) -> str:
         whl_path.stat().st_size,
     )
     return whl_path.name
+
+
+def _write_bundle_collect_diag_py(path: Path) -> None:
+    """Write bundle root ``collect_diag.py`` for one-click incident debug bundle."""
+    path.write_text(
+        '''"""Standalone incident debug bundle entry."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+
+def main() -> int:
+    """Collect debug zip with ``--bundle-dir`` fixed to this directory."""
+    root = Path(__file__).resolve().parent
+    argv = ["--bundle-dir", str(root), *sys.argv[1:]]
+    from trainer_hightier.serving.collect_debug_bundle import run_collect_debug_bundle
+
+    return int(run_collect_debug_bundle(argv))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+''',
+        encoding="utf-8",
+    )
 
 
 def _write_bundle_main_py(path: Path) -> None:
@@ -1093,6 +1135,7 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
     wheels_dir = root / "wheels"
     wheel_name = _build_trainer_hightier_wheel(wheels_dir=wheels_dir)
     _write_bundle_main_py(root / "main.py")
+    _write_bundle_collect_diag_py(root / "collect_diag.py")
     _write_dotenv_example(root / ".env.example")
     _write_standalone_requirements(root / "requirements.txt", wheel_filename=wheel_name)
     models_dir = root / "models"

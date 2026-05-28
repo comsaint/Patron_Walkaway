@@ -4,12 +4,17 @@ Similar in spirit to legacy ``trainer.backtester`` (date window, offline metrics
 **same supplier stack** as live ``score_once`` (PIT short-term, trial 1h, Feast mid/slow, composite)
 instead of training-time feature SQL.
 
-Example (deploy bundle + ClickHouse gaming-day window)::
+Example (deploy bundle + ClickHouse gaming-day window; default labeled backtest)::
 
     python -m trainer_hightier.serving.offline_serving_backtest \\
         --bundle-dir /path/to/deploy_bundle \\
-        --gaming-day-start 2026-05-01 --gaming-day-end 2026-05-07 \\
-        --max-bets 2000
+        --gaming-day-start 2026-05-01 --gaming-day-end 2026-05-07
+
+Legacy quick replay (no labels/AP)::
+
+    python -m trainer_hightier.serving.offline_serving_backtest \\
+        --bundle-dir /path/to/deploy_bundle \\
+        --quick-replay --gaming-day-start 2026-05-01 --gaming-day-end 2026-05-07
 
 When ``--output-json`` is omitted, the report defaults to
 ``<model-bundle>/offline_serving_backtest.json`` (canonical training bundle when available).
@@ -29,7 +34,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Final, Iterator
 
@@ -41,6 +46,8 @@ from zoneinfo import ZoneInfo
 from trainer_hightier.config import (
     TRAINER_HIGHTIER_PACKAGE_DIR,
     HightierServingConfig,
+    LABEL_LOOKAHEAD_MIN,
+    WALKAWAY_GAP_MIN,
     apply_hightier_serving_environ_overrides,
     set_hightier_serving_deploy_override,
 )
@@ -69,6 +76,7 @@ from trainer_hightier.serving.feast_online_adapter import (
 )
 from trainer_hightier.serving.feature_builder import (
     assert_features_ready,
+    attach_canonical_id,
     attach_mid_term_composite_columns,
     attach_mid_term_snapshot_asof,
     attach_synthetic_etl_and_prediction_visible,
@@ -96,7 +104,11 @@ from trainer_hightier.serving.scorer import (
     assert_bets_gaming_day_contract,
     split_allowlist_player_id_chunks,
 )
-from trainer_hightier.serving.snapshot_freshness import post_join_feature_smoke
+from trainer_hightier.serving.snapshot_freshness import (
+    post_join_feature_smoke,
+    serving_day_for_eval_gaming_day_end,
+)
+from trainer_hightier.walkaway_compute_labels import compute_labels
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +157,7 @@ def _resolve_feast_repo_path(
     bundle_root: Path | None,
     feast_repo: Path | None,
     cfg: HightierServingConfig,
+    require_online_store: bool = True,
 ) -> Path:
     """Pick Feast repo for offline production replay (bundle > explicit > package default)."""
     if feast_repo is not None:
@@ -161,7 +174,7 @@ def _resolve_feast_repo_path(
             f"feast_repo missing or invalid (need feature_store.yaml): {repo}"
         )
     online_db = repo / "data" / "online_store.db"
-    if not online_db.is_file():
+    if require_online_store and not online_db.is_file():
         raise FileNotFoundError(
             f"Feast online store missing at {online_db}; run feast_online_refresh / feast apply first"
         )
@@ -200,7 +213,8 @@ def resolve_offline_context(
     mid_term_snapshot_parquet: Path | None = None,
     use_feast_online: bool = True,
     allow_slow_parquet_fallback: bool = False,
-    use_training_mid_snapshot_for_parity: bool = True,
+    use_training_mid_snapshot_for_parity: bool = False,
+    require_feast_online_store: bool = True,
 ) -> OfflineBacktestContext:
     """Resolve bundle, mapping, allowlist, and Feast repo (deploy bundle or explicit paths)."""
     if bundle_dir is not None:
@@ -258,6 +272,7 @@ def resolve_offline_context(
             bundle_root=bundle_root,
             feast_repo=feast_repo,
             cfg=cfg,
+            require_online_store=require_feast_online_store,
         )
         cfg = replace(cfg, scorer_feast_repo_path=feast_path)
     elif needs_feast_suppliers and allow_slow_parquet_fallback:
@@ -303,7 +318,7 @@ def fetch_bets_gaming_day_window(
     allowlist_ids: frozenset[int],
     gaming_day_start: date,
     gaming_day_end: date,
-    max_bets: int,
+    max_bets: int | None = None,
 ) -> pd.DataFrame:
     """Fetch allowlist bets whose ``gaming_day`` falls in ``[start, end]`` (inclusive)."""
     if gaming_day_end < gaming_day_start:
@@ -315,13 +330,15 @@ def fetch_bets_gaming_day_window(
 
     client = get_clickhouse_client()
     placeholder = int(cfg.placeholder_player_id)
-    lim = max(1, int(max_bets))
     select_cols = _incremental_bet_select_list(casino_player_id_select=_TBET_CASINO_PLAYER_ID_SELECT)
-    params = {
+    params: dict[str, Any] = {
         "gday_start": gaming_day_start.isoformat(),
         "gday_end": gaming_day_end.isoformat(),
-        "lim": lim,
     }
+    limit_clause = ""
+    if max_bets is not None:
+        params["lim"] = max(1, int(max_bets))
+        limit_clause = "LIMIT %(lim)s"
     chunk_sz = int(cfg.hightier_scorer_player_id_chunk_size)
     chunks = split_allowlist_player_id_chunks(allowlist_ids, chunk_sz)
     frames: list[pd.DataFrame] = []
@@ -340,16 +357,129 @@ def fetch_bets_gaming_day_window(
               AND player_id != {placeholder}
               AND player_id IN ({in_list})
             ORDER BY payout_complete_dtm ASC, bet_id ASC
-            LIMIT %(lim)s
+            {limit_clause}
         """
         frames.append(client.query_df(q, parameters=params))
-    bets = pd.concat([f for f in frames if not f.empty], ignore_index=True) if frames else pd.DataFrame()
+    nonempty = [f for f in frames if f is not None and not f.empty]
+    bets = pd.concat(nonempty, ignore_index=True) if nonempty else pd.DataFrame()
     if bets.empty:
         return bets
-    bets = bets.drop_duplicates(subset=["bet_id"], keep="first").head(lim).reset_index(drop=True)
+    bets = bets.drop_duplicates(subset=["bet_id"], keep="first")
+    if max_bets is not None:
+        bets = bets.head(int(max_bets))
+    bets = bets.reset_index(drop=True)
     _postprocess_incremental_bets_timestamps(bets)
     assert_bets_gaming_day_contract(bets, "offline_serving_backtest_gaming_day")
     return bets
+
+
+def fetch_bets_payout_window(
+    *,
+    cfg: HightierServingConfig,
+    player_ids: frozenset[int],
+    payout_start: datetime,
+    payout_end: datetime,
+) -> pd.DataFrame:
+    """Fetch settled bets for *player_ids* with payout in ``[payout_start, payout_end]``."""
+    if not player_ids:
+        return pd.DataFrame()
+    if payout_end < payout_start:
+        raise ValueError(
+            f"payout_end {payout_end!r} before payout_start {payout_start!r}",
+        )
+
+    client = get_clickhouse_client()
+    placeholder = int(cfg.placeholder_player_id)
+    select_cols = _incremental_bet_select_list(casino_player_id_select=_TBET_CASINO_PLAYER_ID_SELECT)
+    params = {"ws": payout_start, "we": payout_end}
+    chunk_sz = int(cfg.hightier_scorer_player_id_chunk_size)
+    chunks = split_allowlist_player_id_chunks(player_ids, chunk_sz)
+    frames: list[pd.DataFrame] = []
+    for chunk in chunks:
+        in_list = ",".join(str(int(x)) for x in chunk)
+        q = f"""
+            SELECT
+                {select_cols}
+            FROM {cfg.source_db}.{cfg.tbet} FINAL
+            WHERE payout_complete_dtm >= %(ws)s
+              AND payout_complete_dtm <= %(we)s
+              AND payout_complete_dtm IS NOT NULL
+              AND gaming_day IS NOT NULL
+              AND wager > 0
+              AND player_id IS NOT NULL
+              AND player_id != {placeholder}
+              AND player_id IN ({in_list})
+            ORDER BY payout_complete_dtm ASC, bet_id ASC
+        """
+        frames.append(client.query_df(q, parameters=params))
+    nonempty = [f for f in frames if f is not None and not f.empty]
+    bets = pd.concat(nonempty, ignore_index=True) if nonempty else pd.DataFrame()
+    if bets.empty:
+        return bets
+    bets = bets.drop_duplicates(subset=["bet_id"], keep="first").reset_index(drop=True)
+    _postprocess_incremental_bets_timestamps(bets)
+    return bets
+
+
+def _label_payout_bounds(eval_bets: pd.DataFrame) -> tuple[datetime, datetime]:
+    """Return ``(window_end, extended_end)`` for walkaway label computation."""
+    ts = pd.to_datetime(eval_bets["payout_complete_dtm"], errors="coerce").dropna()
+    if ts.empty:
+        raise ValueError("eval bets have no valid payout_complete_dtm for label bounds")
+    window_end = ts.max()
+    if window_end.tzinfo is not None:
+        window_end = window_end.tz_convert(HK_TZ)
+    extended_end = window_end + timedelta(
+        minutes=float(LABEL_LOOKAHEAD_MIN + WALKAWAY_GAP_MIN),
+    )
+    return window_end.to_pydatetime(), extended_end.to_pydatetime()
+
+
+def _attach_walkaway_labels_to_eval_bets(
+    eval_bets: pd.DataFrame,
+    *,
+    cfg: HightierServingConfig,
+    mapping_parquet: Path,
+) -> pd.DataFrame:
+    """Compute walkaway labels on a CH payout corpus and join onto eval rows."""
+    if eval_bets.empty:
+        return eval_bets.copy()
+    window_end, extended_end = _label_payout_bounds(eval_bets)
+    payout_start = pd.to_datetime(eval_bets["payout_complete_dtm"], errors="coerce").min()
+    if payout_start.tzinfo is not None:
+        payout_start = payout_start.tz_convert(HK_TZ)
+    player_ids = frozenset(
+        int(x)
+        for x in pd.to_numeric(eval_bets["player_id"], errors="coerce").dropna().astype(int).tolist()
+    )
+    corpus = fetch_bets_payout_window(
+        cfg=cfg,
+        player_ids=player_ids,
+        payout_start=payout_start.to_pydatetime(),
+        payout_end=extended_end,
+    )
+    if corpus.empty:
+        raise ValueError("label corpus fetch returned 0 rows from ClickHouse")
+    corpus = attach_canonical_id(corpus, mapping_parquet=mapping_parquet)
+    labeled = compute_labels(corpus, window_end=window_end, extended_end=extended_end)
+    labeled = labeled.loc[~labeled["censored"].astype(bool)].copy()
+    if labeled.empty:
+        raise ValueError("all eval bets censored after compute_labels")
+    label_by_bet = labeled.set_index("bet_id")["label"]
+    out = eval_bets.copy()
+    out["_bid"] = pd.to_numeric(out["bet_id"], errors="coerce")
+    out["walkaway_label"] = out["_bid"].map(label_by_bet).astype("Int64")
+    out = out.loc[out["walkaway_label"].notna()].copy()
+    out["walkaway_label"] = out["walkaway_label"].astype(np.int8)
+    out = out.drop(columns=["_bid"])
+    n_censored = int(len(eval_bets) - len(out))
+    if n_censored:
+        logger.info(
+            "[offline_backtest] dropped %d censored/unlabeled eval bets (kept %d)",
+            n_censored,
+            len(out),
+        )
+    return out.reset_index(drop=True)
 
 
 def load_bets_from_cleaned_parquet(
@@ -430,16 +560,17 @@ def load_offline_bets(
     max_bets: int | None,
 ) -> pd.DataFrame:
     """Load bet rows for offline replay (CH window, local parquet, or audit log path)."""
-    cap = int(max_bets) if max_bets is not None else 5000
     if local_cleaned_bet is not None:
         if gaming_day_start is None or gaming_day_end is None:
             raise ValueError("--local-cleaned-bet requires --gaming-day-start and --gaming-day-end")
+        if max_bets is None:
+            raise ValueError("--local-cleaned-bet requires --max-bets (local path has no unbounded default)")
         return load_bets_from_cleaned_parquet(
             local_cleaned_bet,
             allowlist_ids=ctx.allowlist_ids,
             gaming_day_start=gaming_day_start,
             gaming_day_end=gaming_day_end,
-            max_bets=cap,
+            max_bets=int(max_bets),
         )
     if gaming_day_start is not None and gaming_day_end is not None:
         return fetch_bets_gaming_day_window(
@@ -447,7 +578,7 @@ def load_offline_bets(
             allowlist_ids=ctx.allowlist_ids,
             gaming_day_start=gaming_day_start,
             gaming_day_end=gaming_day_end,
-            max_bets=cap,
+            max_bets=max_bets,
         )
     return _load_audit_bets(
         cfg=ctx.cfg,
@@ -1164,6 +1295,196 @@ def run_test_split_comparison(
     }
 
 
+def run_feast_refresh_at_eval_end(
+    ctx: OfflineBacktestContext,
+    *,
+    eval_gaming_day_end: date,
+) -> dict[str, Any]:
+    """Materialize Feast online mid/slow through *eval_gaming_day_end* (production path)."""
+    if ctx.feast_repo is None:
+        raise ValueError("feast_repo required for refresh@eval_end")
+    from trainer_hightier.serving.feast_online_refresh import RefreshOptions, run_feast_online_refresh
+
+    serving_day = serving_day_for_eval_gaming_day_end(eval_gaming_day_end)
+    feast_repo = Path(ctx.feast_repo).resolve()
+    feast_art = feast_repo.parent / "artifacts" / "feast"
+    feast_art.mkdir(parents=True, exist_ok=True)
+    opts = RefreshOptions(
+        layers=frozenset({"mid", "slow"}),
+        source="clickhouse",
+        skip_apply=False,
+        skip_materialize=False,
+        smoke_only=False,
+        dry_run=False,
+        feast_repo=feast_repo,
+        readiness_path=feast_art / "feast_online_readiness.json",
+        canonical_mapping=Path(ctx.mapping_parquet).resolve(),
+        adt_allowlist=Path(ctx.cfg.adt_allowed_players_parquet or ctx.mapping_parquet).resolve(),
+        local_cleaned_bet=None,
+        local_cleaned_session=None,
+        max_smoke_entities=50,
+        summary_path=feast_art / "offline_backtest_refresh_summary.json",
+        bootstrap_mid=True,
+        apply_schema=True,
+        serving_day=serving_day,
+    )
+    logger.info(
+        "[offline_backtest] Feast refresh@eval_end serving_day=%s anchor_end=%s",
+        serving_day.isoformat(),
+        (serving_day - timedelta(days=1)).isoformat(),
+    )
+    summary = run_feast_online_refresh(opts)
+    if summary.get("verdict") != "ok":
+        raise RuntimeError(f"Feast refresh@eval_end failed: {summary}")
+    return {
+        "skipped": False,
+        "serving_day": serving_day.isoformat(),
+        "feast_refresh_anchor": (serving_day - timedelta(days=1)).isoformat(),
+        "refresh_summary": summary,
+    }
+
+
+def _iter_eval_batches(
+    eval_bets: pd.DataFrame,
+    *,
+    batch_size: int,
+) -> Iterator[pd.DataFrame]:
+    """Yield eval bet batches in payout-time order."""
+    from trainer_hightier.serving.short_term_scoring_context import sort_bets_for_scoring_batch
+
+    work = sort_bets_for_scoring_batch(eval_bets)
+    bs = max(1, int(batch_size))
+    for start in range(0, len(work), bs):
+        yield work.iloc[start : start + bs].copy()
+
+
+def run_labeled_gaming_day_backtest(
+    *,
+    bundle_dir: Path | None = None,
+    model_dir: Path | None = None,
+    mapping_parquet: Path | None = None,
+    allowlist_parquet: Path | None = None,
+    feast_repo: Path | None = None,
+    gaming_day_start: date,
+    gaming_day_end: date,
+    max_bets: int | None = None,
+    batch_size: int = 5000,
+    skip_refresh: bool = False,
+    strict_smoke: bool = False,
+    allow_slow_parquet_fallback: bool = False,
+) -> dict[str, Any]:
+    """Default backtest: CH eval window, labels, Feast refresh@eval_end, test_ap."""
+    ctx = resolve_offline_context(
+        bundle_dir=bundle_dir,
+        model_dir=model_dir,
+        mapping_parquet=mapping_parquet,
+        allowlist_parquet=allowlist_parquet,
+        feast_repo=feast_repo,
+        slow_patron_parquet=None,
+        mid_term_snapshot_parquet=None,
+        use_feast_online=True,
+        allow_slow_parquet_fallback=allow_slow_parquet_fallback,
+        use_training_mid_snapshot_for_parity=False,
+        require_feast_online_store=skip_refresh,
+    )
+    feast_refresh: dict[str, Any] | None = None
+    if not skip_refresh and (
+        ctx.supplier_plan.feast_mid_cols or ctx.supplier_plan.feast_slow_cols
+    ):
+        feast_refresh = run_feast_refresh_at_eval_end(
+            ctx,
+            eval_gaming_day_end=gaming_day_end,
+        )
+
+    eval_bets = fetch_bets_gaming_day_window(
+        cfg=ctx.cfg,
+        allowlist_ids=ctx.allowlist_ids,
+        gaming_day_start=gaming_day_start,
+        gaming_day_end=gaming_day_end,
+        max_bets=max_bets,
+    )
+    if eval_bets.empty:
+        raise ValueError(
+            f"no eval bets for gaming_day [{gaming_day_start}, {gaming_day_end}]",
+        )
+    labeled = _attach_walkaway_labels_to_eval_bets(
+        eval_bets,
+        cfg=ctx.cfg,
+        mapping_parquet=ctx.mapping_parquet,
+    )
+    if labeled.empty:
+        raise ValueError("no labeled eval bets after censored filter")
+
+    needs_feast = bool(
+        ctx.supplier_plan.feast_mid_cols or ctx.supplier_plan.feast_slow_cols,
+    )
+    feast_adapter: OnlineFeastAdapter | None = (
+        _build_feast_online_adapter(ctx) if ctx.use_feast_online and needs_feast else None
+    )
+    prob_parts: list[np.ndarray] = []
+    label_parts: list[np.ndarray] = []
+    n_skipped = 0
+    feast_entity_missing = 0
+    batches_run = 0
+    for batch_df in _iter_eval_batches(labeled, batch_size=batch_size):
+        batch = build_offline_scoring_batch(batch_df, cfg=ctx.cfg)
+        result = run_offline_production_pipeline(
+            batch,
+            ctx,
+            feast_adapter,
+            strict_smoke=strict_smoke,
+            allow_slow_parquet_fallback=allow_slow_parquet_fallback,
+        )
+        prob_parts.append(result.probabilities)
+        label_parts.append(batch_df["walkaway_label"].astype(np.int8).to_numpy())
+        n_skipped += len(result.skipped_entity_missing)
+        feast_entity_missing += int(result.feast_diag.n_entity_missing)
+        batches_run += 1
+        logger.info(
+            "[offline_backtest] eval batch %d rows=%d scored=%d",
+            batches_run,
+            len(batch_df),
+            len(result.staged),
+        )
+
+    scores = np.concatenate(prob_parts) if prob_parts else np.array([], dtype=np.float64)
+    labels = np.concatenate(label_parts) if label_parts else np.array([], dtype=np.int8)
+    thr = float(ctx.bundle.threshold)
+    wh = _window_hours_from_payout(labeled.head(len(scores)))
+    metrics = _split_metrics_block("test", labels, scores, thr, window_hours=wh)
+    ref_path = ctx.model_dir / "training_metrics.json"
+    deltas: dict[str, Any] = {}
+    if ref_path.is_file():
+        ref = json.loads(ref_path.read_text(encoding="utf-8"))
+        deltas = {
+            "ap_delta": metrics["test_ap"] - float(ref.get("test_ap", 0.0)),
+            "precision_delta": metrics["test_precision"] - float(ref.get("test_precision", 0.0)),
+            "recall_delta": metrics["test_recall"] - float(ref.get("test_recall", 0.0)),
+            "alerts_delta": metrics["test_alerts"] - int(ref.get("test_alerts", 0)),
+        }
+    return {
+        "mode": "labeled_gaming_day_backtest",
+        "data_source": "clickhouse_raw",
+        "feature_supplier": "feast_online",
+        "gaming_day_start": gaming_day_start.isoformat(),
+        "gaming_day_end": gaming_day_end.isoformat(),
+        "feast_repo": str(ctx.feast_repo) if ctx.feast_repo else None,
+        "feast_refresh": feast_refresh,
+        "batch_size": int(batch_size),
+        "batches_run": batches_run,
+        "max_bets": max_bets,
+        "n_bets_fetched": int(len(eval_bets)),
+        "n_labeled_eval": int(len(labeled)),
+        "n_skipped_entity_missing": n_skipped,
+        "feast_entity_missing": feast_entity_missing,
+        "model_version": ctx.bundle.model_version,
+        "model_dir": str(ctx.model_dir),
+        "threshold": thr,
+        "metrics": metrics,
+        "deltas_vs_training_metrics": deltas,
+    }
+
+
 def run_offline_serving_backtest(
     *,
     bundle_dir: Path | None = None,
@@ -1179,7 +1500,7 @@ def run_offline_serving_backtest(
     max_bets: int | None = None,
     strict_smoke: bool = False,
 ) -> dict[str, Any]:
-    """End-to-end offline production replay; returns summary dict."""
+    """Quick replay without labels/AP (opt-in via ``--quick-replay``)."""
     ctx = resolve_offline_context(
         bundle_dir=bundle_dir,
         model_dir=model_dir,
@@ -1189,6 +1510,7 @@ def run_offline_serving_backtest(
         slow_patron_parquet=None,
         use_feast_online=True,
         allow_slow_parquet_fallback=False,
+        use_training_mid_snapshot_for_parity=True,
     )
     bets = load_offline_bets(
         ctx,
@@ -1276,7 +1598,28 @@ def run_cli(argv: list[str] | None = None) -> int:
     )
     pr.add_argument("--prediction-log", type=Path, default=None, help="CSV with bet_id column")
     pr.add_argument("--lookback-hours", type=float, default=6.0, help="when no gaming-day window")
-    pr.add_argument("--max-bets", type=int, default=5000)
+    pr.add_argument(
+        "--max-bets",
+        type=int,
+        default=None,
+        help="optional cap on eval bets (default: score all bets in window)",
+    )
+    pr.add_argument(
+        "--batch-size",
+        type=int,
+        default=5000,
+        help="scoring batch size for default labeled backtest",
+    )
+    pr.add_argument(
+        "--skip-refresh",
+        action="store_true",
+        help="debug only: skip Feast refresh@eval_end (requires existing online store)",
+    )
+    pr.add_argument(
+        "--quick-replay",
+        action="store_true",
+        help="legacy path: production replay without labels/test_ap",
+    )
     pr.add_argument(
         "--output-json",
         type=Path,
@@ -1344,20 +1687,44 @@ def run_cli(argv: list[str] | None = None) -> int:
 
     g_start = _parse_gaming_day(args.gaming_day_start) if args.gaming_day_start else None
     g_end = _parse_gaming_day(args.gaming_day_end) if args.gaming_day_end else None
-    report = run_offline_serving_backtest(
-        bundle_dir=args.bundle_dir,
-        model_dir=args.model_dir,
-        mapping_parquet=args.mapping_parquet,
-        allowlist_parquet=args.allowlist_parquet,
-        feast_repo=args.feast_repo,
-        gaming_day_start=g_start,
-        gaming_day_end=g_end,
-        local_cleaned_bet=args.local_cleaned_bet,
-        prediction_log=args.prediction_log,
-        lookback_hours=float(args.lookback_hours),
-        max_bets=args.max_bets,
-        strict_smoke=bool(args.strict_smoke),
-    )
+
+    if args.quick_replay:
+        report = run_offline_serving_backtest(
+            bundle_dir=args.bundle_dir,
+            model_dir=args.model_dir,
+            mapping_parquet=args.mapping_parquet,
+            allowlist_parquet=args.allowlist_parquet,
+            feast_repo=args.feast_repo,
+            gaming_day_start=g_start,
+            gaming_day_end=g_end,
+            local_cleaned_bet=args.local_cleaned_bet,
+            prediction_log=args.prediction_log,
+            lookback_hours=float(args.lookback_hours),
+            max_bets=args.max_bets,
+            strict_smoke=bool(args.strict_smoke),
+        )
+    else:
+        if g_start is None or g_end is None:
+            pr.error(
+                "default labeled backtest requires --gaming-day-start and --gaming-day-end "
+                "(or use --quick-replay / --evaluate-test-split)",
+            )
+        if args.model_dir is None and args.bundle_dir is None:
+            pr.error("--model-dir or --bundle-dir required")
+        report = run_labeled_gaming_day_backtest(
+            bundle_dir=args.bundle_dir,
+            model_dir=args.model_dir,
+            mapping_parquet=args.mapping_parquet,
+            allowlist_parquet=args.allowlist_parquet,
+            feast_repo=args.feast_repo,
+            gaming_day_start=g_start,
+            gaming_day_end=g_end,
+            max_bets=args.max_bets,
+            batch_size=int(args.batch_size),
+            skip_refresh=bool(args.skip_refresh),
+            strict_smoke=bool(args.strict_smoke),
+            allow_slow_parquet_fallback=bool(args.slow_parquet_fallback),
+        )
     text = json.dumps(report, indent=2, default=str)
     print(text)
     out = resolve_backtest_output_json(
@@ -1367,11 +1734,15 @@ def run_cli(argv: list[str] | None = None) -> int:
     )
     if out is not None:
         write_backtest_report(out, report)
-    critical = int(report.get("n_skipped_entity_missing", 0)) + len(
-        report.get("post_join_smoke_failures") or [],
-    )
-    if report.get("readiness_gate", {}).get("ok") is False:
-        critical += 1
+    critical = 0
+    if report.get("mode") == "labeled_gaming_day_backtest":
+        critical = int(report.get("n_skipped_entity_missing", 0))
+    else:
+        critical = int(report.get("n_skipped_entity_missing", 0)) + len(
+            report.get("post_join_smoke_failures") or [],
+        )
+        if report.get("readiness_gate", {}).get("ok") is False:
+            critical += 1
     return 1 if critical > 0 else 0
 
 
