@@ -997,6 +997,7 @@ def test_build_bundle_rewrites_manifest_relative_paths(tmp_path: Path) -> None:
     assert whls, "expected trainer_hightier wheel under bundle wheels/"
     req_txt = (out / "requirements.txt").read_text(encoding="utf-8")
     assert whls[0].name in req_txt
+    assert "six==" in req_txt
 
 
 def test_build_bundle_archive_zip(tmp_path: Path) -> None:

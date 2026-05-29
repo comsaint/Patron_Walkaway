@@ -72,6 +72,8 @@ def test_fetch_bets_incremental_global_query_no_tbets_casino_expression(monkeypa
     assert "CAST(wager AS Nullable(Float64)) AS wager" in q
     assert "CAST(casino_win AS Nullable(Float64)) AS casino_win" in q
     assert "CAST(payout_odds AS Nullable(Float64)) AS payout_odds" in q
+    assert "toDate(toTimeZone(payout_complete_dtm, 'Asia/Hong_Kong')) AS gaming_day_event" in q
+    assert "gaming_day_event IS NOT NULL" not in q
     assert "trim(casino_player_id)" not in q.replace(" ", "").lower()
 
 

@@ -22,6 +22,7 @@ import pickle
 import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -951,15 +952,53 @@ CH_PASS=
     )
 
 
-def _write_standalone_requirements(dest: Path, *, wheel_filename: str) -> None:
-    """Write ``requirements.txt`` with a relative wheel path and comment header."""
+def _freeze_wheel_transitive_requirements(wheel_path: Path) -> list[str]:
+    """Install *wheel_path* into a temp venv and return pinned ``pip freeze`` lines."""
+    wheel_path = Path(wheel_path).resolve()
+    if not wheel_path.is_file():
+        raise FileNotFoundError(f"trainer_hightier wheel missing for requirements freeze: {wheel_path}")
+    with tempfile.TemporaryDirectory(prefix="trainer_hightier_req_freeze_") as tmp:
+        venv_dir = Path(tmp) / "venv"
+        subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
+        if sys.platform == "win32":
+            pip_exe = venv_dir / "Scripts" / "pip.exe"
+        else:
+            pip_exe = venv_dir / "bin" / "pip"
+        subprocess.run([str(pip_exe), "install", str(wheel_path)], check=True)
+        proc = subprocess.run(
+            [str(pip_exe), "freeze"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    lines: list[str] = []
+    for raw in proc.stdout.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("-e "):
+            continue
+        pkg = line.split("==", 1)[0].strip().lower()
+        if pkg in {"pip", "setuptools", "trainer-hightier"}:
+            continue
+        lines.append(line)
+    return sorted(lines, key=str.lower)
+
+
+def _write_standalone_requirements(dest: Path, *, wheels_dir: Path, wheel_filename: str) -> None:
+    """Write ``requirements.txt`` with local wheel plus pinned transitive deps."""
     wheel_line = f"wheels/{wheel_filename}"
-    dest.write_text(
-        "# trainer_hightier standalone: local wheel; transitive deps from PyPI/internal index (wheel metadata).\n"
-        "# Run from THIS directory (bundle root): pip install -r requirements.txt\n"
-        f"{wheel_line}\n",
-        encoding="utf-8",
+    wheel_path = Path(wheels_dir) / wheel_filename
+    dep_lines = _freeze_wheel_transitive_requirements(wheel_path)
+    body = "\n".join(
+        [
+            "# trainer_hightier standalone: install from bundle root.",
+            "# pip install -r requirements.txt",
+            "# Do not use --no-deps on the local wheel; this file pins transitive deps.",
+            wheel_line,
+            *dep_lines,
+            "",
+        ]
     )
+    dest.write_text(body, encoding="utf-8")
 
 
 def _ensure_model_bundle(model_src: Path, models_dest: Path, *, strict: bool) -> str:
@@ -1139,7 +1178,11 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
     _write_bundle_main_py(root / "main.py")
     _write_bundle_collect_diag_py(root / "collect_diag.py")
     _write_dotenv_example(root / ".env.example")
-    _write_standalone_requirements(root / "requirements.txt", wheel_filename=wheel_name)
+    _write_standalone_requirements(
+        root / "requirements.txt",
+        wheels_dir=wheels_dir,
+        wheel_filename=wheel_name,
+    )
     models_dir = root / "models"
     snap_dir = root / "snapshots"
     art_dir = snap_dir / "artifacts"

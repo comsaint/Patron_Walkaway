@@ -21,7 +21,15 @@ CH_TBET_WAGER_POSITIVE_PRED: Final[str] = (
     "wager IS NOT NULL AND CAST(wager AS Nullable(Float64)) > 0"
 )
 # Day semantics are defined in schema/time_semantics_registry.yaml: derive from payout_complete_dtm in HK.
-CH_TBET_GAMING_DAY_EVENT_EXPR: Final[str] = "toDate(toTimeZone(payout_complete_dtm, 'Asia/Hong_Kong'))"
+def ch_tbet_gaming_day_event_sql(*, table_alias: str = "") -> str:
+    """Return ClickHouse SQL for HK ``gaming_day_event`` from raw ``t_bet``."""
+    col = f"{table_alias}.payout_complete_dtm" if table_alias else "payout_complete_dtm"
+    return f"toDate(toTimeZone({col}, 'Asia/Hong_Kong'))"
+
+
+CH_TBET_GAMING_DAY_EVENT_EXPR: Final[str] = ch_tbet_gaming_day_event_sql()
+CH_TBET_GAMING_DAY_EVENT_SELECT: Final[str] = f"{CH_TBET_GAMING_DAY_EVENT_EXPR} AS gaming_day_event"
+CH_TBET_GAMING_DAY_EVENT_NOT_NULL_PRED: Final[str] = f"{CH_TBET_GAMING_DAY_EVENT_EXPR} IS NOT NULL"
 
 # Day semantics for t_session: prefer session_end_dtm falling back to lud_dtm (last user/device activity)
 # Normalize to HK date to match other day semantics.

@@ -27,8 +27,11 @@ from trainer_hightier.serving.adt_allowlist import (
 )
 from trainer_hightier.serving.ch_adapter import (
     CH_TBET_CASINO_WIN_SELECT,
+    CH_TBET_GAMING_DAY_EVENT_NOT_NULL_PRED,
+    CH_TBET_GAMING_DAY_EVENT_SELECT,
     CH_TBET_PAYOUT_ODDS_SELECT,
     CH_TBET_WAGER_SELECT,
+    ch_tbet_gaming_day_event_sql,
     get_clickhouse_client,
 )
 from trainer_hightier.serving.contracts import (
@@ -346,7 +349,7 @@ def fetch_bets_incremental_etl_probe(
         WHERE payout_complete_dtm >= %(start)s
           AND payout_complete_dtm <= %(bet_avail)s
           AND payout_complete_dtm IS NOT NULL
-          AND gaming_day_event IS NOT NULL
+          AND {CH_TBET_GAMING_DAY_EVENT_NOT_NULL_PRED}
           AND wager > 0
           AND player_id IS NOT NULL
           AND player_id != {placeholder}
@@ -368,7 +371,7 @@ def _incremental_bet_select_list(*, casino_player_id_select: str) -> str:
                 type_of_bet,
                 __etl_insert_Dtm,
                 payout_complete_dtm,
-                gaming_day_event,
+                {CH_TBET_GAMING_DAY_EVENT_SELECT},
                 session_id,
                 player_id,
                 table_id,
@@ -424,7 +427,7 @@ def _fetch_bets_incremental_allowlist_chunk(
             WHERE payout_complete_dtm >= %(start)s
               AND payout_complete_dtm <= %(bet_avail)s
               AND payout_complete_dtm IS NOT NULL
-              AND gaming_day_event IS NOT NULL
+              AND {CH_TBET_GAMING_DAY_EVENT_NOT_NULL_PRED}
               AND wager > 0
               AND player_id IS NOT NULL
               AND player_id != {placeholder}
@@ -475,7 +478,7 @@ def _fetch_bets_incremental_allowlist_external(
         WHERE t.payout_complete_dtm >= %(start)s
           AND t.payout_complete_dtm <= %(bet_avail)s
           AND t.payout_complete_dtm IS NOT NULL
-          AND t.gaming_day_event IS NOT NULL
+          AND {ch_tbet_gaming_day_event_sql(table_alias="t")} IS NOT NULL
           AND t.wager > 0
           AND t.player_id IS NOT NULL
           AND t.player_id != {placeholder}
@@ -584,7 +587,7 @@ def fetch_bets_incremental(
             WHERE payout_complete_dtm >= %(start)s
               AND payout_complete_dtm <= %(bet_avail)s
               AND payout_complete_dtm IS NOT NULL
-              AND gaming_day_event IS NOT NULL
+              AND {CH_TBET_GAMING_DAY_EVENT_NOT_NULL_PRED}
               AND wager > 0
               AND player_id IS NOT NULL
               AND player_id != {placeholder}
@@ -641,7 +644,7 @@ def fetch_bet_pool_window(
                 type_of_bet,
                 __etl_insert_Dtm,
                 payout_complete_dtm,
-                gaming_day_event,
+                {CH_TBET_GAMING_DAY_EVENT_SELECT},
                 session_id,
                 player_id,
                 table_id,
@@ -655,7 +658,7 @@ def fetch_bet_pool_window(
             WHERE payout_complete_dtm >= %(ws)s
               AND payout_complete_dtm <= %(we)s
               AND payout_complete_dtm IS NOT NULL
-              AND gaming_day_event IS NOT NULL
+              AND {CH_TBET_GAMING_DAY_EVENT_NOT_NULL_PRED}
               AND player_id IS NOT NULL
               AND player_id != {placeholder}
               AND player_id IN ({in_list})
