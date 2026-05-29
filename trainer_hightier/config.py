@@ -448,8 +448,8 @@ class Step4SplitConfig:
     ``test`` receives the remainder after train and val.
     """
 
-    train_day_fraction: float = 0.70
-    val_day_fraction: float = 0.15
+    train_day_fraction: float = 0.80
+    val_day_fraction: float = 0.10
     #: When ``None``, defaults to ``trainer_hightier/artifacts/training_data/splits``.
     splits_output_dir: Path | None = None
     #: When set, drop split rows whose ``canonical_id`` is absent from this slow monthly Parquet.
@@ -464,7 +464,7 @@ class Step5TrainConfig:
     #: When ``True``, use :data:`baseline_*` hyperparameters only (no Optuna).
     skip_optuna: bool = False
     #: ``study.optimize(..., timeout=...)`` wall-clock cap in seconds.
-    optuna_timeout_sec: float = 60 * 60 * 5  # 10-minute Optuna wall-clock budget
+    optuna_timeout_sec: float = 60 * 60 * 1  # 10-minute Optuna wall-clock budget
     early_stopping_rounds: int = 50
     #: Upper bound on boosting rounds (early stopping usually stops sooner).
     lgb_n_estimators_cap: int = 2000
