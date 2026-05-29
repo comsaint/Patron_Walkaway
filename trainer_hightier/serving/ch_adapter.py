@@ -20,6 +20,8 @@ CH_TBET_PAYOUT_ODDS_SELECT: Final[str] = "CAST(payout_odds AS Nullable(Float64))
 CH_TBET_WAGER_POSITIVE_PRED: Final[str] = (
     "wager IS NOT NULL AND CAST(wager AS Nullable(Float64)) > 0"
 )
+# Day semantics are defined in schema/time_semantics_registry.yaml: derive from payout_complete_dtm in HK.
+CH_TBET_GAMING_DAY_EVENT_EXPR: Final[str] = "toDate(toTimeZone(payout_complete_dtm, 'Asia/Hong_Kong'))"
 
 _thread_local = threading.local()
 

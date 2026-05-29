@@ -37,6 +37,7 @@ from trainer_hightier.feature_experiment.materialize_mid_term_daily_snapshot imp
 )
 from trainer_hightier.serving.adt_allowlist import load_adt_allowlist_ids, resolve_adt_allowlist_path
 from trainer_hightier.serving.ch_adapter import (
+    CH_TBET_GAMING_DAY_EVENT_EXPR,
     CH_TBET_PAYOUT_ODDS_SELECT,
     CH_TBET_WAGER_POSITIVE_PRED,
     CH_TBET_WAGER_SELECT,
@@ -136,15 +137,14 @@ def export_clickhouse_bets_to_parquet(
         q = f"""
         SELECT
             CAST(player_id AS Int64) AS player_id,
-            CAST(gaming_day_event AS Date) AS gaming_day_event,
+            {CH_TBET_GAMING_DAY_EVENT_EXPR} AS gaming_day_event,
             CAST(payout_complete_dtm AS DateTime64(3, 'UTC')) AS payout_complete_dtm,
             {CH_TBET_WAGER_SELECT},
             {CH_TBET_PAYOUT_ODDS_SELECT}
         FROM {cfg.source_db}.{cfg.tbet} FINAL
-        WHERE gaming_day_event >= %(g_start)s
-          AND gaming_day_event <= %(g_end)s
+        WHERE {CH_TBET_GAMING_DAY_EVENT_EXPR} >= %(g_start)s
+          AND {CH_TBET_GAMING_DAY_EVENT_EXPR} <= %(g_end)s
           AND payout_complete_dtm IS NOT NULL
-          AND gaming_day_event IS NOT NULL
           AND {CH_TBET_WAGER_POSITIVE_PRED}
           AND player_id IS NOT NULL
           AND player_id != {placeholder}
