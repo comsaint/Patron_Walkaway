@@ -95,7 +95,7 @@ def test_build_run_summary_includes_split_periods(tmp_path) -> None:
         step5=Step5TrainConfig(run_step5=False),
     )
     periods = {
-        "basis": "gaming_day",
+        "basis": "gaming_day_event",
         "train_day_fraction": 0.7,
         "val_day_fraction": 0.15,
         "distinct_gaming_days": 100,
@@ -146,13 +146,13 @@ def test_build_metrics_detailed_and_pipeline_debug_smoke() -> None:
         "step5_seconds": 10.0,
         "run_training_total_seconds": 100.0,
         "model_path": "out/models_high_tier_mvp/run/model.pkl",
-        "step4_split_periods": {"basis": "gaming_day", "by_split": {"train": {"min_gaming_day": "2024-01-01"}}},
+        "step4_split_periods": {"basis": "gaming_day_event", "by_split": {"train": {"min_gaming_day": "2024-01-01"}}},
     }
     md = build_metrics_detailed(metrics)
     assert md["split_metrics"]["train"]["ap"] == 0.55
     assert md["feature_columns"] == ["x"]
-    assert md["split_periods"]["basis"] == "gaming_day"
+    assert md["split_periods"]["basis"] == "gaming_day_event"
     dbg = build_pipeline_debug(metrics)
     assert dbg["cache"]["session_clean_cache_hit"] is True
-    assert dbg["split_periods"]["basis"] == "gaming_day"
+    assert dbg["split_periods"]["basis"] == "gaming_day_event"
     assert dbg["timings_sec"]["prepare_training_frame"] == 1.0

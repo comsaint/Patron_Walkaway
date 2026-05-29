@@ -33,7 +33,7 @@ def _write_mid_term_snapshot(
     anchor_day = anchor or expected_mid_term_anchor(date.today())
     row: dict[str, object] = {
         "canonical_id": ["c1"],
-        "anchor_gaming_day": [anchor_day.isoformat()],
+        "anchor_gaming_day_event": [anchor_day.isoformat()],
     }
     for col in MID_TERM_SNAPSHOT_OUTPUT_COLUMNS:
         if col.startswith("fe__"):

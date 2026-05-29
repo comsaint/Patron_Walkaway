@@ -171,7 +171,7 @@ def _expand_pool_canonical_aliases(
         q = f"""
             SELECT
                 b.bet_id, b.player_id, b.payout_complete_dtm,
-                CAST(b.gaming_day AS TIMESTAMP) AS gaming_day,
+                CAST(b.gaming_day_event AS TIMESTAMP) AS gaming_day_event,
                 b.session_id, b.table_id, b.wager, b.casino_win, b.payout_odds,
                 b.is_back_bet, b.bet_type, b.type_of_bet
             FROM read_parquet('{glob_path}', hive_partitioning=true) AS b
@@ -294,7 +294,7 @@ def _canonical_alias_study(
 ) -> dict[str, Any]:
     """Test whether fe__today drift correlates with multi-card canonicals and pool expansion."""
     cfg = ctx.cfg
-    need = ["bet_id", "player_id", "canonical_id", "gaming_day", "payout_complete_dtm", _FE_COL]
+    need = ["bet_id", "player_id", "canonical_id", "gaming_day_event", "payout_complete_dtm", _FE_COL]
     miss = [c for c in need if c not in test.columns]
     if miss:
         raise ValueError(f"test parquet missing columns for alias study: {miss}")
@@ -419,8 +419,8 @@ def _sample_alias_wager_gap(
         for _, row in samp.iterrows():
             bid = float(row["bet_id"])
             cid = str(row["canonical_id"]).strip()
-            gday = pd.Timestamp(row["gaming_day"]).date()
-            pcd = pd.Timestamp(row.get("payout_complete_dtm", row["gaming_day"]))
+            gday = pd.Timestamp(row["gaming_day_event"]).date()
+            pcd = pd.Timestamp(row.get("payout_complete_dtm", row["gaming_day_event"]))
             q = f"""
 WITH cmap AS (
   SELECT TRY_CAST(player_id AS BIGINT) AS player_id,
@@ -434,7 +434,7 @@ day_bets AS (
          CAST(b.payout_complete_dtm AS TIMESTAMPTZ) AS pcd
   FROM read_parquet('{glob_esc}', hive_partitioning=true) AS b
   INNER JOIN cmap AS c ON b.player_id = c.player_id
-  WHERE CAST(b.gaming_day AS DATE) = DATE '{gday}'
+  WHERE CAST(b.gaming_day_event AS DATE) = DATE '{gday}'
     AND TRY_CAST(b.wager AS DOUBLE) > 0
 )
 SELECT

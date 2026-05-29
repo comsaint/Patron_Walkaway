@@ -278,7 +278,7 @@ def test_fetch_bet_pool_window_chunks_merge(monkeypatch: pytest.MonkeyPatch) -> 
                     "type_of_bet": ["MAIN_BET"],
                     "__etl_insert_Dtm": [ws],
                     "payout_complete_dtm": [ws + pd.Timedelta(minutes=self.i)],
-                    "gaming_day": [pd.Timestamp("2025-01-01").date()],
+                    "gaming_day_event": [pd.Timestamp("2025-01-01").date()],
                     "session_id": [1],
                     "player_id": [pid],
                     "table_id": [1],
@@ -483,9 +483,9 @@ def test_compute_hot_pool_window_start_extends_to_gaming_day_open() -> None:
     bets = pd.DataFrame(
         {
             "payout_complete_dtm": [pd.Timestamp("2025-01-01 08:00:00", tz=hk)],
-            "gaming_day": [pd.Timestamp("2025-01-01").date()],
+            "gaming_day_event": [pd.Timestamp("2025-01-01").date()],
         }
     )
     got = compute_hot_pool_window_start(bets, cfg=cfg)
-    expected = pd.Timestamp("2025-01-01 03:00:00", tz=hk).to_pydatetime()
+    expected = pd.Timestamp("2025-01-01 00:00:00", tz=hk).to_pydatetime()
     assert got == expected

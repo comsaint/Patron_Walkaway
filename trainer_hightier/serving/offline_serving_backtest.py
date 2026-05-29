@@ -100,8 +100,9 @@ from trainer_hightier.serving.scorer import (
     _attach_feast_mid_slow,
     _build_staged_features,
     _incremental_bet_select_list,
+    _postprocess_cleaned_l0_bets_timestamps,
     _postprocess_incremental_bets_timestamps,
-    assert_bets_gaming_day_contract,
+    assert_bets_gaming_day_event_contract,
     split_allowlist_player_id_chunks,
 )
 from trainer_hightier.serving.snapshot_freshness import (
@@ -348,10 +349,10 @@ def fetch_bets_gaming_day_window(
             SELECT
                 {select_cols}
             FROM {cfg.source_db}.{cfg.tbet} FINAL
-            WHERE toDate(gaming_day) >= toDate(%(gday_start)s)
-              AND toDate(gaming_day) <= toDate(%(gday_end)s)
+            WHERE toDate(gaming_day_event) >= toDate(%(gday_start)s)
+              AND toDate(gaming_day_event) <= toDate(%(gday_end)s)
               AND payout_complete_dtm IS NOT NULL
-              AND gaming_day IS NOT NULL
+              AND gaming_day_event IS NOT NULL
               AND wager > 0
               AND player_id IS NOT NULL
               AND player_id != {placeholder}
@@ -369,7 +370,7 @@ def fetch_bets_gaming_day_window(
         bets = bets.head(int(max_bets))
     bets = bets.reset_index(drop=True)
     _postprocess_incremental_bets_timestamps(bets)
-    assert_bets_gaming_day_contract(bets, "offline_serving_backtest_gaming_day")
+    assert_bets_gaming_day_event_contract(bets, "offline_serving_backtest_gaming_day_event")
     return bets
 
 
@@ -414,7 +415,7 @@ def fetch_bets_payout_window(
             WHERE payout_complete_dtm >= %(ws)s
               AND payout_complete_dtm <= %(we)s
               AND payout_complete_dtm IS NOT NULL
-              AND gaming_day IS NOT NULL
+              AND gaming_day_event IS NOT NULL
               AND wager > 0
               AND player_id IS NOT NULL
               AND player_id != {placeholder}
@@ -534,7 +535,7 @@ def load_bets_from_cleaned_parquet(
                 b.bet_type,
                 b.type_of_bet,
                 b.payout_complete_dtm,
-                CAST(b.gaming_day AS TIMESTAMP) AS gaming_day,
+                CAST(b.gaming_day_event AS TIMESTAMP) AS gaming_day_event,
                 b.session_id,
                 b.player_id,
                 b.table_id,
@@ -543,8 +544,8 @@ def load_bets_from_cleaned_parquet(
                 b.payout_odds
             FROM read_parquet('{glob_path}', hive_partitioning=true) AS b
             INNER JOIN allowlist AS a ON b.player_id = a.player_id
-            WHERE CAST(b.gaming_day AS DATE) >= CAST(? AS DATE)
-              AND CAST(b.gaming_day AS DATE) <= CAST(? AS DATE)
+            WHERE CAST(b.gaming_day_event AS DATE) >= CAST(? AS DATE)
+              AND CAST(b.gaming_day_event AS DATE) <= CAST(? AS DATE)
               AND b.payout_complete_dtm IS NOT NULL
               AND b.wager > 0
             ORDER BY b.payout_complete_dtm ASC, b.bet_id ASC
@@ -628,7 +629,7 @@ _TEST_BET_COLUMNS: tuple[str, ...] = (
     "bet_type",
     "type_of_bet",
     "payout_complete_dtm",
-    "gaming_day",
+    "gaming_day_event",
     "session_id",
     "player_id",
     "table_id",
@@ -723,11 +724,16 @@ def _iter_test_batches(
 
 def _bets_frame_from_test_batch(batch: pd.DataFrame) -> pd.DataFrame:
     """Subset of test parquet columns required by scorer feature build."""
+    from trainer_hightier.utils.hk_time_semantics import pandas_ts_series_to_hk_l0_contract
+
     miss = [c for c in _TEST_BET_COLUMNS if c not in batch.columns]
     if miss:
         raise ValueError(f"test split missing bet columns {miss}")
     bets = batch[list(_TEST_BET_COLUMNS)].copy()
-    bets["__etl_insert_Dtm"] = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce")
+    bets["payout_complete_dtm"] = pandas_ts_series_to_hk_l0_contract(
+        bets["payout_complete_dtm"],
+    )
+    bets["__etl_insert_Dtm"] = bets["payout_complete_dtm"]
     if "casino_player_id" not in bets.columns:
         bets["casino_player_id"] = None
     return bets
@@ -826,7 +832,7 @@ def build_pool_from_cleaned_parquet(
                 b.bet_type,
                 b.type_of_bet,
                 b.payout_complete_dtm,
-                CAST(b.gaming_day AS TIMESTAMP) AS gaming_day,
+                CAST(b.gaming_day_event AS TIMESTAMP) AS gaming_day_event,
                 b.session_id,
                 b.player_id,
                 b.table_id,
@@ -848,7 +854,7 @@ def build_pool_from_cleaned_parquet(
             "[offline_backtest] cleaned bet pool empty; check --local-cleaned-bet path and dates"
         )
     pool["__etl_insert_Dtm"] = pool["payout_complete_dtm"]
-    _postprocess_incremental_bets_timestamps(pool)
+    _postprocess_cleaned_l0_bets_timestamps(pool)
     return attach_synthetic_etl_and_prediction_visible(pool)
 
 
@@ -1300,7 +1306,7 @@ def run_test_split_comparison(
         max_rows=max_rows,
         allow_slow_parquet_fallback=allow_slow_parquet_fallback,
     )
-    gdays = pd.read_parquet(test_parquet, columns=["gaming_day"])["gaming_day"]
+    gdays = pd.read_parquet(test_parquet, columns=["gaming_day_event"])["gaming_day_event"]
     gmin = pd.Timestamp(gdays.min()).date()
     gmax = pd.Timestamp(gdays.max()).date()
     return {

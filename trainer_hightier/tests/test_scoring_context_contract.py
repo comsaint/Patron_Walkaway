@@ -76,7 +76,7 @@ def test_per_bet_scoring_bounds_batch_invariant_for_fe_w15m() -> None:
             "canonical_id": ["c10", "c10"],
             "session_id": [1, 1],
             "table_id": [1, 1],
-            "gaming_day": pd.to_datetime([day, day]),
+            "gaming_day_event": pd.to_datetime([day, day]),
             "payout_complete_dtm": [t_early, t_late],
             "wager": [5000.0, 7000.0],
             "payout_odds": [2.0, 2.0],
@@ -90,7 +90,7 @@ def test_per_bet_scoring_bounds_batch_invariant_for_fe_w15m() -> None:
             "player_id": [10],
             "canonical_id": ["c10"],
             "payout_complete_dtm": [t_late],
-            "gaming_day": [day],
+            "gaming_day_event": [day],
         },
     )
     both = pd.DataFrame(
@@ -99,7 +99,7 @@ def test_per_bet_scoring_bounds_batch_invariant_for_fe_w15m() -> None:
             "player_id": [10, 10],
             "canonical_id": ["c10", "c10"],
             "payout_complete_dtm": [t_early, t_late],
-            "gaming_day": [day, day],
+            "gaming_day_event": [day, day],
         },
     )
     solo = compute_fe_derived_features_from_pool(

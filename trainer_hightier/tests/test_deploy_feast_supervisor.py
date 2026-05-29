@@ -42,7 +42,7 @@ def _layer(
     return FeastLayerReadiness(
         layer=layer,
         source_scope=FEAST_READINESS_SCOPE_PRODUCTION,
-        anchor_gaming_day_max=anchor,
+        anchor_gaming_day_event_max=anchor,
         generated_at=generated,
         row_count=100,
         distinct_canonical_count=100,
@@ -101,9 +101,9 @@ def test_feast_refresh_lock_nonblocking_when_held(tmp_path: Path) -> None:
 def test_feast_mid_refresh_needed_fresh(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
     now = _hk_dt(2026, 5, 20, 5)
-    from trainer_hightier.serving.snapshot_freshness import serving_gaming_day
+    from trainer_hightier.serving.snapshot_freshness import serving_gaming_day_event
 
-    serving = serving_gaming_day(now, close_hour=int(cfg.gaming_day_close_hour))
+    serving = serving_gaming_day_event(now)
     anchor = expected_mid_term_anchor(serving)
     need, _reason = deploy_main._feast_mid_refresh_needed(
         cfg,
@@ -117,9 +117,9 @@ def test_feast_mid_refresh_needed_fresh(tmp_path: Path) -> None:
 def test_feast_mid_refresh_needed_stale_before_target_hour(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
     now = _hk_dt(2026, 5, 20, 3, 59)
-    from trainer_hightier.serving.snapshot_freshness import serving_gaming_day
+    from trainer_hightier.serving.snapshot_freshness import serving_gaming_day_event
 
-    serving = serving_gaming_day(now, close_hour=int(cfg.gaming_day_close_hour))
+    serving = serving_gaming_day_event(now)
     anchor = expected_mid_term_anchor(serving) - timedelta(days=1)
     need, _reason = deploy_main._feast_mid_refresh_needed(
         cfg,
@@ -133,9 +133,9 @@ def test_feast_mid_refresh_needed_stale_before_target_hour(tmp_path: Path) -> No
 def test_feast_mid_refresh_needed_stale_after_target_hour(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
     now = _hk_dt(2026, 5, 20, 4, 1)
-    from trainer_hightier.serving.snapshot_freshness import serving_gaming_day
+    from trainer_hightier.serving.snapshot_freshness import serving_gaming_day_event
 
-    serving = serving_gaming_day(now, close_hour=int(cfg.gaming_day_close_hour))
+    serving = serving_gaming_day_event(now)
     anchor = expected_mid_term_anchor(serving) - timedelta(days=1)
     need, _reason = deploy_main._feast_mid_refresh_needed(
         cfg,
@@ -149,9 +149,9 @@ def test_feast_mid_refresh_needed_stale_after_target_hour(tmp_path: Path) -> Non
 def test_feast_mid_refresh_needed_hard_cap(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
     now = _hk_dt(2026, 5, 20, 5)
-    from trainer_hightier.serving.snapshot_freshness import serving_gaming_day
+    from trainer_hightier.serving.snapshot_freshness import serving_gaming_day_event
 
-    serving = serving_gaming_day(now, close_hour=int(cfg.gaming_day_close_hour))
+    serving = serving_gaming_day_event(now)
     anchor = expected_mid_term_anchor(serving) - timedelta(days=4)
     need, _reason = deploy_main._feast_mid_refresh_needed(
         cfg,

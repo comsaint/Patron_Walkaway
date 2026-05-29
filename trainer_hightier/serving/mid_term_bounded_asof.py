@@ -15,7 +15,7 @@ from trainer_hightier.config import (
     PRODUCTION_MID_ASOF_BACKFILL_DAYS,
 )
 
-FEAST_MID_ANCHOR_COLUMN: str = "anchor_gaming_day"
+FEAST_MID_ANCHOR_COLUMN: str = "anchor_gaming_day_event"
 
 
 def resolve_mid_asof_backfill_days(n_days: int | None = None) -> int:
@@ -57,11 +57,17 @@ def is_mid_anchor_valid(
     return 1 <= age <= n
 
 
-def mid_asof_lateral_lower_bound_sql(gday_sql: str, n_days: int | None = None) -> str:
+def mid_asof_lateral_lower_bound_sql(
+    gday_sql: str,
+    n_days: int | None = None,
+    *,
+    anchor_alias: str = "s",
+) -> str:
     """SQL fragment: anchor must be within the last N gaming days before bet day."""
     n = resolve_mid_asof_backfill_days(n_days)
+    anchor_col = f"{anchor_alias}.anchor_gaming_day_event"
     return (
-        f"AND CAST(s.anchor_gaming_day AS DATE) >= "
+        f"AND CAST({anchor_col} AS DATE) >= "
         f"CAST({gday_sql} AS DATE) - INTERVAL '{n}' DAY"
     )
 
@@ -93,7 +99,7 @@ def apply_mid_term_bounded_asof(
     df: pd.DataFrame,
     *,
     mid_primitive_columns: tuple[str, ...],
-    gaming_day_column: str = "gaming_day",
+    gaming_day_column: str = "gaming_day_event",
     anchor_column: str | None = None,
     n_days: int | None = None,
     write_audit_columns: bool = True,

@@ -217,7 +217,7 @@ def _sample_bets_two_rows() -> tuple[pd.DataFrame, pd.Timestamp]:
             "type_of_bet": ["y", "y"],
             "__etl_insert_Dtm": [etl_early, etl_late],
             "payout_complete_dtm": [etl_early, etl_late],
-            "gaming_day": pd.to_datetime(["2025-06-01", "2025-06-01"]),
+            "gaming_day_event": pd.to_datetime(["2025-06-01", "2025-06-01"]),
             "session_id": ["s1", "s2"],
             "player_id": [10, 11],
             "table_id": [1, 1],
@@ -588,7 +588,7 @@ def test_score_once_mock_e2e_entity_missing_writes_skipped_log(
             "type_of_bet": ["y"] * n_rows,
             "__etl_insert_Dtm": [etl] * n_rows,
             "payout_complete_dtm": [etl] * n_rows,
-            "gaming_day": pd.to_datetime(["2025-06-01"] * n_rows),
+            "gaming_day_event": pd.to_datetime(["2025-06-01"] * n_rows),
             "session_id": [f"s{i}" for i in range(n_rows)],
             "player_id": list(range(10, 10 + n_rows)),
             "table_id": [1] * n_rows,
@@ -656,7 +656,7 @@ def test_attach_short_term_pit_features_from_bounded_pool() -> None:
             "canonical_id": ["c10", "c10"],
             "session_id": [1, 1],
             "table_id": [1, 1],
-            "gaming_day": pd.to_datetime(["2025-06-01", "2025-06-01"]),
+            "gaming_day_event": pd.to_datetime(["2025-06-01", "2025-06-01"]),
             "payout_complete_dtm": [t0, t0 + pd.Timedelta(minutes=5)],
             "wager": [50.0, 100.0],
             "payout_odds": [2.0, 2.0],
@@ -685,7 +685,7 @@ def test_attach_short_term_pit_features_accepts_decimal_odds() -> None:
             "canonical_id": ["c10", "c10"],
             "session_id": [1, 1],
             "table_id": [1, 1],
-            "gaming_day": pd.to_datetime(["2025-06-01", "2025-06-01"]),
+            "gaming_day_event": pd.to_datetime(["2025-06-01", "2025-06-01"]),
             "payout_complete_dtm": [t0, t0 + pd.Timedelta(minutes=5)],
             "wager": [Decimal("50.0000"), Decimal("100.0000")],
             "payout_odds": [Decimal("2.0000"), Decimal("100.0000")],
@@ -868,7 +868,7 @@ def test_prediction_log_writes_mid_observability_columns(tmp_path: Path) -> None
         threshold=0.9,
         features=features,
         feature_columns=("fe__bets_cnt__w1d", "fe__payout_odds_avg_w7d"),
-        mid_term_anchor_gaming_day_max="2026-05-11",
+        mid_term_anchor_gaming_day_event_max="2026-05-11",
         mid_term_snapshot_age_days=0,
         mid_null_top_features_json=json.dumps(
             [{"feature_id": "fe__payout_odds_avg_w7d", "null_count": 1, "null_rate": 1.0}],
@@ -879,7 +879,7 @@ def test_prediction_log_writes_mid_observability_columns(tmp_path: Path) -> None
     try:
         row = conn.execute(
             """
-            SELECT mid_term_anchor_gaming_day_max, mid_term_snapshot_age_days,
+            SELECT mid_term_anchor_gaming_day_event_max, mid_term_snapshot_age_days,
                    mid_null_top_features_json
             FROM prediction_log
             """
@@ -917,7 +917,7 @@ def test_mid_observability_helpers() -> None:
     layer = FeastLayerReadiness(
         layer="mid_term",
         source_scope="production",
-        anchor_gaming_day_max=date(2026, 5, 11),
+        anchor_gaming_day_event_max=date(2026, 5, 11),
         generated_at=pd.Timestamp.now(tz=ZoneInfo("Asia/Hong_Kong")).to_pydatetime(),
         row_count=100,
         distinct_canonical_count=100,
@@ -927,7 +927,7 @@ def test_mid_observability_helpers() -> None:
         feature_columns=("fe__payout_odds_avg_w7d",),
         feast_feature_view="mid_term_daily_spike_features",
         materialize_source="test",
-        expected_anchor_gaming_day=date(2026, 5, 11),
+        expected_anchor_gaming_day_event=date(2026, 5, 11),
     )
     payload = layer.to_dict()
     assert payload["snapshot_age_days"] == 0
@@ -1246,16 +1246,16 @@ def test_feast_readiness_roundtrip_and_fresh_gate(tmp_path: Path) -> None:
     from trainer_hightier.serving.snapshot_freshness import (
         expected_mid_term_anchor,
         expected_slow_month_end_anchor,
-        serving_gaming_day,
+        serving_gaming_day_event,
     )
 
     hk = ZoneInfo("Asia/Hong_Kong")
-    serving = serving_gaming_day(close_hour=3)
+    serving = serving_gaming_day_event()
     anchor = expected_mid_term_anchor(serving)
     slow_anchor = expected_slow_month_end_anchor(serving, close_hour=3)
     report = {
         "snapshot_scope": "production",
-        "mid_term_anchor_gaming_day_max": anchor.isoformat(),
+        "mid_term_anchor_gaming_day_event_max": anchor.isoformat(),
         "feast_spike_rows": 100,
         "lookup_batch_size": 10,
         "lookup_ok_rows": 10,
@@ -1266,7 +1266,7 @@ def test_feast_readiness_roundtrip_and_fresh_gate(tmp_path: Path) -> None:
     slow_layer = FeastLayerReadiness(
         layer="slow_patron",
         source_scope="adt_allowlist",
-        anchor_gaming_day_max=slow_anchor,
+        anchor_gaming_day_event_max=slow_anchor,
         generated_at=mid_layer.generated_at,
         row_count=50,
         distinct_canonical_count=None,
@@ -1289,7 +1289,7 @@ def test_feast_readiness_roundtrip_and_fresh_gate(tmp_path: Path) -> None:
     loaded = load_feast_online_readiness(out)
     assert loaded is not None
     assert loaded.mid_term is not None
-    assert loaded.mid_term.anchor_gaming_day_max == anchor
+    assert loaded.mid_term.anchor_gaming_day_event_max == anchor
     raw = json.loads(out.read_text(encoding="utf-8"))
     assert raw["mid_term"]["snapshot_age_days"] == 0
     gate = evaluate_feast_readiness_gate(
@@ -1319,23 +1319,23 @@ def test_feast_readiness_gate_passes_data_bounded_mid_expected(tmp_path: Path) -
     )
     from trainer_hightier.serving.snapshot_freshness import (
         expected_mid_term_anchor,
-        serving_gaming_day,
+        serving_gaming_day_event,
     )
 
     data_anchor = date(2026, 5, 11)
-    serving = serving_gaming_day(close_hour=3)
+    serving = serving_gaming_day_event()
     calendar_expected = expected_mid_term_anchor(serving)
     assert calendar_expected > data_anchor
     mid_meta = {
         "snapshot_scope": "production",
         "feast_spike_rows": 498,
         "distinct_canonical_count": 498,
-        "mid_term_anchor_gaming_day_max": data_anchor.isoformat(),
-        "mid_term_expected_anchor_gaming_day": data_anchor.isoformat(),
+        "mid_term_anchor_gaming_day_event_max": data_anchor.isoformat(),
+        "mid_term_expected_anchor_gaming_day_event": data_anchor.isoformat(),
         "materialize_source": "feast_online_refresh",
     }
     mid_layer = layer_readiness_from_production_mid_meta(mid_meta)
-    assert mid_layer.expected_anchor_gaming_day == data_anchor
+    assert mid_layer.expected_anchor_gaming_day_event == data_anchor
     out = tmp_path / "feast_online_readiness.json"
     from trainer_hightier.serving.feast_readiness import FeastOnlineReadiness
 
@@ -1375,7 +1375,7 @@ def test_feast_readiness_rejects_training_scope_mid() -> None:
     mid = FeastLayerReadiness(
         layer="mid_term",
         source_scope="training_step4_only",
-        anchor_gaming_day_max=pd.Timestamp("2026-05-19").date(),
+        anchor_gaming_day_event_max=pd.Timestamp("2026-05-19").date(),
         generated_at=now,
         row_count=1,
         distinct_canonical_count=1,

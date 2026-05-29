@@ -136,8 +136,8 @@ def build_short_term_features_for_batch(
         from trainer_hightier.serving.scorer import compute_scoring_bounds_for_bets
 
         bound_cols = ["bet_id", "player_id", "canonical_id", "payout_complete_dtm"]
-        if "gaming_day" in staged.columns:
-            bound_cols.append("gaming_day")
+        if "gaming_day_event" in staged.columns:
+            bound_cols.append("gaming_day_event")
         scoring_bounds = compute_scoring_bounds_for_bets(
             staged.loc[:, bound_cols],
             cfg=serving_cfg,

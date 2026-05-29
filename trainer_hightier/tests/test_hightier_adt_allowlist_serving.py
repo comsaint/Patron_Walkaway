@@ -134,7 +134,7 @@ def test_score_once_allowlist_all_skipped_advances_watermark(monkeypatch: pytest
             "type_of_bet": ["y"],
             "__etl_insert_Dtm": [etl],
             "payout_complete_dtm": [etl],
-            "gaming_day": ["2025-06-01"],
+            "gaming_day_event": ["2025-06-01"],
             "session_id": ["s1"],
             "player_id": [999],
             "table_id": [1],

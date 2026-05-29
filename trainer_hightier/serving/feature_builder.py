@@ -247,14 +247,12 @@ def _infer_slow_patron_snap_date_column(schema_cols: Iterable[str]) -> str:
 
     cols = tuple(str(c) for c in schema_cols)
     by_lower = {c.lower(): c for c in cols}
-    for token in ("anchor_gaming_day", "gaming_day"):
-        if token in by_lower:
-            pick = by_lower[token]
-            logger.info("[feature_builder] slow patron ASOF anchor column inferred as %s", pick)
-            return pick
+    if "anchor_gaming_day_event" in by_lower:
+        pick = by_lower["anchor_gaming_day_event"]
+        logger.info("[feature_builder] slow patron ASOF anchor column inferred as %s", pick)
+        return pick
     raise ValueError(
-        "slow patron snapshot parquet must expose 'anchor_gaming_day' "
-        "(preferred) or 'gaming_day'; "
+        "slow patron snapshot parquet must expose 'anchor_gaming_day_event'; "
         f"got columns (sample): {sorted(cols)[:40]}"
     )
 
@@ -268,18 +266,14 @@ def _slow_parquet_join_mode(
 
     by_lower = {str(c).lower(): str(c) for c in schema_cols}
     feast_bet = ("bet_id" in by_lower) and ("prediction_visible_ts_cf" in by_lower)
-    canonical_asof = ("canonical_id" in by_lower) and (
-        ("anchor_gaming_day" in by_lower) or ("gaming_day" in by_lower)
-    )
-    legacy_player = ("player_id" in by_lower) and (
-        ("anchor_gaming_day" in by_lower) or ("gaming_day" in by_lower)
-    )
+    canonical_asof = ("canonical_id" in by_lower) and ("anchor_gaming_day_event" in by_lower)
+    legacy_player = ("player_id" in by_lower) and ("anchor_gaming_day_event" in by_lower)
     grain = str(prefer_grain or "").strip().lower()
     if grain == SLOW_PATRON_GRAIN_CANONICAL_ASOF:
         if not canonical_asof:
             raise ValueError(
                 "[feature_builder] manifest requests canonical_asof slow grain but parquet schema "
-                f"lacks canonical_id + anchor_gaming_day; columns={sorted(by_lower.keys())[:40]}"
+                f"lacks canonical_id + anchor_gaming_day_event; columns={sorted(by_lower.keys())[:40]}"
             )
         return "canonical_asof"
     if grain == SLOW_PATRON_GRAIN_BET:
@@ -322,7 +316,7 @@ def _slow_parquet_join_mode(
 
     raise ValueError(
         "[feature_builder] slow patron parquet unsupported schema "
-        "(need canonical_id+anchor_gaming_day, player_id+anchor, or bet_id+prediction_visible_ts_cf); "
+        "(need canonical_id+anchor_gaming_day_event, player_id+anchor, or bet_id+prediction_visible_ts_cf); "
         f"columns sample={sorted(by_lower.keys())[:40]}"
     )
 
@@ -405,8 +399,8 @@ def join_production_fe_suppliers(
         return bets
     if "canonical_id" not in bets.columns:
         raise ValueError("[feature_builder] bets missing canonical_id for production fe join")
-    if "gaming_day" not in bets.columns:
-        raise ValueError("[feature_builder] bets missing gaming_day for production fe join")
+    if "gaming_day_event" not in bets.columns:
+        raise ValueError("[feature_builder] bets missing gaming_day_event for production fe join")
     if mid_term_columns and mid_term_snapshot_parquet is None:
         raise ValueError("[feature_builder] mid_term_columns require mid_term_snapshot_parquet")
 
@@ -440,10 +434,10 @@ def join_production_fe_suppliers(
             if not sp.is_file():
                 raise FileNotFoundError(f"fe_short_term parquet missing: {sp}")
             esc = str(sp).replace("'", "''")
-            short_select = ",\n  ".join(f's."{c}" AS "{c}"' for c in short_term_columns)
+            short_select = ",\n  ".join(f'st."{c}" AS "{c}"' for c in short_term_columns)
             short_join = f"""
-LEFT JOIN read_parquet('{esc}') AS s
-  ON TRY_CAST(b.bet_id AS DOUBLE) = s.bet_id"""
+LEFT JOIN read_parquet('{esc}') AS st
+  ON TRY_CAST(b.bet_id AS DOUBLE) = st.bet_id"""
 
         mid_cte = ""
         mid_select = ""
@@ -452,24 +446,32 @@ LEFT JOIN read_parquet('{esc}') AS s
             mp = Path(mid_term_snapshot_parquet).resolve()
             if not mp.is_file():
                 raise FileNotFoundError(f"mid_term snapshot parquet missing: {mp}")
+            schema_names = frozenset(pq.read_schema(mp).names)
+            if "anchor_gaming_day_event" not in schema_names:
+                raise ValueError(
+                    "mid_term snapshot missing anchor_gaming_day_event; "
+                    f"rebuild after gaming_day_event migration (columns={sorted(schema_names)[:12]}...)"
+                )
             mesc = str(mp).replace("'", "''")
             staging_aliases = _mid_term_staging_aliases(mid_term_columns)
             staging_select = ",\n    ".join(_MID_TERM_STAGING_SQL[a] for a in staging_aliases)
             if staging_select:
                 staging_select = f",\n    {staging_select}"
             backfill_n = resolve_mid_asof_backfill_days(PRODUCTION_MID_ASOF_BACKFILL_DAYS)
-            lateral_lb = mid_asof_lateral_lower_bound_sql("bw._gday", n_days=backfill_n)
+            lateral_lb = mid_asof_lateral_lower_bound_sql(
+                "bw._gday", n_days=backfill_n, anchor_alias="mid_row"
+            )
             if include_audit_columns:
                 missing_expr = mid_snapshot_missing_flag_sql(
-                    "lst.anchor_gaming_day",
+                    "lst.anchor_gaming_day_event",
                     "bw._gday",
                     n_days=backfill_n,
                 )
                 audit_mid_select = f""",
-    CAST(lst.anchor_gaming_day AS DATE) AS {MID_TERM_ANCHOR_AUDIT_COLUMN},
+    CAST(lst.anchor_gaming_day_event AS DATE) AS {MID_TERM_ANCHOR_AUDIT_COLUMN},
     CASE
-      WHEN lst.anchor_gaming_day IS NULL OR bw._gday IS NULL THEN CAST(NULL AS BIGINT)
-      ELSE DATE_DIFF('day', CAST(lst.anchor_gaming_day AS DATE), bw._gday)
+      WHEN lst.anchor_gaming_day_event IS NULL OR bw._gday IS NULL THEN CAST(NULL AS BIGINT)
+      ELSE DATE_DIFF('day', CAST(lst.anchor_gaming_day_event AS DATE), bw._gday)
     END AS {MID_TERM_SNAPSHOT_AGE_AUDIT_COLUMN},
     {missing_expr} AS {MID_TERM_SNAPSHOT_MISSING_AUDIT_COLUMN}"""
             else:
@@ -482,7 +484,7 @@ b_with_day AS (
   SELECT
     b.*,
     TRIM(CAST(b.canonical_id AS VARCHAR)) AS _cid,
-    CAST(b.gaming_day AS DATE) AS _gday
+    CAST(b.gaming_day_event AS DATE) AS _gday
   FROM bets_in AS b
 ),
 mid_asof AS (
@@ -491,11 +493,11 @@ mid_asof AS (
   FROM b_with_day AS bw
   LEFT JOIN LATERAL (
     SELECT *
-    FROM mid_snap AS s
-    WHERE TRIM(CAST(s.canonical_id AS VARCHAR)) = bw._cid
-      AND CAST(s.anchor_gaming_day AS DATE) < bw._gday
+    FROM mid_snap AS mid_row
+    WHERE TRIM(CAST(mid_row.canonical_id AS VARCHAR)) = bw._cid
+      AND CAST(mid_row.anchor_gaming_day_event AS DATE) < bw._gday
       {lateral_lb}
-    ORDER BY CAST(s.anchor_gaming_day AS DATE) DESC
+    ORDER BY CAST(mid_row.anchor_gaming_day_event AS DATE) DESC
     LIMIT 1
   ) AS lst ON TRUE
 )"""
@@ -621,8 +623,8 @@ def attach_short_term_pit_features(
     from trainer_hightier.serving.scorer import compute_scoring_bounds_for_bets
 
     bound_cols = ["bet_id", "player_id", "canonical_id", "payout_complete_dtm"]
-    if "gaming_day" in staged.columns:
-        bound_cols.append("gaming_day")
+    if "gaming_day_event" in staged.columns:
+        bound_cols.append("gaming_day_event")
     scoring_bounds = compute_scoring_bounds_for_bets(
         staged.loc[:, bound_cols],
         cfg=default_hightier_serving_config(),
@@ -716,12 +718,12 @@ def _join_slow_patron_canonical_asof_snapshot(
     *,
     key_days: str | None = None,
 ) -> pd.DataFrame:
-    """ASOF-join slow patron features on ``canonical_id`` × ``gaming_day``."""
+    """ASOF-join slow patron features on ``canonical_id`` × ``gaming_day_event``."""
 
     if "canonical_id" not in bets.columns:
         raise ValueError("bets must contain canonical_id for canonical ASOF slow join")
-    if "gaming_day" not in bets.columns:
-        raise ValueError("bets must contain gaming_day for canonical ASOF slow join")
+    if "gaming_day_event" not in bets.columns:
+        raise ValueError("bets must contain gaming_day_event for canonical ASOF slow join")
     schema_cols = list(pq.read_schema(slow_parquet).names)
     by_lower = {str(c).lower(): str(c) for c in schema_cols}
     exp = key_days.strip() if key_days is not None and str(key_days).strip() else ""
@@ -740,7 +742,7 @@ WITH slow AS (
   SELECT * FROM read_parquet('{esc}')
 ),
 b AS (
-  SELECT *, CAST(gaming_day AS DATE) AS bet_gday FROM bets_in
+  SELECT *, CAST(gaming_day_event AS DATE) AS bet_gday FROM bets_in
 )
 SELECT
   b.*,
@@ -807,8 +809,8 @@ def join_slow_patron_snapshot(
     else:
         anchor_sql_col = _infer_slow_patron_snap_date_column(schema_cols)
 
-    if "gaming_day" not in bets.columns:
-        raise ValueError("bets must contain gaming_day for slow patron join")
+    if "gaming_day_event" not in bets.columns:
+        raise ValueError("bets must contain gaming_day_event for slow patron join")
     con = duckdb.connect(database=":memory:")
     try:
         con.register("bets_in", bets)
@@ -818,7 +820,7 @@ WITH slow AS (
   SELECT * FROM read_parquet('{esc}')
 ),
 b AS (
-  SELECT *, CAST(gaming_day AS DATE) AS bet_gday FROM bets_in
+  SELECT *, CAST(gaming_day_event AS DATE) AS bet_gday FROM bets_in
 )
 SELECT
   b.*,

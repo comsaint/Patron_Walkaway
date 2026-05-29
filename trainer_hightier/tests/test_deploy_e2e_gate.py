@@ -264,7 +264,7 @@ def test_startup_refresh_registry_missing_runs_apply_before_materialize(
     bet = tmp_path / "bet"
     bet.mkdir()
     sess = tmp_path / "session.parquet"
-    pd.DataFrame({"player_id": [1], "gaming_day": ["2026-05-01"]}).to_parquet(sess, index=False)
+    pd.DataFrame({"player_id": [1], "gaming_day_event": ["2026-05-01"]}).to_parquet(sess, index=False)
 
     call_order: list[str] = []
 
@@ -416,7 +416,7 @@ def test_run_cli_provisions_venv_and_reexecs_gate(
     bet = tmp_path / "bet"
     bet.mkdir()
     sess = tmp_path / "session.parquet"
-    pd.DataFrame({"player_id": [1], "gaming_day": ["2026-05-01"]}).to_parquet(sess, index=False)
+    pd.DataFrame({"player_id": [1], "gaming_day_event": ["2026-05-01"]}).to_parquet(sess, index=False)
     (deploy / "requirements.txt").write_text("trainer-hightier\n", encoding="utf-8")
 
     reexec_argv: list[str] = []

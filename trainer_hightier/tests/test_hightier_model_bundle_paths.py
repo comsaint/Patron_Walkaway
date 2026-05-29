@@ -17,7 +17,7 @@ from trainer_hightier.core.model_bundle_paths import (
     resolve_model_bundle_dir,
     resolve_model_bundle_for_reports,
 )
-from trainer_hightier.config import DuckDbRuntimeConfig, Step5TrainConfig
+from trainer_hightier.config import DuckDbRuntimeConfig, Step5TrainConfig, Step6ParityConfig
 from trainer_hightier.trainer import HighTierTrainArgs, run_training
 
 
@@ -68,6 +68,7 @@ def test_run_training_success_writes_latest_manifest_resolve(
         build_training_dataset=False,
         duckdb_runtime=DuckDbRuntimeConfig(),
         step5=Step5TrainConfig(run_step5=True),
+        step6=Step6ParityConfig(run_step6=False),
     )
     with patch(
         "trainer_hightier.trainer._mlflow_hightier_run_name",

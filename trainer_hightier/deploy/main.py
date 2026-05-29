@@ -479,18 +479,20 @@ def _mid_term_refresh_needed(cfg: HightierServingConfig) -> tuple[bool, str]:
     from trainer_hightier.serving.snapshot_freshness import (
         evaluate_mid_term_freshness,
         read_mid_term_anchor_max,
+        serving_gaming_day_event,
     )
 
     man = read_active_manifest()
     if man is None:
         return True, "active manifest missing"
     anchor = read_mid_term_anchor_max(man.mid_term_snapshot_parquet, man.raw)
+    now_hk = datetime.now(ZoneInfo(HK_TZ))
+    serving_day = serving_gaming_day_event(now_hk)
     status = evaluate_mid_term_freshness(
         anchor_max=anchor,
+        serving_day=serving_day,
         hard_cap_days=int(cfg.mid_term_stale_hard_cap_days),
-        close_hour=int(cfg.gaming_day_close_hour),
     )
-    now_hk = datetime.now(ZoneInfo(HK_TZ))
     after_refresh_target = int(now_hk.hour) >= int(cfg.mid_term_refresh_target_hour)
     if status.status in ("missing", "hard_cap_breached"):
         return True, status.message
@@ -926,11 +928,11 @@ def _feast_mid_refresh_needed(
         return True, "mid readiness missing"
     if readiness.mid_term is None:
         return True, "mid_term layer missing from readiness"
-    anchor = readiness.mid_term.anchor_gaming_day_max
+    anchor = readiness.mid_term.anchor_gaming_day_event_max
     now_hk = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(HK_TZ))
-    from trainer_hightier.serving.snapshot_freshness import serving_gaming_day
+    from trainer_hightier.serving.snapshot_freshness import serving_gaming_day_event
 
-    serving_day = serving_gaming_day(now_hk, close_hour=int(cfg.gaming_day_close_hour))
+    serving_day = serving_gaming_day_event(now_hk)
     status = evaluate_mid_term_freshness(
         anchor_max=anchor,
         serving_day=serving_day,
@@ -966,11 +968,11 @@ def _feast_slow_refresh_needed(
         return True, "slow readiness missing"
     if readiness.slow_patron is None:
         return True, "slow_patron layer missing from readiness"
-    anchor = readiness.slow_patron.anchor_gaming_day_max
+    anchor = readiness.slow_patron.anchor_gaming_day_event_max
     now_hk = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(HK_TZ))
-    from trainer_hightier.serving.snapshot_freshness import serving_gaming_day
+    from trainer_hightier.serving.snapshot_freshness import serving_gaming_day_event
 
-    serving_day = serving_gaming_day(now_hk, close_hour=int(cfg.gaming_day_close_hour))
+    serving_day = serving_gaming_day_event(now_hk)
     status = evaluate_slow_freshness(
         anchor_max=anchor,
         serving_day=serving_day,

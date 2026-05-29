@@ -435,7 +435,7 @@ def feast_registry_feature_view_columns(feast_repo: Path, view_name: str) -> fro
 
 
 def mid_anchor_column_in_feast_registry(feast_repo: Path) -> bool:
-    """True when ``anchor_gaming_day`` is registered on the mid-term spike feature view."""
+    """True when ``anchor_gaming_day_event`` is registered on the mid-term spike feature view."""
     try:
         cols = feast_registry_feature_view_columns(feast_repo, MID_SPIKE_FEATURE_VIEW_NAME)
     except Exception:

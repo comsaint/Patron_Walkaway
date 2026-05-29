@@ -71,7 +71,7 @@ def test_slow_parquet_grain_canonical_vs_bet(tmp_path: Path) -> None:
     pd.DataFrame(
         {
             "canonical_id": ["c1"],
-            "anchor_gaming_day": [date(2026, 4, 30)],
+            "anchor_gaming_day_event": [date(2026, 4, 30)],
             "patron__theo_win_sum__w180d_m1snap": [1.0],
             "patron__gaming_days_cnt__w180d_m1snap": [2],
             "patron__adt__w180d_m1snap": [0.5],
@@ -97,7 +97,7 @@ def test_attach_canonical_slow_snap_for_entities(tmp_path: Path) -> None:
     pd.DataFrame(
         {
             "canonical_id": ["c1"],
-            "anchor_gaming_day": [date(2026, 4, 30)],
+            "anchor_gaming_day_event": [date(2026, 4, 30)],
             "patron__theo_win_sum__w180d_m1snap": [42.0],
             "patron__gaming_days_cnt__w180d_m1snap": [3],
             "patron__adt__w180d_m1snap": [14.0],

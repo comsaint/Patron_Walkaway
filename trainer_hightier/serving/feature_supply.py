@@ -698,7 +698,7 @@ def load_frozen_registry_for_bundle(model_bundle_dir: Path) -> CandidateRegistry
 _SPIKE_MID_TERM_COLUMN_SET: frozenset[str] = frozenset(PRODUCTION_MID_TERM_FEATURE_COLUMNS)
 _SPIKE_SLOW_COLUMN_SET: frozenset[str] = frozenset(PRODUCTION_LONG_TERM_FEATURE_COLUMNS)
 _MATERIALIZER_MID_COLUMNS: frozenset[str] = frozenset(
-    c for c in MID_TERM_SNAPSHOT_OUTPUT_COLUMNS if c not in ("canonical_id", "anchor_gaming_day")
+    c for c in MID_TERM_SNAPSHOT_OUTPUT_COLUMNS if c not in ("canonical_id", "anchor_gaming_day_event")
 )
 
 

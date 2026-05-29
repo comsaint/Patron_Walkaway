@@ -329,7 +329,7 @@ def ml_predictions():
         "is_rated_obs",
         "features_json",
         "fe_features_missing",
-        "mid_term_anchor_gaming_day_max",
+        "mid_term_anchor_gaming_day_event_max",
         "mid_term_snapshot_age_days",
         "mid_null_top_features_json",
     ]

@@ -92,10 +92,10 @@ def gaming_day_epochs_from_test_parquet(
 ) -> list[date]:
     """Sorted unique ``gaming_day`` dates in ``test_parquet`` for one calendar month."""
     cols = parquet_columns(test_parquet)
-    if "gaming_day" not in cols:
+    if "gaming_day_event" not in cols:
         return []
-    frame = read_parquet_sample(test_parquet, ["gaming_day"], max_rows=max_rows)
-    ts = parse_gaming_day_dates(frame["gaming_day"]).dropna()
+    frame = read_parquet_sample(test_parquet, ["gaming_day_event"], max_rows=max_rows)
+    ts = parse_gaming_day_dates(frame["gaming_day_event"]).dropna()
     epochs = [ts.loc[i].date() for i in ts.index]
     return gaming_day_epochs_in_calendar_month(epochs, year=year, month=month)
 
@@ -179,7 +179,7 @@ def read_parquet_sample(path: Path, columns: list[str], max_rows: int) -> pd.Dat
 def infer_anchor_column(columns: list[str]) -> str | None:
     """Infer the slow monthly anchor column from a Parquet schema."""
     by_lower = {c.lower(): c for c in columns}
-    for name in ("anchor_gaming_day", "anchor_day", "snapshot_gaming_day"):
+    for name in ("anchor_gaming_day_event", "anchor_day", "snapshot_gaming_day"):
         if name in by_lower:
             return by_lower[name]
     return None
@@ -278,7 +278,7 @@ def validate_slow_artifact(
     if "canonical_id" not in cols:
         result["issues"].append("slow artifact is not canonical-grain: missing canonical_id")
     if anchor_col is None:
-        result["issues"].append("slow artifact is not anchor-grain: missing anchor_gaming_day")
+        result["issues"].append("slow artifact is not anchor-grain: missing anchor_gaming_day_event")
     if "bet_id" in cols and ("canonical_id" not in cols or anchor_col is None):
         result["issues"].append("slow artifact appears bet-grain; it is not production-safe")
     if anchor_col is not None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Final
 
-FEAST_MID_ANCHOR_COLUMN: Final[str] = "anchor_gaming_day"
+FEAST_MID_ANCHOR_COLUMN: Final[str] = "anchor_gaming_day_event"
 
 PRODUCTION_MID_TERM_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     "fe__bets_cnt__w1d",

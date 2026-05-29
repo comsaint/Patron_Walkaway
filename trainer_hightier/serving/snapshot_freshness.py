@@ -102,16 +102,12 @@ def _parse_iso_datetime(value: Any) -> datetime | None:
     return ts.to_pydatetime()
 
 
-def serving_gaming_day(now: datetime | None = None, *, close_hour: int = 3) -> date:
-    """Return current serving gaming day (closes at ``close_hour`` local wall clock)."""
+def serving_gaming_day_event(now: datetime | None = None) -> date:
+    """Return current serving gaming day event (HK calendar date)."""
     ts = now or datetime.now(timezone.utc)
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
-    local = ts.astimezone()
-    day = local.date()
-    if local.hour < close_hour:
-        day = day - timedelta(days=1)
-    return day
+    return ts.astimezone(ZoneInfo(HK_TZ)).date()
 
 
 def expected_mid_term_anchor(serving_day: date) -> date:
@@ -128,13 +124,13 @@ def serving_day_for_eval_gaming_day_end(eval_gaming_day_end: date) -> date:
     return eval_gaming_day_end
 
 
-def mid_feast_event_timestamp_for_anchor(anchor_gaming_day: date) -> datetime:
+def mid_feast_event_timestamp_for_anchor(anchor_gaming_day_event: date) -> datetime:
     """Feast ``event_timestamp`` for mid-term online lookup (end of anchor gaming day, HK).
 
     Must match ``write_mid_feast_parquet`` in ``feast_online_refresh``.
     """
     zone = ZoneInfo(HK_TZ)
-    day_start = datetime.combine(anchor_gaming_day, datetime.min.time(), tzinfo=zone)
+    day_start = datetime.combine(anchor_gaming_day_event, datetime.min.time(), tzinfo=zone)
     return day_start + timedelta(days=1) - timedelta(seconds=1)
 
 
@@ -201,7 +197,8 @@ def evaluate_mid_term_freshness(
     expected_anchor: date | None = None,
 ) -> LayerFreshnessResult:
     """Evaluate mid-term freshness against expected ``D - 1`` anchor."""
-    day = serving_day or serving_gaming_day(close_hour=close_hour)
+    del close_hour  # legacy param retained for call-site compatibility
+    day = serving_day or serving_gaming_day_event()
     expected = expected_anchor or expected_mid_term_anchor(day)
     stale = _staleness_days(anchor_max, expected)
     base = _classify_staleness(
@@ -232,7 +229,8 @@ def evaluate_slow_freshness(
     del monthly_grace_days, hard_cap_days  # legacy params retained for call-site compatibility
     from trainer_hightier.utils.slow_month_turn import resolve_slow_month_turn_context
 
-    day = serving_day or serving_gaming_day(close_hour=close_hour)
+    del close_hour  # legacy param retained for call-site compatibility
+    day = serving_day or serving_gaming_day_event()
     ctx = resolve_slow_month_turn_context(day, month_epochs=month_epochs)
     if anchor_max is None:
         return LayerFreshnessResult(
@@ -345,7 +343,7 @@ def validate_mid_term_artifact(
             message=f"mid_term grain={grain!r} expected {expected_grain!r}",
         )
     cols, n_rows = _read_parquet_columns(p)
-    required_keys = ("canonical_id", "anchor_gaming_day")
+    required_keys = ("canonical_id", "anchor_gaming_day_event")
     missing_keys = [c for c in required_keys if c not in cols]
     if missing_keys:
         return SnapshotValidationResult(
@@ -390,7 +388,7 @@ def validate_mid_term_artifact(
             ok=False,
             hard_failure=True,
             status="invalid_grain",
-            message="mid_term duplicate (canonical_id, anchor_gaming_day)",
+            message="mid_term duplicate (canonical_id, anchor_gaming_day_event)",
             row_count=n_rows,
         )
     return SnapshotValidationResult(
@@ -541,7 +539,7 @@ def read_mid_term_anchor_max(path: Path | None, manifest: dict[str, Any] | None)
     if anchor is not None:
         return anchor
     if path is not None and Path(path).is_file():
-        return _max_anchor_from_parquet(Path(path), "anchor_gaming_day")
+        return _max_anchor_from_parquet(Path(path), "anchor_gaming_day_event")
     return None
 
 
@@ -552,7 +550,7 @@ def read_slow_anchor_max(path: Path | None, manifest: dict[str, Any] | None) -> 
     if anchor is not None:
         return anchor
     if path is not None and Path(path).is_file():
-        for col in ("anchor_gaming_day", "gaming_day", "asof_gaming_day"):
+        for col in ("anchor_gaming_day_event", "gaming_day_event", "asof_gaming_day"):
             try:
                 cols, _ = _read_parquet_columns(Path(path))
             except (OSError, ValueError):
@@ -564,7 +562,8 @@ def read_slow_anchor_max(path: Path | None, manifest: dict[str, Any] | None) -> 
 
 def expected_slow_month_end_anchor(serving_day: date | None = None, *, close_hour: int = 3) -> date:
     """Expected slow target anchor (previous calendar month-end) for ``serving_day``."""
-    day = serving_day or serving_gaming_day(close_hour=close_hour)
+    del close_hour  # legacy param retained for call-site compatibility
+    day = serving_day or serving_gaming_day_event()
     return date(day.year, day.month, 1) - timedelta(days=1)
 
 

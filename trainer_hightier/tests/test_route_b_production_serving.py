@@ -76,7 +76,7 @@ def test_shadow_validate_route_b_non_null(tmp_path: Path) -> None:
     pd.DataFrame(
         {
             "canonical_id": ["c1"],
-            "anchor_gaming_day": pd.to_datetime(["2025-01-01"]),
+            "anchor_gaming_day_event": pd.to_datetime(["2025-01-01"]),
             "patron__theo_win_sum__w180d_m1snap": [100.0],
             "patron__gaming_days_cnt__w180d_m1snap": [10],
             "patron__adt__w180d_m1snap": [10.0],
@@ -87,7 +87,7 @@ def test_shadow_validate_route_b_non_null(tmp_path: Path) -> None:
         {
             "bet_id": [1.0],
             "player_id": [42],
-            "gaming_day": pd.to_datetime(["2025-06-01"]),
+            "gaming_day_event": pd.to_datetime(["2025-06-01"]),
         }
     )
     cmap = tmp_path / "map.parquet"

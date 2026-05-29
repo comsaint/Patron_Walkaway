@@ -54,7 +54,7 @@ from trainer_hightier.serving.production_materialize import (
 )
 from trainer_hightier.serving.production_source_mirror import ensure_production_mirrors_ready
 from trainer_hightier.serving.snapshot_freshness import (
-    serving_gaming_day,
+    serving_gaming_day_event,
     validate_mid_term_artifact,
     validate_slow_artifact,
 )
@@ -131,7 +131,7 @@ def run_mid_term_refresh(
         if not al_src.is_file():
             raise FileNotFoundError(f"adt allowlist missing: {al_src}")
 
-        serving_day = serving_gaming_day(close_hour=int(cfg.gaming_day_close_hour))
+        serving_day = serving_gaming_day_event()
         anchor_end = serving_day - timedelta(days=1)
         anchor_start = anchor_end - timedelta(days=1) if bootstrap else anchor_end
 
@@ -141,8 +141,8 @@ def run_mid_term_refresh(
             canonical_mapping_parquet=cmap,
             adt_allowlist_parquet=al_src,
             out_parquet=staging,
-            anchor_gaming_day_start=anchor_start,
-            anchor_gaming_day_end=anchor_end,
+            anchor_gaming_day_event_start=anchor_start,
+            anchor_gaming_day_event_end=anchor_end,
         )
         val = validate_mid_term_artifact(staging)
         if val.hard_failure:
@@ -160,7 +160,7 @@ def run_mid_term_refresh(
                 MANIFEST_KEY_MID_TERM_COVERAGE_END: cov_iso,
                 "coverage_end_exclusive": cov_iso,
                 MANIFEST_KEY_MID_TERM_GENERATED_AT: cov_iso,
-                MANIFEST_KEY_MID_TERM_ANCHOR_MAX: mid_meta.get("mid_term_anchor_gaming_day_max"),
+                MANIFEST_KEY_MID_TERM_ANCHOR_MAX: mid_meta.get("mid_term_anchor_gaming_day_event_max"),
                 MANIFEST_KEY_MID_TERM_STALE_HARD_CAP_DAYS: int(cfg.mid_term_stale_hard_cap_days),
                 "fe_derived_source_kind": FE_DERIVED_SOURCE_KIND_PRODUCTION,
             },
@@ -205,7 +205,7 @@ def run_slow_refresh(
 
         anchor_max = read_slow_anchor_max(staging, None)
         if anchor_max is not None:
-            slow_meta["anchor_gaming_day_max"] = anchor_max.isoformat()
+            slow_meta["anchor_gaming_day_event_max"] = anchor_max.isoformat()
         val = validate_slow_artifact(staging, manifest_grain=SLOW_PATRON_GRAIN_CANONICAL_ASOF)
         if val.hard_failure:
             raise ValueError(f"slow staging validation failed: {val.message}")
@@ -220,7 +220,7 @@ def run_slow_refresh(
                 "slow_patron_parquet": str(staging.resolve()),
                 "slow_patron_grain": SLOW_PATRON_GRAIN_CANONICAL_ASOF,
                 MANIFEST_KEY_SLOW_GENERATED_AT: cov_iso,
-                MANIFEST_KEY_SLOW_ANCHOR_MAX: slow_meta.get("anchor_gaming_day_max"),
+                MANIFEST_KEY_SLOW_ANCHOR_MAX: slow_meta.get("anchor_gaming_day_event_max"),
                 MANIFEST_KEY_SLOW_MONTHLY_GRACE_DAYS: int(cfg.slow_monthly_grace_days),
                 MANIFEST_KEY_SLOW_STALE_HARD_CAP_DAYS: int(cfg.slow_stale_hard_cap_days),
             },
@@ -363,7 +363,7 @@ def run_snapshot_updater(
                 from trainer_hightier.serving.production_materialize import default_production_cleaned_bet_path
 
                 bet_src = default_production_cleaned_bet_path()
-            serving_day = serving_gaming_day(close_hour=int(cfg.gaming_day_close_hour))
+            serving_day = serving_gaming_day_event()
             anchor_end = serving_day - timedelta(days=1)
             mid_staged = manifest_dir / f"mid_term_daily_{run_id}.parquet"
             mid_staged, mid_meta = materialize_production_mid_term_daily_snapshot(
@@ -371,8 +371,8 @@ def run_snapshot_updater(
                 canonical_mapping_parquet=cmap,
                 adt_allowlist_parquet=al_src,
                 out_parquet=mid_staged,
-                anchor_gaming_day_start=anchor_end - timedelta(days=1),
-                anchor_gaming_day_end=anchor_end,
+                anchor_gaming_day_event_start=anchor_end - timedelta(days=1),
+                anchor_gaming_day_event_end=anchor_end,
             )
             mid_val = validate_mid_term_artifact(mid_staged)
             if mid_val.hard_failure:
@@ -424,7 +424,7 @@ def run_snapshot_updater(
             payload[MANIFEST_KEY_SLOW_STALE_HARD_CAP_DAYS] = int(cfg.slow_stale_hard_cap_days)
             payload["slow_patron_grain"] = slow_grain or SLOW_PATRON_GRAIN_CANONICAL_ASOF
             payload[MANIFEST_KEY_MID_TERM_GENERATED_AT] = cov_iso if mid_staged is not None else None
-            payload[MANIFEST_KEY_MID_TERM_ANCHOR_MAX] = mid_meta.get("mid_term_anchor_gaming_day_max")
+            payload[MANIFEST_KEY_MID_TERM_ANCHOR_MAX] = mid_meta.get("mid_term_anchor_gaming_day_event_max")
             if fe_meta:
                 payload["fe_derived_coverage_start"] = fe_meta.get("coverage_start")
                 payload["fe_derived_row_count"] = fe_meta.get("row_count")
@@ -432,7 +432,7 @@ def run_snapshot_updater(
             if slow_meta:
                 payload["slow_patron_row_count"] = slow_meta.get("row_count")
                 payload[MANIFEST_KEY_SLOW_GENERATED_AT] = cov_iso
-                payload[MANIFEST_KEY_SLOW_ANCHOR_MAX] = slow_meta.get("anchor_gaming_day_max")
+                payload[MANIFEST_KEY_SLOW_ANCHOR_MAX] = slow_meta.get("anchor_gaming_day_event_max")
 
         publish_manifest_atomic(payload)
         upsert_adt_allowlist_meta(

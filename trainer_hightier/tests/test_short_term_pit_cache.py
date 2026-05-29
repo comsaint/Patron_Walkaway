@@ -38,7 +38,7 @@ def _write_cleaned_bet_hive(root: Path, rows: list[dict[str, object]]) -> None:
     enriched: list[dict[str, object]] = []
     for row in rows:
         item = dict(row)
-        item.setdefault("gaming_day", day)
+        item.setdefault("gaming_day_event", day)
         item.setdefault("gaming_month", "202406")
         item.setdefault("gaming_day_key", "2024-06-01")
         enriched.append(item)
@@ -54,7 +54,7 @@ def _minimal_training_rows() -> list[dict[str, object]]:
     base = {
         "session_id": 1,
         "table_id": 1,
-        "gaming_day": day,
+        "gaming_day_event": day,
         "bet_type": "PLAYER",
         "type_of_bet": "MAIN",
     }
@@ -93,7 +93,7 @@ def _minimal_cleaned_rows() -> list[dict[str, object]]:
             "player_id": 10,
             "session_id": 1,
             "table_id": 1,
-            "gaming_day": day,
+            "gaming_day_event": day,
             "payout_complete_dtm": t_prev,
             "wager": 80.0,
             "is_back_bet": 0,
@@ -224,7 +224,7 @@ def test_short_term_pit_cache_universe_change_misses_shard(short_cache_fixture: 
             "player_id": 10,
             "session_id": 1,
             "table_id": 1,
-            "gaming_day": rows[0]["gaming_day"],
+            "gaming_day_event": rows[0]["gaming_day_event"],
             "payout_complete_dtm": pd.Timestamp("2024-06-01 07:30:00", tz="UTC"),
             "wager": 10.0,
             "is_back_bet": 0,

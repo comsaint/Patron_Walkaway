@@ -29,7 +29,7 @@ def _fake_bets() -> pd.DataFrame:
         {
             "bet_id": [101.0, 102.0],
             "player_id": [1, 1],
-            "gaming_day": pd.to_datetime(["2026-05-18", "2026-05-18"]),
+            "gaming_day_event": pd.to_datetime(["2026-05-18", "2026-05-18"]),
             "payout_complete_dtm": pd.to_datetime(
                 ["2026-05-18T10:00:00+00:00", "2026-05-18T11:00:00+00:00"],
                 utc=True,
@@ -83,6 +83,24 @@ def _deploy_layout(tmp_path: Path) -> Path:
     (deploy / "deploy_bundle_paths.json").write_text(json.dumps(rel), encoding="utf-8")
     shutil.copytree(bundle_dir, deploy / bundle_dir.name)
     return deploy
+
+
+def _write_test_mid_snapshot(path: Path, *, anchor: date = date(2026, 5, 17)) -> Path:
+    """Minimal mid-term snapshot with post-migration ``anchor_gaming_day_event`` schema."""
+    from trainer_hightier.feature_experiment.materialize_mid_term_daily_snapshot import (
+        MID_TERM_SNAPSHOT_OUTPUT_COLUMNS,
+    )
+
+    row: dict[str, list] = {
+        "canonical_id": ["c1"],
+        "anchor_gaming_day_event": [anchor.isoformat()],
+    }
+    for col in MID_TERM_SNAPSHOT_OUTPUT_COLUMNS:
+        if col.startswith("fe__"):
+            row[col] = [1.0]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(row).to_parquet(path, index=False)
+    return path
 
 
 def test_offline_pipeline_mock_feast(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -188,6 +206,11 @@ def test_run_offline_serving_backtest_monkeypatched(
             bet__payout_odds_avg__w1h=1.5,
         ),
     )
+    mid_snap = _write_test_mid_snapshot(tmp_path / "mid_term_daily_snapshot.parquet")
+    monkeypatch.setattr(
+        "trainer_hightier.serving.offline_serving_backtest._resolve_training_mid_snapshot_path",
+        lambda **k: mid_snap,
+    )
 
     report = run_offline_serving_backtest(
         bundle_dir=deploy,
@@ -212,3 +235,30 @@ def test_resolve_hot_pool_player_ids_expands_canonical_aliases(tmp_path: Path) -
     ).to_parquet(mapping, index=False)
     bets = pd.DataFrame({"player_id": [2]})
     assert resolve_hot_pool_player_ids(bets, mapping, expand_canonical_aliases=True) == [1, 2]
+
+
+def test_bets_frame_from_test_batch_normalizes_pcd_to_hk(tmp_path: Path) -> None:
+    from trainer_hightier.serving.offline_serving_backtest import _bets_frame_from_test_batch
+
+    batch = pd.DataFrame(
+        {
+            "bet_id": [1.0],
+            "is_back_bet": [False],
+            "bet_type": ["S"],
+            "type_of_bet": ["S"],
+            "payout_complete_dtm": [pd.Timestamp("2026-03-15 17:09:47", tz="UTC")],
+            "gaming_day_event": [pd.Timestamp("2026-03-16")],
+            "session_id": [1],
+            "player_id": [1],
+            "table_id": [1],
+            "position_idx": [1],
+            "wager": [10.0],
+            "casino_win": [0.0],
+            "payout_odds": [1.0],
+            "status": ["S"],
+        },
+    )
+    bets = _bets_frame_from_test_batch(batch)
+    pcd = bets.iloc[0]["payout_complete_dtm"]
+    assert str(pcd.tzinfo) == "Asia/Hong_Kong"
+    assert pcd.hour == 1 and pcd.day == 16

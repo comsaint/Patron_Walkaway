@@ -208,7 +208,7 @@ def _write_mid_term_production_fixture(path: Path, *, anchor: date | None = None
     anchor_day = anchor or expected_mid_term_anchor(date.today())
     row: dict[str, object] = {
         "canonical_id": ["c1"],
-        "anchor_gaming_day": [anchor_day.isoformat()],
+        "anchor_gaming_day_event": [anchor_day.isoformat()],
     }
     for col in MID_TERM_SNAPSHOT_OUTPUT_COLUMNS:
         if col.startswith("fe__"):
@@ -245,16 +245,16 @@ def _write_slow_bet_fixture(path: Path, *, include_registry_slow_feat: bool = Tr
 def _write_slow_player_fixture(
     path: Path,
     *,
-    anchor_kind: str = "gaming_day",
+    anchor_kind: str = "gaming_day_event",
     include_registry_slow_feat: bool = True,
 ) -> None:
     """Legacy player-grain snapshot for scorer ASOF path (tests / older parquet)."""
 
     data: dict[str, list[float | int]] = {"player_id": [1, 2]}
-    if anchor_kind == "gaming_day":
-        data["gaming_day"] = [20250101, 20250201]
-    elif anchor_kind == "anchor_gaming_day":
-        data["anchor_gaming_day"] = [20250101, 20250201]
+    if anchor_kind == "gaming_day_event":
+        data["gaming_day_event"] = [20250101, 20250201]
+    elif anchor_kind == "anchor_gaming_day_event":
+        data["anchor_gaming_day_event"] = [20250101, 20250201]
     else:
         raise ValueError(f"unknown anchor_kind: {anchor_kind!r}")
     if include_registry_slow_feat:
@@ -648,8 +648,8 @@ def test_static_slow_feast_missing_etl_skipped_in_feast_only(tmp_path: Path) -> 
     _assert_feast_only_bundle(out)
 
 
-def test_build_bundle_accepts_anchor_gaming_day_slow(tmp_path: Path) -> None:
-    """Static gate accepts anchor_gaming_day as slow ASOF anchor."""
+def test_build_bundle_accepts_anchor_gaming_day_event_slow(tmp_path: Path) -> None:
+    """Static gate accepts anchor_gaming_day_event as slow ASOF anchor."""
 
     model_src = tmp_path / "model_in_agd"
     snap_src = tmp_path / "snap_in_agd"
@@ -657,7 +657,7 @@ def test_build_bundle_accepts_anchor_gaming_day_slow(tmp_path: Path) -> None:
     art.mkdir(parents=True)
     slow = art / "slow.parquet"
     allow = art / "allow.parquet"
-    _write_slow_player_fixture(slow, anchor_kind="anchor_gaming_day")
+    _write_slow_player_fixture(slow, anchor_kind="anchor_gaming_day_event")
     _write_parquet(allow)
     _write_minimal_model_bundle(model_src)
     _write_frozen_registry_abc_fixture(model_src)

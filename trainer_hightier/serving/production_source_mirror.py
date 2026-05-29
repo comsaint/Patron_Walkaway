@@ -27,14 +27,14 @@ logger = logging.getLogger(__name__)
 
 PRODUCTION_BET_MIRROR_REQUIRED_COLUMNS: tuple[str, ...] = (
     "player_id",
-    "gaming_day",
+    "gaming_day_event",
     "wager",
     "payout_complete_dtm",
     "bet_id",
 )
 PRODUCTION_SESSION_MIRROR_REQUIRED_COLUMNS: tuple[str, ...] = (
     "player_id",
-    "gaming_day",
+    "gaming_day_event",
     "theo_win",
 )
 
@@ -92,11 +92,11 @@ def _bet_mirror_gaming_day_bounds(root: Path) -> tuple[date | None, date | None,
         row = con.execute(
             f"""
 SELECT
-  MIN(CAST(gaming_day AS DATE)) AS min_gday,
-  MAX(CAST(gaming_day AS DATE)) AS max_gday,
+  MIN(CAST(gaming_day_event AS DATE)) AS min_gday,
+  MAX(CAST(gaming_day_event AS DATE)) AS max_gday,
   COUNT(*) AS nrows
 FROM {bet_from}
-WHERE gaming_day IS NOT NULL
+WHERE gaming_day_event IS NOT NULL
 """.strip()
         ).fetchone()
     finally:
@@ -144,7 +144,7 @@ def validate_production_bet_mirror(
         return MirrorValidationResult(
             layer="bet_mirror",
             ok=False,
-            message="cleaned bet mirror has no usable gaming_day rows",
+            message="cleaned bet mirror has no usable gaming_day_event rows",
         )
     today = date.today()
     need_from = today - timedelta(days=retain)
@@ -152,7 +152,7 @@ def validate_production_bet_mirror(
         return MirrorValidationResult(
             layer="bet_mirror",
             ok=False,
-            message=f"cleaned bet mirror max gaming_day={max_day} too stale for refresh",
+            message=f"cleaned bet mirror max gaming_day_event={max_day} too stale for refresh",
             min_gaming_day=min_day,
             max_gaming_day=max_day,
             row_count=nrows,
@@ -216,10 +216,10 @@ def validate_production_session_mirror(
         row = con.execute(
             f"""
 SELECT
-  MIN(CAST(gaming_day AS DATE)) AS min_gday,
-  MAX(CAST(gaming_day AS DATE)) AS max_gday
+  MIN(CAST(gaming_day_event AS DATE)) AS min_gday,
+  MAX(CAST(gaming_day_event AS DATE)) AS max_gday
 FROM read_parquet('{esc}')
-WHERE gaming_day IS NOT NULL
+WHERE gaming_day_event IS NOT NULL
 """.strip()
         ).fetchone()
     finally:
@@ -228,7 +228,7 @@ WHERE gaming_day IS NOT NULL
         return MirrorValidationResult(
             layer="session_mirror",
             ok=False,
-            message="cleaned session mirror has no usable gaming_day rows",
+            message="cleaned session mirror has no usable gaming_day_event rows",
             row_count=nrows,
         )
     min_day = date.fromisoformat(str(row[0])[:10])

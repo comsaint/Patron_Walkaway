@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 from zoneinfo import ZoneInfo
 
-from trainer_hightier.bet_contract import assert_bets_gaming_day_contract
+from trainer_hightier.bet_contract import assert_bets_gaming_day_event_contract
 
 from trainer_hightier.config import HightierServingConfig, default_hightier_serving_config
 from trainer_hightier.serving.adt_allowlist import (
@@ -297,17 +297,31 @@ def merge_incremental_chunk_frames(frames: list[pd.DataFrame], limit_rows: int) 
 
 
 def _postprocess_incremental_bets_timestamps(bets: pd.DataFrame) -> None:
-    """Normalize warehouse timestamps to HK (in-place)."""
+    """Normalize ClickHouse warehouse timestamps to HK (in-place).
+
+    Naive warehouse timestamps are interpreted as UTC before conversion.
+    """
     if not bets.empty and "payout_complete_dtm" in bets.columns:
-        _pc = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce")
-        if getattr(_pc.dt, "tz", None) is None:
-            _pc = _pc.dt.tz_localize(UTC_TZ, ambiguous="NaT", nonexistent="shift_forward")
-        bets["payout_complete_dtm"] = _pc.dt.tz_convert(ZoneInfo(HK_TZ))
+        bets["payout_complete_dtm"] = _warehouse_ts_series_to_hk(bets["payout_complete_dtm"])
     if not bets.empty and "__etl_insert_Dtm" in bets.columns:
-        _etl = pd.to_datetime(bets["__etl_insert_Dtm"], errors="coerce")
-        if getattr(_etl.dt, "tz", None) is None:
-            _etl = _etl.dt.tz_localize(UTC_TZ, ambiguous="NaT", nonexistent="shift_forward")
-        bets["__etl_insert_Dtm"] = _etl.dt.tz_convert(ZoneInfo(HK_TZ))
+        bets["__etl_insert_Dtm"] = _warehouse_ts_series_to_hk(bets["__etl_insert_Dtm"])
+
+
+def _postprocess_cleaned_l0_bets_timestamps(bets: pd.DataFrame) -> None:
+    """Normalize cleaned L0 parquet timestamps to HK (in-place).
+
+    Naive parquet timestamps are HK wall clock, not UTC.
+    """
+    from trainer_hightier.utils.hk_time_semantics import pandas_ts_series_to_hk_l0_contract
+
+    if not bets.empty and "payout_complete_dtm" in bets.columns:
+        bets["payout_complete_dtm"] = pandas_ts_series_to_hk_l0_contract(
+            bets["payout_complete_dtm"],
+        )
+    if not bets.empty and "__etl_insert_Dtm" in bets.columns:
+        bets["__etl_insert_Dtm"] = pandas_ts_series_to_hk_l0_contract(
+            bets["__etl_insert_Dtm"],
+        )
 
 
 def fetch_bets_incremental_etl_probe(
@@ -332,7 +346,7 @@ def fetch_bets_incremental_etl_probe(
         WHERE payout_complete_dtm >= %(start)s
           AND payout_complete_dtm <= %(bet_avail)s
           AND payout_complete_dtm IS NOT NULL
-          AND gaming_day IS NOT NULL
+          AND gaming_day_event IS NOT NULL
           AND wager > 0
           AND player_id IS NOT NULL
           AND player_id != {placeholder}
@@ -354,7 +368,7 @@ def _incremental_bet_select_list(*, casino_player_id_select: str) -> str:
                 type_of_bet,
                 __etl_insert_Dtm,
                 payout_complete_dtm,
-                gaming_day,
+                gaming_day_event,
                 session_id,
                 player_id,
                 table_id,
@@ -410,7 +424,7 @@ def _fetch_bets_incremental_allowlist_chunk(
             WHERE payout_complete_dtm >= %(start)s
               AND payout_complete_dtm <= %(bet_avail)s
               AND payout_complete_dtm IS NOT NULL
-              AND gaming_day IS NOT NULL
+              AND gaming_day_event IS NOT NULL
               AND wager > 0
               AND player_id IS NOT NULL
               AND player_id != {placeholder}
@@ -461,7 +475,7 @@ def _fetch_bets_incremental_allowlist_external(
         WHERE t.payout_complete_dtm >= %(start)s
           AND t.payout_complete_dtm <= %(bet_avail)s
           AND t.payout_complete_dtm IS NOT NULL
-          AND t.gaming_day IS NOT NULL
+          AND t.gaming_day_event IS NOT NULL
           AND t.wager > 0
           AND t.player_id IS NOT NULL
           AND t.player_id != {placeholder}
@@ -570,7 +584,7 @@ def fetch_bets_incremental(
             WHERE payout_complete_dtm >= %(start)s
               AND payout_complete_dtm <= %(bet_avail)s
               AND payout_complete_dtm IS NOT NULL
-              AND gaming_day IS NOT NULL
+              AND gaming_day_event IS NOT NULL
               AND wager > 0
               AND player_id IS NOT NULL
               AND player_id != {placeholder}
@@ -592,7 +606,7 @@ def fetch_bets_incremental(
 
     _postprocess_incremental_bets_timestamps(bets)
     if not bets.empty:
-        assert_bets_gaming_day_contract(bets, "hightier_fetch_bets_incremental")
+        assert_bets_gaming_day_event_contract(bets, "hightier_fetch_bets_incremental")
     return bets
 
 
@@ -627,7 +641,7 @@ def fetch_bet_pool_window(
                 type_of_bet,
                 __etl_insert_Dtm,
                 payout_complete_dtm,
-                gaming_day,
+                gaming_day_event,
                 session_id,
                 player_id,
                 table_id,
@@ -641,7 +655,7 @@ def fetch_bet_pool_window(
             WHERE payout_complete_dtm >= %(ws)s
               AND payout_complete_dtm <= %(we)s
               AND payout_complete_dtm IS NOT NULL
-              AND gaming_day IS NOT NULL
+              AND gaming_day_event IS NOT NULL
               AND player_id IS NOT NULL
               AND player_id != {placeholder}
               AND player_id IN ({in_list})
@@ -699,15 +713,18 @@ def compute_hot_pool_window_start(
         p_min - timedelta(hours=int(cfg.hot_feature_pool_lookback_hours))
     ).to_pydatetime()
     candidates: list[datetime] = [lookback_start]
-    if "gaming_day" in bets.columns:
-        hk = ZoneInfo(cfg.hk_tz)
-        close_hour = int(cfg.gaming_day_close_hour)
-        for raw_gday in pd.to_datetime(bets["gaming_day"], errors="coerce").dropna().unique():
-            gday = pd.Timestamp(raw_gday).date()
-            day_start = datetime(gday.year, gday.month, gday.day, close_hour, 0, 0, tzinfo=hk)
-            if getattr(p_min, "tzinfo", None) is not None:
-                day_start = day_start.astimezone(p_min.tzinfo)
-            candidates.append(day_start)
+    if "gaming_day_event" not in bets.columns:
+        raise ValueError(
+            "compute_hot_pool_window_start requires gaming_day_event on bets; "
+            f"got columns={list(bets.columns)}",
+        )
+    hk = ZoneInfo(cfg.hk_tz)
+    for raw_gday in pd.to_datetime(bets["gaming_day_event"], errors="coerce").dropna().unique():
+        gday = pd.Timestamp(raw_gday).date()
+        day_start = datetime(gday.year, gday.month, gday.day, 0, 0, 0, tzinfo=hk)
+        if getattr(p_min, "tzinfo", None) is not None:
+            day_start = day_start.astimezone(p_min.tzinfo)
+        candidates.append(day_start)
     pool_start = min(candidates)
     if getattr(p_min, "tzinfo", None) is not None and pool_start.tzinfo is None:
         pool_start = pool_start.replace(tzinfo=p_min.tzinfo)
@@ -742,25 +759,28 @@ def compute_scoring_bounds_for_bets(
     lookback_h = int(cfg.hot_feature_pool_lookback_hours)
     lookback_start = pcd - pd.Timedelta(hours=lookback_h)
     pool_start = lookback_start.copy()
-    if "gaming_day" in bets.columns:
-        hk = ZoneInfo(cfg.hk_tz)
-        close_hour = int(cfg.gaming_day_close_hour)
-        day_starts: list[pd.Timestamp] = []
-        for raw_gday, p_row in zip(
-            pd.to_datetime(bets["gaming_day"], errors="coerce"),
-            pcd,
-            strict=True,
-        ):
-            if pd.isna(raw_gday) or pd.isna(p_row):
-                day_starts.append(pd.NaT)
-                continue
-            gday = pd.Timestamp(raw_gday).date()
-            day_open = datetime(gday.year, gday.month, gday.day, close_hour, 0, 0, tzinfo=hk)
-            if getattr(p_row, "tzinfo", None) is not None:
-                day_open = day_open.astimezone(p_row.tzinfo)
-            day_starts.append(pd.Timestamp(day_open))
-        day_start_s = pd.Series(day_starts, index=bets.index)
-        pool_start = pd.concat([lookback_start, day_start_s], axis=1).min(axis=1)
+    if "gaming_day_event" not in bets.columns:
+        raise ValueError(
+            "compute_scoring_bounds_for_bets requires gaming_day_event on bets; "
+            f"got columns={list(bets.columns)}",
+        )
+    hk = ZoneInfo(cfg.hk_tz)
+    day_starts: list[pd.Timestamp] = []
+    for raw_gday, p_row in zip(
+        pd.to_datetime(bets["gaming_day_event"], errors="coerce"),
+        pcd,
+        strict=True,
+    ):
+        if pd.isna(raw_gday) or pd.isna(p_row):
+            day_starts.append(pd.NaT)
+            continue
+        gday = pd.Timestamp(raw_gday).date()
+        day_open = datetime(gday.year, gday.month, gday.day, 0, 0, 0, tzinfo=hk)
+        if getattr(p_row, "tzinfo", None) is not None:
+            day_open = day_open.astimezone(p_row.tzinfo)
+        day_starts.append(pd.Timestamp(day_open))
+    day_start_s = pd.Series(day_starts, index=bets.index)
+    pool_start = pd.concat([lookback_start, day_start_s], axis=1).min(axis=1)
     out = pd.DataFrame(
         {
             "bet_id": pd.to_numeric(bets["bet_id"], errors="coerce"),
@@ -1129,12 +1149,12 @@ def score_once(
         else None
     )
     mid_anchor = (
-        feast_readiness.mid_term.anchor_gaming_day_max
+        feast_readiness.mid_term.anchor_gaming_day_event_max
         if uses_feast_mid and feast_readiness and feast_readiness.mid_term
         else read_mid_term_anchor_max(Path(mid_path) if mid_path else None, manifest.raw if manifest else None)
     )
     slow_anchor = (
-        feast_readiness.slow_patron.anchor_gaming_day_max
+        feast_readiness.slow_patron.anchor_gaming_day_event_max
         if supplier_plan.feast_slow_cols and feast_readiness and feast_readiness.slow_patron
         else read_slow_anchor_max(
             Path(manifest.slow_patron_parquet) if manifest is not None else None,
@@ -1265,7 +1285,7 @@ def score_once(
                 mid_term_freshness_status=mid_fresh.status,
                 slow_freshness_status=slow_fresh.status,
                 snapshot_scoring_degraded=gate.degraded,
-                mid_term_anchor_gaming_day_max=(
+                mid_term_anchor_gaming_day_event_max=(
                     mid_anchor.isoformat() if mid_anchor is not None else None
                 ),
                 mid_term_snapshot_age_days=mid_fresh.staleness_days,

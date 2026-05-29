@@ -56,7 +56,7 @@ class FeastLayerReadiness:
 
     layer: str
     source_scope: str
-    anchor_gaming_day_max: date | None
+    anchor_gaming_day_event_max: date | None
     generated_at: datetime
     row_count: int
     distinct_canonical_count: int | None
@@ -66,19 +66,19 @@ class FeastLayerReadiness:
     feature_columns: tuple[str, ...]
     feast_feature_view: str | None
     materialize_source: str
-    expected_anchor_gaming_day: date | None = None
+    expected_anchor_gaming_day_event: date | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-serializable payload for ``feast_online_readiness.json``."""
         out: dict[str, Any] = {
             "layer": self.layer,
             "source_scope": self.source_scope,
-            "anchor_gaming_day_max": (
-                self.anchor_gaming_day_max.isoformat() if self.anchor_gaming_day_max else None
+            "anchor_gaming_day_event_max": (
+                self.anchor_gaming_day_event_max.isoformat() if self.anchor_gaming_day_event_max else None
             ),
-            "expected_anchor_gaming_day": (
-                self.expected_anchor_gaming_day.isoformat()
-                if self.expected_anchor_gaming_day
+            "expected_anchor_gaming_day_event": (
+                self.expected_anchor_gaming_day_event.isoformat()
+                if self.expected_anchor_gaming_day_event
                 else None
             ),
             "generated_at": self.generated_at.isoformat(),
@@ -93,8 +93,8 @@ class FeastLayerReadiness:
         }
         if self.layer == "mid_term":
             age = compute_mid_snapshot_age_days(
-                self.anchor_gaming_day_max,
-                self.expected_anchor_gaming_day,
+                self.anchor_gaming_day_event_max,
+                self.expected_anchor_gaming_day_event,
             )
             if age is not None:
                 out["snapshot_age_days"] = age
@@ -109,9 +109,9 @@ class FeastLayerReadiness:
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> FeastLayerReadiness:
         """Parse one layer block from readiness JSON."""
-        anchor_raw = raw.get("anchor_gaming_day_max")
+        anchor_raw = raw.get("anchor_gaming_day_event_max")
         anchor = pd.Timestamp(str(anchor_raw)).date() if anchor_raw else None
-        exp_raw = raw.get("expected_anchor_gaming_day")
+        exp_raw = raw.get("expected_anchor_gaming_day_event")
         expected_anchor = pd.Timestamp(str(exp_raw)).date() if exp_raw else None
         gen_raw = raw.get("generated_at")
         if not gen_raw:
@@ -123,7 +123,7 @@ class FeastLayerReadiness:
         return cls(
             layer=str(raw.get("layer", "")),
             source_scope=str(raw.get("source_scope", "")),
-            anchor_gaming_day_max=anchor,
+            anchor_gaming_day_event_max=anchor,
             generated_at=gen,
             row_count=int(raw.get("row_count") or 0),
             distinct_canonical_count=(
@@ -145,7 +145,7 @@ class FeastLayerReadiness:
                 str(raw["feast_feature_view"]) if raw.get("feast_feature_view") else None
             ),
             materialize_source=str(raw.get("materialize_source") or "unknown"),
-            expected_anchor_gaming_day=expected_anchor,
+            expected_anchor_gaming_day_event=expected_anchor,
         )
 
 
@@ -257,12 +257,12 @@ def compute_mid_snapshot_age_days(
     from trainer_hightier.serving.snapshot_freshness import (
         _staleness_days,
         expected_mid_term_anchor,
-        serving_gaming_day,
+        serving_gaming_day_event,
     )
 
     if anchor_max is None:
         return None
-    expected = expected_anchor or expected_mid_term_anchor(serving_gaming_day(close_hour=close_hour))
+    expected = expected_anchor or expected_mid_term_anchor(serving_gaming_day_event())
     return _staleness_days(anchor_max, expected)
 
 
@@ -332,7 +332,7 @@ def layer_readiness_from_mid_spike_report(report: dict[str, Any]) -> FeastLayerR
     return FeastLayerReadiness(
         layer="mid_term",
         source_scope=scope,
-        anchor_gaming_day_max=_parse_anchor(report.get("mid_term_anchor_gaming_day_max")),
+        anchor_gaming_day_event_max=_parse_anchor(report.get("mid_term_anchor_gaming_day_event_max")),
         generated_at=_hk_now(),
         row_count=int(report.get("feast_spike_rows") or report.get("row_count") or 0),
         distinct_canonical_count=int(report["distinct_canonical_count"])
@@ -361,7 +361,7 @@ def layer_readiness_from_production_mid_meta(meta: dict[str, Any]) -> FeastLayer
     return FeastLayerReadiness(
         layer="mid_term",
         source_scope=str(meta.get("snapshot_scope") or FEAST_READINESS_SCOPE_PRODUCTION).strip(),
-        anchor_gaming_day_max=_parse_anchor(meta.get("mid_term_anchor_gaming_day_max")),
+        anchor_gaming_day_event_max=_parse_anchor(meta.get("mid_term_anchor_gaming_day_event_max")),
         generated_at=_hk_now(),
         row_count=int(meta.get("feast_spike_rows") or meta.get("row_count") or 0),
         distinct_canonical_count=int(distinct) if distinct is not None else None,
@@ -371,7 +371,7 @@ def layer_readiness_from_production_mid_meta(meta: dict[str, Any]) -> FeastLayer
         feature_columns=PRODUCTION_MID_TERM_FEATURE_COLUMNS,
         feast_feature_view="mid_term_daily_spike_features",
         materialize_source=str(meta.get("materialize_source") or "production_materialize"),
-        expected_anchor_gaming_day=_parse_anchor(meta.get("mid_term_expected_anchor_gaming_day")),
+        expected_anchor_gaming_day_event=_parse_anchor(meta.get("mid_term_expected_anchor_gaming_day_event")),
     )
 
 
@@ -380,7 +380,7 @@ def layer_readiness_from_production_slow_meta(meta: dict[str, Any]) -> FeastLaye
     return FeastLayerReadiness(
         layer="slow_patron",
         source_scope=FEAST_READINESS_SCOPE_PRODUCTION,
-        anchor_gaming_day_max=_parse_anchor(meta.get("slow_anchor_gaming_day_max")),
+        anchor_gaming_day_event_max=_parse_anchor(meta.get("slow_anchor_gaming_day_event_max")),
         generated_at=_hk_now(),
         row_count=int(meta.get("row_count") or 0),
         distinct_canonical_count=int(meta["distinct_bet_count"])
@@ -413,13 +413,13 @@ def write_minimal_test_feast_readiness(
     feast_repo: Path | None = None,
 ) -> Path:
     """Write fresh production-scoped readiness for unit tests (no spike reports required)."""
-    from trainer_hightier.serving.snapshot_freshness import expected_mid_term_anchor, serving_gaming_day
+    from trainer_hightier.serving.snapshot_freshness import expected_mid_term_anchor, serving_gaming_day_event
 
-    anchor = expected_mid_term_anchor(serving_gaming_day(close_hour=3))
+    anchor = expected_mid_term_anchor(serving_gaming_day_event())
     mid = FeastLayerReadiness(
         layer="mid_term",
         source_scope=FEAST_READINESS_SCOPE_PRODUCTION,
-        anchor_gaming_day_max=anchor,
+        anchor_gaming_day_event_max=anchor,
         generated_at=_hk_now(),
         row_count=1,
         distinct_canonical_count=1,
@@ -433,7 +433,7 @@ def write_minimal_test_feast_readiness(
     slow = FeastLayerReadiness(
         layer="slow_patron",
         source_scope=FEAST_READINESS_SCOPE_PRODUCTION,
-        anchor_gaming_day_max=anchor,
+        anchor_gaming_day_event_max=anchor,
         generated_at=mid.generated_at,
         row_count=1,
         distinct_canonical_count=1,
@@ -460,7 +460,7 @@ def layer_readiness_from_long_spike_report(report: dict[str, Any]) -> FeastLayer
     return FeastLayerReadiness(
         layer="slow_patron",
         source_scope=scope,
-        anchor_gaming_day_max=_parse_anchor(report.get("slow_anchor_gaming_day_max")),
+        anchor_gaming_day_event_max=_parse_anchor(report.get("slow_anchor_gaming_day_event_max")),
         generated_at=_hk_now(),
         row_count=int(report.get("feast_spike_rows") or report.get("slow_snapshot_rows") or 0),
         distinct_canonical_count=None,
@@ -645,10 +645,10 @@ def evaluate_feast_readiness_gate(
                 raise RuntimeError("[feast_readiness] mid_term layer missing from readiness document")
             _assert_layer_scope(readiness.mid_term)
             mid_fresh = evaluate_mid_term_freshness(
-                anchor_max=readiness.mid_term.anchor_gaming_day_max,
+                anchor_max=readiness.mid_term.anchor_gaming_day_event_max,
                 hard_cap_days=mid_hard_cap_days,
                 close_hour=close_hour,
-                expected_anchor=readiness.mid_term.expected_anchor_gaming_day,
+                expected_anchor=readiness.mid_term.expected_anchor_gaming_day_event,
             )
             if mid_fresh.status == "hard_cap_breached":
                 raise RuntimeError(mid_fresh.message)
@@ -657,7 +657,7 @@ def evaluate_feast_readiness_gate(
                 raise RuntimeError("[feast_readiness] slow_patron layer missing from readiness document")
             _assert_layer_scope(readiness.slow_patron)
             slow_fresh = evaluate_slow_freshness(
-                anchor_max=readiness.slow_patron.anchor_gaming_day_max,
+                anchor_max=readiness.slow_patron.anchor_gaming_day_event_max,
                 monthly_grace_days=slow_grace_days,
                 hard_cap_days=slow_hard_cap_days,
                 close_hour=close_hour,

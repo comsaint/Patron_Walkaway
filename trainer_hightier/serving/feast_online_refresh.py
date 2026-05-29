@@ -76,7 +76,7 @@ from trainer_hightier.serving.production_materialize import (
 from trainer_hightier.serving.snapshot_freshness import (
     expected_mid_term_anchor,
     mid_feast_event_timestamp_for_anchor,
-    serving_gaming_day,
+    serving_gaming_day_event,
 )
 from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_parquet_path
 
@@ -181,7 +181,7 @@ def _mid_export_bounds(
 ) -> tuple[date, date, date, date]:
     """Return anchor_start, anchor_end, bets_gday_start, bets_gday_end."""
     cfg = default_hightier_serving_config()
-    serving_day = serving_day or serving_gaming_day(close_hour=close_hour)
+    serving_day = serving_day or serving_gaming_day_event()
     anchor_end = expected_mid_term_anchor(serving_day)
     if bootstrap_mid:
         days = int(
@@ -206,7 +206,7 @@ def _slow_export_bounds(
     lookback_days: int,
     serving_day: date | None = None,
 ) -> tuple[date, date]:
-    serving_day = serving_day or serving_gaming_day(close_hour=close_hour)
+    serving_day = serving_day or serving_gaming_day_event()
     gaming_day_end = serving_day - timedelta(days=1)
     gaming_day_start = gaming_day_end - timedelta(days=int(lookback_days) - 1)
     return gaming_day_start, gaming_day_end
@@ -230,15 +230,15 @@ def export_clickhouse_bets_to_parquet(
         q = f"""
         SELECT
             CAST(player_id AS Int64) AS player_id,
-            CAST(gaming_day AS Date) AS gaming_day,
+            CAST(gaming_day_event AS Date) AS gaming_day_event,
             CAST(payout_complete_dtm AS DateTime64(3, 'UTC')) AS payout_complete_dtm,
             {CH_TBET_WAGER_SELECT},
             {CH_TBET_PAYOUT_ODDS_SELECT}
         FROM {cfg.source_db}.{cfg.tbet} FINAL
-        WHERE gaming_day >= %(g_start)s
-          AND gaming_day <= %(g_end)s
+        WHERE gaming_day_event >= %(g_start)s
+          AND gaming_day_event <= %(g_end)s
           AND payout_complete_dtm IS NOT NULL
-          AND gaming_day IS NOT NULL
+          AND gaming_day_event IS NOT NULL
           AND {CH_TBET_WAGER_POSITIVE_PRED}
           AND player_id IS NOT NULL
           AND player_id != {placeholder}
@@ -268,7 +268,7 @@ def export_clickhouse_bets_to_parquet(
     elapsed = round(time.perf_counter() - t0, 3)
     if df.empty:
         raise ValueError(
-            f"ClickHouse bet export returned 0 rows for gaming_day in "
+            f"ClickHouse bet export returned 0 rows for gaming_day_event in "
             f"[{bets_gaming_day_start}, {bets_gaming_day_end}]"
         )
     df.to_parquet(out_parquet, index=False)
@@ -282,7 +282,7 @@ def export_clickhouse_bets_to_parquet(
 
 
 def _sanitize_ch_session_export_df(df: pd.DataFrame) -> pd.DataFrame:
-    required = ("player_id", "gaming_day", "theo_win")
+    required = ("player_id", "gaming_day_event", "theo_win")
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"session export missing columns {missing}")
@@ -291,8 +291,8 @@ def _sanitize_ch_session_export_df(df: pd.DataFrame) -> pd.DataFrame:
     out = df.loc[:, list(required)].copy()
     out["player_id"] = pd.to_numeric(out["player_id"], errors="coerce")
     out["theo_win"] = pd.to_numeric(out["theo_win"], errors="coerce")
-    out["gaming_day"] = pd.to_datetime(out["gaming_day"], errors="coerce").dt.normalize()
-    out = out.loc[out["player_id"].notna() & out["gaming_day"].notna()].copy()
+    out["gaming_day_event"] = pd.to_datetime(out["gaming_day_event"], errors="coerce").dt.normalize()
+    out = out.loc[out["player_id"].notna() & out["gaming_day_event"].notna()].copy()
     out["player_id"] = out["player_id"].astype("int64", copy=False)
     return out
 
@@ -320,11 +320,11 @@ def export_clickhouse_sessions_to_parquet(
     for i, chunk in enumerate(chunks):
         in_list = ",".join(str(int(x)) for x in chunk)
         q = f"""
-            SELECT player_id, gaming_day, theo_win
+            SELECT player_id, gaming_day_event, theo_win
             FROM {cfg.source_db}.{cfg.tsession} FINAL
-            WHERE gaming_day >= %(g_start)s
-              AND gaming_day <= %(g_end)s
-              AND gaming_day IS NOT NULL
+            WHERE gaming_day_event >= %(g_start)s
+              AND gaming_day_event <= %(g_end)s
+              AND gaming_day_event IS NOT NULL
               AND player_id IS NOT NULL
               AND player_id != {placeholder}
               AND COALESCE(is_deleted, 0) = 0
@@ -342,7 +342,7 @@ def export_clickhouse_sessions_to_parquet(
     df = _sanitize_ch_session_export_df(raw)
     if df.empty:
         raise ValueError(
-            f"ClickHouse session export returned 0 rows for gaming_day in "
+            f"ClickHouse session export returned 0 rows for gaming_day_event in "
             f"[{gaming_day_start}, {gaming_day_end}]"
         )
     df.to_parquet(out_parquet, index=False)
@@ -432,7 +432,7 @@ def materialize_training_mid_feast_seed(
     sql = f"""
 COPY (
   SELECT TRIM(CAST(s.canonical_id AS VARCHAR)) AS canonical_id,
-         CAST(s.anchor_gaming_day AS DATE) AS anchor_gaming_day,
+         CAST(s.anchor_gaming_day_event AS DATE) AS anchor_gaming_day_event,
          {feat_sql}
   FROM read_parquet('{src_esc}') AS s
   INNER JOIN (
@@ -443,9 +443,9 @@ COPY (
     WHERE TRIM(CAST(m.canonical_id AS VARCHAR)) <> ''
   ) AS allow
     ON TRIM(CAST(s.canonical_id AS VARCHAR)) = allow.canonical_id
-  WHERE CAST(s.anchor_gaming_day AS DATE) <= CAST('{anchor_end.isoformat()}' AS DATE)
+  WHERE CAST(s.anchor_gaming_day_event AS DATE) <= CAST('{anchor_end.isoformat()}' AS DATE)
     {
-        f"AND CAST(s.anchor_gaming_day AS DATE) >= CAST('{anchor_start.isoformat()}' AS DATE)"
+        f"AND CAST(s.anchor_gaming_day_event AS DATE) >= CAST('{anchor_start.isoformat()}' AS DATE)"
         if anchor_start is not None
         else ""
     }
@@ -496,36 +496,36 @@ def merge_mid_feast_carry_forward(
         prev_esc = _path_esc(prev_path)
         combined_sql = f"""
         SELECT TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id,
-               CAST(event_timestamp AS DATE) AS anchor_gaming_day,
+               CAST(event_timestamp AS DATE) AS anchor_gaming_day_event,
                {feat_cols}
         FROM read_parquet('{prev_esc}')
         UNION ALL
         SELECT TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id,
-               CAST(anchor_gaming_day AS DATE) AS anchor_gaming_day,
+               CAST(anchor_gaming_day_event AS DATE) AS anchor_gaming_day_event,
                {feat_cols}
         FROM read_parquet('{new_esc}')
         """
     else:
         combined_sql = f"""
         SELECT TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id,
-               CAST(anchor_gaming_day AS DATE) AS anchor_gaming_day,
+               CAST(anchor_gaming_day_event AS DATE) AS anchor_gaming_day_event,
                {feat_cols}
         FROM read_parquet('{new_esc}')
         """
     sql = f"""
 COPY (
   SELECT canonical_id,
-    CAST(anchor_gaming_day AS VARCHAR) AS anchor_gaming_day,
+    CAST(anchor_gaming_day_event AS VARCHAR) AS anchor_gaming_day_event,
     {feat_cols},
     CAST(
-      timezone('Asia/Hong_Kong', CAST(anchor_gaming_day AS TIMESTAMP) + INTERVAL '1' DAY - INTERVAL '1' SECOND)
+      timezone('Asia/Hong_Kong', CAST(anchor_gaming_day_event AS TIMESTAMP) + INTERVAL '1' DAY - INTERVAL '1' SECOND)
       AS TIMESTAMPTZ
     ) AS event_timestamp
   FROM (
-    SELECT canonical_id, anchor_gaming_day, {feat_cols},
+    SELECT canonical_id, anchor_gaming_day_event, {feat_cols},
       ROW_NUMBER() OVER (
         PARTITION BY canonical_id
-        ORDER BY anchor_gaming_day DESC
+        ORDER BY anchor_gaming_day_event DESC
       ) AS rn
     FROM ({combined_sql}) AS combined
   ) AS ranked
@@ -584,19 +584,19 @@ def enrich_mid_refresh_meta_from_feast(
         **meta,
         "feast_spike_rows": int(stats["rows"]),
         "distinct_canonical_count": int(stats["distinct_canonical"]),
-        "mid_term_anchor_gaming_day_max": (
+        "mid_term_anchor_gaming_day_event_max": (
             stats["anchor_max"].isoformat() if stats["anchor_max"] is not None else None
         ),
         "materialize_source": "feast_online_refresh",
     }
     use_bounded = data_bounded_expected_anchor or training_seed_meta is not None
     if use_bounded and stats["anchor_max"] is not None:
-        out["mid_term_expected_anchor_gaming_day"] = stats["anchor_max"].isoformat()
+        out["mid_term_expected_anchor_gaming_day_event"] = stats["anchor_max"].isoformat()
     return out
 
 
 def ensure_mid_feast_parquet_has_anchor_column(feast_parquet: Path) -> None:
-    """Backfill ``anchor_gaming_day`` on legacy Feast mid spike parquets (pre-Option B)."""
+    """Backfill ``anchor_gaming_day_event`` on legacy Feast mid spike parquets (pre-Option B)."""
     import pyarrow.parquet as pq
 
     dst = Path(feast_parquet).resolve()
@@ -651,18 +651,18 @@ def write_mid_feast_parquet(full_snap: Path, feast_out: Path) -> int:
     sql = f"""
 COPY (
   SELECT canonical_id,
-    CAST(anchor_gaming_day AS VARCHAR) AS anchor_gaming_day,
+    CAST(anchor_gaming_day_event AS VARCHAR) AS anchor_gaming_day_event,
     {feat_cols},
     CAST(
-      timezone('Asia/Hong_Kong', CAST(anchor_gaming_day AS TIMESTAMP) + INTERVAL '1' DAY - INTERVAL '1' SECOND)
+      timezone('Asia/Hong_Kong', CAST(anchor_gaming_day_event AS TIMESTAMP) + INTERVAL '1' DAY - INTERVAL '1' SECOND)
       AS TIMESTAMPTZ
     ) AS event_timestamp
   FROM (
     SELECT TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id,
-      CAST(anchor_gaming_day AS DATE) AS anchor_gaming_day, {feat_cols},
+      CAST(anchor_gaming_day_event AS DATE) AS anchor_gaming_day_event, {feat_cols},
       ROW_NUMBER() OVER (
         PARTITION BY TRIM(CAST(canonical_id AS VARCHAR))
-        ORDER BY CAST(anchor_gaming_day AS DATE) DESC
+        ORDER BY CAST(anchor_gaming_day_event AS DATE) DESC
       ) AS rn
     FROM read_parquet('{src}')
   ) AS ranked
@@ -679,6 +679,52 @@ COPY (
     return nrows
 
 
+def ensure_slow_feast_parquet_has_anchor_column(feast_parquet: Path) -> None:
+    """Backfill ``anchor_gaming_day_event`` on legacy Feast slow parquets missing anchor grain."""
+    import pyarrow.parquet as pq
+
+    dst = Path(feast_parquet).resolve()
+    if not dst.is_file():
+        raise FileNotFoundError(f"feast slow parquet missing: {dst}")
+    schema_names = set(pq.read_schema(str(dst)).names)
+    if FEAST_MID_ANCHOR_COLUMN in schema_names:
+        return
+    if "event_timestamp" not in schema_names:
+        raise ValueError(
+            f"feast slow parquet must include {FEAST_MID_ANCHOR_COLUMN!r} or event_timestamp; "
+            f"path={dst} columns={sorted(schema_names)}",
+        )
+    tmp = dst.parent / f"{dst.stem}__anchor_repair.parquet"
+    dst_esc = _path_esc(dst)
+    tmp_esc = _path_esc(tmp)
+    feat_cols = ", ".join(f'"{c}"' for c in PRODUCTION_LONG_TERM_FEATURE_COLUMNS)
+    sql = f"""
+COPY (
+  SELECT TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id,
+    CAST(CAST(event_timestamp AS DATE) AS VARCHAR) AS {FEAST_MID_ANCHOR_COLUMN},
+    {feat_cols},
+    CAST(event_timestamp AS TIMESTAMPTZ) AS event_timestamp
+  FROM read_parquet('{dst_esc}')
+) TO '{tmp_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+""".strip()
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.execute(sql)
+        nrows = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{tmp_esc}')").fetchone()[0])
+    finally:
+        con.close()
+    if nrows <= 0:
+        tmp.unlink(missing_ok=True)
+        raise ValueError(f"slow anchor repair produced no rows for {dst}")
+    tmp.replace(dst)
+    logger.info(
+        "[feast_online_refresh] repaired missing %s on slow %s rows=%d",
+        FEAST_MID_ANCHOR_COLUMN,
+        dst.name,
+        nrows,
+    )
+
+
 def write_slow_feast_parquet(full_snap: Path, feast_out: Path) -> int:
     """Collapse slow snapshot to latest monthly anchor per canonical_id."""
     src = str(Path(full_snap).resolve()).replace("\\", "/").replace("'", "''")
@@ -689,29 +735,46 @@ def write_slow_feast_parquet(full_snap: Path, feast_out: Path) -> int:
     import pyarrow.parquet as pq
 
     schema_names = set(pq.read_schema(str(Path(full_snap).resolve())).names)
-    if "anchor_gaming_day" in schema_names:
-        ts_expr = (
-            "CAST((CAST(anchor_gaming_day AS TIMESTAMP) + INTERVAL '1' DAY "
-            "- INTERVAL '1' SECOND) AS TIMESTAMPTZ)"
-        )
-    elif "event_timestamp" in schema_names:
-        ts_expr = "CAST(event_timestamp AS TIMESTAMPTZ)"
-    else:
+    if "anchor_gaming_day_event" not in schema_names and "event_timestamp" not in schema_names:
         raise ValueError(
-            f"slow snapshot must include anchor_gaming_day or event_timestamp: {full_snap}",
+            f"slow snapshot must include anchor_gaming_day_event or event_timestamp: {full_snap}",
         )
-    sql = f"""
+    if "anchor_gaming_day_event" in schema_names:
+        sql = f"""
 COPY (
-  SELECT canonical_id, {feat_cols},
-    {ts_expr} AS event_timestamp
+  SELECT canonical_id,
+    CAST(anchor_gaming_day_event AS VARCHAR) AS anchor_gaming_day_event,
+    {feat_cols},
+    CAST(
+      timezone('Asia/Hong_Kong', CAST(anchor_gaming_day_event AS TIMESTAMP) + INTERVAL '1' DAY - INTERVAL '1' SECOND)
+      AS TIMESTAMPTZ
+    ) AS event_timestamp
+  FROM (
+    SELECT TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id,
+      CAST(anchor_gaming_day_event AS DATE) AS anchor_gaming_day_event, {feat_cols},
+      ROW_NUMBER() OVER (
+        PARTITION BY TRIM(CAST(canonical_id AS VARCHAR))
+        ORDER BY CAST(anchor_gaming_day_event AS DATE) DESC
+      ) AS rn
+    FROM read_parquet('{src}')
+  ) AS ranked
+  WHERE rn = 1
+) TO '{dst_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+""".strip()
+    else:
+        sql = f"""
+COPY (
+  SELECT canonical_id,
+    CAST(CAST(event_timestamp AS DATE) AS VARCHAR) AS anchor_gaming_day_event,
+    {feat_cols},
+    CAST(event_timestamp AS TIMESTAMPTZ) AS event_timestamp
   FROM (
     SELECT TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id,
       {feat_cols},
-      {"CAST(anchor_gaming_day AS DATE) AS anchor_gaming_day," if "anchor_gaming_day" in schema_names else ""}
-      {"CAST(event_timestamp AS TIMESTAMPTZ) AS event_timestamp," if "event_timestamp" in schema_names else ""}
+      CAST(event_timestamp AS TIMESTAMPTZ) AS event_timestamp,
       ROW_NUMBER() OVER (
         PARTITION BY TRIM(CAST(canonical_id AS VARCHAR))
-        ORDER BY {"CAST(anchor_gaming_day AS DATE) DESC" if "anchor_gaming_day" in schema_names else "event_timestamp DESC"}
+        ORDER BY CAST(event_timestamp AS TIMESTAMPTZ) DESC
       ) AS rn
     FROM read_parquet('{src}')
   ) AS ranked
@@ -721,9 +784,11 @@ COPY (
     con = duckdb.connect(database=":memory:")
     try:
         con.execute(sql)
-        return int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{dst_esc}')").fetchone()[0])
+        nrows = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{dst_esc}')").fetchone()[0])
     finally:
         con.close()
+    ensure_slow_feast_parquet_has_anchor_column(dst)
+    return nrows
 
 
 def run_feast_apply(feast_repo: Path, *, reset_runtime: bool = False) -> float:
@@ -767,7 +832,7 @@ def _materialize_window_from_feast_parquet(feast_parquet: Path) -> tuple[datetim
 
 
 def ensure_feast_mid_anchor_column_ready(feast_repo: Path) -> None:
-    """Ensure production Feast schema is ready (includes ``anchor_gaming_day`` on mid FV)."""
+    """Ensure production Feast schema is ready (includes ``anchor_gaming_day_event`` on mid FV)."""
     from trainer_hightier.serving.feast_online_adapter import ensure_feast_schema_ready
 
     ensure_feast_schema_ready(Path(feast_repo).resolve(), auto_apply=True)
@@ -781,7 +846,7 @@ def sync_training_mid_snapshot_to_feast_online(
     """Publish training mid-term daily snapshot into Feast online (Step 6 / parity replay).
 
     Collapses to latest anchor per ``canonical_id`` and materializes ``mid_term_daily_spike_features``
-    including ``anchor_gaming_day`` for Option B bounded ASOF.
+    including ``anchor_gaming_day_event`` for Option B bounded ASOF.
     """
     src = Path(mid_snapshot).resolve()
     if not src.is_file():
@@ -978,8 +1043,8 @@ def _refresh_mid_layer(
         canonical_mapping_parquet=opts.canonical_mapping,
         adt_allowlist_parquet=opts.adt_allowlist,
         out_parquet=artifact_path,
-        anchor_gaming_day_start=anchor_start,
-        anchor_gaming_day_end=anchor_end,
+        anchor_gaming_day_event_start=anchor_start,
+        anchor_gaming_day_event_end=anchor_end,
         publish_readiness=False,
     )
     compute_seconds = round(time.perf_counter() - t0, 3)
@@ -1217,7 +1282,7 @@ def run_feast_online_refresh(opts: RefreshOptions) -> dict[str, Any]:
                     smoke_event_ts = read_feast_parquet_max_event_timestamp(outcome.feast_parquet_path)
                     break
             if smoke_event_ts is None:
-                sd = opts.serving_day or serving_gaming_day(close_hour=int(cfg.gaming_day_close_hour))
+                sd = opts.serving_day or serving_gaming_day_event()
                 anchor_end = expected_mid_term_anchor(sd)
                 smoke_event_ts = mid_feast_event_timestamp_for_anchor(anchor_end)
         smoke = run_allowlist_feast_lookup_smoke(
@@ -1281,9 +1346,9 @@ def run_feast_online_refresh(opts: RefreshOptions) -> dict[str, Any]:
                 status="ok",
                 artifact_path=str(outcome.artifact_path),
                 row_count=int(outcome.meta.get("row_count") or 0),
-                anchor_gaming_day_max=str(
-                    outcome.meta.get("mid_term_anchor_gaming_day_max")
-                    or outcome.meta.get("slow_anchor_gaming_day_max")
+                anchor_gaming_day_event_max=str(
+                    outcome.meta.get("mid_term_anchor_gaming_day_event_max")
+                    or outcome.meta.get("slow_anchor_gaming_day_event_max")
                     or ""
                 )
                 or None,

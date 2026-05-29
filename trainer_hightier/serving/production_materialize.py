@@ -253,12 +253,12 @@ def materialize_production_slow_canonical_asof(
     ctx = resolve_slow_month_turn_context(ctx_day)
     anchor_max = None
     pf = pq.ParquetFile(out)
-    if pf.metadata and pf.metadata.num_rows > 0 and "anchor_gaming_day" in pf.schema_arrow.names:
+    if pf.metadata and pf.metadata.num_rows > 0 and "anchor_gaming_day_event" in pf.schema_arrow.names:
         con = duckdb.connect(database=":memory:")
         try:
             esc = _path_esc(out)
             raw = con.execute(
-                f"SELECT MAX(CAST(anchor_gaming_day AS DATE)) FROM read_parquet('{esc}')"
+                f"SELECT MAX(CAST(anchor_gaming_day_event AS DATE)) FROM read_parquet('{esc}')"
             ).fetchone()[0]
             if raw is not None:
                 anchor_max = pd.Timestamp(raw).date()
@@ -269,7 +269,7 @@ def materialize_production_slow_canonical_asof(
         "slow_patron_grain": SLOW_PATRON_GRAIN_CANONICAL_ASOF,
         "snapshot_scope": "production",
         "lookback_days": lb,
-        "slow_anchor_gaming_day_max": anchor_max.isoformat() if anchor_max else None,
+        "slow_anchor_gaming_day_event_max": anchor_max.isoformat() if anchor_max else None,
         **ctx.to_manifest_dict(),
         "sha256": _sha256_file(out),
         **parquet_row_stats(out, key_col="canonical_id"),
@@ -339,8 +339,8 @@ def materialize_production_mid_term_daily_snapshot(
     canonical_mapping_parquet: Path,
     adt_allowlist_parquet: Path,
     out_parquet: Path,
-    anchor_gaming_day_start: date | None = None,
-    anchor_gaming_day_end: date | None = None,
+    anchor_gaming_day_event_start: date | None = None,
+    anchor_gaming_day_event_end: date | None = None,
     lookback_days: int | None = None,
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
     publish_readiness: bool = True,
@@ -367,8 +367,8 @@ def materialize_production_mid_term_daily_snapshot(
         duckdb_runtime=rt,
         canonical_mapping_parquet=canonical_mapping_parquet,
         lookback_days=lb,
-        anchor_gaming_day_start=anchor_gaming_day_start,
-        anchor_gaming_day_end=anchor_gaming_day_end,
+        anchor_gaming_day_event_start=anchor_gaming_day_event_start,
+        anchor_gaming_day_event_end=anchor_gaming_day_event_end,
         snapshot_scope=MID_TERM_SNAPSHOT_SCOPE_PRODUCTION,
     )
     _filter_parquet_to_allowlist_canonical_ids(
@@ -382,12 +382,12 @@ def materialize_production_mid_term_daily_snapshot(
     dst = Path(out_parquet).resolve()
     anchor_max = None
     pf = pq.ParquetFile(dst)
-    if pf.metadata and pf.metadata.num_rows > 0 and "anchor_gaming_day" in pf.schema_arrow.names:
+    if pf.metadata and pf.metadata.num_rows > 0 and "anchor_gaming_day_event" in pf.schema_arrow.names:
         con = duckdb.connect(database=":memory:")
         try:
             esc = _path_esc(dst)
             raw = con.execute(
-                f"SELECT MAX(CAST(anchor_gaming_day AS DATE)) FROM read_parquet('{esc}')"
+                f"SELECT MAX(CAST(anchor_gaming_day_event AS DATE)) FROM read_parquet('{esc}')"
             ).fetchone()[0]
             if raw is not None:
                 anchor_max = pd.Timestamp(raw).date()
@@ -398,13 +398,13 @@ def materialize_production_mid_term_daily_snapshot(
         "mid_term_grain": MID_TERM_GRAIN_CANONICAL_DAILY_ASOF,
         "snapshot_scope": MID_TERM_SNAPSHOT_SCOPE_PRODUCTION,
         "lookback_days": lb,
-        "anchor_gaming_day_start": (
-            anchor_gaming_day_start.isoformat() if anchor_gaming_day_start is not None else None
+        "anchor_gaming_day_event_start": (
+            anchor_gaming_day_event_start.isoformat() if anchor_gaming_day_event_start is not None else None
         ),
-        "anchor_gaming_day_end": (
-            anchor_gaming_day_end.isoformat() if anchor_gaming_day_end is not None else None
+        "anchor_gaming_day_event_end": (
+            anchor_gaming_day_event_end.isoformat() if anchor_gaming_day_event_end is not None else None
         ),
-        "mid_term_anchor_gaming_day_max": anchor_max.isoformat() if anchor_max is not None else None,
+        "mid_term_anchor_gaming_day_event_max": anchor_max.isoformat() if anchor_max is not None else None,
         "sha256": _sha256_file(dst),
         **parquet_row_stats(dst, key_col="canonical_id"),
     }

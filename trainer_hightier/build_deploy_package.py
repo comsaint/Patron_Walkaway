@@ -81,11 +81,11 @@ _METADATA_MANIFEST_PASS_THROUGH: frozenset[str] = frozenset(
         "adt_allowlist_version",
         "slow_patron_grain",
         "mid_term_grain",
-        "mid_term_anchor_gaming_day_max",
+        "mid_term_anchor_gaming_day_event_max",
         "mid_term_coverage_end_exclusive",
         "mid_term_generated_at",
         "mid_term_stale_hard_cap_days",
-        "slow_anchor_gaming_day_max",
+        "slow_anchor_gaming_day_event_max",
         "slow_generated_at",
         "slow_monthly_grace_days",
         "slow_stale_hard_cap_days",
@@ -376,19 +376,19 @@ def _static_slow_minimum_contract_pack(slow_pack_path: Path) -> None:
 
     Two supported shapes:
 
-    - **Canonical active-month (production/training)** — ``canonical_id`` + ``anchor_gaming_day`` +
+    - **Canonical active-month (production/training)** — ``canonical_id`` + ``anchor_gaming_day_event`` +
       ``event_timestamp`` (see ``contracts/slow_patron_180d_monthly_features.yaml``).
     - **Bet-grain (diagnostic only)** — one row per ``bet_id`` with PIT timestamps; must not ship in deploy.
     - **Legacy player-grain snapshot** — used by tests / older tooling: ``player_id`` + calendar anchor.
     """
 
     slow_idx = _parquet_lower_column_index(slow_pack_path)
-    canonical_snapshot = ("canonical_id" in slow_idx) and ("anchor_gaming_day" in slow_idx) and (
+    canonical_snapshot = ("canonical_id" in slow_idx) and ("anchor_gaming_day_event" in slow_idx) and (
         "bet_id" not in slow_idx
     )
     bet_snapshot = ("bet_id" in slow_idx) and ("prediction_visible_ts_cf" in slow_idx)
     player_snapshot = ("player_id" in slow_idx) and (
-        ("anchor_gaming_day" in slow_idx) or ("gaming_day" in slow_idx)
+        ("anchor_gaming_day_event" in slow_idx) or ("gaming_day_event" in slow_idx)
     )
 
     if canonical_snapshot and not bet_snapshot:
@@ -397,7 +397,7 @@ def _static_slow_minimum_contract_pack(slow_pack_path: Path) -> None:
             role="slow_patron",
             required=(
                 "canonical_id",
-                "anchor_gaming_day",
+                "anchor_gaming_day_event",
                 "event_timestamp",
                 "patron__theo_win_sum__w180d_m1snap",
                 "patron__gaming_days_cnt__w180d_m1snap",
@@ -433,9 +433,9 @@ def _static_slow_minimum_contract_pack(slow_pack_path: Path) -> None:
 
     if player_snapshot and not bet_snapshot:
         _ensure_parquet_columns(slow_pack_path, role="slow_patron", required=("player_id",))
-        if "anchor_gaming_day" not in slow_idx and "gaming_day" not in slow_idx:
+        if "anchor_gaming_day_event" not in slow_idx and "gaming_day_event" not in slow_idx:
             raise ValueError(
-                "[pack-schema] slow parquet (player-grain) must expose anchor_gaming_day or gaming_day "
+                "[pack-schema] slow parquet (player-grain) must expose anchor_gaming_day_event or gaming_day "
                 f"for legacy ASOF join; got {slow_pack_path}"
             )
         return
@@ -445,9 +445,9 @@ def _static_slow_minimum_contract_pack(slow_pack_path: Path) -> None:
     ellipsis = "" if len(sample) <= 50 else ", …"
     raise ValueError(
         "[pack-schema] slow_patron parquet unsupported structure: "
-        "need canonical active-month (canonical_id + anchor_gaming_day + event_timestamp + patron__*), "
+        "need canonical active-month (canonical_id + anchor_gaming_day_event + event_timestamp + patron__*), "
         "diagnostic bet-grain (bet_id + prediction_visible_ts_cf + __etl_insert_*synthetic*), "
-        "or legacy player snapshot (player_id + gaming_day|anchor_gaming_day); "
+        "or legacy player snapshot (player_id + gaming_day|anchor_gaming_day_event); "
         f"schema(lowercase-sample)=[{tip}{ellipsis}] — file={slow_pack_path}"
     )
 

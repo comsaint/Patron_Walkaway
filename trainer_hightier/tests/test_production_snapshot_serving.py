@@ -50,7 +50,7 @@ from trainer_hightier.serving.snapshot_freshness import (
 def _write_mid_term_snapshot(path: Path, *, anchor: date) -> None:
     row: dict[str, list] = {
         "canonical_id": ["c1"],
-        "anchor_gaming_day": [anchor.isoformat()],
+        "anchor_gaming_day_event": [anchor.isoformat()],
     }
     for col in MID_TERM_SNAPSHOT_OUTPUT_COLUMNS:
         if col.startswith("fe__"):
@@ -63,7 +63,7 @@ def _write_slow_snapshot(path: Path, *, anchor: date) -> None:
         pa.Table.from_pydict(
             {
                 "canonical_id": ["c1"],
-                "anchor_gaming_day": [anchor.isoformat()],
+                "anchor_gaming_day_event": [anchor.isoformat()],
                 "patron__adt__w180d_m1snap": [100.0],
                 "patron__theo_win_sum__w180d_m1snap": [10.0],
                 "patron__gaming_days_cnt__w180d_m1snap": [5.0],
@@ -122,7 +122,7 @@ def test_validate_mid_term_rejects_all_null(tmp_path: Path) -> None:
     path = tmp_path / "mid.parquet"
     row: dict[str, list] = {
         "canonical_id": ["c1"],
-        "anchor_gaming_day": ["2026-05-18"],
+        "anchor_gaming_day_event": ["2026-05-18"],
     }
     for col in MID_TERM_SNAPSHOT_OUTPUT_COLUMNS:
         if col.startswith("fe__"):
@@ -170,7 +170,7 @@ def test_asof_boundary_anchor_less_than_gaming_day(tmp_path: Path) -> None:
         {
             "bet_id": [1],
             "canonical_id": ["c1"],
-            "gaming_day": [d2.isoformat()],
+            "gaming_day_event": [d2.isoformat()],
             "payout_odds": [2.0],
         }
     )
@@ -215,9 +215,9 @@ def _publish_test_manifest(
         payload["mid_term_snapshot_parquet"] = mid_path.name
         payload["mid_term_grain"] = MID_TERM_GRAIN_CANONICAL_DAILY_ASOF
         if mid_anchor is not None:
-            payload["mid_term_anchor_gaming_day_max"] = mid_anchor.isoformat()
+            payload["mid_term_anchor_gaming_day_event_max"] = mid_anchor.isoformat()
     if slow_anchor is not None:
-        payload["slow_anchor_gaming_day_max"] = slow_anchor.isoformat()
+        payload["slow_anchor_gaming_day_event_max"] = slow_anchor.isoformat()
     (snap_dir / "active_manifest.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
@@ -351,7 +351,7 @@ def test_bet_mirror_rejects_missing_columns(tmp_path: Path) -> None:
     bet_dir = tmp_path / "cleaned_bet"
     bet_dir.mkdir()
     pq.write_table(
-        pa.Table.from_pydict({"gaming_day": ["2026-05-18"], "player_id": ["p1"]}),
+        pa.Table.from_pydict({"gaming_day_event": ["2026-05-18"], "player_id": ["p1"]}),
         bet_dir / "part.parquet",
     )
     result = validate_production_bet_mirror(mirror_dir=bet_dir, required_lookback_days=3)
@@ -365,7 +365,7 @@ def test_session_mirror_rejects_insufficient_coverage(tmp_path: Path) -> None:
         pa.Table.from_pydict(
             {
                 "player_id": ["p1"],
-                "gaming_day": ["2026-05-18"],
+                "gaming_day_event": ["2026-05-18"],
                 "theo_win": [1.0],
             }
         ),

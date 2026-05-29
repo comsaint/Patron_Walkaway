@@ -165,7 +165,7 @@ def init_feature_state_db(path: Optional[Path] = None) -> Path:
                 layer TEXT NOT NULL,
                 artifact_path TEXT,
                 row_count INTEGER,
-                anchor_gaming_day_max TEXT,
+                anchor_gaming_day_event_max TEXT,
                 source_scope TEXT,
                 feature_view TEXT,
                 export_rows INTEGER,
@@ -394,7 +394,7 @@ def upsert_feast_refresh_layer(
     status: str,
     artifact_path: str | None = None,
     row_count: int | None = None,
-    anchor_gaming_day_max: str | None = None,
+    anchor_gaming_day_event_max: str | None = None,
     source_scope: str | None = None,
     feature_view: str | None = None,
     export_rows: int | None = None,
@@ -413,7 +413,7 @@ def upsert_feast_refresh_layer(
         conn.execute(
             """
             INSERT INTO feast_refresh_layer(
-                run_id, layer, artifact_path, row_count, anchor_gaming_day_max,
+                run_id, layer, artifact_path, row_count, anchor_gaming_day_event_max,
                 source_scope, feature_view, export_rows, export_seconds, compute_seconds,
                 smoke_sample_size, smoke_entity_present_rate, status, detail_json
             )
@@ -421,7 +421,7 @@ def upsert_feast_refresh_layer(
             ON CONFLICT(run_id, layer) DO UPDATE SET
                 artifact_path=excluded.artifact_path,
                 row_count=excluded.row_count,
-                anchor_gaming_day_max=excluded.anchor_gaming_day_max,
+                anchor_gaming_day_event_max=excluded.anchor_gaming_day_event_max,
                 source_scope=excluded.source_scope,
                 feature_view=excluded.feature_view,
                 export_rows=excluded.export_rows,
@@ -437,7 +437,7 @@ def upsert_feast_refresh_layer(
                 layer,
                 artifact_path,
                 row_count,
-                anchor_gaming_day_max,
+                anchor_gaming_day_event_max,
                 source_scope,
                 feature_view,
                 export_rows,
