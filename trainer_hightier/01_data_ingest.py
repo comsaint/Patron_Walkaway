@@ -140,7 +140,6 @@ _REQUIRED_SESSION_PARQUET_COLS: tuple[str, ...] = (
     "num_bets",
     "__etl_insert_Dtm",
     "theo_win",
-    "gaming_day",
 )
 
 

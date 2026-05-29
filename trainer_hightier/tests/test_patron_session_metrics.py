@@ -25,7 +25,7 @@ def _sess_row(pid: int, sid: int, theo: float, gd: date) -> dict:
         "lud_dtm": t,
         "session_start_dtm": t,
         "session_end_dtm": t,
-        "gaming_day": gd,
+        "gaming_day_event": gd,
         "theo_win": theo,
         "is_manual": 0,
         "is_deleted": 0,
@@ -178,7 +178,7 @@ def test_slow_patron_canonical_active_month_single_anchor(tmp_path) -> None:
     got = pd.read_parquet(out)
     assert len(got) == 1
     assert str(got.iloc[0]["canonical_id"]) == "c1"
-    anchors = pd.to_datetime(got["anchor_gaming_day"]).dt.date.tolist()
+    anchors = pd.to_datetime(got["anchor_gaming_day_event"]).dt.date.tolist()
     assert anchors == [date(2024, 5, 31)]
     assert "event_timestamp" in got.columns
     assert pd.notna(got.iloc[0]["event_timestamp"])
@@ -228,7 +228,7 @@ def test_slow_patron_180d_monthly_bet_grain_diagnostic_assigns_latest_anchor(tmp
             "payout_ha": 0.0,
             "base_ha": 0.0,
             "is_back_bet": 0,
-            "gaming_day": pgd,
+            "gaming_day_event": pgd,
             "prediction_visible_ts_cf": pit,
             "__etl_insert_Dtm_synthetic": pit,
         }
@@ -252,9 +252,9 @@ def test_slow_patron_180d_monthly_bet_grain_diagnostic_assigns_latest_anchor(tmp
     r0 = got.iloc[0]
     assert pd.isna(r0["patron__theo_win_sum__w180d_m1snap"])
     r1 = got.iloc[1]
-    assert float(r1["patron__theo_win_sum__w180d_m1snap"]) == 100.0
-    assert int(r1["patron__gaming_days_cnt__w180d_m1snap"]) == 1
-    assert float(r1["patron__adt__w180d_m1snap"]) == 100.0
+    assert float(r1["patron__theo_win_sum__w180d_m1snap"]) == 150.0
+    assert int(r1["patron__gaming_days_cnt__w180d_m1snap"]) == 2
+    assert float(r1["patron__adt__w180d_m1snap"]) == 75.0
     r2 = got.iloc[2]
     assert abs(float(r2["patron__theo_win_sum__w180d_m1snap"]) - 350.0) < 1e-6
     assert int(r2["patron__gaming_days_cnt__w180d_m1snap"]) == 3

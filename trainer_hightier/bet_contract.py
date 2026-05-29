@@ -17,7 +17,6 @@ BET_INGEST_READ_COLS_ORDERED: Final[tuple[str, ...]] = (
     "player_id",
     "game_id",
     "table_id",
-    "gaming_day",
     "payout_complete_dtm",
     "__etl_insert_Dtm",
     "wager",
@@ -55,13 +54,15 @@ def bet_ingest_read_cols_ordered() -> tuple[str, ...]:
     return BET_INGEST_READ_COLS_ORDERED
 
 
-def assert_bets_gaming_day_contract(bets: pd.DataFrame, context: str) -> None:
-    """Fail fast when ``gaming_day`` is missing or null (t_bet contract)."""
+def assert_bets_gaming_day_event_contract(bets: pd.DataFrame, context: str) -> None:
+    """Fail fast when ``gaming_day_event`` is missing or null (cleaned t_bet contract)."""
 
-    if "gaming_day" not in bets.columns:
-        raise ValueError(f"{context}: missing required column 'gaming_day' (no fallback)")
+    if "gaming_day_event" not in bets.columns:
+        raise ValueError(f"{context}: missing required column 'gaming_day_event' (no fallback)")
     if bets.empty:
         return
-    if bets["gaming_day"].isna().any():
-        n = int(bets["gaming_day"].isna().sum())
-        raise ValueError(f"{context}: gaming_day must be non-null on all bet rows (found {n} nulls)")
+    if bets["gaming_day_event"].isna().any():
+        n = int(bets["gaming_day_event"].isna().sum())
+        raise ValueError(
+            f"{context}: gaming_day_event must be non-null on all bet rows (found {n} nulls)"
+        )

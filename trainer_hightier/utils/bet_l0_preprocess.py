@@ -37,10 +37,19 @@ from trainer_hightier.preprocess_bet_fix_registry import (
     resolve_bet_ingest_fix004_cap_binding,
 )
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas, execute_sql_with_progress_oom_retry
+from trainer_hightier.utils.hk_time_semantics import (
+    GAMING_DAY_EVENT_COLUMN,
+    T_BET_EVENT_TIME_COLUMN,
+    T_BET_OBSERVED_AT_COLUMN,
+    T_BET_TIMESTAMP_COLUMNS,
+    assert_no_etl_before_event_violations,
+    duckdb_gaming_day_event_sql,
+    duckdb_quote_ident as _hk_quote_ident,
+)
 
 logger = logging.getLogger("trainer_hightier")
 
-_BET_CLEAN_CACHE_MANIFEST_VERSION = 9
+_BET_CLEAN_CACHE_MANIFEST_VERSION = 10
 
 
 def _duckdb_quote_ident(name: str) -> str:
@@ -256,7 +265,6 @@ def _bet_dq_where_sql(names: frozenset[str]) -> str:
         f'AND TRY_CAST("player_id" AS BIGINT) <> {ph}',
         'TRY_CAST("session_id" AS DOUBLE) IS NOT NULL',
         'TRY_CAST("payout_complete_dtm" AS TIMESTAMP) IS NOT NULL',
-        'TRY_CAST("gaming_day" AS DATE) IS NOT NULL',
         'COALESCE(TRY_CAST("wager" AS DOUBLE), 0.0) > 0',
     ]
     frag.extend(_bet_optional_flag_sql(names))
@@ -347,6 +355,29 @@ def _duckdb_read_parquet_sources_sql(paths: list[Path]) -> str:
     return "read_parquet([" + inner + "])"
 
 
+def _bet_hk_norm_select_list(read_cols_ordered: tuple[str, ...]) -> str:
+    """Build SELECT list: non-timestamp passthrough + HK tz-aware timestamps + ``gaming_day_event``."""
+    names = frozenset(read_cols_ordered)
+    passthrough = [
+        c for c in read_cols_ordered
+        if c not in T_BET_TIMESTAMP_COLUMNS and c != "gaming_day"
+    ]
+    parts = [f"lf.{_duckdb_quote_ident(c)}" for c in passthrough]
+    for col in T_BET_TIMESTAMP_COLUMNS:
+        if col in names:
+            ident = _duckdb_quote_ident(col)
+            parts.append(
+                f"timezone('Asia/Hong_Kong', TRY_CAST(lf.{ident} AS TIMESTAMPTZ)) AS {ident}"
+            )
+    parts.append(
+        duckdb_gaming_day_event_sql(T_BET_EVENT_TIME_COLUMN).replace(
+            f"TRY_CAST({_hk_quote_ident(T_BET_EVENT_TIME_COLUMN)} AS TIMESTAMPTZ)",
+            f"TRY_CAST(lf.{_hk_quote_ident(T_BET_EVENT_TIME_COLUMN)} AS TIMESTAMPTZ)",
+        )
+    )
+    return ",\n    ".join(parts)
+
+
 def _duckdb_bet_clean_pipeline_select_sql(
     *,
     src_read_parquet_clause: str,
@@ -412,12 +443,12 @@ lf AS (
   WHERE {l0_where}{bucket_filter}
 )"""
     syn = f"""CASE
-    WHEN TRY_CAST(lf."__etl_insert_Dtm" AS TIMESTAMP) IS NULL
-      OR TRY_CAST(lf."payout_complete_dtm" AS TIMESTAMP) IS NULL
+    WHEN TRY_CAST(hk."__etl_insert_Dtm" AS TIMESTAMP) IS NULL
+      OR TRY_CAST(hk."payout_complete_dtm" AS TIMESTAMP) IS NULL
     THEN NULL
     ELSE LEAST(
-      TRY_CAST(lf."__etl_insert_Dtm" AS TIMESTAMP),
-      TRY_CAST(lf."payout_complete_dtm" AS TIMESTAMP) + INTERVAL {cap} SECOND
+      TRY_CAST(hk."__etl_insert_Dtm" AS TIMESTAMP),
+      TRY_CAST(hk."payout_complete_dtm" AS TIMESTAMP) + INTERVAL {cap} SECOND
     )
   END"""
     eps = _bet_episode_scalar_sql(tags, obs_alias="obs")
@@ -428,11 +459,16 @@ FROM fin
 """
     return f"""
 {with_lf},
+hk AS (
+  SELECT
+    {_bet_hk_norm_select_list(read_cols_ordered)}
+  FROM lf AS lf
+),
 obs AS (
   SELECT
-    lf.*,
+    hk.*,
     {syn} AS "__etl_insert_Dtm_synthetic"
-  FROM lf AS lf
+  FROM hk AS hk
 ),
 tagged AS (
   SELECT
@@ -496,8 +532,8 @@ def _wrapped_bet_select_for_partitioned_copy(pipeline_sql: str) -> str:
     return (
         "SELECT\n"
         "  p.*,\n"
-        "  strftime(TRY_CAST(p.gaming_day AS DATE), '%Y%m') AS gaming_month,\n"
-        "  strftime(TRY_CAST(p.gaming_day AS DATE), '%Y-%m-%d') AS gaming_day_key\n"
+        "  strftime(TRY_CAST(p.gaming_day_event AS DATE), '%Y%m') AS gaming_month,\n"
+        "  strftime(TRY_CAST(p.gaming_day_event AS DATE), '%Y-%m-%d') AS gaming_day_key\n"
         f"FROM ({inner}) AS p\n"
     )
 
@@ -551,7 +587,7 @@ def _partitioned_parquet_manifest_block(dataset_root: Path) -> dict[str, Any]:
     )
     digest = hashlib.sha256(lines).hexdigest()
     return {
-        "kind": "gaming_day_partitioned_parquet_dataset_v1",
+        "kind": "gaming_day_event_partitioned_parquet_dataset_v1",
         "dataset_root": root_s.replace("\\", "/"),
         "shard_count": int(len(shards)),
         "total_num_rows": int(total_rows),
@@ -573,15 +609,16 @@ def _bet_artifact_manifest_block(path: Path) -> dict[str, Any]:
     raise FileNotFoundError(ap)
 
 
-def _enforce_no_null_gaming_day_partitioned(dataset_root: Path, *, duckdb_cfg: DuckDbRuntimeConfig) -> None:
+def _enforce_no_null_gaming_day_event_partitioned(dataset_root: Path, *, duckdb_cfg: DuckDbRuntimeConfig) -> None:
     root = Path(dataset_root).resolve()
     if not any(root.rglob("*.parquet")):
         return
     glo = cleaned_bet_dataset_glob_posix(root).replace("'", "''")
+    col = GAMING_DAY_EVENT_COLUMN
     sql = f"""
 SELECT COUNT(*) AS n_null
 FROM read_parquet('{glo}', hive_partitioning=false) AS _
-WHERE TRY_CAST(_.gaming_day AS DATE) IS NULL
+WHERE TRY_CAST(_."{col}" AS DATE) IS NULL
 """.strip()
     con = duckdb.connect(database=":memory:")
     try:
@@ -591,7 +628,7 @@ WHERE TRY_CAST(_.gaming_day AS DATE) IS NULL
         con.close()
     if n > 0:
         raise ValueError(
-            f"gaming_day null gate failed after partitioned bet preprocess: rows_with_null_date={n} root={dataset_root}"
+            f"{col} null gate failed after partitioned bet preprocess: rows_with_null_date={n} root={dataset_root}"
         )
 
 
@@ -626,6 +663,18 @@ def _preprocess_bets_duckdb_single_copy(
     cap_sec, _applied = _bet_cap_applied_rules(registry_yaml)
     tags = bulk_bet_episode_calendar_tags(registry_yaml)
     src_clause = _duckdb_read_parquet_sources_sql(source_parquets)
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_cfg)
+        assert_no_etl_before_event_violations(
+            con,
+            src_read_parquet_clause=src_clause,
+            event_time_column=T_BET_EVENT_TIME_COLUMN,
+            observed_at_column=T_BET_OBSERVED_AT_COLUMN,
+            context="[Step 2b] t_bet preprocess ETL sanity gate",
+        )
+    finally:
+        con.close()
     out_esc = _path_posix(ds_root).replace("'", "''")
     adt_allowed_esc = _resolve_adt_allowed_players_posix(cfg)
     if adt_allowed_esc is not None:
@@ -683,7 +732,7 @@ def _preprocess_bets_duckdb_single_copy(
                 final_dataset_root=ds_root,
                 n_buckets=n,
             )
-    _enforce_no_null_gaming_day_partitioned(ds_root, duckdb_cfg=duckdb_cfg)
+    _enforce_no_null_gaming_day_event_partitioned(ds_root, duckdb_cfg=duckdb_cfg)
     return cap_sec, tags
 
 
@@ -815,8 +864,8 @@ def segment_cleaned_bet_from_base_parquet(
 COPY (
   SELECT
     s.*,
-    strftime(TRY_CAST(s.gaming_day AS DATE), '%Y%m') AS gaming_month,
-    strftime(TRY_CAST(s.gaming_day AS DATE), '%Y-%m-%d') AS gaming_day_key
+    strftime(TRY_CAST(s.gaming_day_event AS DATE), '%Y%m') AS gaming_month,
+    strftime(TRY_CAST(s.gaming_day_event AS DATE), '%Y-%m-%d') AS gaming_day_key
   FROM (
     SELECT DISTINCT b.*
     FROM {b_from} AS b
@@ -836,7 +885,7 @@ COPY (
         desc="[Step 2b] DuckDB segment bet from base",
         join_timeout_s=7200.0,
     )
-    _enforce_no_null_gaming_day_partitioned(out, duckdb_cfg=ddb)
+    _enforce_no_null_gaming_day_event_partitioned(out, duckdb_cfg=ddb)
     nrows = partitioned_cleaned_bet_total_rows(out)
     logger.info(
         "[Step 2b] segmented bet dataset from base rows=%d -> %s",

@@ -44,7 +44,7 @@ MID_TERM_SNAPSHOT_MAX_LOOKBACK_DAYS: Final[int] = 32
 MID_TERM_SNAPSHOT_SCOPE_TRAINING: Final[str] = "training_step4_only"
 MID_TERM_SNAPSHOT_SCOPE_PRODUCTION: Final[str] = "production"
 # Training audit columns written by mid-term ASOF enrich.
-MID_TERM_ANCHOR_AUDIT_COLUMN: Final[str] = "mid_term_anchor_gaming_day"
+MID_TERM_ANCHOR_AUDIT_COLUMN: Final[str] = "mid_term_anchor_gaming_day_event"
 MID_TERM_SNAPSHOT_AGE_AUDIT_COLUMN: Final[str] = "mid_term_snapshot_age_days"
 MID_TERM_SNAPSHOT_MISSING_AUDIT_COLUMN: Final[str] = "mid_term_snapshot_missing_flag"
 # Manifest keys for Route B production feature suppliers.
@@ -52,7 +52,7 @@ MANIFEST_KEY_FE_DERIVED_SOURCE_KIND: Final[str] = "fe_derived_source_kind"
 MANIFEST_KEY_SLOW_PATRON_GRAIN: Final[str] = "slow_patron_grain"
 MANIFEST_KEY_MID_TERM_SNAPSHOT: Final[str] = "mid_term_snapshot_parquet"
 MANIFEST_KEY_MID_TERM_GRAIN: Final[str] = "mid_term_grain"
-MANIFEST_KEY_MID_TERM_ANCHOR_MAX: Final[str] = "mid_term_anchor_gaming_day_max"
+MANIFEST_KEY_MID_TERM_ANCHOR_MAX: Final[str] = "mid_term_anchor_gaming_day_event_max"
 MANIFEST_KEY_MID_TERM_COVERAGE_END: Final[str] = "mid_term_coverage_end_exclusive"
 MANIFEST_KEY_MID_TERM_GENERATED_AT: Final[str] = "mid_term_generated_at"
 MANIFEST_KEY_MID_TERM_STALE_HARD_CAP_DAYS: Final[str] = "mid_term_stale_hard_cap_days"
@@ -60,7 +60,7 @@ MANIFEST_KEY_MID_TERM_STALE_HARD_CAP_DAYS: Final[str] = "mid_term_stale_hard_cap
 # ``MANIFEST_KEY_SHORT_TERM_PIT_CACHE`` and ``doc/Scorer Runtime Contract - SSOT.md`` §Short-term.
 MANIFEST_KEY_FE_SHORT_TERM: Final[str] = "fe_short_term_parquet"
 MANIFEST_KEY_SHORT_TERM_PIT_CACHE: Final[str] = MANIFEST_KEY_FE_SHORT_TERM
-MANIFEST_KEY_SLOW_ANCHOR_MAX: Final[str] = "slow_anchor_gaming_day_max"
+MANIFEST_KEY_SLOW_ANCHOR_MAX: Final[str] = "slow_anchor_gaming_day_event_max"
 MANIFEST_KEY_SLOW_ANCHOR_TARGET: Final[str] = "slow_anchor_target"
 MANIFEST_KEY_SLOW_ANCHOR_EFFECTIVE: Final[str] = "slow_anchor_effective"
 MANIFEST_KEY_SLOW_MONTH_TURN_PHASE: Final[str] = "slow_month_turn_phase"

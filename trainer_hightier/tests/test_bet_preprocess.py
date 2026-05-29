@@ -78,8 +78,6 @@ def _bet_row(**kwargs: object) -> dict[str, object]:
         __deleted="False",
     )
     merged.update(kwargs)
-    if merged.get("gaming_day") is None:
-        merged["gaming_day"] = pd.Timestamp(merged["payout_complete_dtm"]).date()
     return {c: merged[c] for c in BET_INGEST_READ_COLS_ORDERED}
 
 
@@ -99,12 +97,12 @@ def cap_sec(registry_path: Path) -> int:
 
 def test_preprocess_bet_dedup_keeps_latest_synthetic(registry_path: Path, tmp_path) -> None:
     t_pay = pd.Timestamp("2025-05-27 18:00:00")
-    t_old = pd.Timestamp("2025-05-27 17:50:00")
-    t_new = pd.Timestamp("2025-05-27 17:58:00")
+    t_old = pd.Timestamp("2025-05-27 18:01:00")
+    t_new = pd.Timestamp("2025-05-27 18:02:00")
     df = pd.DataFrame(
         [
-            _bet_row(bet_id=7, payout_complete_dtm=t_pay, gaming_day=t_pay.date(), __etl_insert_Dtm=t_old),
-            _bet_row(bet_id=7, payout_complete_dtm=t_pay, gaming_day=t_pay.date(), __etl_insert_Dtm=t_new),
+            _bet_row(bet_id=7, payout_complete_dtm=t_pay, __etl_insert_Dtm=t_old),
+            _bet_row(bet_id=7, payout_complete_dtm=t_pay, __etl_insert_Dtm=t_new),
         ]
     )
     raw = tmp_path / "gmwds_t_bet.parquet"

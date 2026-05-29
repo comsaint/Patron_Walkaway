@@ -14,12 +14,12 @@ from trainer_hightier.utils.duckdb_runtime import execute_sql_with_progress_oom_
 
 logger = logging.getLogger("trainer_hightier")
 
-_REQUIRED_CLEAN_COLS: frozenset[str] = frozenset({"player_id", "theo_win", "gaming_day"})
+_REQUIRED_CLEAN_COLS: frozenset[str] = frozenset({"player_id", "theo_win", "gaming_day_event"})
 _PROFILE_REQUIRED_CLEAN_COLS: frozenset[str] = frozenset(
     {
         "session_id",
         "player_id",
-        "gaming_day",
+        "gaming_day_event",
         "theo_win",
         "turnover",
         "player_win",
@@ -91,7 +91,7 @@ joined AS (
     COALESCE(TRY_CAST(sess.cash_buyins AS DOUBLE), 0.0) AS cash_buyins,
     COALESCE(TRY_CAST(sess.player_win AS DOUBLE), 0.0) AS player_win,
     COALESCE(TRY_CAST(sess.num_bets AS BIGINT), CAST(0 AS BIGINT)) AS num_bets,
-    sess.gaming_day AS gaming_day
+    sess.gaming_day_event AS gaming_day_event
   FROM sess
   INNER JOIN map
     ON TRY_CAST(sess.player_id AS BIGINT) = TRY_CAST(map.player_id AS BIGINT)
@@ -103,14 +103,14 @@ agg AS (
     CAST(SUM(turnover) AS DOUBLE) AS total_turnover,
     CAST(SUM(cash_buyins) AS DOUBLE) AS total_cash_buyins,
     CAST(SUM(player_win) AS DOUBLE) AS total_player_win,
-    CAST(COUNT(DISTINCT gaming_day) AS BIGINT) AS unique_gaming_days,
+    CAST(COUNT(DISTINCT gaming_day_event) AS BIGINT) AS unique_gaming_days,
     CAST(SUM(num_bets) AS BIGINT) AS total_num_bets,
     CAST(COUNT(*) AS BIGINT) AS session_count,
-    CAST(MIN(gaming_day) AS VARCHAR) AS first_gaming_day,
-    CAST(MAX(gaming_day) AS VARCHAR) AS last_gaming_day,
+    CAST(MIN(gaming_day_event) AS VARCHAR) AS first_gaming_day,
+    CAST(MAX(gaming_day_event) AS VARCHAR) AS last_gaming_day,
     CASE
-      WHEN COUNT(DISTINCT gaming_day) > 0 THEN
-        CAST(SUM(theo_win) AS DOUBLE) / CAST(COUNT(DISTINCT gaming_day) AS DOUBLE)
+      WHEN COUNT(DISTINCT gaming_day_event) > 0 THEN
+        CAST(SUM(theo_win) AS DOUBLE) / CAST(COUNT(DISTINCT gaming_day_event) AS DOUBLE)
       ELSE NULL
     END AS adt
   FROM joined
@@ -142,7 +142,7 @@ joined AS (
   SELECT
     CAST(map.canonical_id AS VARCHAR) AS canonical_id,
     COALESCE(TRY_CAST(sess.theo_win AS DOUBLE), 0.0) AS theo_win,
-    sess.gaming_day AS gaming_day
+    sess.gaming_day_event AS gaming_day_event
   FROM sess
   INNER JOIN map
     ON TRY_CAST(sess.player_id AS BIGINT) = TRY_CAST(map.player_id AS BIGINT)
@@ -151,10 +151,10 @@ agg AS (
   SELECT
     canonical_id,
     CAST(SUM(theo_win) AS DOUBLE) AS total_theo_win,
-    CAST(COUNT(DISTINCT gaming_day) AS BIGINT) AS gaming_days,
+    CAST(COUNT(DISTINCT gaming_day_event) AS BIGINT) AS gaming_days,
     CASE
-      WHEN COUNT(DISTINCT gaming_day) > 0 THEN
-        CAST(SUM(theo_win) AS DOUBLE) / CAST(COUNT(DISTINCT gaming_day) AS DOUBLE)
+      WHEN COUNT(DISTINCT gaming_day_event) > 0 THEN
+        CAST(SUM(theo_win) AS DOUBLE) / CAST(COUNT(DISTINCT gaming_day_event) AS DOUBLE)
       ELSE NULL
     END AS adt
   FROM joined
@@ -177,7 +177,7 @@ def compile_canonical_patron_session_metrics(
     """Write Parquet with ``canonical_id``, ``total_theo_win``, ``gaming_days``, ``adt`` (ADT descending).
 
     Sessions whose ``player_id`` is absent from the mapping are dropped (inner join).
-    Patrons with zero distinct ``gaming_day`` values get ``adt`` NULL and sort last.
+    Patrons with zero distinct ``gaming_day_event`` values get ``adt`` NULL and sort last.
     """
     src_c = Path(cleaned_session_parquet).resolve()
     src_m = Path(canonical_mapping_parquet).resolve()
@@ -223,8 +223,8 @@ def compile_canonical_patron_profile_csv(
     """Join cleaned sessions to mapping; write one CSV row per ``canonical_id``.
 
     ADT (average daily theo) = ``total_theo_win / unique_gaming_days`` when
-    ``unique_gaming_days > 0``; otherwise NULL. ``COUNT(DISTINCT gaming_day)``
-    ignores NULL ``gaming_day`` values (DuckDB default).
+    ``unique_gaming_days > 0``; otherwise NULL. ``COUNT(DISTINCT gaming_day_event)``
+    ignores NULL ``gaming_day_event`` values (DuckDB default).
 
     Parameters
     ----------

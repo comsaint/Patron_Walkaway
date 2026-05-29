@@ -160,9 +160,9 @@ def test_etl_insert_synthetic_caps_per_registry(tmp_path_factory) -> None:
     assert got == cap
 
 
-def test_session_end_imputed_from_start_for_synthetic(tmp_path_factory) -> None:
-    """Null session_end_dtm filled from start before synthetic."""
-    td = tmp_path_factory.mktemp("sess_impute")
+def test_session_null_end_excluded(tmp_path_factory) -> None:
+    """Rows with null session_end_dtm are excluded (no session_start_dtm fallback)."""
+    td = tmp_path_factory.mktemp("sess_null_end")
     t0 = datetime(2024, 6, 1, 12, 0, 0)
     etl = t0 + timedelta(hours=2)
 
@@ -184,7 +184,6 @@ def test_session_end_imputed_from_start_for_synthetic(tmp_path_factory) -> None:
             cash_buyins=0.0,
             num_bets=0,
             theo_win=0.0,
-            gaming_day=t0.date(),
             __etl_insert_Dtm=etl,
         ),
     ]
@@ -192,10 +191,7 @@ def test_session_end_imputed_from_start_for_synthetic(tmp_path_factory) -> None:
     pq.write_table(pa.Table.from_pandas(pd.DataFrame(rows)), pq_path)
 
     out = _hpre.preprocess_sessions_from_parquet(pq_path)
-    assert len(out) == 1
-    cap = pd.Timestamp(t0) + timedelta(seconds=636)
-    got = pd.Timestamp(out["__etl_insert_Dtm_synthetic"].iloc[0])
-    assert got == cap
+    assert len(out) == 0
 
 
 def test_streaming_preprocess_fnd01_dedup_across_row_groups(tmp_path) -> None:

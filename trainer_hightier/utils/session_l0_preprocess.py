@@ -28,7 +28,16 @@ from trainer_hightier.config import (
     SessionPreprocessConfig,
 )
 from trainer_hightier.utils.canonical_mapping import _CANONICAL_SESSION_COLS
-from trainer_hightier.utils.duckdb_runtime import execute_sql_with_progress_oom_retry
+from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas, execute_sql_with_progress_oom_retry
+from trainer_hightier.utils.hk_time_semantics import (
+    GAMING_DAY_EVENT_COLUMN,
+    T_SESSION_EVENT_TIME_COLUMN,
+    T_SESSION_OBSERVED_AT_COLUMN,
+    T_SESSION_TIMESTAMP_COLUMNS,
+    assert_no_etl_before_event_violations,
+    duckdb_gaming_day_event_sql,
+    duckdb_quote_ident as _hk_quote_ident,
+)
 
 _01_ingest = importlib.import_module("trainer_hightier.01_data_ingest")
 
@@ -40,7 +49,6 @@ _SESSION_PREPROCESS_REQUIRED_EXTRAS: frozenset[str] = frozenset(
     {
         "__etl_insert_Dtm",
         "theo_win",
-        "gaming_day",
         # Patron-level profile CSV (trainer_hightier.utils.patron_session_metrics)
         "player_win",
         "cash_buyins",
@@ -65,7 +73,6 @@ SESSION_PREPROCESS_READ_COLS_ORDERED: tuple[str, ...] = (
     "num_bets",
     "__etl_insert_Dtm",
     "theo_win",
-    "gaming_day",
 )
 
 if frozenset(SESSION_PREPROCESS_READ_COLS_ORDERED) != (
@@ -135,43 +142,56 @@ def _fnd04_activity_sql(names: frozenset[str]) -> str:
     return f"(({t} > 0) OR ({g} > 0))"
 
 
+def _session_hk_norm_select_list(read_cols_ordered: tuple[str, ...]) -> str:
+    """Build SELECT list with HK tz-aware timestamps and ``gaming_day_event``."""
+    names = frozenset(read_cols_ordered)
+    passthrough = [c for c in read_cols_ordered if c not in T_SESSION_TIMESTAMP_COLUMNS]
+    parts = [f"s1.{_duckdb_quote_ident(c)}" for c in passthrough]
+    for col in T_SESSION_TIMESTAMP_COLUMNS:
+        if col in names:
+            ident = _duckdb_quote_ident(col)
+            parts.append(
+                f"timezone('Asia/Hong_Kong', TRY_CAST(s1.{ident} AS TIMESTAMPTZ)) AS {ident}"
+            )
+    parts.append(
+        duckdb_gaming_day_event_sql(T_SESSION_EVENT_TIME_COLUMN).replace(
+            f"TRY_CAST({_hk_quote_ident(T_SESSION_EVENT_TIME_COLUMN)} AS TIMESTAMPTZ)",
+            f"TRY_CAST(s1.{_hk_quote_ident(T_SESSION_EVENT_TIME_COLUMN)} AS TIMESTAMPTZ)",
+        )
+    )
+    return ",\n    ".join(parts)
+
+
 def _s1_cte_sql(names: frozenset[str]) -> str:
-    """Impute ``session_end_dtm`` from ``session_start_dtm`` when both exist (trainer parity)."""
-    has_end = "session_end_dtm" in names
-    has_start = "session_start_dtm" in names
-    if has_end and has_start:
-        return """s1 AS (
-  SELECT * REPLACE (
-    COALESCE(
-      TRY_CAST("session_end_dtm" AS TIMESTAMP),
-      TRY_CAST("session_start_dtm" AS TIMESTAMP)
-    ) AS "session_end_dtm"
-  ) FROM l0
+    """Drop rows with null ``session_end_dtm`` (no ``session_start_dtm`` fallback)."""
+    if "session_end_dtm" not in names:
+        return "s1 AS ( SELECT * FROM l0 )"
+    return """s1 AS (
+  SELECT * FROM l0
+  WHERE TRY_CAST("session_end_dtm" AS TIMESTAMP) IS NOT NULL
 )"""
-    return "s1 AS ( SELECT * FROM l0 )"
 
 
-def _build_s2_cte_sql(names: frozenset[str]) -> str:
+def _build_s2_cte_sql(names: frozenset[str], *, source_alias: str = "hk") -> str:
     """Registry synthetic; skip if raw cannot produce column (parity with pandas)."""
     need = "__etl_insert_Dtm" in names and "session_end_dtm" in names
     if not need:
-        return "s2 AS ( SELECT * FROM s1 )"
-    star = "s1.*"
+        return f"s2 AS ( SELECT * FROM {source_alias} )"
+    star = f"{source_alias}.*"
     if "__etl_insert_Dtm_synthetic" in names:
-        star = 's1.* EXCLUDE ("__etl_insert_Dtm_synthetic")'
-    # Pandas: LEAST(etl, end+636s) with skipna=False → null if either input null.
+        star = f'{source_alias}.* EXCLUDE ("__etl_insert_Dtm_synthetic")'
     syn = f"""CASE
-    WHEN s1."__etl_insert_Dtm" IS NULL OR s1."session_end_dtm" IS NULL THEN NULL
+    WHEN {source_alias}."__etl_insert_Dtm" IS NULL OR {source_alias}."session_end_dtm" IS NULL THEN NULL
     ELSE LEAST(
-      TRY_CAST(s1."__etl_insert_Dtm" AS TIMESTAMP),
-      CAST(s1."session_end_dtm" AS TIMESTAMP) + INTERVAL 636 SECOND
+      TRY_CAST({source_alias}."__etl_insert_Dtm" AS TIMESTAMP),
+      CAST({source_alias}."session_end_dtm" AS TIMESTAMP) + INTERVAL 636 SECOND
     )
   END"""
     return f"""s2 AS (
   SELECT
     {star},
     {syn} AS "__etl_insert_Dtm_synthetic"
-  FROM s1
+  FROM {source_alias}
 )"""
 
 
@@ -227,6 +247,11 @@ WITH l0 AS (
   WHERE {l0w}{bucket_filter}
 ),
 {s1b},
+hk AS (
+  SELECT
+    {_session_hk_norm_select_list(read_cols_ordered)}
+  FROM s1 AS s1
+),
 {s2b},
 d AS (
   SELECT
@@ -261,6 +286,18 @@ def _preprocess_sessions_duckdb_single_copy(
         src_clause = f"read_parquet('{sp}')"
     else:
         src_clause = _duckdb_read_parquet_array_sql([Path(x) for x in session_sources])
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_cfg)
+        assert_no_etl_before_event_violations(
+            con,
+            src_read_parquet_clause=src_clause,
+            event_time_column=T_SESSION_EVENT_TIME_COLUMN,
+            observed_at_column=T_SESSION_OBSERVED_AT_COLUMN,
+            context="[Step 2] t_session preprocess ETL sanity gate",
+        )
+    finally:
+        con.close()
     out = Path(output_path).resolve()
     n = int(dedup_hash_buckets)
     if n < 1:
@@ -384,7 +421,7 @@ def _preprocess_sessions_pandas_shard_batches(
 _SESSION_INGEST_DELAY_CAP_SEC = 636
 
 # Bump when cache record schema or semantics change (invalidates old sidecars).
-_SESSION_CLEAN_CACHE_MANIFEST_VERSION = 5
+_SESSION_CLEAN_CACHE_MANIFEST_VERSION = 6
 
 
 def _filter_session_l0_deleted_canceled(chunk: pd.DataFrame) -> pd.DataFrame:
@@ -404,32 +441,19 @@ def _filter_session_l0_deleted_canceled(chunk: pd.DataFrame) -> pd.DataFrame:
 def impute_session_end_from_session_start(
     sessions: pd.DataFrame, *, batched_shard: bool = False
 ) -> pd.DataFrame:
-    """Fill null ``session_end_dtm`` from ``session_start_dtm`` (in-place copy).
-
-    Does not drop rows. Rows where both are null keep null ``session_end_dtm``.
-
-    Args:
-        batched_shard: If True, per-chunk statistics log at DEBUG (row-group pipeline).
-    """
+    """Drop rows with null ``session_end_dtm`` (no ``session_start_dtm`` fallback)."""
     if "session_end_dtm" not in sessions.columns:
         return sessions
-    if "session_start_dtm" not in sessions.columns:
-        return sessions
-    out = sessions.copy()
-    end = pd.to_datetime(out["session_end_dtm"], utc=False, errors="coerce")
-    start = pd.to_datetime(out["session_start_dtm"], utc=False, errors="coerce")
-    n_null_end = int(end.isna().sum())
-    filled = end.where(~end.isna(), start)
-    out["session_end_dtm"] = filled
-    n_filled = int((end.isna() & start.notna()).sum())
-    if n_null_end:
+    end = pd.to_datetime(sessions["session_end_dtm"], utc=False, errors="coerce")
+    n_null = int(end.isna().sum())
+    if n_null:
         _log = logger.debug if batched_shard else logger.info
         _log(
-            "[Step 2] impute session_end_dtm from session_start_dtm: %d rows had null end; %d filled from start",
-            n_null_end,
-            n_filled,
+            "[Step 2] exclude sessions with null session_end_dtm: %d/%d rows",
+            n_null,
+            len(sessions),
         )
-    return out
+    return sessions.loc[end.notna()].copy()
 
 
 def add_etl_insert_dtm_synthetic(
