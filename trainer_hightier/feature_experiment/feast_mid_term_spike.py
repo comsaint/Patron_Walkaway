@@ -138,7 +138,7 @@ def export_clickhouse_bets_to_parquet(
         SELECT
             CAST(player_id AS Int64) AS player_id,
             {CH_TBET_GAMING_DAY_EVENT_EXPR} AS gaming_day_event,
-            CAST(payout_complete_dtm AS DateTime64(3, 'UTC')) AS payout_complete_dtm,
+            CAST(payout_complete_dtm AS Nullable(DateTime64(3, 'UTC'))) AS payout_complete_dtm,
             {CH_TBET_WAGER_SELECT},
             {CH_TBET_PAYOUT_ODDS_SELECT}
         FROM {cfg.source_db}.{cfg.tbet} FINAL

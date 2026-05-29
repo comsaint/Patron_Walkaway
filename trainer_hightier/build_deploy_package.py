@@ -850,13 +850,15 @@ def _clean_trainer_hightier_staging_build_dir() -> None:
 def _build_trainer_hightier_wheel(*, wheels_dir: Path) -> str:
     """Build ``trainer_hightier`` wheel into *wheels_dir*; return wheel filename."""
     wheels_dir.mkdir(parents=True, exist_ok=True)
+    for stale in wheels_dir.glob("trainer_hightier-*.whl"):
+        stale.unlink()
     pkg_root = _REPO_ROOT / "trainer_hightier"
     pyproj = pkg_root / "pyproject.toml"
     if not pyproj.is_file():
         raise FileNotFoundError(f"trainer_hightier pyproject missing: {pyproj}")
     _clean_trainer_hightier_staging_build_dir()
     subprocess.run(
-        [sys.executable, "-m", "pip", "wheel", ".", "-w", str(wheels_dir), "--no-deps"],
+        [sys.executable, "-m", "pip", "wheel", ".", "-w", str(wheels_dir), "--no-deps", "--no-cache-dir"],
         check=True,
         cwd=str(pkg_root),
     )
