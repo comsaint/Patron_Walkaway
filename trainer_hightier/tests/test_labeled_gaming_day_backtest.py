@@ -21,7 +21,11 @@ from trainer_hightier.serving.offline_serving_backtest import (
     run_offline_serving_backtest,
 )
 from trainer_hightier.serving.snapshot_freshness import serving_day_for_eval_gaming_day_end
-from trainer_hightier.tests.test_offline_serving_backtest import _deploy_layout, _fake_bets
+from trainer_hightier.tests.test_offline_serving_backtest import (
+    _deploy_layout,
+    _fake_bets,
+    _write_test_mid_snapshot,
+)
 
 
 def test_serving_day_for_eval_end_matches_mid_anchor_semantics() -> None:
@@ -239,6 +243,11 @@ def test_quick_replay_still_available(
             bet__back_bet_ratio__w1h=0.0,
             bet__payout_odds_avg__w1h=1.5,
         ),
+    )
+    mid_snap = _write_test_mid_snapshot(tmp_path / "mid_term_daily_snapshot.parquet")
+    monkeypatch.setattr(
+        "trainer_hightier.serving.offline_serving_backtest._resolve_training_mid_snapshot_path",
+        lambda **k: mid_snap,
     )
 
     report = run_offline_serving_backtest(

@@ -140,7 +140,7 @@ def test_freeze_deploy_inputs_manifest_has_freshness_metadata(monkeypatch, tmp_p
     slow_p = tmp_path / "slow_patron_180d_monthly.parquet"
     pd.DataFrame({"player_id": [1], "canonical_id": [10]}).to_parquet(map_p, index=False)
     pd.DataFrame({"player_id": [1]}).to_parquet(allow_p, index=False)
-    pd.DataFrame({"player_id": [1], "gaming_day": [20250101]}).to_parquet(slow_p, index=False)
+    pd.DataFrame({"player_id": [1], "gaming_day_event": [20250101]}).to_parquet(slow_p, index=False)
     (bundle_dir / "feature_candidate_registry.snapshot.yaml").write_text(
         "registry_version: test\nfeatures: []\n",
         encoding="utf-8",

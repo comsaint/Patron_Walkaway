@@ -329,7 +329,7 @@ def _step4_gaming_day_periods_from_report(report: dict[str, Any]) -> dict[str, A
     if not by_split:
         return None
     return {
-        "basis": "gaming_day",
+        "basis": "gaming_day_event",
         "train_day_fraction": report.get("train_day_fraction"),
         "val_day_fraction": report.get("val_day_fraction"),
         "distinct_gaming_days": report.get("distinct_gaming_days"),
@@ -1083,6 +1083,92 @@ def _resolve_features_parquet(args: HighTierTrainArgs) -> Path:
     return _b3.DEFAULT_OUTPUT.resolve()
 
 
+def _ensure_training_parquet_gaming_day_event_column(
+    parquet_path: Path,
+    *,
+    duckdb_runtime: DuckDbRuntimeConfig,
+    cleaned_bet_parquet: Path | None = None,
+) -> Path:
+    """Sync ``gaming_day_event`` from cleaned bet event time; drop legacy ``gaming_day``."""
+
+    import duckdb
+
+    from trainer_hightier.utils.bet_l0_preprocess import resolved_cleaned_bet_read_parquet_sql
+    from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
+
+    p = Path(parquet_path).resolve()
+    cleaned = Path(cleaned_bet_parquet or _hpre.default_cleaned_bet_parquet_path()).resolve()
+    names = set(pq.read_schema(p).names)
+    if "bet_id" not in names:
+        raise ValueError(f"training parquet missing bet_id; path={p}")
+
+    exclude = ["gaming_day", "gaming_day_event"]
+    exclude_present = [c for c in exclude if c in names]
+    other_cols = [c for c in names if c not in exclude_present]
+    if not other_cols:
+        raise ValueError(f"training parquet has no columns to preserve; path={p}")
+
+    tmp = p.parent / f"{p.stem}.__gde_migrate__.parquet"
+    p_esc = str(p).replace("\\", "/").replace("'", "''")
+    tmp_esc = str(tmp).replace("\\", "/").replace("'", "''")
+    bet_from = resolved_cleaned_bet_read_parquet_sql(cleaned)
+    select_cols = ",\n    ".join(f'h."{c}"' for c in other_cols)
+    legacy_gday = "CAST(TRY_CAST(h.gaming_day AS DATE) AS DATE)" if "gaming_day" in names else "CAST(NULL AS DATE)"
+    existing_gde = (
+        "CAST(TRY_CAST(h.gaming_day_event AS DATE) AS DATE)"
+        if "gaming_day_event" in names
+        else "CAST(NULL AS DATE)"
+    )
+    sql = f"""
+COPY (
+  SELECT
+    {select_cols},
+    COALESCE(
+      CAST(b.gaming_day_event AS DATE),
+      {existing_gde},
+      {legacy_gday}
+    ) AS gaming_day_event
+  FROM read_parquet('{p_esc}') h
+  LEFT JOIN (
+    SELECT
+      TRY_CAST(bet_id AS DOUBLE) AS bet_id,
+      MIN(CAST(gaming_day_event AS DATE)) AS gaming_day_event
+    FROM {bet_from} AS _cbd
+    WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
+    GROUP BY 1
+  ) b ON TRY_CAST(h.bet_id AS DOUBLE) = b.bet_id
+) TO '{tmp_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+""".strip()
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        con.execute(sql)
+        n_bad = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{tmp_esc}') "
+            "WHERE gaming_day_event IS NULL",
+        ).fetchone()
+        n_bad_i = int(n_bad[0]) if n_bad else 0
+        if n_bad_i > 0:
+            logger.warning(
+                "[Step 4] gaming_day_event sync left %d NULL row(s) in %s "
+                "(no cleaned-bet match); re-run Step 3 to rebuild training_set.",
+                n_bad_i,
+                p.name,
+            )
+    finally:
+        con.close()
+    backup = p.with_suffix(".parquet.legacy_gaming_day.bak")
+    if not backup.is_file() and p.is_file():
+        shutil.copy2(p, backup)
+    tmp.replace(p)
+    logger.info(
+        "[Step 4] synced gaming_day_event from cleaned bet for %s (dropped legacy gaming_day=%s)",
+        p.name,
+        "gaming_day" in names,
+    )
+    return p
+
+
 def _assert_training_parquet_has_short_term_pit_columns(
     parquet_path: Path,
     *,
@@ -1203,8 +1289,8 @@ def _ensure_fe_enriched_training_parquet_for_step4(
             canonical_mapping_parquet=cmap_path,
             canonical_universe_parquet=universe_pq,
             lookback_days=lb,
-            anchor_gaming_day_start=anchor_start,
-            anchor_gaming_day_end=anchor_end,
+            anchor_gaming_day_event_start=anchor_start,
+            anchor_gaming_day_event_end=anchor_end,
         )
         if cached is not None:
             _, mid_meta = cached
@@ -1232,8 +1318,8 @@ def _ensure_fe_enriched_training_parquet_for_step4(
                 canonical_mapping_parquet=cmap_path,
                 canonical_universe_parquet=universe_pq,
                 lookback_days=lb,
-                anchor_gaming_day_start=anchor_start,
-                anchor_gaming_day_end=anchor_end,
+                anchor_gaming_day_event_start=anchor_start,
+                anchor_gaming_day_event_end=anchor_end,
                 bets_gaming_day_start=bets_start,
                 bets_gaming_day_end=bets_end,
                 snapshot_scope=MID_TERM_SNAPSHOT_SCOPE_TRAINING,
@@ -1303,6 +1389,7 @@ def _maybe_run_step4(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None)
         logger.warning("[Step 4] skip: no features parquet at %s", fp.resolve())
         return
     logger.info("[Step 4] starting from features parquet %s", fp.resolve())
+    fp = _ensure_training_parquet_gaming_day_event_column(fp, duckdb_runtime=args.duckdb_runtime)
     fp_eff = _ensure_fe_enriched_training_parquet_for_step4(args, fp, metrics=metrics)
     reg_p = Path(args.feature_candidate_registry).resolve() if args.feature_candidate_registry else None
     snap = load_candidate_registry(reg_p)
@@ -1698,9 +1785,9 @@ def _freeze_deploy_inputs(
         man[MANIFEST_KEY_MID_TERM_GENERATED_AT] = coverage_end
         mid_meta = metrics.get("main_trainer_mid_term_snapshot_meta")
         if isinstance(mid_meta, dict) and str(mid_meta.get("snapshot_scope", "")).strip() == MID_TERM_SNAPSHOT_SCOPE_PRODUCTION:
-            anchor_max = mid_meta.get("mid_term_anchor_gaming_day_max")
+            anchor_max = mid_meta.get("mid_term_anchor_gaming_day_event_max")
             if anchor_max is None:
-                anchor_max = mid_meta.get("anchor_gaming_day_max")
+                anchor_max = mid_meta.get("anchor_gaming_day_event_max")
             if anchor_max is not None:
                 man[MANIFEST_KEY_MID_TERM_ANCHOR_MAX] = str(anchor_max)
     man[MANIFEST_KEY_MID_TERM_STALE_HARD_CAP_DAYS] = MID_TERM_STALE_HARD_CAP_DAYS

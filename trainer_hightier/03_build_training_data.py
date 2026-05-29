@@ -16,7 +16,7 @@ Steps (see :func:`build_training_data`):
 1. Optional: materialize derived slow patron 180d monthly Parquet (short-term ``bet__*`` / ``fe__*`` come from Step 3.5 bounded hot pool).
 2. Write entity Parquet (``bet_id``, ``event_timestamp``) from cleaned bet.
 3. ``get_historical_features`` + ``persist`` → staging feature Parquet (Ibis/DuckDB).
-4. DuckDB left-join labels on ``bet_id`` + ``gaming_day`` from cleaned bet → ``artifacts/training_data/training_set.parquet``.
+4. DuckDB left-join labels on ``bet_id`` + ``gaming_day_event`` from cleaned bet → ``artifacts/training_data/training_set.parquet``.
 
 Prerequisites: ``feast_repo/data/registry.db`` must exist before Feast retrieval.
 By default Step 3 will run ``feast apply`` in ``feast_repo`` when registry is missing
@@ -790,8 +790,8 @@ def _join_labels_to_features(
 ) -> int | None:
     """Merge Feast features with labels and split keys for downstream Step 4.
 
-    Adds ``canonical_id`` from ``walkaway_labels`` and ``gaming_day`` from cleaned
-    bet (VARCHAR ``YYYY-MM-DD``) via ``bet_id``; no change to Feast retrieval.
+    Adds ``canonical_id`` from ``walkaway_labels`` and ``gaming_day_event`` from cleaned
+    bet (DATE) via ``bet_id``; no change to Feast retrieval.
     """
 
     f_esc = _path_posix(features_parquet).replace("'", "''")
@@ -805,7 +805,7 @@ COPY (
     y.label AS walkaway_label,
     y.censored AS walkaway_censored,
     y.canonical_id AS canonical_id,
-    b.gaming_day AS gaming_day
+    b.gaming_day_event AS gaming_day_event
   FROM read_parquet('{f_esc}') h
   LEFT JOIN (
     SELECT
@@ -818,7 +818,7 @@ COPY (
   LEFT JOIN (
     SELECT
       TRY_CAST(bet_id AS DOUBLE) AS bet_id,
-      MIN(strftime(TRY_CAST(gaming_day AS DATE), '%Y-%m-%d')) AS gaming_day
+      MIN(CAST(gaming_day_event AS DATE)) AS gaming_day_event
     FROM {bet_from} AS _cbd
     WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
     GROUP BY 1

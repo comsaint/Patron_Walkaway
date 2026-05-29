@@ -37,7 +37,7 @@ def test_step4_splits_rows_and_writes_report(tmp_path: Path) -> None:
                 "walkaway_label": i % 2,
                 "walkaway_censored": False,
                 "canonical_id": f"c{i % 3}",
-                "gaming_day": gd,
+                "gaming_day_event": gd,
                 "wager": "100.5",
             }
         )
@@ -75,7 +75,7 @@ def test_step4_drops_censored_rows_and_removes_column(tmp_path: Path) -> None:
                 "walkaway_label": i % 2,
                 "walkaway_censored": i == 3,
                 "canonical_id": f"c{i % 3}",
-                "gaming_day": gd,
+                "gaming_day_event": gd,
             }
         )
     inp = tmp_path / "features.parquet"
@@ -103,7 +103,7 @@ def test_step4_schema_gate_missing_canonical_id(tmp_path: Path) -> None:
         {
             "walkaway_label": [0],
             "walkaway_censored": [False],
-            "gaming_day": ["2024-01-01"],
+            "gaming_day_event": ["2024-01-01"],
             "bet_id": [1.0],
         }
     ).to_parquet(inp, index=False)
@@ -125,7 +125,7 @@ def test_step4_invalid_day_fractions(tmp_path: Path) -> None:
             "walkaway_label": [0],
             "walkaway_censored": [False],
             "canonical_id": ["a"],
-            "gaming_day": ["2024-01-01"],
+            "gaming_day_event": ["2024-01-01"],
         }
     ).to_parquet(inp, index=False)
     with pytest.raises(ValueError, match="train_day_fraction"):

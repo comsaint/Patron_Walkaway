@@ -1,4 +1,4 @@
-"""Step 4: arrange training parquet and split into train/val/test by ``gaming_day``.
+"""Step 4: arrange training parquet and split into train/val/test by ``gaming_day_event``.
 
 No standalone CLI — invoked from :mod:`trainer_hightier.trainer`. Only deterministic
 column projection, numeric casts, and time-ordered day splits; no fit-time transforms.
@@ -26,7 +26,7 @@ _PACKAGE_ROOT = Path(__file__).resolve().parent
 _DEFAULT_SPLITS_PARENT = _PACKAGE_ROOT / "artifacts" / "training_data" / "splits"
 
 REQUIRED_COLUMNS: Final[frozenset[str]] = frozenset(
-    {"walkaway_label", "walkaway_censored", "canonical_id", "gaming_day"},
+    {"walkaway_label", "walkaway_censored", "canonical_id", "gaming_day_event"},
 )
 
 OPTIONAL_DROP_COLS: Final[frozenset[str]] = frozenset(
@@ -206,28 +206,28 @@ WHERE {wc} = FALSE{slow_clause}
 
 
 def _gate_src_quality(con: duckdb.DuckDBPyConnection) -> int:
-    """Return distinct gaming_day count; raise if null keys or no days."""
+    """Return distinct gaming_day_event count; raise if null keys or no days."""
 
     n_bad = con.execute(
         """
         SELECT COUNT(*) FROM _step4_src
-        WHERE TRY_CAST(gaming_day AS DATE) IS NULL
+        WHERE TRY_CAST(gaming_day_event AS DATE) IS NULL
            OR TRIM(CAST(canonical_id AS VARCHAR)) = ''
         """
     ).fetchone()[0]
     if int(n_bad) > 0:
         raise ValueError(
-            f"Step 4: {int(n_bad)} row(s) have NULL gaming_day or empty canonical_id.",
+            f"Step 4: {int(n_bad)} row(s) have NULL gaming_day_event or empty canonical_id.",
         )
     n_days = con.execute(
         """
-        SELECT COUNT(DISTINCT TRY_CAST(gaming_day AS DATE))
+        SELECT COUNT(DISTINCT TRY_CAST(gaming_day_event AS DATE))
         FROM _step4_src
-        WHERE TRY_CAST(gaming_day AS DATE) IS NOT NULL
+        WHERE TRY_CAST(gaming_day_event AS DATE) IS NOT NULL
         """
     ).fetchone()[0]
     if int(n_days) < 1:
-        raise ValueError("Step 4: no distinct gaming_day values; cannot time-split.")
+        raise ValueError("Step 4: no distinct gaming_day_event values; cannot time-split.")
     return int(n_days)
 
 
@@ -245,7 +245,7 @@ WITH src AS (
   SELECT * FROM _step4_src
 ),
 days AS (
-  SELECT DISTINCT TRY_CAST(gaming_day AS DATE) AS gd FROM src
+  SELECT DISTINCT TRY_CAST(gaming_day_event AS DATE) AS gd FROM src
 ),
 ordered AS (
   SELECT gd, ROW_NUMBER() OVER (ORDER BY gd) AS rnk FROM days
@@ -266,7 +266,7 @@ tagged_days AS (
 )
 SELECT s.*, t.split_tag
 FROM src s
-INNER JOIN tagged_days t ON TRY_CAST(s.gaming_day AS DATE) = t.gd
+INNER JOIN tagged_days t ON TRY_CAST(s.gaming_day_event AS DATE) = t.gd
 """.strip()
     con.execute(sql)
 
@@ -305,8 +305,8 @@ def _split_aggregates(con: duckdb.DuckDBPyConnection) -> tuple[list[tuple[Any, .
         """
         SELECT split_tag, COUNT(*)::BIGINT,
                AVG(CAST(walkaway_label AS DOUBLE)),
-               MIN(TRY_CAST(gaming_day AS DATE)),
-               MAX(TRY_CAST(gaming_day AS DATE))
+               MIN(TRY_CAST(gaming_day_event AS DATE)),
+               MAX(TRY_CAST(gaming_day_event AS DATE))
         FROM _step4_tagged
         GROUP BY 1 ORDER BY 1
         """
@@ -352,8 +352,8 @@ def _build_step4_report(
                 "split": str(r[0]),
                 "row_count": int(r[1]),
                 "walkaway_label_rate": float(r[2]) if r[2] is not None else None,
-                "min_gaming_day": str(r[3]) if r[3] is not None else None,
-                "max_gaming_day": str(r[4]) if r[4] is not None else None,
+                "min_gaming_day_event": str(r[3]) if r[3] is not None else None,
+                "max_gaming_day_event": str(r[4]) if r[4] is not None else None,
             }
             for r in split_rows
         ],
@@ -406,7 +406,7 @@ def arrange_and_split_training_data(
     step4: Step4SplitConfig | None = None,
     splits_output_dir: Path | None = None,
 ) -> Step4Result:
-    """Project/cast features, tag rows by ``gaming_day`` splits, write Parquets + JSON report."""
+    """Project/cast features, tag rows by ``gaming_day_event`` splits, write Parquets + JSON report."""
 
     cfg = step4 or Step4SplitConfig()
     _validate_fractions(cfg.train_day_fraction, cfg.val_day_fraction)
