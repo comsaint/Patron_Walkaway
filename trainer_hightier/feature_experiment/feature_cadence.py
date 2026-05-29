@@ -24,7 +24,7 @@ ANCHOR_PRIOR_GAMING_DAY_END: Final[str] = "prior_gaming_day_end"
 ANCHOR_MONTHLY_SNAPSHOT: Final[str] = "monthly_snapshot_anchor"
 
 GRAIN_BET_ID: Final[str] = "bet_id"
-GRAIN_CANONICAL_ANCHOR_DAY: Final[str] = "canonical_id + anchor_gaming_day"
+GRAIN_CANONICAL_ANCHOR_DAY: Final[str] = "canonical_id + anchor_gaming_day_event"
 GRAIN_CANONICAL_ANCHOR_MONTH: Final[str] = "canonical_id + anchor_month"
 
 # Single short-layer supplier id (``bet__*`` + short ``fe__*``; live PIT or offline PIT cache).

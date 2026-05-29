@@ -20,7 +20,7 @@ Trial：需先執行 ``trainer_hightier.utils.trial_bet_behavior_1h.materialize_
 
 Slow patron：需先執行 ``trainer_hightier.utils.slow_patron_180d_monthly.materialize_slow_patron_180d_monthly``
 產生 **canonical-grain** ``artifacts/feast/slow_patron_180d_monthly.parquet``（含 ``canonical_id``、
-``anchor_gaming_day``、``event_timestamp``）後，``slow_patron_180d_monthly_features`` 方可通過檢核。
+``anchor_gaming_day_event``、``event_timestamp``）後，``slow_patron_180d_monthly_features`` 方可通過檢核。
 ``walkaway_bet_trial_v1`` 僅含 cleaned + trial（bet entity）；slow 請用 ``walkaway_canonical_slow_snap_v1``
 或 Step 3 分解快取路徑。
 """
@@ -216,7 +216,7 @@ mid_term_daily_spike_features = FeatureView(
     entities=[canonical_patron],
     ttl=timedelta(days=40),
     schema=[
-        Field(name="anchor_gaming_day", dtype=String),
+        Field(name="anchor_gaming_day_event", dtype=String),
         Field(name="fe__bets_cnt__w1d", dtype=Int64),
         Field(name="fe__wager_sum__w1d", dtype=Float64),
         Field(name="fe__bets_cnt__w7d", dtype=Int64),

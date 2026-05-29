@@ -56,7 +56,7 @@ _TRAINING_BET_STAGING_COLUMNS: Final[tuple[str, ...]] = (
     "type_of_bet",
     "session_id",
     "table_id",
-    "gaming_day",
+    "gaming_day_event",
 )
 
 
@@ -154,7 +154,7 @@ src AS (
     COALESCE(c.canonical_id, CAST(b."player_id" AS VARCHAR)) AS canonical_id,
     TRY_CAST(b."session_id" AS BIGINT) AS session_id,
     TRY_CAST(b."table_id" AS BIGINT) AS table_id,
-    TRY_CAST(b."gaming_day" AS DATE) AS gaming_day,
+    TRY_CAST(b."gaming_day_event" AS DATE) AS gaming_day_event,
     CAST(b."payout_complete_dtm" AS TIMESTAMPTZ) AS pcd,
     TRY_CAST(b."wager" AS DOUBLE) AS wager,
     TRY_CAST(b."payout_odds" AS DOUBLE) AS payout_odds,
@@ -194,11 +194,11 @@ src_lagged AS (
       ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
     ),
     w_canon_day_prior AS (
-      PARTITION BY canonical_id, gaming_day ORDER BY pcd, bet_id
+      PARTITION BY canonical_id, gaming_day_event ORDER BY pcd, bet_id
       ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
     ),
     w_canon_day_inclusive AS (
-      PARTITION BY canonical_id, gaming_day ORDER BY pcd, bet_id
+      PARTITION BY canonical_id, gaming_day_event ORDER BY pcd, bet_id
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     )
 ),
@@ -564,7 +564,7 @@ def _iter_training_bet_batches(
               CAST(type_of_bet AS VARCHAR) AS type_of_bet,
               TRY_CAST(session_id AS BIGINT) AS session_id,
               TRY_CAST(table_id AS BIGINT) AS table_id,
-              CAST(gaming_day AS TIMESTAMP) AS gaming_day,
+              CAST(gaming_day_event AS TIMESTAMP) AS gaming_day_event,
               ROW_NUMBER() OVER (
                 ORDER BY CAST(payout_complete_dtm AS TIMESTAMPTZ) ASC,
                          TRY_CAST(bet_id AS DOUBLE) ASC
@@ -755,11 +755,11 @@ src_lagged AS (
   WINDOW
     w_canonical AS (PARTITION BY canonical_id ORDER BY pcd, bet_id),
     w_canon_day_prior AS (
-      PARTITION BY canonical_id, gaming_day ORDER BY pcd, bet_id
+      PARTITION BY canonical_id, gaming_day_event ORDER BY pcd, bet_id
       ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
     ),
     w_canon_day_inclusive AS (
-      PARTITION BY canonical_id, gaming_day ORDER BY pcd, bet_id
+      PARTITION BY canonical_id, gaming_day_event ORDER BY pcd, bet_id
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     )
 ),
@@ -870,7 +870,7 @@ src AS (
     TRIM(CAST(b."canonical_id" AS VARCHAR)) AS canonical_id,
     TRY_CAST(b."session_id" AS BIGINT) AS session_id,
     TRY_CAST(b."table_id" AS BIGINT) AS table_id,
-    TRY_CAST(b."gaming_day" AS DATE) AS gaming_day,
+    TRY_CAST(b."gaming_day_event" AS DATE) AS gaming_day_event,
     CAST(b."payout_complete_dtm" AS TIMESTAMPTZ) AS pcd,
     TRY_CAST(b."wager" AS DOUBLE) AS wager,
     TRY_CAST(b."payout_odds" AS DOUBLE) AS payout_odds,
@@ -905,11 +905,11 @@ src_lagged AS (
   WINDOW
     w_target AS (PARTITION BY target_bet_id ORDER BY pcd, bet_id),
     w_target_day_prior AS (
-      PARTITION BY target_bet_id, gaming_day ORDER BY pcd, bet_id
+      PARTITION BY target_bet_id, gaming_day_event ORDER BY pcd, bet_id
       ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
     ),
     w_target_day_inclusive AS (
-      PARTITION BY target_bet_id, gaming_day ORDER BY pcd, bet_id
+      PARTITION BY target_bet_id, gaming_day_event ORDER BY pcd, bet_id
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     )
 ),
@@ -1022,8 +1022,8 @@ def _infer_scoring_bounds_from_pool(
     cols = ["bet_id", "player_id", "payout_complete_dtm"]
     if "canonical_id" in staged.columns:
         cols.append("canonical_id")
-    if "gaming_day" in staged.columns:
-        cols.append("gaming_day")
+    if "gaming_day_event" in staged.columns:
+        cols.append("gaming_day_event")
     return compute_scoring_bounds_for_bets(staged.loc[:, cols], cfg=cfg)
 
 
@@ -1063,7 +1063,7 @@ def _prepare_pool_for_fe_derived(pool: pd.DataFrame) -> pd.DataFrame:
         "canonical_id",
         "session_id",
         "table_id",
-        "gaming_day",
+        "gaming_day_event",
         "payout_complete_dtm",
         "wager",
         "payout_odds",

@@ -25,8 +25,13 @@ from trainer_hightier.tests.test_patron_session_metrics import _sess_row
 
 
 def _write_min_session(path: Path) -> None:
-    gd1 = date(2024, 1, 5)
-    gd2 = date(2024, 1, 12)
+    from datetime import date, timedelta
+
+    from trainer_hightier.utils.slow_month_turn import resolve_slow_month_turn_context
+
+    anchor = resolve_slow_month_turn_context(date.today()).slow_anchor_required
+    gd2 = anchor
+    gd1 = anchor - timedelta(days=7)
     sess = pd.DataFrame([_sess_row(100, 1, 100.0, gd1), _sess_row(100, 2, 50.0, gd2)])
     pq.write_table(pa.Table.from_pandas(sess), path)
 
@@ -42,7 +47,7 @@ def test_sanitize_ch_session_export_drops_bad_player_id() -> None:
     raw = pd.DataFrame(
         {
             "player_id": [1, None, "bad"],
-            "gaming_day": ["2024-01-05", "2024-01-06", "2024-01-07"],
+            "gaming_day_event": ["2024-01-05", "2024-01-06", "2024-01-07"],
             "theo_win": [10.0, 20.0, 30.0],
         }
     )
@@ -56,14 +61,14 @@ def test_write_feast_spike_parquet_collapses_latest_anchor(tmp_path: Path) -> No
     rows = [
         {
             "canonical_id": "c1",
-            "anchor_gaming_day": pd.Timestamp("2024-01-31"),
+            "anchor_gaming_day_event": pd.Timestamp("2024-01-31"),
             "patron__theo_win_sum__w180d_m1snap": 100.0,
             "patron__gaming_days_cnt__w180d_m1snap": 1,
             "patron__adt__w180d_m1snap": 100.0,
         },
         {
             "canonical_id": "c1",
-            "anchor_gaming_day": pd.Timestamp("2024-02-29"),
+            "anchor_gaming_day_event": pd.Timestamp("2024-02-29"),
             "patron__theo_win_sum__w180d_m1snap": 150.0,
             "patron__gaming_days_cnt__w180d_m1snap": 2,
             "patron__adt__w180d_m1snap": 75.0,
@@ -88,7 +93,7 @@ def test_clickhouse_session_export_chunks(tmp_path: Path) -> None:
             return pd.DataFrame(
                 {
                     "player_id": [1],
-                    "gaming_day": [pd.Timestamp("2024-01-05")],
+                    "gaming_day_event": [pd.Timestamp("2024-01-05")],
                     "theo_win": [10.0],
                 }
             )

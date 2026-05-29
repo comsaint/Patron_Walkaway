@@ -55,12 +55,12 @@ _EXPECTED_DEFAULT_BASELINE: Final[tuple[str, ...]] = (
 )
 
 
-def test_mid_term_anchor_gaming_day_audit_only_not_baseline() -> None:
+def test_mid_term_anchor_gaming_day_event_audit_only_not_baseline() -> None:
     """Raw anchor date is enrich/log metadata, not a baseline model feature."""
 
     snap = load_candidate_registry(None)
-    assert "mid_term_anchor_gaming_day" not in snap.model_feature_columns
-    row = next(r for r in snap.rows if r.feature_id == "mid_term_anchor_gaming_day")
+    assert "mid_term_anchor_gaming_day_event" not in snap.model_feature_columns
+    row = next(r for r in snap.rows if r.feature_id == "mid_term_anchor_gaming_day_event")
     assert "baseline" not in row.enabled_for
     assert "candidate" in row.enabled_for
     assert "mid_term_snapshot_age_days" in snap.model_feature_columns

@@ -193,9 +193,11 @@ LEFT JOIN read_parquet('{fq}') AS s
         staging_select = ",\n    ".join(_MID_TERM_STAGING_SQL[a] for a in staging_aliases)
         if staging_select:
             staging_select = f",\n    {staging_select}"
-        lateral_lb = mid_asof_lateral_lower_bound_sql("bw._gday", n_days=backfill_n)
+        lateral_lb = mid_asof_lateral_lower_bound_sql(
+            "bw._gday", n_days=backfill_n, anchor_alias="mid_row"
+        )
         missing_expr = mid_snapshot_missing_flag_sql(
-            "lst.anchor_gaming_day",
+            "lst.anchor_gaming_day_event",
             "bw._gday",
             n_days=backfill_n,
         )
@@ -207,26 +209,26 @@ b_with_day AS (
   SELECT
     b.*,
     TRIM(CAST(b.canonical_id AS VARCHAR)) AS _cid,
-    CAST(b.gaming_day AS DATE) AS _gday
+    CAST(b.gaming_day_event AS DATE) AS _gday
   FROM read_parquet('{bq}') AS b
 ),
 mid_asof AS (
   SELECT
     bw.*,
-    CAST(lst.anchor_gaming_day AS DATE) AS {MID_TERM_ANCHOR_AUDIT_COLUMN},
+    CAST(lst.anchor_gaming_day_event AS DATE) AS {MID_TERM_ANCHOR_AUDIT_COLUMN},
     CASE
-      WHEN lst.anchor_gaming_day IS NULL OR bw._gday IS NULL THEN CAST(NULL AS BIGINT)
-      ELSE DATE_DIFF('day', CAST(lst.anchor_gaming_day AS DATE), bw._gday)
+      WHEN lst.anchor_gaming_day_event IS NULL OR bw._gday IS NULL THEN CAST(NULL AS BIGINT)
+      ELSE DATE_DIFF('day', CAST(lst.anchor_gaming_day_event AS DATE), bw._gday)
     END AS {MID_TERM_SNAPSHOT_AGE_AUDIT_COLUMN},
     {missing_expr} AS {MID_TERM_SNAPSHOT_MISSING_AUDIT_COLUMN}{staging_select}
   FROM b_with_day AS bw
   LEFT JOIN LATERAL (
     SELECT *
-    FROM mid_snap AS s
-    WHERE TRIM(CAST(s.canonical_id AS VARCHAR)) = bw._cid
-      AND CAST(s.anchor_gaming_day AS DATE) < bw._gday
+    FROM mid_snap AS mid_row
+    WHERE TRIM(CAST(mid_row.canonical_id AS VARCHAR)) = bw._cid
+      AND CAST(mid_row.anchor_gaming_day_event AS DATE) < bw._gday
       {lateral_lb}
-    ORDER BY CAST(s.anchor_gaming_day AS DATE) DESC
+    ORDER BY CAST(mid_row.anchor_gaming_day_event AS DATE) DESC
     LIMIT 1
   ) AS lst ON TRUE
 )"""

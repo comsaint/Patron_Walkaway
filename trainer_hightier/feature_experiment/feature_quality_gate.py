@@ -543,7 +543,7 @@ def run_feature_quality_gate(
     cfg: FeatureQualityGateConfig,
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
     approved_warn_features: frozenset[str] | None = None,
-    gaming_day_column: str = "gaming_day",
+    gaming_day_column: str = "gaming_day_event",
 ) -> FeatureQualityGateResult:
     """Run FQG L1+L2 on split parquet rows; BLOCK implies ``fqg_pass False``.
 

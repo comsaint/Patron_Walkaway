@@ -7,7 +7,7 @@
 #   - Post-gap (second+ gaming_day epoch): require slow_anchor_target; missing target
 #     hard-stops the entire scorer.
 #
-# Grain: canonical_id + anchor_gaming_day (one active anchor row per patron in deploy artifacts).
+# Grain: canonical_id + anchor_gaming_day_event (one active anchor row per patron in deploy artifacts).
 
 registry_id: slow_patron_180d_monthly_snapshot
 registry_version: v0.2

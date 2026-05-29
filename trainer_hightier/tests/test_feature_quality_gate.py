@@ -24,7 +24,7 @@ def _write_minimal_splits(
         day0 = pd.Timestamp("2024-06-01")
         df = pd.DataFrame(
             {
-                "gaming_day": [day0 + pd.Timedelta(days=i % 180) for i in range(n)],
+                "gaming_day_event": [day0 + pd.Timedelta(days=i % 180) for i in range(n)],
                 "walkaway_label": ([0, 1] * ((n // 2) + 2))[:n],
                 col_name: arr.astype(float),
             },

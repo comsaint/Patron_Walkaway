@@ -35,15 +35,15 @@ def test_mid_asof_lateral_lower_bound_sql_uses_n() -> None:
 def test_apply_mid_term_bounded_asof_nulls_outside_window() -> None:
     df = pd.DataFrame(
         {
-            "gaming_day": [pd.Timestamp("2026-05-19"), pd.Timestamp("2026-05-19")],
-            "anchor_gaming_day": [pd.Timestamp("2026-05-18"), pd.Timestamp("2026-04-01")],
+            "gaming_day_event": [pd.Timestamp("2026-05-19"), pd.Timestamp("2026-05-19")],
+            "anchor_gaming_day_event": [pd.Timestamp("2026-05-18"), pd.Timestamp("2026-04-01")],
             "fe__bets_cnt__w1d": [2.0, 9.0],
         }
     )
     out = apply_mid_term_bounded_asof(
         df,
         mid_primitive_columns=("fe__bets_cnt__w1d",),
-        anchor_column="anchor_gaming_day",
+        anchor_column="anchor_gaming_day_event",
         n_days=30,
     )
     assert float(out.iloc[0]["fe__bets_cnt__w1d"]) == pytest.approx(2.0)

@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 SPIKE_MID_TERM_FEATURE_COLUMNS: Final[tuple[str, ...]] = tuple(
     c
     for c in MID_TERM_SNAPSHOT_OUTPUT_COLUMNS
-    if c not in ("canonical_id", "anchor_gaming_day")
+    if c not in ("canonical_id", "anchor_gaming_day_event")
 )
 SPIKE_FEATURE_VIEW_NAME: Final[str] = "mid_term_daily_spike_features"
 SPIKE_FEATURE_SERVICE_NAME: Final[str] = "walkaway_canonical_mid_term_spike_v1"
@@ -136,15 +136,15 @@ def export_clickhouse_bets_to_parquet(
         q = f"""
         SELECT
             CAST(player_id AS Int64) AS player_id,
-            CAST(gaming_day AS Date) AS gaming_day,
+            CAST(gaming_day_event AS Date) AS gaming_day_event,
             CAST(payout_complete_dtm AS DateTime64(3, 'UTC')) AS payout_complete_dtm,
             {CH_TBET_WAGER_SELECT},
             {CH_TBET_PAYOUT_ODDS_SELECT}
         FROM {cfg.source_db}.{cfg.tbet} FINAL
-        WHERE gaming_day >= %(g_start)s
-          AND gaming_day <= %(g_end)s
+        WHERE gaming_day_event >= %(g_start)s
+          AND gaming_day_event <= %(g_end)s
           AND payout_complete_dtm IS NOT NULL
-          AND gaming_day IS NOT NULL
+          AND gaming_day_event IS NOT NULL
           AND {CH_TBET_WAGER_POSITIVE_PRED}
           AND player_id IS NOT NULL
           AND player_id != {placeholder}
@@ -261,17 +261,17 @@ COPY (
     canonical_id,
     {feat_cols},
     CAST(
-      (CAST(anchor_gaming_day AS TIMESTAMP) + INTERVAL '1' DAY - INTERVAL '1' SECOND)
+      (CAST(anchor_gaming_day_event AS TIMESTAMP) + INTERVAL '1' DAY - INTERVAL '1' SECOND)
       AS TIMESTAMPTZ
     ) AS event_timestamp
   FROM (
     SELECT
       TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id,
-      CAST(anchor_gaming_day AS DATE) AS anchor_gaming_day,
+      CAST(anchor_gaming_day_event AS DATE) AS anchor_gaming_day_event,
       {feat_cols},
       ROW_NUMBER() OVER (
         PARTITION BY TRIM(CAST(canonical_id AS VARCHAR))
-        ORDER BY CAST(anchor_gaming_day AS DATE) DESC
+        ORDER BY CAST(anchor_gaming_day_event AS DATE) DESC
       ) AS rn
     FROM read_parquet('{src}')
   ) AS ranked
@@ -313,8 +313,8 @@ def compute_mid_term_spike_snapshot(
         duckdb_runtime=cfg.duckdb_runtime,
         canonical_mapping_parquet=cmap,
         canonical_universe_parquet=canonical_universe_parquet,
-        anchor_gaming_day_start=anchor_start,
-        anchor_gaming_day_end=anchor_end,
+        anchor_gaming_day_event_start=anchor_start,
+        anchor_gaming_day_event_end=anchor_end,
         bets_gaming_day_start=bets_gday_start,
         bets_gaming_day_end=bets_gday_end,
         snapshot_scope=MID_TERM_SNAPSHOT_SCOPE_PRODUCTION,
@@ -390,7 +390,7 @@ def _pick_probe_bet(
         bets AS (
           SELECT
             TRY_CAST(b.player_id AS BIGINT) AS player_id,
-            CAST(b.gaming_day AS DATE) AS gaming_day,
+            CAST(b.gaming_day_event AS DATE) AS gaming_day_event,
             COALESCE(
               TRIM(CAST(c.canonical_id AS VARCHAR)),
               CAST(TRY_CAST(b.player_id AS BIGINT) AS VARCHAR)
@@ -398,12 +398,12 @@ def _pick_probe_bet(
           FROM read_parquet('{bet_esc}') AS b
           LEFT JOIN read_parquet('{cmap_esc}') AS c
             ON TRY_CAST(b.player_id AS BIGINT) = TRY_CAST(c.player_id AS BIGINT)
-          WHERE b.gaming_day IS NOT NULL
+          WHERE b.gaming_day_event IS NOT NULL
         )
-        SELECT b.player_id, b.gaming_day, b.canonical_id
+        SELECT b.player_id, b.gaming_day_event, b.canonical_id
         FROM bets AS b
         INNER JOIN snap AS s ON b.canonical_id = s.canonical_id
-        ORDER BY b.gaming_day DESC
+        ORDER BY b.gaming_day_event DESC
         LIMIT 1
         """,
     ).fetchone()
@@ -411,7 +411,7 @@ def _pick_probe_bet(
         raise ValueError("no probe bet found with canonical_id present in spike snapshot")
     return {
         "player_id": int(row[0]),
-        "gaming_day": row[1].isoformat() if hasattr(row[1], "isoformat") else str(row[1]),
+        "gaming_day_event": row[1].isoformat() if hasattr(row[1], "isoformat") else str(row[1]),
         "canonical_id": str(row[2]),
     }
 
@@ -514,8 +514,8 @@ def run_spike(cfg: FeastMidTermSpikeConfig | None = None) -> dict[str, Any]:
         "spike": "feast_mid_term",
         "sample_mode": spike_cfg.sample_mode,
         "bet_source": spike_cfg.bet_source,
-        "anchor_gaming_day_start": anchor_start.isoformat(),
-        "anchor_gaming_day_end": anchor_end.isoformat(),
+        "anchor_gaming_day_event_start": anchor_start.isoformat(),
+        "anchor_gaming_day_event_end": anchor_end.isoformat(),
         "feature_columns": list(SPIKE_MID_TERM_FEATURE_COLUMNS),
     }
 

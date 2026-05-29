@@ -187,7 +187,7 @@ features:
   note: 'Ablation KEEP (run_20260515T175157Z): add-one Gate1 pass.'
   time_horizon: short_term
   max_lookback: PT15M
-- feature_id: mid_term_anchor_gaming_day
+- feature_id: mid_term_anchor_gaming_day_event
   group_id: group_a_velocity_ratios
   source: fe_derived
   semantic_owner: trainer_hightier/feature_experiment/dataset_enrich.py
@@ -202,7 +202,7 @@ features:
   max_lookback: P30D
   cadence: daily_gaming_day
   anchor_rule: prior_gaming_day_end
-  grain: canonical_id + anchor_gaming_day
+  grain: canonical_id + anchor_gaming_day_event
   allowed_training_supplier: mid_term_daily_snapshot
 - feature_id: mid_term_snapshot_age_days
   group_id: group_a_velocity_ratios
@@ -220,7 +220,7 @@ features:
   max_lookback: P30D
   cadence: daily_gaming_day
   anchor_rule: prior_gaming_day_end
-  grain: canonical_id + anchor_gaming_day
+  grain: canonical_id + anchor_gaming_day_event
   allowed_training_supplier: mid_term_daily_snapshot
 - feature_id: mid_term_snapshot_missing_flag
   group_id: group_a_velocity_ratios
@@ -238,7 +238,7 @@ features:
   max_lookback: P30D
   cadence: daily_gaming_day
   anchor_rule: prior_gaming_day_end
-  grain: canonical_id + anchor_gaming_day
+  grain: canonical_id + anchor_gaming_day_event
   allowed_training_supplier: mid_term_daily_snapshot
 - feature_id: fe__bets_cnt__w1d
   group_id: group_a_velocity_ratios
@@ -256,7 +256,7 @@ features:
   max_lookback: P1D
   cadence: daily_gaming_day
   anchor_rule: prior_gaming_day_end
-  grain: canonical_id + anchor_gaming_day
+  grain: canonical_id + anchor_gaming_day_event
   allowed_training_supplier: mid_term_daily_snapshot
   runtime_supplier: feast_online_mid
 - feature_id: fe__wager_sum__w15m_over_w1d
@@ -275,7 +275,7 @@ features:
   max_lookback: P1D
   cadence: daily_gaming_day
   anchor_rule: prior_gaming_day_end
-  grain: canonical_id + anchor_gaming_day
+  grain: canonical_id + anchor_gaming_day_event
   allowed_training_supplier: mid_term_daily_snapshot
   runtime_supplier: composite
   runtime_inputs:
@@ -427,7 +427,7 @@ features:
   max_lookback: P7D
   cadence: daily_gaming_day
   anchor_rule: prior_gaming_day_end
-  grain: canonical_id + anchor_gaming_day
+  grain: canonical_id + anchor_gaming_day_event
   allowed_training_supplier: mid_term_daily_snapshot
   runtime_supplier: composite
   runtime_inputs:
@@ -464,7 +464,7 @@ features:
   max_lookback: P30D
   cadence: daily_gaming_day
   anchor_rule: prior_gaming_day_end
-  grain: canonical_id + anchor_gaming_day
+  grain: canonical_id + anchor_gaming_day_event
   allowed_training_supplier: mid_term_daily_snapshot
   runtime_supplier: composite
   runtime_inputs:
@@ -900,7 +900,7 @@ features:
   max_lookback: P7D
   cadence: daily_gaming_day
   anchor_rule: prior_gaming_day_end
-  grain: canonical_id + anchor_gaming_day
+  grain: canonical_id + anchor_gaming_day_event
   allowed_training_supplier: mid_term_daily_snapshot
   runtime_supplier: composite
   runtime_inputs:
@@ -1029,7 +1029,7 @@ features:
   max_lookback: P7D
   cadence: daily_gaming_day
   anchor_rule: prior_gaming_day_end
-  grain: canonical_id + anchor_gaming_day
+  grain: canonical_id + anchor_gaming_day_event
   allowed_training_supplier: mid_term_daily_snapshot
   runtime_supplier: composite
   runtime_inputs:

@@ -38,7 +38,7 @@ _SLOW_CACHE_MANIFEST_VERSION = 1
 
 # End-of-anchor-day instant for Feast ``event_timestamp`` (matches online refresh / spike writers).
 _EVENT_TIMESTAMP_FROM_ANCHOR_SQL = """CAST(
-  (CAST(anchor_gaming_day AS TIMESTAMP) + INTERVAL '1' DAY - INTERVAL '1' SECOND)
+  (CAST(anchor_gaming_day_event AS TIMESTAMP) + INTERVAL '1' DAY - INTERVAL '1' SECOND)
   AS TIMESTAMPTZ
 ) AS event_timestamp"""
 
@@ -126,7 +126,7 @@ def _materialize_sql(
 WITH sessions_mapped AS (
   SELECT
     TRIM(CAST(m.canonical_id AS VARCHAR)) AS canonical_id,
-    CAST(s.gaming_day AS DATE) AS gaming_day_d,
+    CAST(s.gaming_day_event AS DATE) AS gaming_day_d,
     COALESCE(TRY_CAST(s.theo_win AS DOUBLE), 0.0) AS theo_win
   FROM read_parquet('{sess_esc}') s
   INNER JOIN (
@@ -137,22 +137,22 @@ WITH sessions_mapped AS (
     WHERE TRY_CAST(player_id AS BIGINT) IS NOT NULL
     GROUP BY player_id
   ) m ON TRY_CAST(s.player_id AS BIGINT) = m.player_id
-  WHERE s.gaming_day IS NOT NULL
-    AND CAST(s.gaming_day AS DATE) IS NOT NULL
+  WHERE s.gaming_day_event IS NOT NULL
+    AND CAST(s.gaming_day_event AS DATE) IS NOT NULL
     AND TRIM(CAST(m.canonical_id AS VARCHAR)) <> ''
 ),
 monthly_anchors AS (
   SELECT
     canonical_id,
     DATE_TRUNC('month', gaming_day_d)::DATE AS cal_month,
-    MAX(gaming_day_d) AS anchor_gaming_day
+    MAX(gaming_day_d) AS anchor_gaming_day_event
   FROM sessions_mapped
   GROUP BY canonical_id, DATE_TRUNC('month', gaming_day_d)::DATE
 ),
 snapshots AS (
   SELECT
     ma.canonical_id,
-    ma.anchor_gaming_day,
+    ma.anchor_gaming_day_event,
     COALESCE(SUM(s.theo_win), 0.0) AS patron__theo_win_sum__w180d_m1snap,
     CAST(COUNT(DISTINCT s.gaming_day_d) AS BIGINT) AS patron__gaming_days_cnt__w180d_m1snap,
     CASE
@@ -164,9 +164,9 @@ snapshots AS (
   FROM monthly_anchors ma
   INNER JOIN sessions_mapped s
     ON s.canonical_id = ma.canonical_id
-   AND s.gaming_day_d <= ma.anchor_gaming_day
-   AND s.gaming_day_d >= ma.anchor_gaming_day - INTERVAL '{span}' DAY
-  GROUP BY ma.canonical_id, ma.anchor_gaming_day
+   AND s.gaming_day_d <= ma.anchor_gaming_day_event
+   AND s.gaming_day_d >= ma.anchor_gaming_day_event - INTERVAL '{span}' DAY
+  GROUP BY ma.canonical_id, ma.anchor_gaming_day_event
 ),
 map_dedup AS (
   SELECT
@@ -183,7 +183,7 @@ bet_base AS (
     CAST(b.__etl_insert_Dtm_synthetic AS TIMESTAMPTZ) AS __etl_insert_Dtm_synthetic,
     TRIM(CAST(m.canonical_id AS VARCHAR)) AS canonical_id,
     COALESCE(
-      CAST(b.gaming_day AS DATE),
+      CAST(b.gaming_day_event AS DATE),
       CAST(CAST(b.payout_complete_dtm AS TIMESTAMPTZ) AS DATE)
     ) AS bet_gaming_day
   FROM {bet_from_sql} AS b
@@ -193,7 +193,7 @@ bet_base AS (
     AND b.__etl_insert_Dtm_synthetic IS NOT NULL
     AND TRIM(CAST(m.canonical_id AS VARCHAR)) <> ''
     AND COALESCE(
-      CAST(b.gaming_day AS DATE),
+      CAST(b.gaming_day_event AS DATE),
       CAST(CAST(b.payout_complete_dtm AS TIMESTAMPTZ) AS DATE)
     ) IS NOT NULL
 )
@@ -212,8 +212,8 @@ LEFT JOIN LATERAL (
     sn.patron__adt__w180d_m1snap
   FROM snapshots sn
   WHERE sn.canonical_id = bb.canonical_id
-    AND sn.anchor_gaming_day <= bb.bet_gaming_day
-  ORDER BY sn.anchor_gaming_day DESC
+    AND sn.anchor_gaming_day_event <= bb.bet_gaming_day
+  ORDER BY sn.anchor_gaming_day_event DESC
   LIMIT 1
 ) lst ON TRUE
 """.strip()
@@ -240,7 +240,7 @@ SELECT canonical_id
 FROM (
   SELECT
     TRIM(CAST(m.canonical_id AS VARCHAR)) AS canonical_id,
-    CAST(s.gaming_day AS DATE) AS gaming_day_d
+    CAST(s.gaming_day_event AS DATE) AS gaming_day_d
   FROM read_parquet('{sess_esc}') s
   INNER JOIN (
     SELECT
@@ -250,9 +250,9 @@ FROM (
     WHERE TRY_CAST(player_id AS BIGINT) IS NOT NULL
     GROUP BY player_id
   ) m ON TRY_CAST(s.player_id AS BIGINT) = m.player_id
-  WHERE s.gaming_day IS NOT NULL
-    AND CAST(s.gaming_day AS DATE) IS NOT NULL
-    AND CAST(s.gaming_day AS DATE) <= DATE '{anchor_lit}'
+  WHERE s.gaming_day_event IS NOT NULL
+    AND CAST(s.gaming_day_event AS DATE) IS NOT NULL
+    AND CAST(s.gaming_day_event AS DATE) <= DATE '{anchor_lit}'
     AND TRIM(CAST(m.canonical_id AS VARCHAR)) <> ''
 ) AS sessions_mapped
 WHERE gaming_day_d >= DATE '{anchor_lit}' - INTERVAL '{span}' DAY
@@ -276,7 +276,7 @@ def _single_active_anchor_sql(
 WITH sessions_mapped AS (
   SELECT
     TRIM(CAST(m.canonical_id AS VARCHAR)) AS canonical_id,
-    CAST(s.gaming_day AS DATE) AS gaming_day_d,
+    CAST(s.gaming_day_event AS DATE) AS gaming_day_d,
     COALESCE(TRY_CAST(s.theo_win AS DOUBLE), 0.0) AS theo_win
   FROM read_parquet('{sess_esc}') s
   INNER JOIN (
@@ -287,15 +287,15 @@ WITH sessions_mapped AS (
     WHERE TRY_CAST(player_id AS BIGINT) IS NOT NULL
     GROUP BY player_id
   ) m ON TRY_CAST(s.player_id AS BIGINT) = m.player_id
-  WHERE s.gaming_day IS NOT NULL
-    AND CAST(s.gaming_day AS DATE) IS NOT NULL
-    AND CAST(s.gaming_day AS DATE) <= DATE '{anchor_lit}'
+  WHERE s.gaming_day_event IS NOT NULL
+    AND CAST(s.gaming_day_event AS DATE) IS NOT NULL
+    AND CAST(s.gaming_day_event AS DATE) <= DATE '{anchor_lit}'
     AND TRIM(CAST(m.canonical_id AS VARCHAR)) <> ''
 ),
 snapshots AS (
   SELECT
     canonical_id,
-    DATE '{anchor_lit}' AS anchor_gaming_day,
+    DATE '{anchor_lit}' AS anchor_gaming_day_event,
     COALESCE(SUM(theo_win), 0.0) AS patron__theo_win_sum__w180d_m1snap,
     CAST(COUNT(DISTINCT gaming_day_d) AS BIGINT) AS patron__gaming_days_cnt__w180d_m1snap,
     CASE
@@ -310,7 +310,7 @@ snapshots AS (
 )
 SELECT
   canonical_id,
-  anchor_gaming_day,
+  anchor_gaming_day_event,
   {_EVENT_TIMESTAMP_FROM_ANCHOR_SQL},
   patron__theo_win_sum__w180d_m1snap,
   patron__gaming_days_cnt__w180d_m1snap,
@@ -375,7 +375,7 @@ def materialize_slow_patron_canonical_active_month(
         "slow_patron_grain": "canonical_active_month",
         "snapshot_scope": snapshot_scope,
         "lookback_days": lookback_days,
-        "slow_anchor_gaming_day_max": active_anchor.isoformat(),
+        "slow_anchor_gaming_day_event_max": active_anchor.isoformat(),
         **slow_month_turn_metadata(ctx.context_day),
     }
     logger.info(
@@ -398,7 +398,7 @@ def _canonical_asof_sql(*, sess_esc: str, map_esc: str, lookback_days: int) -> s
 WITH sessions_mapped AS (
   SELECT
     TRIM(CAST(m.canonical_id AS VARCHAR)) AS canonical_id,
-    CAST(s.gaming_day AS DATE) AS gaming_day_d,
+    CAST(s.gaming_day_event AS DATE) AS gaming_day_d,
     COALESCE(TRY_CAST(s.theo_win AS DOUBLE), 0.0) AS theo_win
   FROM read_parquet('{sess_esc}') s
   INNER JOIN (
@@ -409,22 +409,22 @@ WITH sessions_mapped AS (
     WHERE TRY_CAST(player_id AS BIGINT) IS NOT NULL
     GROUP BY player_id
   ) m ON TRY_CAST(s.player_id AS BIGINT) = m.player_id
-  WHERE s.gaming_day IS NOT NULL
-    AND CAST(s.gaming_day AS DATE) IS NOT NULL
+  WHERE s.gaming_day_event IS NOT NULL
+    AND CAST(s.gaming_day_event AS DATE) IS NOT NULL
     AND TRIM(CAST(m.canonical_id AS VARCHAR)) <> ''
 ),
 monthly_anchors AS (
   SELECT
     canonical_id,
     DATE_TRUNC('month', gaming_day_d)::DATE AS cal_month,
-    MAX(gaming_day_d) AS anchor_gaming_day
+    MAX(gaming_day_d) AS anchor_gaming_day_event
   FROM sessions_mapped
   GROUP BY canonical_id, DATE_TRUNC('month', gaming_day_d)::DATE
 ),
 snapshots AS (
   SELECT
     ma.canonical_id,
-    ma.anchor_gaming_day,
+    ma.anchor_gaming_day_event,
     COALESCE(SUM(s.theo_win), 0.0) AS patron__theo_win_sum__w180d_m1snap,
     CAST(COUNT(DISTINCT s.gaming_day_d) AS BIGINT) AS patron__gaming_days_cnt__w180d_m1snap,
     CASE
@@ -436,13 +436,13 @@ snapshots AS (
   FROM monthly_anchors ma
   INNER JOIN sessions_mapped s
     ON s.canonical_id = ma.canonical_id
-   AND s.gaming_day_d <= ma.anchor_gaming_day
-   AND s.gaming_day_d >= ma.anchor_gaming_day - INTERVAL '{span}' DAY
-  GROUP BY ma.canonical_id, ma.anchor_gaming_day
+   AND s.gaming_day_d <= ma.anchor_gaming_day_event
+   AND s.gaming_day_d >= ma.anchor_gaming_day_event - INTERVAL '{span}' DAY
+  GROUP BY ma.canonical_id, ma.anchor_gaming_day_event
 )
 SELECT
   canonical_id,
-  anchor_gaming_day,
+  anchor_gaming_day_event,
   patron__theo_win_sum__w180d_m1snap,
   patron__gaming_days_cnt__w180d_m1snap,
   patron__adt__w180d_m1snap
@@ -560,7 +560,7 @@ def materialize_slow_patron_180d_monthly_bet_grain_diagnostic(
             return dst
 
     sess_cols = set(pq.read_schema(src_sess).names)
-    need_sess = frozenset({"player_id", "gaming_day", "theo_win"})
+    need_sess = frozenset({"player_id", "gaming_day_event", "theo_win"})
     miss_s = sorted(need_sess - sess_cols)
     if miss_s:
         raise ValueError(f"cleaned session missing columns {miss_s}; got {sorted(sess_cols)}")
@@ -572,10 +572,10 @@ def materialize_slow_patron_180d_monthly_bet_grain_diagnostic(
     miss_b = sorted(need_bet - bet_cols)
     if miss_b:
         raise ValueError(f"cleaned bet missing columns {miss_b}; got {sorted(bet_cols)}")
-    if "gaming_day" not in bet_cols:
-        logger.warning(
-            "slow_patron_180d_monthly: cleaned bet has no gaming_day; bet_gaming_day falls back to "
-            "DATE(payout_complete_dtm) only."
+    if "gaming_day_event" not in bet_cols:
+        raise ValueError(
+            "slow_patron_180d_monthly: cleaned bet missing gaming_day_event "
+            f"(columns={sorted(bet_cols)})"
         )
 
     map_cols = set(pq.read_schema(src_map).names)

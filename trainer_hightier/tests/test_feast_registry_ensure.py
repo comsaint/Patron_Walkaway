@@ -71,7 +71,7 @@ def test_ensure_schema_drift_on_existing_registry_triggers_apply(tmp_path: Path)
     _touch_registry(fr)
     drift_msg = (
         "feature view 'mid_term_daily_spike_features' missing 1 column(s): "
-        "[anchor_gaming_day]"
+        "[anchor_gaming_day_event]"
     )
     with patch.object(
         adapter,
@@ -104,7 +104,7 @@ def test_ensure_apply_failure_raises_with_context(tmp_path: Path) -> None:
 def test_ensure_drift_remains_after_apply_raises(tmp_path: Path) -> None:
     fr = tmp_path / "feast_repo"
     _touch_registry(fr)
-    drift = ["feature view 'mid_term_daily_spike_features' missing 1 column(s): [anchor_gaming_day]"]
+    drift = ["feature view 'mid_term_daily_spike_features' missing 1 column(s): [anchor_gaming_day_event]"]
     with patch.object(adapter, "feast_schema_drift_issues", return_value=drift), patch(
         "trainer_hightier.serving.feast_online_refresh.run_feast_apply",
         return_value=0.1,
@@ -152,7 +152,7 @@ def test_feast_schema_drift_issues_missing_columns(tmp_path: Path) -> None:
     ):
         issues = adapter.feast_schema_drift_issues(fr)
     assert any("mid_term_daily_spike_features" in i for i in issues)
-    assert any("anchor_gaming_day" in i for i in issues)
+    assert any("anchor_gaming_day_event" in i for i in issues)
 
 
 def test_feast_registry_ensure_result_to_metrics_roundtrip() -> None:
@@ -166,13 +166,13 @@ def test_feast_registry_ensure_result_to_metrics_roundtrip() -> None:
         feast_auto_apply_attempted=True,
         feast_auto_apply_succeeded=True,
         feast_apply_wall_sec=1.23,
-        feast_schema_drift_issues=("missing anchor_gaming_day",),
+        feast_schema_drift_issues=("missing anchor_gaming_day_event",),
     )
     d = b3.feast_registry_ensure_result_to_metrics(r)
     assert d["feast_auto_apply_attempted"] is True
     assert d["feast_auto_apply_succeeded"] is True
     assert abs(float(d["feast_apply_wall_sec"] or 0) - 1.23) < 1e-6
-    assert d["feast_schema_drift_issues"] == ["missing anchor_gaming_day"]
+    assert d["feast_schema_drift_issues"] == ["missing anchor_gaming_day_event"]
 
 
 @patch("trainer_hightier.trainer._b3.ensure_feast_registry_ready")

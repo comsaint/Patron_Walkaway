@@ -27,20 +27,20 @@ def test_join_slow_patron_feast_bet_grain_left_merge(tmp_path: Path) -> None:
         }
     ).to_parquet(slow, index=False)
 
-    bets = pd.DataFrame({"bet_id": [20.0], "gaming_day": pd.to_datetime(["2025-07-01"])})
+    bets = pd.DataFrame({"bet_id": [20.0], "gaming_day_event": pd.to_datetime(["2025-07-01"])})
     got = join_slow_patron_snapshot(bets, Path(slow))
     assert len(got) == 1
     assert float(got.iloc[0]["patron__adt__w180d_m1snap"]) == pytest.approx(44.0 / 3.0)
 
 
-def test_join_slow_patron_inference_gaming_day_column(tmp_path: Path) -> None:
-    """Some slow Parquet builds name the anchor ``gaming_day`` instead of ``anchor_gaming_day``."""
+def test_join_slow_patron_inference_anchor_column(tmp_path: Path) -> None:
+    """Player-grain slow Parquet joins on ``anchor_gaming_day_event``."""
 
     slow = tmp_path / "slow.parquet"
     pd.DataFrame(
         {
             "player_id": [1, 1],
-            "gaming_day": pd.to_datetime(["2025-01-01", "2025-02-01"]),
+            "anchor_gaming_day_event": pd.to_datetime(["2025-01-01", "2025-02-01"]),
             "patron__theo_win_sum__w180d_m1snap": [10.0, 20.0],
             "patron__gaming_days_cnt__w180d_m1snap": [1, 2],
             "patron__adt__w180d_m1snap": [10.0, 10.0],
@@ -51,7 +51,7 @@ def test_join_slow_patron_inference_gaming_day_column(tmp_path: Path) -> None:
         {
             "bet_id": [99.0],
             "player_id": [1],
-            "gaming_day": pd.to_datetime(["2025-02-10"]),
+            "gaming_day_event": pd.to_datetime(["2025-02-10"]),
         }
     )
 
@@ -67,7 +67,7 @@ def test_join_slow_patron_canonical_asof_grain(tmp_path: Path) -> None:
     pd.DataFrame(
         {
             "canonical_id": ["c1", "c1"],
-            "anchor_gaming_day": pd.to_datetime(["2025-01-01", "2025-06-01"]),
+            "anchor_gaming_day_event": pd.to_datetime(["2025-01-01", "2025-06-01"]),
             "patron__theo_win_sum__w180d_m1snap": [10.0, 50.0],
             "patron__gaming_days_cnt__w180d_m1snap": [1, 5],
             "patron__adt__w180d_m1snap": [10.0, 10.0],
@@ -78,22 +78,22 @@ def test_join_slow_patron_canonical_asof_grain(tmp_path: Path) -> None:
         {
             "bet_id": [99.0],
             "canonical_id": ["c1"],
-            "gaming_day": pd.to_datetime(["2025-06-15"]),
+            "gaming_day_event": pd.to_datetime(["2025-06-15"]),
         }
     )
     got = join_slow_patron_snapshot(bets, Path(slow), slow_grain="canonical_asof")
     assert float(got.iloc[0]["patron__theo_win_sum__w180d_m1snap"]) == 50.0
 
 
-def test_join_slow_patron_prefers_anchor_gaming_day_when_present(tmp_path: Path) -> None:
-    """When both anchors exist (should be rare), prefer ``anchor_gaming_day`` like training DSL."""
+def test_join_slow_patron_prefers_anchor_gaming_day_event_when_present(tmp_path: Path) -> None:
+    """When both anchors exist (should be rare), prefer ``anchor_gaming_day_event`` like training DSL."""
 
     slow = tmp_path / "slow2.parquet"
     pd.DataFrame(
         {
             "player_id": [1],
-            "anchor_gaming_day": pd.to_datetime(["2025-06-01"]),
-            "gaming_day": pd.to_datetime(["2025-05-01"]),
+            "anchor_gaming_day_event": pd.to_datetime(["2025-06-01"]),
+            "gaming_day_event": pd.to_datetime(["2025-05-01"]),
             "patron__theo_win_sum__w180d_m1snap": [123.0],
             "patron__gaming_days_cnt__w180d_m1snap": [3],
             "patron__adt__w180d_m1snap": [41.0],
@@ -104,7 +104,7 @@ def test_join_slow_patron_prefers_anchor_gaming_day_when_present(tmp_path: Path)
         {
             "bet_id": [1.0],
             "player_id": [1],
-            "gaming_day": pd.to_datetime(["2025-06-15"]),
+            "gaming_day_event": pd.to_datetime(["2025-06-15"]),
         }
     )
 

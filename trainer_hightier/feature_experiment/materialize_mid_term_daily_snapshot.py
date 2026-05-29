@@ -33,7 +33,7 @@ MID_TERM_CACHE_SCHEMA_VERSION = 1
 
 MID_TERM_SNAPSHOT_OUTPUT_COLUMNS: tuple[str, ...] = (
     "canonical_id",
-    "anchor_gaming_day",
+    "anchor_gaming_day_event",
     "fe__bets_cnt__w1d",
     "fe__wager_sum__w1d",
     "fe__bets_cnt__w7d",
@@ -114,11 +114,11 @@ def _daily_snapshot_sql(
     if anchor_end is not None:
         anchor_pred += f" AND gday <= DATE '{anchor_end.isoformat()}'"
 
-    bets_pred = "WHERE TRY_CAST(b.\"player_id\" AS BIGINT) IS NOT NULL AND b.\"gaming_day\" IS NOT NULL AND b.\"payout_complete_dtm\" IS NOT NULL"
+    bets_pred = "WHERE TRY_CAST(b.\"player_id\" AS BIGINT) IS NOT NULL AND b.\"gaming_day_event\" IS NOT NULL AND b.\"payout_complete_dtm\" IS NOT NULL"
     if bets_gday_start is not None:
-        bets_pred += f" AND CAST(b.\"gaming_day\" AS DATE) >= DATE '{bets_gday_start.isoformat()}'"
+        bets_pred += f" AND CAST(b.\"gaming_day_event\" AS DATE) >= DATE '{bets_gday_start.isoformat()}'"
     if bets_gday_end is not None:
-        bets_pred += f" AND CAST(b.\"gaming_day\" AS DATE) <= DATE '{bets_gday_end.isoformat()}'"
+        bets_pred += f" AND CAST(b.\"gaming_day_event\" AS DATE) <= DATE '{bets_gday_end.isoformat()}'"
 
     universe_cte = ""
     universe_join = ""
@@ -144,7 +144,7 @@ WITH {universe_cte}cmap AS (
 bets AS (
   SELECT
     COALESCE(c.canonical_id, CAST(b."player_id" AS VARCHAR)) AS canonical_id,
-    CAST(b."gaming_day" AS DATE) AS gday,
+    CAST(b."gaming_day_event" AS DATE) AS gday,
     CAST(b."payout_complete_dtm" AS TIMESTAMPTZ) AS pcd,
     TRY_CAST(b."wager" AS DOUBLE) AS wager,
     TRY_CAST(b."payout_odds" AS DOUBLE) AS payout_odds
@@ -211,7 +211,7 @@ rolling AS (
 )
 SELECT
   canonical_id,
-  gday AS anchor_gaming_day,
+  gday AS anchor_gaming_day_event,
   fe__bets_cnt__w1d,
   fe__wager_sum__w1d,
   fe__bets_cnt__w7d,
@@ -255,10 +255,10 @@ def compute_training_mid_term_bounds(
         row = con.execute(
             f"""
             SELECT
-              MIN(CAST(gaming_day AS DATE)) AS mn,
-              MAX(CAST(gaming_day AS DATE)) AS mx
+              MIN(CAST(gaming_day_event AS DATE)) AS mn,
+              MAX(CAST(gaming_day_event AS DATE)) AS mx
             FROM read_parquet('{esc}')
-            WHERE gaming_day IS NOT NULL
+            WHERE gaming_day_event IS NOT NULL
             """,
         ).fetchone()
     finally:
@@ -348,11 +348,11 @@ def _cache_manifest_compatible(
             return False
     elif str(have_univ or "").strip() != universe_fp_sha256:
         return False
-    if str(manifest.get("anchor_gaming_day_start") or "") != (
+    if str(manifest.get("anchor_gaming_day_event_start") or "") != (
         anchor_start.isoformat() if anchor_start is not None else ""
     ):
         return False
-    if str(manifest.get("anchor_gaming_day_end") or "") != (
+    if str(manifest.get("anchor_gaming_day_event_end") or "") != (
         anchor_end.isoformat() if anchor_end is not None else ""
     ):
         return False
@@ -386,8 +386,8 @@ def _write_cache_manifest(
         "cleaned_bet_fingerprint_block": cleaned_fp,
         "canonical_mapping_sha256": mapping_fp_sha256,
         "canonical_universe_sha256": universe_fp_sha256,
-        "anchor_gaming_day_start": anchor_start.isoformat() if anchor_start is not None else None,
-        "anchor_gaming_day_end": anchor_end.isoformat() if anchor_end is not None else None,
+        "anchor_gaming_day_event_start": anchor_start.isoformat() if anchor_start is not None else None,
+        "anchor_gaming_day_event_end": anchor_end.isoformat() if anchor_end is not None else None,
         "output_parquet_stat": out_stat,
     }
     manifest_path.write_text(json.dumps(blob, indent=2, sort_keys=True), encoding="utf-8")
@@ -401,8 +401,8 @@ def try_reuse_mid_term_snapshot_cache(
     canonical_mapping_parquet: Path,
     canonical_universe_parquet: Path | None,
     lookback_days: int,
-    anchor_gaming_day_start: date | None,
-    anchor_gaming_day_end: date | None,
+    anchor_gaming_day_event_start: date | None,
+    anchor_gaming_day_event_end: date | None,
 ) -> tuple[Path, dict[str, Any]] | None:
     """Return cached snapshot metadata when manifest matches; otherwise ``None``."""
 
@@ -427,8 +427,8 @@ def try_reuse_mid_term_snapshot_cache(
         mapping_fp_sha256=_sha256_file(cmap_path),
         universe_fp_sha256=universe_fp,
         lookback_days=int(lookback_days),
-        anchor_start=anchor_gaming_day_start,
-        anchor_end=anchor_gaming_day_end,
+        anchor_start=anchor_gaming_day_event_start,
+        anchor_end=anchor_gaming_day_event_end,
         code_fp=_module_sha256(),
         out_stat=out_stat,
     ):
@@ -473,13 +473,13 @@ def materialize_mid_term_daily_snapshot(
     canonical_mapping_parquet: Path | None = None,
     canonical_universe_parquet: Path | None = None,
     lookback_days: int | None = None,
-    anchor_gaming_day_start: date | None = None,
-    anchor_gaming_day_end: date | None = None,
+    anchor_gaming_day_event_start: date | None = None,
+    anchor_gaming_day_event_end: date | None = None,
     bets_gaming_day_start: date | None = None,
     bets_gaming_day_end: date | None = None,
     snapshot_scope: str | None = None,
 ) -> tuple[Path, dict[str, Any]]:
-    """Write canonical mid-term daily snapshots keyed by ``anchor_gaming_day``."""
+    """Write canonical mid-term daily snapshots keyed by ``anchor_gaming_day_event``."""
 
     src_root = Path(cleaned_bet_parquet).resolve()
     dst = Path(out_parquet).resolve()
@@ -504,8 +504,8 @@ def materialize_mid_term_daily_snapshot(
         bet_from=bet_from,
         cmap_esc=_path_esc(cmap_path),
         lookback_days=lb,
-        anchor_start=anchor_gaming_day_start,
-        anchor_end=anchor_gaming_day_end,
+        anchor_start=anchor_gaming_day_event_start,
+        anchor_end=anchor_gaming_day_event_end,
         canonical_universe_esc=universe_esc,
         bets_gday_start=bets_gaming_day_start,
         bets_gday_end=bets_gaming_day_end,
@@ -529,11 +529,11 @@ def materialize_mid_term_daily_snapshot(
         raise ValueError(f"mid-term snapshot missing columns {miss}; got {sorted(schema_names)}")
 
     anchor_max = None
-    if nrows > 0 and "anchor_gaming_day" in schema_names:
+    if nrows > 0 and "anchor_gaming_day_event" in schema_names:
         con2 = duckdb.connect(database=":memory:")
         try:
             raw = con2.execute(
-                f"SELECT MAX(CAST(anchor_gaming_day AS DATE)) FROM read_parquet('{dst_esc}')",
+                f"SELECT MAX(CAST(anchor_gaming_day_event AS DATE)) FROM read_parquet('{dst_esc}')",
             ).fetchone()[0]
             if raw is not None:
                 anchor_max = raw.isoformat() if isinstance(raw, date) else str(raw)[:10]
@@ -546,16 +546,16 @@ def materialize_mid_term_daily_snapshot(
         "snapshot_scope": scope or None,
         "row_count": nrows,
         "lookback_days": lb,
-        "anchor_gaming_day_start": (
-            anchor_gaming_day_start.isoformat() if anchor_gaming_day_start is not None else None
+        "anchor_gaming_day_event_start": (
+            anchor_gaming_day_event_start.isoformat() if anchor_gaming_day_event_start is not None else None
         ),
-        "anchor_gaming_day_end": anchor_gaming_day_end.isoformat() if anchor_gaming_day_end is not None else None,
+        "anchor_gaming_day_event_end": anchor_gaming_day_event_end.isoformat() if anchor_gaming_day_event_end is not None else None,
         "bets_gaming_day_start": (
             bets_gaming_day_start.isoformat() if bets_gaming_day_start is not None else None
         ),
         "bets_gaming_day_end": bets_gaming_day_end.isoformat() if bets_gaming_day_end is not None else None,
         "canonical_universe_sha256": universe_fp,
-        "mid_term_anchor_gaming_day_max": anchor_max,
+        "mid_term_anchor_gaming_day_event_max": anchor_max,
         "materialize_seconds": elapsed,
         "sha256": _sha256_file(dst),
         "path": str(dst),
@@ -571,8 +571,8 @@ def materialize_mid_term_daily_snapshot(
             mapping_fp_sha256=_sha256_file(cmap_path),
             universe_fp_sha256=universe_fp,
             lookback_days=lb,
-            anchor_start=anchor_gaming_day_start,
-            anchor_end=anchor_gaming_day_end,
+            anchor_start=anchor_gaming_day_event_start,
+            anchor_end=anchor_gaming_day_event_end,
             code_fp=_module_sha256(),
             out_stat=out_stat,
         )
@@ -580,7 +580,7 @@ def materialize_mid_term_daily_snapshot(
         "[mid_term_daily_snapshot] wrote scope=%s rows=%d anchor_end=%s elapsed=%.3fs -> %s",
         scope or "unspecified",
         nrows,
-        anchor_gaming_day_end,
+        anchor_gaming_day_event_end,
         elapsed,
         dst,
     )

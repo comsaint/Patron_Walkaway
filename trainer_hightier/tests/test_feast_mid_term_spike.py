@@ -25,7 +25,7 @@ from trainer_hightier.feature_experiment.feast_mid_term_spike import (
 
 
 def _write_cleaned_bet(root: Path, rows: list[dict[str, object]]) -> None:
-    part = root / "gaming_day=2026-05-18"
+    part = root / "gaming_month=202605" / "gaming_day_key=2026-05-18"
     part.mkdir(parents=True)
     pd.DataFrame(rows).to_parquet(part / "data.parquet", index=False)
 
@@ -49,7 +49,7 @@ def test_feast_entity_rows_dict_of_lists() -> None:
 
 def test_spike_mid_term_feature_columns_match_snapshot_materializer() -> None:
     """Full-schema spike exposes all mid-term snapshot base columns."""
-    assert len(SPIKE_MID_TERM_FEATURE_COLUMNS) == 16
+    assert len(SPIKE_MID_TERM_FEATURE_COLUMNS) == 18
     assert "fe__bets_cnt__w1d" in SPIKE_MID_TERM_FEATURE_COLUMNS
     assert "fe__min_pcd_w7d" in SPIKE_MID_TERM_FEATURE_COLUMNS
 
@@ -109,7 +109,7 @@ def test_clickhouse_export_chunks_player_filter(tmp_path: Path) -> None:
             return pd.DataFrame(
                 {
                     "player_id": [1],
-                    "gaming_day": [pd.Timestamp("2026-05-01")],
+                    "gaming_day_event": [pd.Timestamp("2026-05-01")],
                     "payout_complete_dtm": [pd.Timestamp("2026-05-01T10:00:00Z")],
                     "wager": [100.0],
                     "payout_odds": [2.0],
@@ -149,8 +149,8 @@ def test_clickhouse_export_chunks_player_filter(tmp_path: Path) -> None:
 
 def test_add_event_timestamp_collapses_to_latest_anchor(tmp_path: Path) -> None:
     full = tmp_path / "full.parquet"
-    row_old = {"canonical_id": "c1", "anchor_gaming_day": pd.Timestamp("2026-05-17")}
-    row_new = {"canonical_id": "c1", "anchor_gaming_day": pd.Timestamp("2026-05-18")}
+    row_old = {"canonical_id": "c1", "anchor_gaming_day_event": pd.Timestamp("2026-05-17")}
+    row_new = {"canonical_id": "c1", "anchor_gaming_day_event": pd.Timestamp("2026-05-18")}
     for col in SPIKE_MID_TERM_FEATURE_COLUMNS:
         row_old[col] = 10.0
         row_new[col] = 20.0 if "w7d" in col or col.endswith("w1d") else 10.0
@@ -171,14 +171,14 @@ def test_compute_mid_term_spike_snapshot_local(tmp_path: Path) -> None:
         [
             {
                 "player_id": 1,
-                "gaming_day": pd.Timestamp("2026-05-18"),
+                "gaming_day_event": pd.Timestamp("2026-05-18"),
                 "payout_complete_dtm": pd.Timestamp("2026-05-18T10:00:00Z"),
                 "wager": 100.0,
                 "payout_odds": 2.0,
             },
             {
                 "player_id": 1,
-                "gaming_day": pd.Timestamp("2026-05-17"),
+                "gaming_day_event": pd.Timestamp("2026-05-17"),
                 "payout_complete_dtm": pd.Timestamp("2026-05-17T12:00:00Z"),
                 "wager": 50.0,
                 "payout_odds": 1.5,
@@ -219,14 +219,14 @@ def test_run_spike_end_to_end_local_mock_feast(tmp_path: Path) -> None:
         [
             {
                 "player_id": 1,
-                "gaming_day": pd.Timestamp("2026-05-18"),
+                "gaming_day_event": pd.Timestamp("2026-05-18"),
                 "payout_complete_dtm": pd.Timestamp("2026-05-18T10:00:00Z"),
                 "wager": 80.0,
                 "payout_odds": 2.0,
             },
             {
                 "player_id": 1,
-                "gaming_day": pd.Timestamp("2026-05-17"),
+                "gaming_day_event": pd.Timestamp("2026-05-17"),
                 "payout_complete_dtm": pd.Timestamp("2026-05-17T11:00:00Z"),
                 "wager": 40.0,
                 "payout_odds": 1.5,

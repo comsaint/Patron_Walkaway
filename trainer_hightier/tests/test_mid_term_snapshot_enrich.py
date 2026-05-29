@@ -35,7 +35,7 @@ def _write_mapping(path: Path) -> None:
 
 
 def test_mid_term_snapshot_grain_is_canonical_anchor_day(tmp_path: Path) -> None:
-    """Mid-term artifact must expose canonical_id + anchor_gaming_day (not bet_id)."""
+    """Mid-term artifact must expose canonical_id + anchor_gaming_day_event (not bet_id)."""
 
     cleaned = tmp_path / "cleaned"
     _write_cleaned_bet(
@@ -43,14 +43,14 @@ def test_mid_term_snapshot_grain_is_canonical_anchor_day(tmp_path: Path) -> None
         [
             {
                 "player_id": 1,
-                "gaming_day": pd.Timestamp("2026-05-18"),
+                "gaming_day_event": pd.Timestamp("2026-05-18"),
                 "payout_complete_dtm": pd.Timestamp("2026-05-18T10:00:00Z"),
                 "wager": 100.0,
                 "payout_odds": 2.0,
             },
             {
                 "player_id": 1,
-                "gaming_day": pd.Timestamp("2026-05-17"),
+                "gaming_day_event": pd.Timestamp("2026-05-17"),
                 "payout_complete_dtm": pd.Timestamp("2026-05-17T12:00:00Z"),
                 "wager": 50.0,
                 "payout_odds": 1.5,
@@ -68,14 +68,14 @@ def test_mid_term_snapshot_grain_is_canonical_anchor_day(tmp_path: Path) -> None
     )
     schema = duckdb.sql(f"DESCRIBE SELECT * FROM read_parquet('{out.as_posix()}')").fetchdf()["column_name"]
     assert "canonical_id" in schema.tolist()
-    assert "anchor_gaming_day" in schema.tolist()
+    assert "anchor_gaming_day_event" in schema.tolist()
     assert "bet_id" not in schema.tolist()
     for col in MID_TERM_SNAPSHOT_OUTPUT_COLUMNS:
         assert col in schema.tolist()
 
 
 def test_asof_enrich_uses_prior_gaming_day_snapshot(tmp_path: Path) -> None:
-    """Target gaming_day D must join anchor_gaming_day < D (typically D-1)."""
+    """Target gaming_day D must join anchor_gaming_day_event < D (typically D-1)."""
 
     base = tmp_path / "base.parquet"
     short = tmp_path / "short.parquet"
@@ -86,7 +86,7 @@ def test_asof_enrich_uses_prior_gaming_day_snapshot(tmp_path: Path) -> None:
         {
             "bet_id": [10.0],
             "canonical_id": ["c1"],
-            "gaming_day": pd.Timestamp("2026-05-19"),
+            "gaming_day_event": pd.Timestamp("2026-05-19"),
             "payout_odds": [2.5],
         }
     ).to_parquet(base, index=False)
@@ -102,7 +102,7 @@ def test_asof_enrich_uses_prior_gaming_day_snapshot(tmp_path: Path) -> None:
     pd.DataFrame(
         {
             "canonical_id": ["c1", "c1"],
-            "anchor_gaming_day": pd.to_datetime(["2026-05-17", "2026-05-18"]),
+            "anchor_gaming_day_event": pd.to_datetime(["2026-05-17", "2026-05-18"]),
             "fe__bets_cnt__w1d": [1, 2],
             "fe__wager_sum__w1d": [50.0, 100.0],
             "fe__prior_odds_mean_w30d": [1.8, 1.9],
@@ -130,7 +130,7 @@ def test_asof_enrich_uses_prior_gaming_day_snapshot(tmp_path: Path) -> None:
         ),
     )
     got = pd.read_parquet(out)
-    assert pd.Timestamp(got.iloc[0]["mid_term_anchor_gaming_day"]) == pd.Timestamp("2026-05-18")
+    assert pd.Timestamp(got.iloc[0]["mid_term_anchor_gaming_day_event"]) == pd.Timestamp("2026-05-18")
     assert int(got.iloc[0]["mid_term_snapshot_age_days"]) == 1
     assert float(got.iloc[0]["fe__bets_cnt__w1d"]) == pytest.approx(2.0)
     assert float(got.iloc[0]["fe__wager_sum__w15m_over_w1d"]) == pytest.approx(0.3)
@@ -148,14 +148,14 @@ def test_asof_enrich_does_not_use_target_day_snapshot(tmp_path: Path) -> None:
         {
             "bet_id": [11.0],
             "canonical_id": ["c2"],
-            "gaming_day": pd.Timestamp("2026-05-19"),
+            "gaming_day_event": pd.Timestamp("2026-05-19"),
             "payout_odds": [2.0],
         }
     ).to_parquet(base, index=False)
     pd.DataFrame(
         {
             "canonical_id": ["c2"],
-            "anchor_gaming_day": pd.to_datetime(["2026-05-19"]),
+            "anchor_gaming_day_event": pd.to_datetime(["2026-05-19"]),
             "fe__bets_cnt__w1d": [99],
             "fe__wager_sum__w1d": [999.0],
             "fe__prior_odds_mean_w30d": [1.0],
@@ -177,7 +177,7 @@ def test_asof_enrich_does_not_use_target_day_snapshot(tmp_path: Path) -> None:
         mid_term_columns=("fe__bets_cnt__w1d",),
     )
     got = pd.read_parquet(out)
-    assert pd.isna(got.iloc[0]["mid_term_anchor_gaming_day"])
+    assert pd.isna(got.iloc[0]["mid_term_anchor_gaming_day_event"])
     assert int(got.iloc[0]["mid_term_snapshot_missing_flag"]) == 1
 
 
@@ -190,7 +190,7 @@ def test_training_snapshot_scope_metadata(tmp_path: Path) -> None:
         [
             {
                 "player_id": 1,
-                "gaming_day": pd.Timestamp("2026-05-18"),
+                "gaming_day_event": pd.Timestamp("2026-05-18"),
                 "payout_complete_dtm": pd.Timestamp("2026-05-18T10:00:00Z"),
                 "wager": 100.0,
                 "payout_odds": 2.0,
@@ -204,7 +204,7 @@ def test_training_snapshot_scope_metadata(tmp_path: Path) -> None:
         {
             "bet_id": [1.0],
             "canonical_id": ["c1"],
-            "gaming_day": pd.Timestamp("2026-05-19"),
+            "gaming_day_event": pd.Timestamp("2026-05-19"),
         }
     ).to_parquet(training, index=False)
     universe = tmp_path / "universe.parquet"
@@ -224,8 +224,8 @@ def test_training_snapshot_scope_metadata(tmp_path: Path) -> None:
         duckdb_runtime=DuckDbRuntimeConfig(),
         canonical_mapping_parquet=cmap,
         canonical_universe_parquet=universe,
-        anchor_gaming_day_start=anchor_start,
-        anchor_gaming_day_end=anchor_end,
+        anchor_gaming_day_event_start=anchor_start,
+        anchor_gaming_day_event_end=anchor_end,
         bets_gaming_day_start=bets_start,
         bets_gaming_day_end=bets_end,
         snapshot_scope=MID_TERM_SNAPSHOT_SCOPE_TRAINING,
@@ -246,14 +246,14 @@ def test_canonical_universe_filters_snapshot_rows(tmp_path: Path) -> None:
         [
             {
                 "player_id": 1,
-                "gaming_day": pd.Timestamp("2026-05-18"),
+                "gaming_day_event": pd.Timestamp("2026-05-18"),
                 "payout_complete_dtm": pd.Timestamp("2026-05-18T10:00:00Z"),
                 "wager": 100.0,
                 "payout_odds": 2.0,
             },
             {
                 "player_id": 2,
-                "gaming_day": pd.Timestamp("2026-05-18"),
+                "gaming_day_event": pd.Timestamp("2026-05-18"),
                 "payout_complete_dtm": pd.Timestamp("2026-05-18T11:00:00Z"),
                 "wager": 50.0,
                 "payout_odds": 1.5,
@@ -276,7 +276,7 @@ def test_canonical_universe_filters_snapshot_rows(tmp_path: Path) -> None:
         duckdb_runtime=DuckDbRuntimeConfig(),
         canonical_mapping_parquet=cmap,
         canonical_universe_parquet=universe,
-        anchor_gaming_day_end=pd.Timestamp("2026-05-18").date(),
+        anchor_gaming_day_event_end=pd.Timestamp("2026-05-18").date(),
         bets_gaming_day_end=pd.Timestamp("2026-05-18").date(),
         snapshot_scope=MID_TERM_SNAPSHOT_SCOPE_TRAINING,
     )
@@ -307,7 +307,7 @@ def test_day_end_snapshot_uses_last_bet_inclusive_state(tmp_path: Path) -> None:
         [
             {
                 "player_id": 1,
-                "gaming_day": pd.Timestamp("2026-05-17"),
+                "gaming_day_event": pd.Timestamp("2026-05-17"),
                 "payout_complete_dtm": pd.Timestamp("2026-05-17T12:00:00Z"),
                 "wager": 50.0,
                 "payout_odds": 1.5,
@@ -318,14 +318,14 @@ def test_day_end_snapshot_uses_last_bet_inclusive_state(tmp_path: Path) -> None:
         [
             {
                 "player_id": 1,
-                "gaming_day": pd.Timestamp("2026-05-18"),
+                "gaming_day_event": pd.Timestamp("2026-05-18"),
                 "payout_complete_dtm": pd.Timestamp("2026-05-18T10:00:00Z"),
                 "wager": 100.0,
                 "payout_odds": 2.0,
             },
             {
                 "player_id": 1,
-                "gaming_day": pd.Timestamp("2026-05-18"),
+                "gaming_day_event": pd.Timestamp("2026-05-18"),
                 "payout_complete_dtm": pd.Timestamp("2026-05-18T15:00:00Z"),
                 "wager": 200.0,
                 "payout_odds": 2.5,
@@ -346,7 +346,7 @@ def test_day_end_snapshot_uses_last_bet_inclusive_state(tmp_path: Path) -> None:
         SELECT *
         FROM read_parquet('{out.as_posix()}')
         WHERE canonical_id = 'c1'
-          AND CAST(anchor_gaming_day AS DATE) = DATE '2026-05-18'
+          AND CAST(anchor_gaming_day_event AS DATE) = DATE '2026-05-18'
         """
     ).fetchdf()
     assert len(got) == 1
@@ -368,14 +368,14 @@ def test_enrich_training_payout_odds_z_w7d_from_mid_snapshot(tmp_path: Path) -> 
         [
             {
                 "player_id": 1,
-                "gaming_day": pd.Timestamp("2026-05-17"),
+                "gaming_day_event": pd.Timestamp("2026-05-17"),
                 "payout_complete_dtm": pd.Timestamp("2026-05-17T12:00:00Z"),
                 "wager": 50.0,
                 "payout_odds": 1.5,
             },
             {
                 "player_id": 1,
-                "gaming_day": pd.Timestamp("2026-05-18"),
+                "gaming_day_event": pd.Timestamp("2026-05-18"),
                 "payout_complete_dtm": pd.Timestamp("2026-05-18T10:00:00Z"),
                 "wager": 100.0,
                 "payout_odds": 2.0,
@@ -397,7 +397,7 @@ def test_enrich_training_payout_odds_z_w7d_from_mid_snapshot(tmp_path: Path) -> 
         {
             "bet_id": [42.0],
             "canonical_id": ["c1"],
-            "gaming_day": pd.Timestamp("2026-05-19"),
+            "gaming_day_event": pd.Timestamp("2026-05-19"),
             "payout_odds": [2.5],
         }
     ).to_parquet(base, index=False)
@@ -418,7 +418,7 @@ def test_enrich_training_payout_odds_z_w7d_from_mid_snapshot(tmp_path: Path) -> 
             SELECT fe__payout_odds_avg_w7d
             FROM read_parquet('{mid.as_posix()}')
             WHERE canonical_id = 'c1'
-              AND CAST(anchor_gaming_day AS DATE) = DATE '2026-05-18'
+              AND CAST(anchor_gaming_day_event AS DATE) = DATE '2026-05-18'
             """
         ).fetchone()[0]
     )
@@ -428,7 +428,7 @@ def test_enrich_training_payout_odds_z_w7d_from_mid_snapshot(tmp_path: Path) -> 
             SELECT fe__payout_odds_std_w7d
             FROM read_parquet('{mid.as_posix()}')
             WHERE canonical_id = 'c1'
-              AND CAST(anchor_gaming_day AS DATE) = DATE '2026-05-18'
+              AND CAST(anchor_gaming_day_event AS DATE) = DATE '2026-05-18'
             """
         ).fetchone()[0]
     )
@@ -445,14 +445,14 @@ def test_asof_enrich_nulls_anchor_older_than_backfill_window(tmp_path: Path) -> 
         {
             "bet_id": [20.0],
             "canonical_id": ["c_old"],
-            "gaming_day": pd.Timestamp("2026-05-19"),
+            "gaming_day_event": pd.Timestamp("2026-05-19"),
             "payout_odds": [2.0],
         }
     ).to_parquet(base, index=False)
     pd.DataFrame(
         {
             "canonical_id": ["c_old"],
-            "anchor_gaming_day": pd.to_datetime(["2026-03-01"]),
+            "anchor_gaming_day_event": pd.to_datetime(["2026-03-01"]),
             "fe__bets_cnt__w1d": [7],
             "fe__wager_sum__w1d": [70.0],
         }
@@ -482,14 +482,14 @@ def test_train_serve_mid_term_asof_parity(tmp_path: Path) -> None:
         [
             {
                 "player_id": 1,
-                "gaming_day": pd.Timestamp("2026-05-17"),
+                "gaming_day_event": pd.Timestamp("2026-05-17"),
                 "payout_complete_dtm": pd.Timestamp("2026-05-17T12:00:00Z"),
                 "wager": 50.0,
                 "payout_odds": 1.5,
             },
             {
                 "player_id": 1,
-                "gaming_day": pd.Timestamp("2026-05-18"),
+                "gaming_day_event": pd.Timestamp("2026-05-18"),
                 "payout_complete_dtm": pd.Timestamp("2026-05-18T10:00:00Z"),
                 "wager": 100.0,
                 "payout_odds": 2.0,
@@ -511,7 +511,7 @@ def test_train_serve_mid_term_asof_parity(tmp_path: Path) -> None:
         {
             "bet_id": [42.0],
             "canonical_id": ["c1"],
-            "gaming_day": pd.Timestamp("2026-05-19"),
+            "gaming_day_event": pd.Timestamp("2026-05-19"),
             "payout_odds": [2.5],
         }
     ).to_parquet(base, index=False)
@@ -547,7 +547,7 @@ def test_mid_term_snapshot_cache_reuse(tmp_path: Path) -> None:
         [
             {
                 "player_id": 1,
-                "gaming_day": pd.Timestamp("2026-05-18"),
+                "gaming_day_event": pd.Timestamp("2026-05-18"),
                 "payout_complete_dtm": pd.Timestamp("2026-05-18T10:00:00Z"),
                 "wager": 100.0,
                 "payout_odds": 2.0,
@@ -561,7 +561,7 @@ def test_mid_term_snapshot_cache_reuse(tmp_path: Path) -> None:
         {
             "bet_id": [1.0],
             "canonical_id": ["c1"],
-            "gaming_day": pd.Timestamp("2026-05-19"),
+            "gaming_day_event": pd.Timestamp("2026-05-19"),
         }
     ).to_parquet(training, index=False)
     universe = tmp_path / "universe3.parquet"
@@ -585,8 +585,8 @@ def test_mid_term_snapshot_cache_reuse(tmp_path: Path) -> None:
         duckdb_runtime=DuckDbRuntimeConfig(),
         canonical_mapping_parquet=cmap,
         canonical_universe_parquet=universe,
-        anchor_gaming_day_start=anchor_start,
-        anchor_gaming_day_end=anchor_end,
+        anchor_gaming_day_event_start=anchor_start,
+        anchor_gaming_day_event_end=anchor_end,
         bets_gaming_day_start=bets_start,
         bets_gaming_day_end=bets_end,
         snapshot_scope=MID_TERM_SNAPSHOT_SCOPE_TRAINING,
@@ -598,8 +598,8 @@ def test_mid_term_snapshot_cache_reuse(tmp_path: Path) -> None:
         canonical_mapping_parquet=cmap,
         canonical_universe_parquet=universe,
         lookback_days=32,
-        anchor_gaming_day_start=anchor_start,
-        anchor_gaming_day_end=anchor_end,
+        anchor_gaming_day_event_start=anchor_start,
+        anchor_gaming_day_event_end=anchor_end,
     )
     assert cached is not None
     _, meta = cached

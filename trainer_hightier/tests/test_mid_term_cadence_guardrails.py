@@ -58,7 +58,7 @@ def test_short_term_materializer_uses_bounded_hot_pool_path(
             "type_of_bet": ["MAIN"],
             "session_id": [1],
             "table_id": [1],
-            "gaming_day": [pd.Timestamp("2024-06-01")],
+            "gaming_day_event": [pd.Timestamp("2024-06-01")],
         },
     ).to_parquet(train, index=False)
 

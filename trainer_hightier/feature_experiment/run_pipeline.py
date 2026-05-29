@@ -803,7 +803,7 @@ def main() -> None:
 
     # Val slices — AP by contiguous val-day quartiles
     val_df = pd.read_parquet(paths.splits_dir / "val.parquet")
-    masks = contiguous_val_day_masks(val_df["gaming_day"], k=4)
+    masks = contiguous_val_day_masks(val_df["gaming_day_event"], k=4)
     y_va = pd.to_numeric(val_df[_b5.LABEL_COLUMN], errors="raise").astype(np.int8).to_numpy()
 
     with open(res_base.model_path, "rb") as f:

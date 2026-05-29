@@ -100,7 +100,7 @@ def _session_gaming_day_bounds(*, lookback_days: int) -> tuple[date, date]:
 
 def _sanitize_ch_session_export_df(df: pd.DataFrame) -> pd.DataFrame:
     """Coerce raw ClickHouse session rows for ``materialize_slow_patron_180d_canonical_asof``."""
-    required = ("player_id", "gaming_day", "theo_win")
+    required = ("player_id", "gaming_day_event", "theo_win")
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"session export missing columns {missing}; got {list(df.columns)[:20]}")
@@ -109,8 +109,8 @@ def _sanitize_ch_session_export_df(df: pd.DataFrame) -> pd.DataFrame:
     out = df.loc[:, list(required)].copy()
     out["player_id"] = pd.to_numeric(out["player_id"], errors="coerce")
     out["theo_win"] = pd.to_numeric(out["theo_win"], errors="coerce")
-    out["gaming_day"] = pd.to_datetime(out["gaming_day"], errors="coerce").dt.normalize()
-    out = out.loc[out["player_id"].notna() & out["gaming_day"].notna()].copy()
+    out["gaming_day_event"] = pd.to_datetime(out["gaming_day_event"], errors="coerce").dt.normalize()
+    out = out.loc[out["player_id"].notna() & out["gaming_day_event"].notna()].copy()
     out["player_id"] = out["player_id"].astype("int64", copy=False)
     return out
 
@@ -140,12 +140,12 @@ def export_clickhouse_sessions_to_parquet(
         q = f"""
             SELECT
                 player_id,
-                gaming_day,
+                gaming_day_event,
                 theo_win
             FROM {cfg.source_db}.{cfg.tsession} FINAL
-            WHERE gaming_day >= %(g_start)s
-              AND gaming_day <= %(g_end)s
-              AND gaming_day IS NOT NULL
+            WHERE gaming_day_event >= %(g_start)s
+              AND gaming_day_event <= %(g_end)s
+              AND gaming_day_event IS NOT NULL
               AND player_id IS NOT NULL
               AND player_id != {placeholder}
               AND COALESCE(is_deleted, 0) = 0
@@ -173,7 +173,7 @@ def export_clickhouse_sessions_to_parquet(
     df = _sanitize_ch_session_export_df(raw)
     if df.empty:
         raise ValueError(
-            f"ClickHouse session export returned 0 rows for gaming_day in "
+            f"ClickHouse session export returned 0 rows for gaming_day_event in "
             f"[{gaming_day_start}, {gaming_day_end}]"
         )
     df.to_parquet(out_parquet, index=False)
@@ -205,17 +205,17 @@ COPY (
     canonical_id,
     {feat_cols},
     CAST(
-      (CAST(anchor_gaming_day AS TIMESTAMP) + INTERVAL '1' DAY - INTERVAL '1' SECOND)
+      (CAST(anchor_gaming_day_event AS TIMESTAMP) + INTERVAL '1' DAY - INTERVAL '1' SECOND)
       AS TIMESTAMPTZ
     ) AS event_timestamp
   FROM (
     SELECT
       TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id,
-      CAST(anchor_gaming_day AS DATE) AS anchor_gaming_day,
+      CAST(anchor_gaming_day_event AS DATE) AS anchor_gaming_day_event,
       {feat_cols},
       ROW_NUMBER() OVER (
         PARTITION BY TRIM(CAST(canonical_id AS VARCHAR))
-        ORDER BY CAST(anchor_gaming_day AS DATE) DESC
+        ORDER BY CAST(anchor_gaming_day_event AS DATE) DESC
       ) AS rn
     FROM read_parquet('{src}')
   ) AS ranked
@@ -262,7 +262,7 @@ def compute_long_term_spike_snapshot(
     anchor_max = None
     if nrows > 0:
         row = duckdb.sql(
-            f"SELECT MAX(CAST(anchor_gaming_day AS DATE)) FROM read_parquet('{str(full_snap).replace(chr(92), '/')}')",
+            f"SELECT MAX(CAST(anchor_gaming_day_event AS DATE)) FROM read_parquet('{str(full_snap).replace(chr(92), '/')}')",
         ).fetchone()
         if row and row[0] is not None:
             anchor_max = row[0].isoformat() if hasattr(row[0], "isoformat") else str(row[0])[:10]
@@ -272,7 +272,7 @@ def compute_long_term_spike_snapshot(
         "feast_spike_rows": feast_rows,
         "feast_spike_parquet": str(feast_out),
         "full_snapshot_parquet": str(full_snap),
-        "slow_anchor_gaming_day_max": anchor_max,
+        "slow_anchor_gaming_day_event_max": anchor_max,
         "lookback_days": int(lookback_days),
     }
 
