@@ -129,16 +129,16 @@ prediction_visible_ts_cf AS (
 - **CLI**（在 `feast_repo` 下）：
   - `feast plan`：完整檢核來源時，若 Parquet 仍缺 `prediction_visible_ts_cf` 則會失敗；可暫用 `feast plan --skip-source-validation` 僅驗證 registry 定義。
   - `feast apply`：寫入 registry／online schema；請在來源 Parquet 已對齊欄位後再執行，以便通過檢核與後續 `get_historical_features`。
-- **`gaming_day`**：目前 **未** 納入 `definitions.py` 的 explicit schema（避免 `date32` inference 問題）；需要時請在 preprocess 衍生字串／數值欄並加進 FeatureView。
+- **`gaming_day_event`**：由 event timestamp（`payout_complete_dtm` / `session_end_dtm`）在 **Asia/Hong_Kong** 衍生之日曆日；為唯一 day-level 語意與 partition key。raw `gaming_day` **不再**使用。
 
 ---
 
-## 6.1 慢變動 patron 特徵（180 日窗口 × 每月首日 `gaming_day` 快照）
+## 6.1 慢變動 patron 特徵（180 日窗口 × 月級 `anchor_gaming_day_event` 快照）
 
-- **契約**：`trainer_hightier/contracts/slow_patron_180d_monthly_features.yaml`。
-- **物化**：`trainer_hightier.utils.slow_patron_180d_monthly.materialize_slow_patron_180d_monthly` → `artifacts/feast/slow_patron_180d_monthly.parquet`（**請先跑物化再 `feast apply`**；僅用 DuckDB，不整表載入 pandas）。
-- **語意概要**：在 **canonical_id** 空間內，對每個日曆月中該 patron 實際出現的 **`gaming_day`** 取 **`MIN(gaming_day)`** 作為當月 **anchor**；在 anchor 上計算過去 `lookback_days`（預設 180）個**日曆日**內、以 session 為來源的 `SUM(theo_win)`、`COUNT(DISTINCT gaming_day)` 與 ADT。每筆 cleaned **bet** 透過 `COALESCE(bet.gaming_day, DATE(payout_complete_dtm))` 取得 `bet_gaming_day`，再套用 **不超過該日的最近一個 anchor** 之快照（LATERAL / 等價於「月級最多更新一次」的慢變動值）。
-- **時間欄**：與其他 bet-grain 視圖一致，使用 `prediction_visible_ts_cf` + `__etl_insert_Dtm_synthetic` 註冊 Feast（見該 YAML `feast` 段）。
+- **契約**：`trainer_hightier/contracts/slow_patron_180d_monthly_features.yaml`；時間語意 SSOT：`schema/time_semantics_registry.yaml` v2。
+- **物化**：`trainer_hightier.utils.slow_patron_180d_monthly.materialize_slow_patron_180d_canonical_asof` → `artifacts/feast/slow_patron_180d_monthly.parquet`（**請先跑物化再 `feast apply`**；僅用 DuckDB，不整表載入 pandas）。
+- **語意概要**：在 **canonical_id** 空間內，production 使用 **單一 global active anchor**（`slow_anchor_required`，見 `slow_month_turn` gap/post-gap 契約）。在 anchor 上計算過去 `lookback_days`（預設 180）個**日曆日**內、以 session 為來源、`gaming_day_event <= anchor` 的 `SUM(theo_win)`、`COUNT(DISTINCT gaming_day_event)` 與 ADT。Feast `event_timestamp` 為 anchor 日 HK **23:59:59**。
+- **時間欄**：慢變動 Feast spike 使用 `event_timestamp`（anchor 日末）；與 mid/bet 視圖之 `prediction_visible_ts_cf` 分開管理。
 
 ---
 
@@ -155,4 +155,4 @@ prediction_visible_ts_cf AS (
 - 2026-05-13：初版草案（trainer_hightier／Feast 對齊 scorer 輪詢與 `BET_AVAIL_DELAY_MIN`）。
 - 2026-05-13：離線 store 改為 `duckdb` + `ibis-framework[duckdb]`，並設定 `staging_location`。
 - 2026-05-13：§6.1 慢變動 patron 180d 月度快照特徵與物化路徑
-- 2026-05-13：§6.2 訓練集匯出腳本 `03_build_training_data.py`
+- 2026-05-28：全面遷移至 `gaming_day_event`（HK tz-aware event time 衍生；§6 / §6.1 對齊 `schema/time_semantics_registry.yaml` v2）。
