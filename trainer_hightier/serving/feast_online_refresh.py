@@ -34,6 +34,7 @@ from trainer_hightier.serving.feast_production_constants import (
 from trainer_hightier.serving.adt_allowlist import load_adt_allowlist_ids, resolve_adt_allowlist_path
 from trainer_hightier.serving.ch_adapter import (
     CH_TBET_GAMING_DAY_EVENT_EXPR,
+    CH_TSESSION_GAMING_DAY_EVENT_EXPR,
     CH_TBET_PAYOUT_ODDS_SELECT,
     CH_TBET_WAGER_POSITIVE_PRED,
     CH_TBET_WAGER_SELECT,
@@ -319,18 +320,21 @@ def export_clickhouse_sessions_to_parquet(
     t0 = time.perf_counter()
     for i, chunk in enumerate(chunks):
         in_list = ",".join(str(int(x)) for x in chunk)
-        q = f"""
-            SELECT player_id, gaming_day_event, theo_win
-            FROM {cfg.source_db}.{cfg.tsession} FINAL
-            WHERE gaming_day_event >= %(g_start)s
-              AND gaming_day_event <= %(g_end)s
-              AND gaming_day_event IS NOT NULL
-              AND player_id IS NOT NULL
-              AND player_id != {placeholder}
-              AND COALESCE(is_deleted, 0) = 0
-              AND COALESCE(is_canceled, 0) = 0
-              AND player_id IN ({in_list})
-        """
+                q = f"""
+                        SELECT
+                            CAST(player_id AS Int64) AS player_id,
+                            {CH_TSESSION_GAMING_DAY_EVENT_EXPR} AS gaming_day_event,
+                            CAST(theo_win AS Nullable(Float64)) AS theo_win
+                        FROM {cfg.source_db}.{cfg.tsession} FINAL
+                        WHERE {CH_TSESSION_GAMING_DAY_EVENT_EXPR} >= %(g_start)s
+                            AND {CH_TSESSION_GAMING_DAY_EVENT_EXPR} <= %(g_end)s
+                            AND {CH_TSESSION_GAMING_DAY_EVENT_EXPR} IS NOT NULL
+                            AND player_id IS NOT NULL
+                            AND player_id != {placeholder}
+                            AND COALESCE(is_deleted, 0) = 0
+                            AND COALESCE(is_canceled, 0) = 0
+                            AND player_id IN ({in_list})
+                """
         frames.append(client.query_df(q, parameters={"g_start": gaming_day_start, "g_end": gaming_day_end}))
         if row_cap > 0 and sum(len(f) for f in frames) > row_cap:
             raise RuntimeError(

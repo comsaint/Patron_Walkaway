@@ -23,6 +23,10 @@ CH_TBET_WAGER_POSITIVE_PRED: Final[str] = (
 # Day semantics are defined in schema/time_semantics_registry.yaml: derive from payout_complete_dtm in HK.
 CH_TBET_GAMING_DAY_EVENT_EXPR: Final[str] = "toDate(toTimeZone(payout_complete_dtm, 'Asia/Hong_Kong'))"
 
+# Day semantics for t_session: prefer session_end_dtm falling back to lud_dtm (last user/device activity)
+# Normalize to HK date to match other day semantics.
+CH_TSESSION_GAMING_DAY_EVENT_EXPR: Final[str] = "toDate(toTimeZone(COALESCE(session_end_dtm, lud_dtm), 'Asia/Hong_Kong'))"
+
 _thread_local = threading.local()
 
 
