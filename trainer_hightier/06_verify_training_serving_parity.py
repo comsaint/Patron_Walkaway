@@ -566,7 +566,11 @@ def run_production_feature_replay(
     diff_fraction_fail_threshold: float = 0.02,
     parity_cfg: Step6ParityConfig | None = None,
 ) -> dict[str, Any]:
-    """Replay production suppliers and compare every model feature to training split values."""
+    """Replay production suppliers and compare every model feature to training split values.
+
+    Mid-term ``fe__*`` uses the Step 3.5 training snapshot ASOF join (not Feast latest-anchor
+    lookup) so historical test bets match training enrich; slow ``patron__*`` still uses Feast online.
+    """
     ctx = resolve_offline_context(
         bundle_dir=None,
         model_dir=model_dir,
@@ -575,6 +579,7 @@ def run_production_feature_replay(
         feast_repo=feast_repo,
         slow_patron_parquet=None,
         use_feast_online=True,
+        use_training_mid_snapshot_for_parity=True,
     )
     needs_feast = bool(ctx.supplier_plan.feast_mid_cols or ctx.supplier_plan.feast_slow_cols)
     adapter = _build_feast_online_adapter(ctx) if needs_feast else None

@@ -90,6 +90,45 @@ def test_trainer_step6_retries_once_on_failure(tmp_path: Path, monkeypatch: pyte
     assert metrics["step6_attempt"] == 2
 
 
+def test_run_production_feature_replay_uses_training_mid_snapshot_for_parity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Step 6 mid-term parity must ASOF-join the training snapshot, not Feast latest-anchor only."""
+    import pandas as pd
+
+    mod = _load_step06_module()
+    captured: dict = {}
+
+    def _fake_resolve_offline_context(**kwargs: object) -> MagicMock:
+        captured.update(kwargs)
+        ctx = MagicMock()
+        ctx.supplier_plan.feast_mid_cols = ("fe__bets_cnt__w1d",)
+        ctx.supplier_plan.feast_slow_cols = ()
+        ctx.supplier_plan.mid_composite_cols = ()
+        ctx.bundle.feature_columns = ("fe__bets_cnt__w1d",)
+        return ctx
+
+    monkeypatch.setattr(mod, "resolve_offline_context", _fake_resolve_offline_context)
+    monkeypatch.setattr(mod, "_build_feast_online_adapter", lambda _ctx: MagicMock())
+    monkeypatch.setattr(
+        mod,
+        "compare_training_to_production_features",
+        lambda *_a, **_k: {"mode": "all_model_features", "issues": [], "n_rows_compared": 0},
+    )
+    monkeypatch.setattr(mod.pd, "read_parquet", lambda *_a, **_k: pd.DataFrame({"bet_id": [1.0]}))
+
+    model_dir = Path(__file__).resolve().parents[1] / "tests" / "_fixtures_nonexistent_model"
+    mod.run_production_feature_replay(
+        model_dir,
+        Path(__file__).resolve(),
+        cleaned_bet_root=Path(__file__).resolve().parent,
+        feast_repo=Path(__file__).resolve().parent,
+        max_rows=0,
+        batch_size=1,
+    )
+    assert captured.get("use_training_mid_snapshot_for_parity") is True
+
+
 def test_trainer_step6_fails_after_retry_exhausted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from trainer_hightier import trainer as tr_mod
     from dataclasses import replace

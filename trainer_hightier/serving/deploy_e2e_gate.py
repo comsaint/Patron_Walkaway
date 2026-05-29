@@ -121,16 +121,26 @@ def _parse_gaming_day(value: str) -> date:
         raise ValueError(f"expected gaming day YYYY-MM-DD, got {value!r}") from exc
 
 
+def _split_row_gaming_day_bounds(row: dict[str, Any]) -> tuple[Any, Any]:
+    """Return min/max gaming-day keys from a Step 4 split row (legacy or ``*_event`` names)."""
+    raw_min = row.get("min_gaming_day_event")
+    if raw_min is None:
+        raw_min = row.get("min_gaming_day")
+    raw_max = row.get("max_gaming_day_event")
+    if raw_max is None:
+        raw_max = row.get("max_gaming_day")
+    return raw_min, raw_max
+
+
 def _test_split_gaming_day_range_from_report(report: dict[str, Any]) -> tuple[date, date] | None:
-    """Return test-split ``min_gaming_day`` / ``max_gaming_day`` from Step 4 ``split_report.json`` body."""
+    """Return test-split gaming-day bounds from Step 4 ``split_report.json`` body."""
     splits = report.get("splits")
     if not isinstance(splits, list):
         return None
     for row in splits:
         if not isinstance(row, dict) or str(row.get("split") or "").strip().lower() != "test":
             continue
-        raw_min = row.get("min_gaming_day")
-        raw_max = row.get("max_gaming_day")
+        raw_min, raw_max = _split_row_gaming_day_bounds(row)
         if raw_min is None or raw_max is None:
             return None
         try:
@@ -154,7 +164,8 @@ def resolve_model_bundle_test_gaming_days(model_bundle: Path) -> tuple[date, dat
     rng = _test_split_gaming_day_range_from_report(report)
     if rng is None:
         raise ValueError(
-            f"{report_path} has no test split with min_gaming_day/max_gaming_day; "
+            f"{report_path} has no test split with min/max gaming-day bounds "
+            "(min_gaming_day_event/max_gaming_day_event or legacy min_gaming_day/max_gaming_day); "
             "pass --gaming-day-start/--gaming-day-end explicitly",
         )
     return rng

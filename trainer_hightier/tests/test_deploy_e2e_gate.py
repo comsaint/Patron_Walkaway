@@ -145,6 +145,25 @@ def test_resolve_model_bundle_test_gaming_days(tmp_path: Path) -> None:
     assert end.isoformat() == "2026-05-11"
 
 
+def test_resolve_model_bundle_test_gaming_days_event_column_names(tmp_path: Path) -> None:
+    """Step 4 post-migration reports use min_gaming_day_event / max_gaming_day_event."""
+    model_bundle = tmp_path / "models"
+    model_bundle.mkdir()
+    report = {
+        "splits": [
+            {
+                "split": "test",
+                "min_gaming_day_event": "2026-03-06",
+                "max_gaming_day_event": "2026-05-11",
+            },
+        ],
+    }
+    (model_bundle / "split_report.json").write_text(json.dumps(report), encoding="utf-8")
+    start, end = resolve_model_bundle_test_gaming_days(model_bundle)
+    assert start.isoformat() == "2026-03-06"
+    assert end.isoformat() == "2026-05-11"
+
+
 def test_apply_default_scorability_gaming_days_from_split_report(tmp_path: Path) -> None:
     model_bundle = tmp_path / "models"
     model_bundle.mkdir()

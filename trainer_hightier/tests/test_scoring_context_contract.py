@@ -30,6 +30,18 @@ def test_batch_size_from_serving_config() -> None:
     assert ctx.batch_size == int(cfg.hightier_scorer_max_bets_per_cycle)
 
 
+def test_sort_bets_naive_payout_is_hk_wall_clock_not_utc() -> None:
+    """Naive parquet instants are HK wall clock per L0 contract, not UTC."""
+    bets = pd.DataFrame(
+        {
+            "bet_id": [1.0],
+            "payout_complete_dtm": pd.to_datetime(["2026-03-06 00:00:14"]),
+        },
+    )
+    out = sort_bets_for_scoring_batch(bets)
+    assert out["payout_complete_dtm"].iloc[0] == pd.Timestamp("2026-03-05 16:00:14", tz="UTC")
+
+
 def test_sort_bets_chronological() -> None:
     bets = pd.DataFrame(
         {

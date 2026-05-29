@@ -18,6 +18,7 @@ from trainer_hightier.config import (
 from trainer_hightier.feature_experiment.materialize_fe_derived import (
     compute_fe_derived_features_from_pool,
 )
+from trainer_hightier.utils.hk_time_semantics import pandas_ts_series_to_hk_l0_contract
 
 DEFAULT_EXPAND_CANONICAL_ALIASES: Final[bool] = False
 
@@ -72,7 +73,9 @@ def sort_bets_for_scoring_batch(bets: pd.DataFrame) -> pd.DataFrame:
             f"bets missing sort columns {missing}; got columns={list(bets.columns)}",
         )
     out = bets.copy()
-    out["payout_complete_dtm"] = pd.to_datetime(out["payout_complete_dtm"], errors="coerce", utc=True)
+    out["payout_complete_dtm"] = (
+        pandas_ts_series_to_hk_l0_contract(out["payout_complete_dtm"]).dt.tz_convert("UTC")
+    )
     out["bet_id"] = pd.to_numeric(out["bet_id"], errors="coerce")
     return out.sort_values(list(_BATCH_SORT_COLUMNS), kind="mergesort").reset_index(drop=True)
 
