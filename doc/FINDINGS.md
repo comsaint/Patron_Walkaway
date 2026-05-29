@@ -34,6 +34,7 @@
 | **FND-15** | `t_game`<br>財務欄位 | 🟡 P1 | **財務欄位非零且包含極端值**：`total_turnover`, `casino_win` 等並非全為 0。`casino_win` 包含極端值（如單局虧損 1.1 億），與 `t_bet` 的極端派彩現象一致。 | 若誤以為 `t_game` 財務欄位全為 0 而忽略，會遺失局級別的財務特徵。 | 這是真實的業務數據彙總，可作為特徵使用，但需注意極端值對模型的影響。 |
 | **FND-16** | `t_session`<br>`session_id`, `casino_player_id`, `player_id` | 🟡 P1 | **同一 `session_id` 的多版本中，`casino_player_id` 可能「晚到補齊」(NULL → 非 NULL)，少數情況連 `player_id` 也會被更正**。同時 `t_bet` 本身不含 `casino_player_id` 欄位。 | 線上推論若只看「當下可得的 t_session」可能把實際有卡客暫時當作無卡；若未做 FND-01 去重與 available_time gate，會導致 D2 身份判定與 rated/non-rated 路由不穩定（且可能引入未來資訊）。 | 線上：有卡判定必須加 available_time gate（見 FND-13），並允許身份隨 `t_session` 更新而「升級」。離線/訓練：D2 mapping 必須先做 FND-01 去重再建表；同時保留 mapping cache（`player_id`→`casino_player_id`）作為兜底。 |
 | **FND-17** | `t_bet`（及 `t_session`）<br>`theo_win`, `adjusted_theo_win` | 🟡 P1 | **`theo_win` 與 `adjusted_theo_win` 非同義**：前者為系統依玩法／賠率等計算的「精算向」預期利潤；後者為評級／報表向的「調整後」理論贏。於 repo 內 `trainer/sample data/SmartTableData_tbet_sample.csv`（1000 筆）可重現：`bet_type='PLAYER'` 時 **`adjusted_theo_win = wager * 0.0124` 恆成立**（浮點誤差內），`theo_win` 則略低（約 **wager × 0.01235**）；在常見百家樂閒注定義下 **~1.235% 較貼近文獻精算期望**，**1.24% 多為表定／評級取捨**（實桌規則不同時須重算）。`BANKER` / `SMALL_TIGER` / `BIG_TIGER` / `TIE` 樣本中兩欄相等；部分邊注（如 `LUCKY_SIX`、`*_PAIR`）僅極小差異或四捨五入感。**上游 GDP／Smart Table 未在本 repo 提供完整公式**，其餘注種需以全量 Parquet 再驗或向來源單位確認。 | 與場方 ADT／評級報表對帳時若誤用欄位會系統性偏差；本專案 `trainer/etl/etl_player_profile.py` 彙總 profile 使用 **`SUM(theo_win)`**，與「僅認 `adjusted_theo_win`」的口徑可能不一致。 | 對外報表／評級對齊：優先釐清業務採 **`adjusted_theo_win`** 或 **`theo_win`**；建模特徵若需與 profile 一致，沿用 `theo_win` 鏈路前先確認產品定義。全量驗證見附錄 **[FND-17]**。 |
+| **FND-18** | `t_session` vs `t_bet`<br>`theo_win`, `turnover/wager`, `num_bets` | 🔴 P0 | **跨表對帳存在結構性落差（非 rounding）**：針對 `canonical_patron_profile.csv` 與 cleaned `t_bet` 的重疊 patrons，`|theo_diff| >= 100k` 的高差異案例可回溯到三類根因：1) `t_session` 去重後版本被 `is_deleted/is_canceled` gate 排除，但 `t_bet` 仍保留該 `session_id` 注單；2) `t_bet.session_id` 在 raw `t_session` 查無對應（原始來源覆蓋不一致）；3) 即使 `session_id` 對齊，`t_session` 的彙總欄位與 `t_bet` 聚合非嚴格等值（口徑差）。 | 若直接把 profile（session 口徑）與 bet 聚合視為「應完全一致」，會誤判資料品質、產生錯誤校驗告警，並在監控與模型回歸檢查中引入大量假陽性。 | 對帳必須先拆成「matched / session_only / bet_only」三層，再標記 root cause。高差異個案詳單與逐案根因見 `doc/fnd18_profile_vs_bet_root_cause_cases.md`；下游監控建議以容忍帶 + root-cause bucket 方式落地，而非單一 hard-equality。 |
 
 ---
 
@@ -683,4 +684,49 @@ SELECT
       END) AS n_theo_ne_adj
 FROM read_parquet('data/gmwds_t_bet.parquet')
 WHERE bet_type = 'PLAYER';
+```
+
+### [FND-18] `canonical_patron_profile` vs cleaned `t_bet` 大差異 root-cause 拆解
+
+> 目的：對 `|profile_total_theo_win - bet_total_theo_win| >= 100k` 的高差異案例，區分是 `t_session` gate、raw source 覆蓋不一致，還是 matched-session 口徑差，避免把所有差異都歸咎為單一問題。
+
+**可重現資料（隨 repo 追蹤）**
+
+| 檔案 | 用途 |
+|------|------|
+| `doc/fixtures/fnd18/canonical_player_mapping.parquet` | `player_id` ↔ `canonical_id`（42 位高差異個案） |
+| `doc/fixtures/fnd18/canonical_patron_profile.csv` | patron 彙總（同上 42 位；欄位為附錄 SQL 所需子集） |
+| `doc/fixtures/fnd18/cleaned__gmwds_t_bet.parquet` | 對應 cleaned bet 列（同上 42 位） |
+
+**全量重跑（本機產物，不進 git）**：`trainer_hightier/artifacts/**` 由 `.gitignore` 排除；需先依 [`trainer_hightier/RUNBOOK.md`](../trainer_hightier/RUNBOOK.md) 跑 `python -m trainer_hightier.trainer` 產出 mapping／profile／`cleaned__gmwds_t_bet/`。全量掃描時 bet 請用 `read_parquet('trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet/**/*.parquet', hive_partitioning=true)`（Hive 分區目錄，非單一 `.parquet` 檔）。
+
+```sql
+-- 1) 先鎖定高差異 canonical_id（可調閾值；路徑指向 repo 內 fixture，clone 後可直接跑）
+WITH mp AS (
+  SELECT CAST(player_id AS BIGINT) AS player_id,
+         CAST(canonical_id AS BIGINT) AS canonical_id
+  FROM read_parquet('doc/fixtures/fnd18/canonical_player_mapping.parquet')
+),
+p AS (
+  SELECT CAST(canonical_id AS BIGINT) AS canonical_id,
+         CAST(total_theo_win AS DOUBLE) AS p_theo
+  FROM read_csv_auto('doc/fixtures/fnd18/canonical_patron_profile.csv', header=true)
+),
+b AS (
+  SELECT mp.canonical_id,
+         SUM(COALESCE(CAST(bt.theo_win AS DOUBLE), 0.0)) AS b_theo
+  FROM read_parquet('doc/fixtures/fnd18/cleaned__gmwds_t_bet.parquet') bt
+  JOIN mp ON CAST(bt.player_id AS BIGINT) = mp.player_id
+  GROUP BY 1
+)
+SELECT p.canonical_id, (p.p_theo - b.b_theo) AS theo_gap
+FROM p JOIN b USING (canonical_id)
+WHERE ABS(p.p_theo - b.b_theo) >= 100000
+ORDER BY ABS(p.p_theo - b.b_theo) DESC;
+-- 預期：回傳 42 列（與 doc/fnd18_profile_vs_bet_root_cause_cases.md 個案清單相同）
+
+-- 2) 依 canonical_id + session_id 做 FULL OUTER JOIN 拆成 matched / session_only / bet_only
+--    並把 bet_only 回接 raw t_session 的 dedup 後版本，判斷是 deleted/canceled 還是 raw session 缺失。
+--    逐案分解表為 2026-05-13 全量掃描快照；數字與上式「當前 fixture 重算」可能因上游重跑而漂移。
+--    詳細逐案輸出請參考：doc/fnd18_profile_vs_bet_root_cause_cases.md
 ```

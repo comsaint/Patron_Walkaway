@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trainer-hightier"
+version = "0.2.7"
+description = "trainer_hightier: serving runtime (scorer, validator, API) plus shared top-level modules; training-heavy subpackages omitted from wheel."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "Flask==3.1.3",
+    "pandas==2.3.3",
+    "numpy==2.4.2",
+    "scikit-learn==1.8.0",
+    "joblib==1.5.3",
+    "lightgbm==4.6.0",
+    "PyYAML==6.0.3",
+    "python-dotenv==1.2.1",
+    "clickhouse-connect==0.13.0",
+    "duckdb==1.4.4",
+    "pyarrow==23.0.1",
+    "feast==0.63.0",
+    "ibis-framework[duckdb]>=11.0.0,<12",
+]
+
+[project.optional-dependencies]
+training = [
+    "optuna>=4.7.0",
+]
+
+# Phase B: discover from repo parent (``../trainer_hightier``) and exclude training/CI subtrees.
+# Note: ``tests/`` is not a Python package (no ``__init__.py``) but is still pulled into wheels when
+# ``include-package-data`` tracks VCS files—keep it ``false`` and list only ``contracts`` below.
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["trainer_hightier*"]
+exclude = [
+    "trainer_hightier.tests",
+    "trainer_hightier.tests.*",
+    "trainer_hightier.feast_repo",
+    "trainer_hightier.feast_repo.*",
+    "trainer_hightier.build",
+    "trainer_hightier.build.*",
+]
+
+[tool.setuptools.package-data]
+trainer_hightier = ["contracts/*.yaml", "contracts/*.md"]
+

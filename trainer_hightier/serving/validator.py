@@ -1,0 +1,2289 @@
+from __future__ import annotations
+
+import argparse
+from collections import Counter, deque
+import logging
+import sqlite3
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from bisect import bisect_left, bisect_right
+
+import pandas as pd
+# zoneinfo is available in Python 3.9+. If not present, try backports.zoneinfo for older Pythons.
+# If both are unavailable, fall back to python-dateutil's gettz so the validator can still run
+# without requiring backports (useful in constrained environments).
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    try:
+        from backports.zoneinfo import ZoneInfo  # type: ignore
+    except Exception:
+        try:
+            from dateutil.tz import gettz as ZoneInfo  # type: ignore
+        except Exception:
+            raise ImportError(
+                "ZoneInfo not available: install Python 3.9+ or backports.zoneinfo "
+                "or ensure python-dateutil is installed"
+            )
+
+from trainer_hightier.data_preflight import run_cross_entry_data_preflight
+from trainer_hightier.serving import runtime_config as config
+from trainer_hightier.serving.ch_adapter import get_clickhouse_client
+
+HK_TZ = ZoneInfo(config.HK_TZ)
+# Sentinel for ongoing sessions (NULL session_end_dtm in DB); must not trigger
+# walkaway logic in validate_alert_row (R59 fix).
+_SENTINEL_SESSION_END = pd.Timestamp("2099-12-31 00:00:00", tz="UTC").tz_convert(HK_TZ)
+
+STATE_DB_PATH = config.STATE_DB_PATH
+OUT_DIR = config.VALIDATOR_OUT_DIR
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_PATH = config.RESULTS_PATH  # legacy CSV backfill; DB is source of truth
+
+IGNORED_REASONS = {"missing_player_id"}
+
+logger = logging.getLogger(__name__)
+
+_PERF_WINDOW_SIZE = 200
+_VALIDATOR_STAGE_TIMINGS: Dict[str, deque[float]] = {}
+
+# Task 9 warnings: avoid log spam on misconfiguration.
+_WARNED_TASK9_LOOKBACK_TOO_SMALL = False
+_WARNED_TASK9_LOOKBACK_CLAMPED = False
+_WARNED_TASK9_RETRY_WINDOW_CLAMPED = False
+
+# Task 9B: round-robin offset for no-bet retry selection (fairness across > limit backlog).
+_NO_BET_RETRY_ROT_OFFSET: int = 0
+
+# Throttle O(n) in-memory cache prune (see VALIDATOR_CACHE_PRUNE_INTERVAL_SECONDS).
+_CACHE_PRUNE_LAST_MONO: float = 0.0
+
+
+def _safe_int_config(name: str, default: int, *, min_value: int) -> int:
+    """Parse int config with fallback; never raise."""
+    try:
+        raw = getattr(config, name, default)
+        v = int(raw)  # accepts numeric strings too
+    except Exception:
+        logger.warning("[validator] Invalid %s=%r; using default %s", name, getattr(config, name, None), default)
+        v = int(default)
+    return max(int(min_value), v)
+
+
+def _no_bet_bet_id_lookup_enabled() -> bool:
+    raw = getattr(config, "VALIDATOR_NO_BET_BET_ID_LOOKUP_ENABLED", True)
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return bool(raw)
+
+
+def _record_validator_stage_timing(stage: str, seconds: float) -> None:
+    bucket = _VALIDATOR_STAGE_TIMINGS.setdefault(stage, deque(maxlen=_PERF_WINDOW_SIZE))
+    bucket.append(max(0.0, float(seconds)))
+
+
+def _emit_validator_perf_summary(cycle_stage_seconds: Dict[str, float]) -> None:
+    if not cycle_stage_seconds:
+        return
+    for stage, sec in cycle_stage_seconds.items():
+        _record_validator_stage_timing(stage, sec)
+    top_stages = sorted(cycle_stage_seconds.items(), key=lambda x: x[1], reverse=True)[:2]
+    parts: List[str] = []
+    for stage, sec in top_stages:
+        hist = _VALIDATOR_STAGE_TIMINGS.get(stage)
+        if not hist:
+            continue
+        arr = pd.Series(hist, dtype="float64")
+        p50 = float(arr.quantile(0.5))
+        p95 = float(arr.quantile(0.95))
+        parts.append(f"{stage}={sec:.3f}s (p50={p50:.3f}s, p95={p95:.3f}s, n={len(arr)})")
+    if parts:
+        logger.debug("[validator][perf] top_hotspots: %s", "; ".join(parts))
+
+VALIDATION_COLUMNS = [
+    "alert_ts",
+    "validated_at",
+    "player_id",
+    "casino_player_id",
+    "canonical_id",
+    "table_id",
+    "position_idx",
+    "session_id",
+    "bet_id",
+    "score",
+    "result",
+    "gap_start",
+    "gap_minutes",
+    "reason",
+    "bet_ts",
+    "model_version",
+]
+
+# Columns added to validation_results in Phase 1 (step 8) + casino_player_id (ML API protocol)
+_NEW_VAL_COLS: List[Tuple[str, str]] = [
+    ("canonical_id", "TEXT"),
+    ("model_version", "TEXT"),
+    ("casino_player_id", "TEXT"),
+    ("bet_ts", "TEXT"),  # legacy DBs created before bet_ts; API/protocol already expose bet_ts
+]
+
+# Alerts ALTERs aligned with trainer.serving.scorer.init_state_db (validator-first DB path; Unified Plan v2 T3).
+_ALERTS_MIGRATION_COLS: List[Tuple[str, str]] = [
+    ("canonical_id", "TEXT"),
+    ("is_rated_obs", "INTEGER"),
+    ("reason_codes", "TEXT"),
+    ("model_version", "TEXT"),
+    ("margin", "REAL"),
+    ("scored_at", "TEXT"),
+    ("casino_player_id", "TEXT"),
+]
+_VALIDATOR_META_KEY_LAST_ROWID = "validation_results_last_loaded_rowid"
+
+
+def _latest_model_version_from_alerts(alerts_df: pd.DataFrame) -> Optional[str]:
+    """Newest alert by ``ts`` with non-empty ``model_version`` (Unified Plan v2 T3).
+
+    Semantic: **驗證當下認定的版本** for this validation cycle — not a global deploy SSOT.
+    """
+    if alerts_df.empty or "model_version" not in alerts_df.columns or "ts" not in alerts_df.columns:
+        return None
+    try:
+        sub = alerts_df.sort_values("ts", ascending=False)
+    except Exception:
+        return None
+    for val in sub["model_version"]:
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            continue
+        s = str(val).strip()
+        if s:
+            return s
+    return None
+
+
+def _rolling_precision_by_validated_at(
+    finalized_df: pd.DataFrame,
+    *,
+    now_hk: datetime,
+    window: timedelta,
+) -> Tuple[float, int, int]:
+    """MATCH rate over rows whose ``validated_at`` falls in ``[now_hk - window, now_hk]`` (HK).
+
+    ``now_hk`` is the **window upper bound** chosen by the caller. In ``validate_once`` it must be
+    **end-of-cycle** ``datetime.now(HK_TZ)`` so rows stamped with per-alert ``validated_at`` during
+    the same cycle are not excluded by ``validated_at > cycle_start`` (see Task 11 / DEC-038).
+    """
+    if finalized_df.empty or "validated_at" not in finalized_df.columns:
+        return 0.0, 0, 0
+    if now_hk.tzinfo is None:
+        now_hk = now_hk.replace(tzinfo=HK_TZ)
+
+    raw_col = finalized_df["validated_at"]
+    must_fallback = False
+    # Heuristic: mixed tz-aware (+08:00/Z) and tz-naive strings can silently coerce some rows to NaT.
+    if raw_col.dtype == "object":
+        try:
+            s = raw_col.astype(str)
+            _tz_suffix_re = r"(?:Z|[+-]\d\d:\d\d)$"
+            has_tz_suffix = s.str.contains(_tz_suffix_re, regex=True).any()
+            has_no_tz_suffix = (~s.str.contains(_tz_suffix_re, regex=True) & s.str.contains(r"^\d{4}-\d{2}-\d{2}", regex=True)).any()
+            if bool(has_tz_suffix) and bool(has_no_tz_suffix):
+                must_fallback = True
+        except Exception:
+            must_fallback = True
+
+    vt_raw = pd.to_datetime(raw_col, errors="coerce")
+    try:
+        # Fast path: datetime-like Series supports `.dt` accessors
+        if must_fallback:
+            raise ValueError("mixed tz string inputs; use fallback normalization")
+        if getattr(vt_raw.dt, "tz", None) is None:
+            vt = vt_raw.dt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
+        else:
+            vt = vt_raw.dt.tz_convert(HK_TZ)
+    except Exception:
+        # Fallback for mixed tz-aware / tz-naive inputs that may produce non-datetimelike dtype.
+        normalized: List[pd.Timestamp] = []
+        for x in finalized_df["validated_at"].tolist():
+            ts = pd.to_datetime(x, errors="coerce")
+            if ts is pd.NaT:
+                normalized.append(pd.NaT)
+                continue
+            if getattr(ts, "tzinfo", None) is None:
+                normalized.append(ts.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward"))
+            else:
+                normalized.append(ts.tz_convert(HK_TZ))
+        vt = pd.Series(pd.DatetimeIndex(normalized), index=finalized_df.index)
+    cutoff = now_hk - window
+    sub = finalized_df[(vt >= cutoff) & (vt <= now_hk)]
+    if sub.empty:
+        return 0.0, 0, 0
+    total = len(sub)
+    matches = int(sub["reason"].eq("MATCH").sum()) if "reason" in sub.columns else 0
+    precision = (matches / total) if total > 0 else 0.0
+    return float(precision), matches, total
+
+
+def _append_validator_metrics(
+    conn: sqlite3.Connection,
+    *,
+    recorded_at: str,
+    model_version: Optional[str],
+    precision: float,
+    total: int,
+    matches: int,
+) -> None:
+    """Insert one precision snapshot (``validator_metrics`` table).
+
+    Intended to align with the rolling **15m-by-validated_at** SLO KPI logged in ``validate_once``.
+    """
+    conn.execute(
+        """
+        INSERT INTO validator_metrics (recorded_at, model_version, precision, total, matches)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (recorded_at, model_version or "", float(precision), int(total), int(matches)),
+    )
+
+
+def _retention_row_ts_hk(row: Dict[str, Any]) -> Optional[pd.Timestamp]:
+    """Primary ``validated_at``, fallback ``alert_ts`` — matches ``prune_validator_retention`` SQL."""
+    for col in ("validated_at", "alert_ts"):
+        vt = pd.to_datetime(row.get(col), errors="coerce")
+        if pd.isna(vt):
+            continue
+        if vt.tzinfo is None:
+            vt = vt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
+        else:
+            vt = vt.tz_convert(HK_TZ)
+        if pd.notna(vt):
+            return vt
+    return None
+
+
+def _prune_existing_results_cache(
+    existing_results: Dict[str, Dict[str, Any]],
+    *,
+    now_hk: datetime,
+) -> int:
+    """Drop cache rows older than retention horizon (aligned with DB prune).
+
+    Uses ``validated_at`` when present, else ``alert_ts``, same as
+    ``prune_validator_retention`` for ``validation_results``.
+    """
+    days = getattr(config, "VALIDATION_RESULTS_RETENTION_DAYS", None)
+    if days is None or days <= 0 or not existing_results:
+        return 0
+    cutoff = now_hk - timedelta(days=days)
+    removed = 0
+    for key, row in list(existing_results.items()):
+        try:
+            vt = _retention_row_ts_hk(row)
+            if vt is None or pd.isna(vt):
+                continue
+            if vt < cutoff:
+                existing_results.pop(key, None)
+                removed += 1
+        except Exception:
+            continue
+    return removed
+
+
+def _should_run_cache_prune() -> bool:
+    raw = getattr(config, "VALIDATOR_CACHE_PRUNE_INTERVAL_SECONDS", 300)
+    try:
+        interval = float(raw)
+    except Exception:
+        interval = 300.0
+    if interval <= 0:
+        return True
+    now = time.monotonic()
+    if _CACHE_PRUNE_LAST_MONO == 0.0 or (now - _CACHE_PRUNE_LAST_MONO) >= interval:
+        return True
+    return False
+
+
+def _mark_cache_prune_done() -> None:
+    global _CACHE_PRUNE_LAST_MONO
+    _CACHE_PRUNE_LAST_MONO = time.monotonic()
+
+
+def _build_cid_to_player_ids(alerts_df: pd.DataFrame) -> Dict[str, List[int]]:
+    """Build {canonical_id: [player_ids]} reverse mapping from the alerts DataFrame.
+
+    The alerts table has both ``canonical_id`` (Phase-1 column) and ``player_id``.
+    For rated players the canonical_id is their casino card ID; for non-rated it is
+    str(player_id).  Grouping by canonical_id lets us fetch all bets that belong
+    to the same person even if they used different player_ids (换卡 / 断链重发).
+    """
+    if alerts_df.empty:
+        return {}
+
+    cid_col = "canonical_id" if "canonical_id" in alerts_df.columns else None
+    pid_col = "player_id" if "player_id" in alerts_df.columns else None
+
+    mapping: Dict[str, List[int]] = {}
+    for row in alerts_df.itertuples(index=False):
+        cid_raw = getattr(row, cid_col, None) if cid_col else None
+        pid_raw = getattr(row, pid_col, None) if pid_col else None
+
+        pid = None if (pid_raw is None or pd.isna(pid_raw)) else int(pid_raw)
+        if cid_raw is None or pd.isna(cid_raw) or str(cid_raw).strip() == "":
+            # fall back: use str(player_id) as canonical_id
+            cid = str(pid) if pid is not None else None
+        else:
+            cid = str(cid_raw)
+
+        if cid is None or pid is None:
+            continue
+        mapping.setdefault(cid, [])
+        if pid not in mapping[cid]:
+            mapping[cid].append(pid)
+
+    return mapping
+
+
+# Maximum player_ids per ClickHouse IN clause; avoids "Query is too large" errors (R44).
+_PLAYER_ID_CHUNK_SIZE = 5_000
+
+
+def fetch_bets_by_canonical_id(
+    cid_to_pids: Dict[str, List[int]],
+    start: datetime,
+    end: datetime,
+) -> Dict[str, List[datetime]]:
+    """Fetch bets for all player_ids, returning a {canonical_id: [bet_times]} dict.
+
+    Bets from multiple player_ids that share a canonical_id are merged and sorted
+    so that the validation logic treats all sub-identities of a rated player as one.
+
+    Large player_id lists are sent in chunks to avoid ClickHouse IN-clause limits
+    (R44 — _PLAYER_ID_CHUNK_SIZE per batch).
+
+    DB errors are not silenced — they propagate to the caller so that the
+    validation cycle can abort gracefully rather than producing false MISS verdicts
+    from an empty cache (R41).
+    """
+    if not cid_to_pids or get_clickhouse_client is None:
+        return {}
+
+    all_pids: List[int] = []
+    pid_to_cid: Dict[int, str] = {}
+    for cid, pids in cid_to_pids.items():
+        for pid in pids:
+            if pid not in pid_to_cid:
+                pid_to_cid[pid] = cid
+                all_pids.append(pid)
+
+    if not all_pids:
+        return {}
+
+    client = get_clickhouse_client()  # errors propagate to caller (R41)
+
+    cache: Dict[str, List[datetime]] = {}
+
+    # Batch queries to avoid oversized IN clauses (R44)
+    for i in range(0, len(all_pids), _PLAYER_ID_CHUNK_SIZE):
+        chunk_pids = all_pids[i : i + _PLAYER_ID_CHUNK_SIZE]
+        params = {"players": tuple(chunk_pids), "start": start, "end": end}
+        query = f"""
+            SELECT player_id, payout_complete_dtm
+            FROM {config.SOURCE_DB}.{config.TBET} FINAL
+            WHERE player_id IN %(players)s
+              AND player_id IS NOT NULL
+              AND player_id != {config.PLACEHOLDER_PLAYER_ID}
+              AND payout_complete_dtm >= %(start)s
+              AND payout_complete_dtm <= %(end)s
+              AND payout_complete_dtm IS NOT NULL
+              AND wager > 0
+            ORDER BY player_id, payout_complete_dtm
+        """
+        df = client.query_df(query, parameters=params)  # errors propagate (R41)
+        if df.empty:
+            continue
+
+        df["payout_complete_dtm"] = pd.to_datetime(df["payout_complete_dtm"])
+        if df["payout_complete_dtm"].dt.tz is None:
+            df["payout_complete_dtm"] = df["payout_complete_dtm"].dt.tz_localize(HK_TZ)
+        else:
+            df["payout_complete_dtm"] = df["payout_complete_dtm"].dt.tz_convert(HK_TZ)
+
+        for _, row in df.iterrows():
+            pid = int(row["player_id"])
+            resolved_cid = pid_to_cid.get(pid)
+            if resolved_cid is None:
+                continue
+            cache.setdefault(resolved_cid, [])
+            cache[resolved_cid].append(row["payout_complete_dtm"])
+
+    # Sort each canonical_id's bet list by time
+    for cid in cache:
+        cache[cid].sort()
+
+    return cache
+
+
+def fetch_bet_payout_times_by_bet_ids(
+    bet_ids: List[int],
+    *,
+    chunk_size: int,
+) -> Tuple[Dict[str, Tuple[datetime, Optional[int]]], int, int, int]:
+    """Fetch ``payout_complete_dtm`` (and ``player_id``) from TBET FINAL by ``bet_id``.
+
+    Used when per-``player_id`` time-window queries return no rows but the bet row
+    may still exist under the same ``bet_id`` (TBET ``player_id`` drift after ETL).
+
+    Returns:
+        mapping: bet_id string -> (payout in HK_TZ, TBET player_id or None)
+        chunks_attempted: number of ClickHouse queries issued
+        rows_read: raw row count before per-bet_id dedup
+        failed_queries: chunk queries that raised
+    """
+    empty: Dict[str, Tuple[datetime, Optional[int]]] = {}
+    if not bet_ids or get_clickhouse_client is None:
+        return empty, 0, 0, 0
+
+    size = max(1, int(chunk_size))
+    client = get_clickhouse_client()
+    placeholder = int(getattr(config, "PLACEHOLDER_PLAYER_ID", -1))
+    acc: Dict[str, Tuple[datetime, Optional[int]]] = {}
+    chunks_attempted = 0
+    rows_read = 0
+    failed_queries = 0
+
+    for i in range(0, len(bet_ids), size):
+        chunk = tuple(int(x) for x in bet_ids[i : i + size])
+        if not chunk:
+            continue
+        chunks_attempted += 1
+        params = {"ids": chunk}
+        query = f"""
+            SELECT bet_id, payout_complete_dtm, player_id
+            FROM {config.SOURCE_DB}.{config.TBET} FINAL
+            WHERE bet_id IN %(ids)s
+              AND payout_complete_dtm IS NOT NULL
+              AND wager > 0
+              AND player_id IS NOT NULL
+              AND player_id != {placeholder}
+        """
+        try:
+            df = client.query_df(query, parameters=params)
+        except Exception as exc:
+            failed_queries += 1
+            logger.warning(
+                "[validator] no-bet bet_id lookup query failed ids=%s: %s",
+                chunk[:5],
+                exc,
+            )
+            continue
+        if df.empty:
+            continue
+        rows_read += len(df)
+        df = df.copy()
+        df["bet_id"] = pd.to_numeric(df["bet_id"], errors="coerce")
+        df = df.dropna(subset=["bet_id"])
+        df["bet_id"] = df["bet_id"].astype("int64")
+        ts = pd.to_datetime(df["payout_complete_dtm"], errors="coerce")
+        if getattr(ts.dt, "tz", None) is None:
+            ts = ts.dt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
+        else:
+            ts = ts.dt.tz_convert(HK_TZ)
+        df["_payout_hk"] = ts
+        df = df.dropna(subset=["_payout_hk"])
+        for bid_int, sub in df.groupby("bet_id", sort=False):
+            bkey = str(int(bid_int))
+            row = sub.nlargest(1, "_payout_hk", keep="first").iloc[0]
+            payout_hk = row["_payout_hk"]
+            if pd.isna(payout_hk):
+                continue
+            payout_dt = (
+                payout_hk.to_pydatetime()
+                if isinstance(payout_hk, pd.Timestamp)
+                else payout_hk
+            )
+            ch_pid: Optional[int] = None
+            try:
+                if pd.notna(row.get("player_id")):
+                    ch_pid = int(row["player_id"])
+            except Exception:
+                ch_pid = None
+            prev = acc.get(bkey)
+            if prev is None or payout_dt > prev[0]:
+                acc[bkey] = (payout_dt, ch_pid)
+
+    return acc, chunks_attempted, rows_read, failed_queries
+
+
+def _fetch_bets_for_no_bet_rows(
+    missing_rows: List[pd.Series],
+    *,
+    pre_context_min: int,
+    freshness_buffer_min: int,
+    extended_wait_min: int,
+    max_alerts: int,
+) -> Tuple[Dict[str, List[datetime]], Dict[str, int]]:
+    """Targeted retry for alerts that hit ``No bet data`` in this cycle."""
+    if not missing_rows or get_clickhouse_client is None:
+        z = {
+            "selected": 0,
+            "queries": 0,
+            "rows": 0,
+            "failed_queries": 0,
+            "bet_id_chunks": 0,
+            "bet_id_rows_raw": 0,
+            "bet_id_hits": 0,
+            "bet_id_failed_queries": 0,
+        }
+        return {}, z
+
+    selected_rows = missing_rows[: max(1, int(max_alerts))]
+    per_pid: Dict[int, Dict[str, Any]] = {}
+    lookahead_plus = int(config.LABEL_LOOKAHEAD_MIN + max(0, freshness_buffer_min) + max(0, extended_wait_min))
+    max_window_min = _safe_int_config("VALIDATOR_NO_BET_RETRY_MAX_WINDOW_MINUTES", 240, min_value=1)
+    global _WARNED_TASK9_RETRY_WINDOW_CLAMPED
+
+    for row in selected_rows:
+        pid_raw = row.get("player_id")
+        if pid_raw is None or pd.isna(pid_raw):
+            continue
+        try:
+            pid = int(pid_raw)
+        except Exception:
+            continue
+
+        bt_raw = row.get("bet_ts")
+        if bt_raw is None or pd.isna(bt_raw):
+            bt_raw = row.get("ts")
+        bt = pd.to_datetime(bt_raw, errors="coerce")
+        if pd.isna(bt):
+            continue
+        if bt.tzinfo is None:
+            bt = bt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
+        else:
+            bt = bt.tz_convert(HK_TZ)
+        if pd.isna(bt):
+            continue
+
+        retry_start = bt - timedelta(minutes=max(0, int(pre_context_min)))
+        retry_end = bt + timedelta(minutes=lookahead_plus)
+        span_min = (retry_end - retry_start).total_seconds() / 60.0
+        if span_min > float(max_window_min):
+            if not _WARNED_TASK9_RETRY_WINDOW_CLAMPED:
+                logger.warning(
+                    "[validator] no-bet retry window span %.1fmin exceeds cap %s; clamping (centered on bet_ts)",
+                    span_min,
+                    max_window_min,
+                )
+                _WARNED_TASK9_RETRY_WINDOW_CLAMPED = True
+            half = float(max_window_min) / 2.0
+            retry_start = bt - timedelta(minutes=half)
+            retry_end = bt + timedelta(minutes=half)
+        cid_raw = row.get("canonical_id")
+        cid = str(pid) if (cid_raw is None or pd.isna(cid_raw) or str(cid_raw).strip() == "") else str(cid_raw)
+
+        slot = per_pid.setdefault(pid, {"start": retry_start, "end": retry_end, "cids": set()})
+        if retry_start < slot["start"]:
+            slot["start"] = retry_start
+        if retry_end > slot["end"]:
+            slot["end"] = retry_end
+        slot["cids"].add(cid)
+
+    cache: Dict[str, List[datetime]] = {}
+    total_queries = 0
+    total_rows = 0
+    failed_queries = 0
+
+    if per_pid:
+        client = get_clickhouse_client()
+        for pid, win in list(per_pid.items()):
+            span_agg = (win["end"] - win["start"]).total_seconds() / 60.0
+            if span_agg > float(max_window_min):
+                mid = win["start"] + (win["end"] - win["start"]) / 2
+                half = float(max_window_min) / 2.0
+                win["start"] = mid - timedelta(minutes=half)
+                win["end"] = mid + timedelta(minutes=half)
+        for pid, win in per_pid.items():
+            total_queries += 1
+            params = {"player": int(pid), "start": win["start"], "end": win["end"]}
+            query = f"""
+            SELECT payout_complete_dtm
+            FROM {config.SOURCE_DB}.{config.TBET} FINAL
+            WHERE player_id = %(player)s
+              AND player_id IS NOT NULL
+              AND player_id != {config.PLACEHOLDER_PLAYER_ID}
+              AND payout_complete_dtm >= %(start)s
+              AND payout_complete_dtm <= %(end)s
+              AND payout_complete_dtm IS NOT NULL
+              AND wager > 0
+            ORDER BY payout_complete_dtm
+        """
+            try:
+                df = client.query_df(query, parameters=params)
+            except Exception as exc:
+                failed_queries += 1
+                logger.warning(
+                    "[validator] no-bet retry query failed player_id=%s start=%s end=%s: %s",
+                    pid,
+                    win["start"],
+                    win["end"],
+                    exc,
+                )
+                continue
+            if df.empty:
+                logger.debug(
+                    "[validator] no-bet retry: player_id=%s start=%s end=%s rows=0",
+                    pid,
+                    win["start"],
+                    win["end"],
+                )
+                continue
+
+            total_rows += len(df)
+            ts = pd.to_datetime(df["payout_complete_dtm"], errors="coerce")
+            if getattr(ts.dt, "tz", None) is None:
+                ts = ts.dt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
+            else:
+                ts = ts.dt.tz_convert(HK_TZ)
+            vals = [t for t in ts.tolist() if pd.notna(t)]
+            for cid in win["cids"]:
+                cache.setdefault(cid, [])
+                cache[cid].extend(vals)
+            logger.debug(
+                "[validator] no-bet retry: player_id=%s start=%s end=%s rows=%s cids=%s",
+                pid,
+                win["start"],
+                win["end"],
+                len(vals),
+                len(win["cids"]),
+            )
+
+    bet_id_chunks = 0
+    bet_id_rows_raw = 0
+    bet_id_hits = 0
+    bet_id_failed_queries = 0
+    if _no_bet_bet_id_lookup_enabled():
+        bid_chunk_sz = _safe_int_config("VALIDATOR_NO_BET_BET_ID_CHUNK_SIZE", 500, min_value=1)
+        bet_to_cids: Dict[str, set] = {}
+        bet_to_alert_pid: Dict[str, int] = {}
+        unique_bids: List[int] = []
+        seen_bids: set = set()
+        for row in selected_rows:
+            bid_raw = row.get("bet_id")
+            if bid_raw is None or pd.isna(bid_raw):
+                continue
+            try:
+                bid_int = int(bid_raw)
+            except Exception:
+                continue
+            pid_raw = row.get("player_id")
+            if pid_raw is None or pd.isna(pid_raw):
+                continue
+            try:
+                alert_pid = int(pid_raw)
+            except Exception:
+                continue
+            bkey = str(bid_int)
+            if bid_int not in seen_bids:
+                seen_bids.add(bid_int)
+                unique_bids.append(bid_int)
+            cid_raw = row.get("canonical_id")
+            cid = (
+                str(alert_pid)
+                if (cid_raw is None or pd.isna(cid_raw) or str(cid_raw).strip() == "")
+                else str(cid_raw)
+            )
+            bet_to_cids.setdefault(bkey, set()).add(cid)
+            bet_to_alert_pid.setdefault(bkey, alert_pid)
+
+        if unique_bids:
+            bid_map, bet_id_chunks, bet_id_rows_raw, bet_id_failed_queries = fetch_bet_payout_times_by_bet_ids(
+                unique_bids,
+                chunk_size=bid_chunk_sz,
+            )
+            bet_id_hits = len(bid_map)
+            for bid_str, (payout_hk, ch_pid) in bid_map.items():
+                alert_player_id = bet_to_alert_pid.get(bid_str)
+                if alert_player_id is None:
+                    continue
+                if ch_pid is not None and int(ch_pid) != int(alert_player_id):
+                    logger.debug(
+                        "[validator] no-bet retry bet_id lookup: TBET player_id=%s != alert player_id=%s bet_id=%s",
+                        ch_pid,
+                        alert_player_id,
+                        bid_str,
+                    )
+                for cid in bet_to_cids.get(bid_str, ()):
+                    cache.setdefault(cid, [])
+                    cache[cid].append(payout_hk)
+            logger.debug(
+                "[validator] no-bet bet_id lookup: n_ids=%s chunks=%s rows_raw=%s hits=%s failed_chunks=%s",
+                len(unique_bids),
+                bet_id_chunks,
+                bet_id_rows_raw,
+                bet_id_hits,
+                bet_id_failed_queries,
+            )
+
+    for cid in list(cache.keys()):
+        cache[cid] = sorted(set(cache[cid]))
+    return cache, {
+        "selected": len(selected_rows),
+        "queries": total_queries,
+        "rows": total_rows,
+        "failed_queries": failed_queries,
+        "bet_id_chunks": bet_id_chunks,
+        "bet_id_rows_raw": bet_id_rows_raw,
+        "bet_id_hits": bet_id_hits,
+        "bet_id_failed_queries": bet_id_failed_queries,
+    }
+
+
+def _apply_pending_validation_result(
+    *,
+    row: pd.Series,
+    res: Dict[str, Any],
+    existing_results: Dict[str, Dict[str, Any]],
+    processed: set,
+    finality_cutoff: datetime,
+) -> Tuple[int, bool]:
+    """Apply one pending-row validation result. Returns (updated_delta, processed_added)."""
+    if res.get("result") is None:
+        return 0, False
+
+    bid = str(row["bet_id"])
+    key = bid if bid != "nan" else f"{row['player_id']}_{row['ts']}"
+    updated_delta = 0
+    processed_added = False
+
+    is_new = key not in existing_results
+    stored = existing_results.get(key, {}).get("result")
+    stored_is_match = (
+        stored is True
+        or stored == 1
+        or (isinstance(stored, float) and not pd.isna(stored) and stored == 1.0)
+    )
+    is_upgrade = not is_new and res["result"] and not stored_is_match
+    was_pending = not is_new and existing_results.get(key, {}).get("reason") == "PENDING"
+    is_finalize = was_pending and res.get("reason") == "MISS"
+
+    if res.get("reason") in IGNORED_REASONS:
+        existing_results[key] = res
+        processed.add(row["bet_id"])
+        return 0, True
+
+    if is_new or is_upgrade or is_finalize:
+        existing_results[key] = res
+        if is_upgrade or is_finalize:
+            updated_delta += 1
+
+    alert_dt = pd.to_datetime(row["bet_ts"] if pd.notnull(row["bet_ts"]) else row["ts"])
+    if alert_dt.tzinfo is None:
+        alert_dt = alert_dt.replace(tzinfo=HK_TZ)
+
+    if res["result"] or alert_dt <= finality_cutoff:
+        if not res["result"]:
+            res["reason"] = "MISS"
+            existing_results[key] = res
+        processed.add(row["bet_id"])
+        processed_added = True
+
+    return updated_delta, processed_added
+
+
+def fetch_sessions_by_canonical_id(
+    cid_to_pids: Dict[str, List[int]],
+    start: datetime,
+    end: datetime,
+) -> Dict[str, List[Dict]]:
+    """Fetch sessions for all player_ids, grouped by canonical_id (R42).
+
+    Sessions from multiple player_ids that share a canonical_id are merged and
+    time-sorted, so that rated players who swap casino-club cards within a run
+    are treated as a single identity by validate_alert_row.
+
+    DB errors propagate to the caller — they are not silenced.
+    """
+    if not cid_to_pids or get_clickhouse_client is None:
+        return {}
+
+    all_pids: List[int] = []
+    pid_to_cid: Dict[int, str] = {}
+    for cid, pids in cid_to_pids.items():
+        for pid in pids:
+            if pid not in pid_to_cid:
+                pid_to_cid[pid] = cid
+                all_pids.append(pid)
+
+    if not all_pids:
+        return {}
+
+    client = get_clickhouse_client()  # errors propagate to caller
+
+    raw: List[Dict] = []
+    for i in range(0, len(all_pids), _PLAYER_ID_CHUNK_SIZE):
+        chunk_pids = all_pids[i : i + _PLAYER_ID_CHUNK_SIZE]
+        params = {"players": tuple(chunk_pids), "start": start, "end": end}
+        query = f"""
+            WITH deduped AS (
+                SELECT
+                    player_id,
+                    session_id,
+                    COALESCE(session_end_dtm, lud_dtm) AS session_avail_dtm,
+                    session_end_dtm,
+                    COALESCE(turnover, 0) AS turnover,
+                    COALESCE(num_games_with_wager, 0) AS num_games_with_wager,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY session_id
+                        ORDER BY lud_dtm DESC NULLS LAST, __etl_insert_Dtm DESC
+                    ) AS rn
+                FROM {config.SOURCE_DB}.{config.TSESSION}
+                WHERE player_id IN %(players)s
+                  AND COALESCE(session_end_dtm, lud_dtm) >= %(start)s - INTERVAL 1 DAY
+                  AND COALESCE(session_end_dtm, lud_dtm) <= %(end)s + INTERVAL 1 DAY
+                  AND is_deleted = 0
+                  AND is_canceled = 0
+                  AND is_manual = 0
+            )
+            SELECT player_id, session_id, session_avail_dtm, session_end_dtm
+            FROM deduped
+            WHERE rn = 1
+              AND (COALESCE(turnover, 0) > 0 OR COALESCE(num_games_with_wager, 0) > 0)
+            ORDER BY player_id, session_avail_dtm, session_end_dtm
+        """
+        df = client.query_df(query, parameters=params)
+        if df.empty:
+            continue
+
+        for col in ["session_avail_dtm", "session_end_dtm"]:
+            df[col] = pd.to_datetime(df[col])
+            if df[col].dt.tz is None:
+                df[col] = df[col].dt.tz_localize(HK_TZ)
+            else:
+                df[col] = df[col].dt.tz_convert(HK_TZ)
+
+        # session_end_dtm is NULL for ongoing sessions; replace NaT with a
+        # far-future sentinel so sort-key and gap arithmetic remain valid (R59).
+        df["session_end_dtm"] = df["session_end_dtm"].fillna(_SENTINEL_SESSION_END)
+
+        for _, row in df.iterrows():
+            pid = int(row["player_id"])
+            resolved_cid = pid_to_cid.get(pid)
+            if resolved_cid is None:
+                continue
+            raw.append(
+                {
+                    "canonical_id": resolved_cid,
+                    "session_id": int(row["session_id"]) if pd.notna(row["session_id"]) else None,
+                    "start": row["session_avail_dtm"],
+                    "end": row["session_end_dtm"],
+                }
+            )
+
+    # Group by canonical_id, sort by start time, compute next_start
+    by_cid: Dict[str, List[Dict]] = {}
+    for item in raw:
+        by_cid.setdefault(item["canonical_id"], []).append(item)
+
+    cache: Dict[str, List[Dict]] = {}
+    for cid, items in by_cid.items():
+        sorted_items = sorted(items, key=lambda s: (s["start"], s["end"]))
+        sessions = []
+        for idx, item in enumerate(sorted_items):
+            next_start = sorted_items[idx + 1]["start"] if idx + 1 < len(sorted_items) else None
+            sessions.append(
+                {
+                    "session_id": item["session_id"],
+                    "start": item["start"],
+                    "end": item["end"],
+                    "next_start": next_start,
+                }
+            )
+        cache[cid] = sessions
+
+    return cache
+
+
+# ------------------ State helpers (SQLite) ------------------
+def get_db_conn() -> sqlite3.Connection:
+    from trainer_hightier.serving.prediction_log import init_prediction_log_db
+    from trainer_hightier.serving.state_db import apply_sqlite_serving_pragmas, init_state_db
+
+    init_state_db(STATE_DB_PATH)
+    init_prediction_log_db(config.PREDICTION_LOG_DB_PATH)
+    conn = sqlite3.connect(STATE_DB_PATH)
+    apply_sqlite_serving_pragmas(conn)
+    return conn
+
+
+def load_processed(conn: sqlite3.Connection) -> set:
+    try:
+        rows = conn.execute("SELECT bet_id FROM processed_alerts").fetchall()
+        return {r[0] for r in rows if r[0] is not None}
+    except Exception:
+        return set()
+
+
+def mark_processed(conn: sqlite3.Connection, bet_ids: List) -> None:
+    if not bet_ids:
+        return
+    ts = datetime.now(HK_TZ).isoformat()
+    rows = [(str(bid), ts) for bid in bet_ids if pd.notna(bid)]
+    conn.executemany(
+        """
+        INSERT INTO processed_alerts(bet_id, processed_ts)
+        VALUES (?, ?)
+        ON CONFLICT(bet_id) DO UPDATE SET processed_ts=excluded.processed_ts
+        """,
+        rows,
+    )
+    conn.commit()
+
+
+def prune_validator_retention(conn: sqlite3.Connection, now_hk: datetime) -> None:
+    days = getattr(config, "VALIDATION_RESULTS_RETENTION_DAYS", None)
+    if days is None or days <= 0:
+        return
+    cutoff = now_hk - timedelta(days=days)
+    cut_s = cutoff.isoformat()
+    # Align with in-memory cache / rolling KPI: primary validated_at, fallback alert_ts when missing.
+    conn.execute(
+        """
+        DELETE FROM validation_results
+        WHERE (
+            (validated_at IS NOT NULL AND validated_at != '' AND validated_at < ?)
+            OR (
+                (validated_at IS NULL OR validated_at = '')
+                AND alert_ts < ?
+            )
+        )
+        """,
+        (cut_s, cut_s),
+    )
+    conn.execute("DELETE FROM processed_alerts WHERE processed_ts < ?", (cut_s,))
+    conn.commit()
+
+
+def load_existing_results(conn: sqlite3.Connection) -> Dict:
+    return load_existing_results_incremental(conn, {})
+
+
+def _get_validation_results_last_loaded_rowid(conn: sqlite3.Connection) -> int:
+    try:
+        row = conn.execute(
+            "SELECT value FROM validator_runtime_meta WHERE key = ?",
+            (_VALIDATOR_META_KEY_LAST_ROWID,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    if not row:
+        return 0
+    try:
+        return max(0, int(str(row[0]).strip()))
+    except Exception:
+        return 0
+
+
+def _set_validation_results_last_loaded_rowid(conn: sqlite3.Connection, rowid: int) -> None:
+    try:
+        conn.execute(
+            """
+            INSERT INTO validator_runtime_meta(key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (_VALIDATOR_META_KEY_LAST_ROWID, str(max(0, int(rowid)))),
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        # load_existing_results can be called with ad-hoc in-memory connections
+        # in tests that do not initialize full schema.
+        pass
+
+
+def load_existing_results_incremental(
+    conn: sqlite3.Connection,
+    existing_results: Dict[str, Dict],
+    *,
+    warm_cache: Optional[Dict[str, Dict]] = None,
+) -> Dict[str, Dict]:
+    """Load validation_results with a rowid watermark.
+
+    First cycle does one full bootstrap; subsequent cycles only load new rowid
+    deltas to reduce per-cycle SQLite read and memory pressure on large tables.
+
+    ``warm_cache``: when ``existing_results`` is empty but the process has a
+    warm in-memory dict from the previous tick (non-empty), we may use
+    incremental deltas without a full table scan. On cold start (no warm cache),
+    an empty ``existing_results`` still does a full bootstrap even if a rowid
+    watermark exists in meta.
+    """
+    last_loaded_rowid = _get_validation_results_last_loaded_rowid(conn)
+    current_max_rowid = 0
+    try:
+        row = conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM validation_results").fetchone()
+        current_max_rowid = int(row[0]) if row and row[0] is not None else 0
+    except Exception:
+        current_max_rowid = 0
+
+    # Persisted watermark above table max (e.g. DB restore / truncate): reset meta and full bootstrap.
+    if last_loaded_rowid > 0 and current_max_rowid < last_loaded_rowid:
+        logger.warning(
+            "[validator] validation_results rowid watermark drift (max_rowid=%s < last_loaded_rowid=%s); "
+            "resetting meta and full bootstrap",
+            current_max_rowid,
+            last_loaded_rowid,
+        )
+        try:
+            conn.execute(
+                "DELETE FROM validator_runtime_meta WHERE key = ?",
+                (_VALIDATOR_META_KEY_LAST_ROWID,),
+            )
+            conn.commit()
+        except Exception:
+            pass
+        last_loaded_rowid = 0
+
+    # IMPORTANT:
+    # If caller cache is empty (e.g. fresh process start), we must do a full bootstrap
+    # even when runtime_meta has a persisted rowid watermark. Otherwise KPI/logging
+    # would only see post-watermark deltas and under-count rolling windows.
+    bootstrap_full = not bool(existing_results)
+    if bootstrap_full and last_loaded_rowid > 0 and bool(warm_cache):
+        # Empty accumulator but warm in-memory state will be merged after load — deltas only.
+        bootstrap_full = False
+    query = (
+        "SELECT rowid AS _rowid, * FROM validation_results"
+        if bootstrap_full or last_loaded_rowid <= 0
+        else "SELECT rowid AS _rowid, * FROM validation_results WHERE rowid > ?"
+    )
+    params: Tuple[int, ...] = (
+        tuple()
+        if bootstrap_full or last_loaded_rowid <= 0
+        else (last_loaded_rowid,)
+    )
+    try:
+        df_db = pd.read_sql_query(query, conn, params=params)
+        if not df_db.empty:
+            for _, r in df_db.iterrows():
+                key = str(r["bet_id"]) if pd.notnull(r["bet_id"]) else f"{r['player_id']}_{r['alert_ts']}"
+                existing_results[key] = r.to_dict()
+            if "_rowid" in df_db.columns:
+                _max = pd.to_numeric(df_db["_rowid"], errors="coerce").max()
+                if pd.notna(_max):
+                    current_max_rowid = max(current_max_rowid, int(_max))
+    except Exception:
+        pass
+
+    # Legacy CSV fallback only for initial bootstrap.
+    if last_loaded_rowid <= 0 and RESULTS_PATH.exists():
+        try:
+            df_old = pd.read_csv(RESULTS_PATH)
+            for _, r in df_old.iterrows():
+                key = str(r["bet_id"]) if pd.notnull(r["bet_id"]) else f"{r['player_id']}_{r['alert_ts']}"
+                if key not in existing_results:
+                    existing_results[key] = r.to_dict()
+        except Exception:
+            pass
+
+    if current_max_rowid > last_loaded_rowid:
+        _set_validation_results_last_loaded_rowid(conn, current_max_rowid)
+    return existing_results
+
+
+def save_validation_results(conn: sqlite3.Connection, final_df: pd.DataFrame) -> None:
+    if final_df.empty:
+        return
+
+    def _s(v: object) -> Optional[str]:
+        try:
+            return None if pd.isna(v) else str(v)
+        except (TypeError, ValueError):
+            return str(v) if v is not None else None
+
+    def _session_id_safe(v: object) -> Optional[str]:
+        """Safe session_id for DB: None/NaN -> None; numeric -> str(int); else str(v) or None on error."""
+        if v is None or pd.isna(v):
+            return None
+        try:
+            if isinstance(v, (int, float)):
+                return str(int(v))
+            return str(v)
+        except (TypeError, ValueError):
+            return str(v) if v is not None else None
+
+    rows = [
+        (
+            _s(r.bet_id),
+            getattr(r, "alert_ts", None),
+            getattr(r, "validated_at", None),
+            None if pd.isna(r.player_id) else int(r.player_id),
+            _s(getattr(r, "casino_player_id", None)),
+            _s(getattr(r, "canonical_id", None)),
+            _s(r.table_id),
+            getattr(r, "position_idx", None),
+            _session_id_safe(getattr(r, "session_id", None)),
+            getattr(r, "score", None),
+            None if pd.isna(r.result) else int(bool(r.result)),
+            getattr(r, "gap_start", None),
+            getattr(r, "gap_minutes", None),
+            getattr(r, "reason", None),
+            getattr(r, "bet_ts", None),
+            _s(getattr(r, "model_version", None)),
+        )
+        for r in final_df.itertuples(index=False)
+    ]
+    conn.executemany(
+        """
+        INSERT INTO validation_results(
+            bet_id, alert_ts, validated_at, player_id, casino_player_id, canonical_id, table_id,
+            position_idx, session_id, score, result, gap_start, gap_minutes,
+            reason, bet_ts, model_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(bet_id) DO UPDATE SET
+            alert_ts=excluded.alert_ts,
+            validated_at=excluded.validated_at,
+            player_id=excluded.player_id,
+            casino_player_id=excluded.casino_player_id,
+            canonical_id=excluded.canonical_id,
+            table_id=excluded.table_id,
+            position_idx=excluded.position_idx,
+            session_id=excluded.session_id,
+            score=excluded.score,
+            result=excluded.result,
+            gap_start=excluded.gap_start,
+            gap_minutes=excluded.gap_minutes,
+            reason=excluded.reason,
+            bet_ts=excluded.bet_ts,
+            model_version=excluded.model_version
+        """,
+        rows,
+    )
+    conn.commit()
+
+
+# ------------------ Validation logic ------------------
+def parse_alerts(conn: sqlite3.Connection) -> pd.DataFrame:
+    retention_days = getattr(config, "VALIDATOR_ALERT_RETENTION_DAYS", None)
+    try:
+        df = pd.read_sql_query("SELECT * FROM alerts", conn)
+        if not df.empty:
+            df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+            df["bet_ts"] = pd.to_datetime(df.get("bet_ts"), errors="coerce")
+            # Stored naive datetimes are HK local (scorer writes tz-naive HK); do not treat as UTC.
+            df["ts"] = df["ts"].dt.tz_localize(HK_TZ) if df["ts"].dt.tz is None else df["ts"].dt.tz_convert(HK_TZ)
+            if "bet_ts" in df.columns:
+                df["bet_ts"] = df["bet_ts"].dt.tz_localize(HK_TZ) if df["bet_ts"].dt.tz is None else df["bet_ts"].dt.tz_convert(HK_TZ)
+            if retention_days is not None and retention_days > 0:
+                cutoff = datetime.now(HK_TZ) - timedelta(days=retention_days)
+                df = df[df["ts"] >= cutoff]
+            return df
+    except Exception:
+        pass
+
+    return pd.DataFrame()
+
+
+def find_gap_within_window(alert_ts: datetime, bet_times: List[datetime], base_start: Optional[datetime] = None) -> Tuple[bool, Optional[datetime], float]:
+    """Return (is_true, gap_start, gap_minutes). Gap must start within ALERT_HORIZON_MIN of alert and last >= WALKAWAY_GAP_MIN (values from config). Gap start must be >= alert_ts (labels parity)."""
+    horizon_end = alert_ts + timedelta(minutes=config.LABEL_LOOKAHEAD_MIN)
+    bet_times = [t for t in bet_times if t >= alert_ts and t <= horizon_end]
+    bet_times.sort()
+
+    current_start = base_start or alert_ts
+    for bt in bet_times:
+        gap_minutes = (bt - current_start).total_seconds() / 60.0
+        start_ok = (current_start - alert_ts).total_seconds() >= 0 and (current_start - alert_ts).total_seconds() / 60.0 <= config.ALERT_HORIZON_MIN
+        if gap_minutes >= config.WALKAWAY_GAP_MIN and start_ok:
+            return True, current_start, gap_minutes
+        current_start = bt
+    # Tail gap to horizon end
+    gap_minutes = (horizon_end - current_start).total_seconds() / 60.0
+    start_ok = (current_start - alert_ts).total_seconds() >= 0 and (current_start - alert_ts).total_seconds() / 60.0 <= config.ALERT_HORIZON_MIN
+    if gap_minutes >= config.WALKAWAY_GAP_MIN and start_ok:
+        return True, current_start, gap_minutes
+    return False, None, 0.0
+
+
+def _norm_casino_player_id(v: Any) -> Optional[str]:
+    """Normalize casino_player_id: None/pd.NA/empty or whitespace -> None (FND-03 / Review §1)."""
+    if v is None or pd.isna(v):
+        return None
+    s = str(v).strip()
+    return s if s else None
+
+
+def validate_alert_row(
+    row: pd.Series,
+    bet_cache: Dict[str, List[datetime]],
+    session_cache: Dict[str, List[Dict]],
+    force_finalize: bool = False,
+    *,
+    gap_base_at_bet_ts: bool = False,
+) -> Dict:
+    """Validate a single alert row.
+
+    ``bet_cache`` is now keyed by ``canonical_id`` (str) to support rated players
+    whose bets may span multiple ``player_id``s.  A player_id-based fallback is
+    still used when canonical_id is absent (e.g., legacy alerts).
+
+    Verdict (MATCH/MISS/PENDING) is bet-based only; session_cache is not used for
+    verdict (retained for API compatibility).
+    """
+    score_ts = pd.to_datetime(row["ts"])
+    if score_ts.tzinfo is None:
+        score_ts = score_ts.tz_localize(HK_TZ)
+    else:
+        score_ts = score_ts.tz_convert(HK_TZ)
+    bet_ts = row.get("bet_ts")
+    if pd.isna(bet_ts):
+        bet_ts = score_ts
+    else:
+        bet_ts = pd.to_datetime(bet_ts)
+        if bet_ts.tzinfo is None:
+            bet_ts = bet_ts.tz_localize(HK_TZ)
+        else:
+            bet_ts = bet_ts.tz_convert(HK_TZ)
+    player_id = row.get("player_id")
+    bet_id = row.get("bet_id")
+
+    # Resolve canonical_id for bet_cache lookup (step 8)
+    cid_raw = row.get("canonical_id")
+    if cid_raw is None or pd.isna(cid_raw) or str(cid_raw).strip() == "":
+        canonical_id = str(int(player_id)) if pd.notna(player_id) else None
+    else:
+        canonical_id = str(cid_raw)
+
+    model_version = row.get("model_version")
+    casino_player_id = _norm_casino_player_id(row.get("casino_player_id"))
+    scored_at = row.get("scored_at")
+    if pd.isna(scored_at):
+        scored_at_hk = score_ts
+    else:
+        scored_at_hk = pd.to_datetime(scored_at)
+        if scored_at_hk.tzinfo is None:
+            scored_at_hk = scored_at_hk.tz_localize(HK_TZ)
+        else:
+            scored_at_hk = scored_at_hk.tz_convert(HK_TZ)
+
+    now_hk = datetime.now(HK_TZ)
+
+    # Template for result with all columns
+    res_base: Dict[str, Any] = {col: None for col in VALIDATION_COLUMNS}
+    res_base.update(
+        {
+            "alert_ts": score_ts.isoformat(),
+            "validated_at": now_hk.isoformat(),
+            "bet_ts": bet_ts.isoformat(),
+            "bet_id": bet_id,
+            "score": row.get("score"),
+            "player_id": int(player_id) if pd.notna(player_id) else None,
+            "casino_player_id": casino_player_id,
+            "canonical_id": canonical_id,
+            "table_id": row.get("table_id"),
+            "position_idx": row.get("position_idx"),
+            "session_id": row.get("session_id"),
+            "model_version": model_version if pd.notna(model_version) else None,
+        }
+    )
+
+    if pd.isna(player_id):
+        res_base.update({"result": False, "reason": "missing_player_id"})
+        return res_base
+
+    # Only validate after the bet has aged past the alert horizon plus a small buffer
+    freshness_buffer_min = getattr(config, "VALIDATOR_FRESHNESS_BUFFER_MINUTES", 2)
+    wait_minutes = config.LABEL_LOOKAHEAD_MIN + max(0, freshness_buffer_min)
+    if bet_ts > now_hk - timedelta(minutes=wait_minutes):
+        return {"result": None}  # too recent; special key to signal skip
+
+    # Use canonical_id to look up the merged bet list for this player (step 8).
+    # Falls back to player_id lookup for legacy bet_cache entries.
+    if canonical_id is not None and canonical_id in bet_cache:
+        bet_list = bet_cache[canonical_id]
+    else:
+        bet_list = bet_cache.get(str(int(player_id)) if pd.notna(player_id) else "", [])
+
+    # Do not conclude MATCH when we have no bet data (e.g. fetch failed, wrong range, or TZ mismatch).
+    # Otherwise find_gap_within_window(..., []) would treat "no bets in window" as a LABEL_LOOKAHEAD_MIN gap and we'd falsely MATCH.
+    if not bet_list:
+        logger.warning(
+            "[validator] No bet data for casino_player_id=%s player_id=%s bet_id=%s bet_ts=%s scored_at=%s — leaving PENDING (cannot verify late arrivals)",
+            casino_player_id, player_id, bet_id, bet_ts.isoformat(), scored_at_hk.isoformat(),
+        )
+        res_base.update({"result": None, "reason": "PENDING"})
+        res_base["_no_bet_data"] = True
+        return res_base
+
+    idx = bisect_left(bet_list, bet_ts)
+    if gap_base_at_bet_ts:
+        base_start = bet_ts
+    else:
+        last_bet_before = bet_list[idx - 1] if idx > 0 else None
+        base_start = last_bet_before or bet_ts
+
+    # Bets within LABEL_LOOKAHEAD_MIN horizon after bet_ts (bet-based only; session_cache not used for verdict)
+    horizon_end = bet_ts + timedelta(minutes=config.LABEL_LOOKAHEAD_MIN)
+    right_idx = bisect_right(bet_list, horizon_end)
+    bet_times = bet_list[idx:right_idx]
+
+    # Bet-gap check (aligned with trainer/labels.py compute_labels; DEC-030)
+    is_true, gap_start, gap_minutes = find_gap_within_window(bet_ts, bet_times, base_start=base_start)
+    
+    # If a gap was found via bets, we verify if it was within ALERT_HORIZON_MIN or late (merged to MISS)
+    if is_true:
+        # A detected gap is a candidate MATCH, but per policy we allow a short
+        # extended wait window for late-arriving data (arrivals with timestamps
+        # in the (ALERT_HORIZON_MIN, LABEL_LOOKAHEAD_MIN] interval) before finalizing MATCH.
+        res_base.update({
+            "result": None,
+            "gap_start": gap_start.isoformat() if gap_start is not None else None,
+            "gap_minutes": gap_minutes,
+            "reason": "PENDING"
+        })
+        # If we're past the extended wait window, finalize now by checking whether any
+        # late arrival (bet only) appeared whose timestamp falls within the horizon window.
+        extended_wait = getattr(config, 'VALIDATOR_EXTENDED_WAIT_MINUTES', 15)
+        late_threshold = bet_ts + timedelta(minutes=config.ALERT_HORIZON_MIN)
+        horizon_end = bet_ts + timedelta(minutes=config.LABEL_LOOKAHEAD_MIN)
+        extended_end = bet_ts + timedelta(minutes=config.LABEL_LOOKAHEAD_MIN + extended_wait)
+
+        if now_hk >= extended_end or force_finalize:
+            any_late_bet_in_window = any((bt > late_threshold and bt <= horizon_end) for bt in bet_list)
+            _gs_iso = gap_start.isoformat() if gap_start is not None else None
+            if any_late_bet_in_window:
+                res_base.update({
+                    "result": False,
+                    "gap_start": _gs_iso,
+                    "gap_minutes": gap_minutes,
+                    "reason": "MISS"
+                })
+                logger.debug("[validator] Finalizing candidate as MISS (late arrival in horizon window or forced) player=%s bet_id=%s", player_id, bet_id)
+            else:
+                res_base.update({
+                    "result": True,
+                    "gap_start": _gs_iso,
+                    "gap_minutes": gap_minutes,
+                    "reason": "MATCH"
+                })
+                logger.debug("[validator] Finalizing candidate as MATCH (no late arrivals in horizon window or forced) player=%s bet_id=%s", player_id, bet_id)
+    else:
+        # No gap found within the horizon.
+        # Policy:
+        #  - If any bet exists after bet_ts + ALERT_HORIZON_MIN and within LABEL_LOOKAHEAD_MIN horizon,
+        #    we can immediately conclude MISS (final at horizon).
+        #  - Otherwise, if VALIDATOR_FINALIZE_ON_HORIZON is enabled, wait an extra
+        #    VALIDATOR_EXTENDED_WAIT_MINUTES before finalizing; during this period we
+        #    return a special {'result': None} to indicate re-check later.
+        extended_wait = getattr(config, 'VALIDATOR_EXTENDED_WAIT_MINUTES', 15)
+        late_threshold = bet_ts + timedelta(minutes=config.ALERT_HORIZON_MIN)
+        horizon_end = bet_ts + timedelta(minutes=config.LABEL_LOOKAHEAD_MIN)
+        extended_end = bet_ts + timedelta(minutes=config.LABEL_LOOKAHEAD_MIN + extended_wait)
+
+        # Check for any bets after ALERT_HORIZON_MIN threshold up to LABEL_LOOKAHEAD_MIN horizon -> immediate MISS (bet-based only)
+        any_late_bet_within_horizon = any((bt > late_threshold and bt <= horizon_end) for bt in bet_list)
+
+        if any_late_bet_within_horizon:
+            res_base.update({
+                "result": False,
+                "gap_start": None,
+                "gap_minutes": 0,
+                "reason": "MISS"
+            })
+            logger.debug("[validator] Finalizing alert as MISS (evidence within horizon) player=%s bet_id=%s", player_id, bet_id)
+        else:
+            if getattr(config, 'VALIDATOR_FINALIZE_ON_HORIZON', False):
+                # Still within extended wait window -> skip (to be re-checked later)
+                if now_hk < extended_end and not force_finalize:
+                    return {"result": None}
+
+                # Either extended window passed or force_finalize requested; check for any late arrivals (bet only)
+                # whose timestamps fall within the horizon window after bet_ts.
+                any_late_bet_in_extended = any((bt > late_threshold and bt <= horizon_end) for bt in bet_list)
+
+                if any_late_bet_in_extended:
+                    res_base.update({
+                        "result": False,
+                        "gap_start": None,
+                        "gap_minutes": 0,
+                        "reason": "MISS"
+                    })
+                    logger.debug("[validator] Finalizing alert as MISS (late arrival in horizon window) player=%s bet_id=%s", player_id, bet_id)
+                else:
+                    # No late arrivals in the horizon window -> confirm MATCH
+                    res_base.update({
+                        "result": True,
+                        "gap_start": None,
+                        "gap_minutes": 0,
+                        "reason": "MATCH"
+                    })
+                    logger.debug("[validator] Finalizing alert as MATCH (no late arrivals in horizon window) player=%s bet_id=%s", player_id, bet_id)
+            else:
+                res_base.update({
+                    "result": False,
+                    "gap_start": None,
+                    "gap_minutes": 0,
+                    "reason": "PENDING"
+                })
+    return res_base
+
+
+validate_observation_row = validate_alert_row
+
+
+def _prediction_row_to_validator_series(row: pd.Series) -> pd.Series:
+    """Map a ``prediction_log`` row to the shape expected by ``validate_observation_row``."""
+    return pd.Series(
+        {
+            "ts": row.get("scored_at"),
+            "bet_ts": row.get("bet_ts"),
+            "bet_id": row.get("bet_id"),
+            "player_id": row.get("player_id"),
+            "canonical_id": row.get("canonical_id"),
+            "casino_player_id": row.get("casino_player_id"),
+            "score": row.get("score"),
+            "session_id": row.get("session_id"),
+            "table_id": row.get("table_id"),
+            "model_version": row.get("model_version"),
+            "scored_at": row.get("scored_at"),
+            "position_idx": row.get("position_idx"),
+            "is_alert": row.get("is_alert"),
+        }
+    )
+
+
+def _load_existing_prediction_results(conn: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
+    """Load ``prediction_validation_results`` keyed by ``bet_id``."""
+    existing: Dict[str, Dict[str, Any]] = {}
+    try:
+        df = pd.read_sql_query("SELECT * FROM prediction_validation_results", conn)
+        if df.empty:
+            return existing
+        for _, row in df.iterrows():
+            bid = row.get("bet_id")
+            if bid is None or pd.isna(bid):
+                continue
+            existing[str(bid)] = row.to_dict()
+    except Exception:
+        pass
+    return existing
+
+
+def _prediction_validation_fetch_window(
+    pending: pd.DataFrame,
+    *,
+    now_hk: datetime,
+    freshness_buffer_min: int,
+) -> tuple[datetime, datetime] | None:
+    """Forward-only CH window for Phase B, anchored on pending ``bet_ts`` (no ``now`` lookback floor)."""
+    bet_ts = pd.to_datetime(pending["bet_ts"], errors="coerce")
+    if bet_ts.empty:
+        return None
+    if bet_ts.dt.tz is None:
+        bet_ts = bet_ts.dt.tz_localize(HK_TZ)
+    else:
+        bet_ts = bet_ts.dt.tz_convert(HK_TZ)
+    pending_min_ts = bet_ts.min()
+    pending_max_ts = bet_ts.max()
+    if pd.isna(pending_min_ts) or pd.isna(pending_max_ts):
+        return None
+
+    ext_wait_min = int(getattr(config, "VALIDATOR_EXTENDED_WAIT_MINUTES", 15))
+    policy_tail_min = int(config.LABEL_LOOKAHEAD_MIN) + max(0, int(freshness_buffer_min)) + ext_wait_min
+    min_ts = pending_min_ts.to_pydatetime() if isinstance(pending_min_ts, pd.Timestamp) else pending_min_ts
+    max_ts = pending_max_ts.to_pydatetime() if isinstance(pending_max_ts, pd.Timestamp) else pending_max_ts
+    fetch_end = max(now_hk, max_ts + timedelta(minutes=policy_tail_min))
+    return min_ts, fetch_end
+
+
+def _fetch_prediction_bet_cache_extension(
+    pending: pd.DataFrame,
+    bet_cache: Dict[str, List[datetime]],
+    *,
+    now_hk: datetime,
+    freshness_buffer_min: int,
+) -> None:
+    """Extend ``bet_cache`` in-place for pending prediction canonical_ids not yet loaded."""
+    if pending.empty or get_clickhouse_client is None:
+        return
+    cid_to_pids = _build_cid_to_player_ids(pending)
+    if not cid_to_pids:
+        return
+    window = _prediction_validation_fetch_window(
+        pending,
+        now_hk=now_hk,
+        freshness_buffer_min=freshness_buffer_min,
+    )
+    if window is None:
+        return
+    fetch_start, fetch_end = window
+    logger.debug(
+        "[validator][prediction] CH bet fetch window: fetch_start=%s fetch_end=%s pending_rows=%s",
+        fetch_start,
+        fetch_end,
+        len(pending),
+    )
+    try:
+        extra = fetch_bets_by_canonical_id(cid_to_pids, fetch_start, fetch_end)
+    except Exception as exc:
+        logger.warning("[validator][prediction] CH fetch extension failed: %s", exc)
+        return
+    for cid, vals in extra.items():
+        bet_cache.setdefault(cid, [])
+        bet_cache[cid].extend(vals)
+        bet_cache[cid] = sorted(set(bet_cache[cid]))
+
+
+def validate_predictions_once(
+    *,
+    bet_cache: Dict[str, List[datetime]],
+    force_finalize: bool = False,
+    cycle_start_mono: float,
+    budget_seconds: float,
+) -> None:
+    """Best-effort ground-truth validation for rows in ``prediction_log`` (Phase B)."""
+    if not getattr(config, "PREDICTION_VALIDATION_ENABLED", True):
+        return
+    pl_path = getattr(config, "PREDICTION_LOG_DB_PATH", None)
+    if pl_path is None or not str(pl_path).strip():
+        return
+    elapsed = time.perf_counter() - cycle_start_mono
+    remaining = float(budget_seconds) - elapsed
+    if remaining <= 1.0:
+        logger.debug("[validator][prediction] skip cycle (budget exhausted %.2fs left)", remaining)
+        return
+
+    from trainer_hightier.serving.prediction_log import (
+        ensure_prediction_validation_tables,
+        load_processed_predictions,
+        mark_processed_predictions,
+        prune_prediction_validation_retention,
+        save_prediction_validation_results,
+    )
+
+    now_hk = datetime.now(HK_TZ)
+    freshness_buffer_min = getattr(config, "VALIDATOR_FRESHNESS_BUFFER_MINUTES", 2)
+    wait_minutes = config.LABEL_LOOKAHEAD_MIN + max(0, freshness_buffer_min)
+    cutoff = now_hk - timedelta(minutes=wait_minutes)
+    finality_cutoff = now_hk - timedelta(hours=getattr(config, "VALIDATOR_FINALITY_HOURS", 1))
+    max_rows = _safe_int_config(
+        "PREDICTION_VALIDATION_MAX_ROWS_PER_CYCLE",
+        200,
+        min_value=1,
+    )
+    retention_days = _safe_int_config("PREDICTION_VALIDATION_RETENTION_DAYS", 180, min_value=0)
+
+    pl_conn = sqlite3.connect(str(Path(pl_path).resolve()))
+    try:
+        pl_conn.execute("PRAGMA journal_mode=WAL;")
+        ensure_prediction_validation_tables(pl_conn)
+        prune_prediction_validation_retention(pl_conn, now_hk, retention_days=retention_days)
+
+        pending_df = pd.read_sql_query(
+            """
+            SELECT p.*
+            FROM prediction_log p
+            WHERE p.scoring_status = 'scored'
+              AND p.bet_ts IS NOT NULL
+              AND TRIM(p.bet_ts) != ''
+              AND p.bet_id IS NOT NULL
+              AND p.bet_id NOT IN (SELECT bet_id FROM processed_predictions)
+              AND p.bet_ts <= ?
+            ORDER BY p.bet_ts ASC
+            LIMIT ?
+            """,
+            pl_conn,
+            params=(cutoff.isoformat(), int(max_rows)),
+        )
+        if pending_df.empty:
+            logger.debug("[validator][prediction] no pending scored rows")
+            return
+
+        processed = load_processed_predictions(pl_conn)
+        existing_results = _load_existing_prediction_results(pl_conn)
+        session_cache_disabled: Dict[str, List[Dict]] = {}
+
+        _fetch_prediction_bet_cache_extension(
+            pending_df,
+            bet_cache,
+            now_hk=now_hk,
+            freshness_buffer_min=max(0, int(freshness_buffer_min)),
+        )
+
+        new_processed_ids: List[Any] = []
+        updated_count = 0
+        no_bet_pending_rows: List[pd.Series] = []
+
+        def _validate_prediction_row(prow: pd.Series) -> Dict:
+            vrow = _prediction_row_to_validator_series(prow)
+            return validate_observation_row(
+                vrow,
+                bet_cache,
+                session_cache_disabled,
+                force_finalize=force_finalize,
+                gap_base_at_bet_ts=True,
+            )
+
+        for _, prow in pending_df.iterrows():
+            if time.perf_counter() - cycle_start_mono >= float(budget_seconds):
+                logger.debug("[validator][prediction] budget exhausted mid-batch")
+                break
+            vrow = _prediction_row_to_validator_series(prow)
+            res = _validate_prediction_row(prow)
+            if res.get("result") is None:
+                if bool(res.get("_no_bet_data")):
+                    no_bet_pending_rows.append(prow.copy())
+                continue
+            res["scored_at"] = prow.get("scored_at")
+            res["bet_ts"] = prow.get("bet_ts")
+            res["is_alert"] = prow.get("is_alert")
+            updated_delta, processed_added = _apply_pending_validation_result(
+                row=vrow,
+                res=res,
+                existing_results=existing_results,
+                processed=processed,
+                finality_cutoff=finality_cutoff,
+            )
+            updated_count += updated_delta
+            if processed_added:
+                new_processed_ids.append(prow["bet_id"])
+
+        retry_limit = _safe_int_config("VALIDATOR_NO_BET_RETRY_MAX_ALERTS", 50, min_value=1)
+        if no_bet_pending_rows and time.perf_counter() - cycle_start_mono < float(budget_seconds):
+            ext_wait_min = _safe_int_config("VALIDATOR_EXTENDED_WAIT_MINUTES", 15, min_value=0)
+            n_nb = len(no_bet_pending_rows)
+            retry_slice = no_bet_pending_rows[:retry_limit]
+            retry_cache, _retry_stats = _fetch_bets_for_no_bet_rows(
+                [_prediction_row_to_validator_series(r) for r in retry_slice],
+                pre_context_min=0,
+                freshness_buffer_min=max(0, int(freshness_buffer_min)),
+                extended_wait_min=ext_wait_min,
+                max_alerts=max(1, len(retry_slice)),
+            )
+            for cid, vals in retry_cache.items():
+                bet_cache.setdefault(cid, [])
+                bet_cache[cid].extend(vals)
+                bet_cache[cid] = sorted(set(bet_cache[cid]))
+            logger.debug(
+                "[validator][prediction] no-bet retry: before=%s selected=%s resolved_cids=%s",
+                n_nb,
+                len(retry_slice),
+                len(retry_cache),
+            )
+            for _, prow in retry_slice:
+                if time.perf_counter() - cycle_start_mono >= float(budget_seconds):
+                    break
+                vrow = _prediction_row_to_validator_series(prow)
+                res = _validate_prediction_row(prow)
+                if res.get("result") is None:
+                    continue
+                res["scored_at"] = prow.get("scored_at")
+                res["bet_ts"] = prow.get("bet_ts")
+                res["is_alert"] = prow.get("is_alert")
+                updated_delta, processed_added = _apply_pending_validation_result(
+                    row=vrow,
+                    res=res,
+                    existing_results=existing_results,
+                    processed=processed,
+                    finality_cutoff=finality_cutoff,
+                )
+                updated_count += updated_delta
+                if processed_added:
+                    new_processed_ids.append(prow["bet_id"])
+
+        for key, saved_row in list(existing_results.items()):
+            if saved_row.get("reason") != "PENDING":
+                continue
+            if time.perf_counter() - cycle_start_mono >= float(budget_seconds):
+                break
+            bid = saved_row.get("bet_id")
+            match = pending_df[pending_df["bet_id"].astype(str) == str(bid)]
+            if match.empty:
+                continue
+            vrow = _prediction_row_to_validator_series(match.iloc[0])
+            newr = validate_observation_row(
+                vrow,
+                bet_cache,
+                session_cache_disabled,
+                force_finalize=force_finalize,
+                gap_base_at_bet_ts=True,
+            )
+            if newr.get("result") is None or newr.get("reason") == "PENDING":
+                continue
+            newr["scored_at"] = match.iloc[0].get("scored_at")
+            newr["bet_ts"] = match.iloc[0].get("bet_ts")
+            newr["is_alert"] = match.iloc[0].get("is_alert")
+            existing_results[key] = newr
+            updated_count += 1
+            processed.add(str(bid))
+            new_processed_ids.append(bid)
+
+        if existing_results:
+            out_rows = []
+            for rec in existing_results.values():
+                out_rows.append(
+                    {
+                        "bet_id": rec.get("bet_id"),
+                        "scored_at": rec.get("scored_at"),
+                        "bet_ts": rec.get("bet_ts"),
+                        "validated_at": rec.get("validated_at"),
+                        "player_id": rec.get("player_id"),
+                        "canonical_id": rec.get("canonical_id"),
+                        "casino_player_id": rec.get("casino_player_id"),
+                        "model_version": rec.get("model_version"),
+                        "score": rec.get("score"),
+                        "is_alert": rec.get("is_alert"),
+                        "result": rec.get("result"),
+                        "gap_start": rec.get("gap_start"),
+                        "gap_minutes": rec.get("gap_minutes"),
+                        "reason": rec.get("reason"),
+                    }
+                )
+            save_prediction_validation_results(pl_conn, pd.DataFrame(out_rows))
+
+        mark_processed_predictions(pl_conn, new_processed_ids)
+        if new_processed_ids or updated_count:
+            logger.debug(
+                "[validator][prediction] finalized=%d updated=%d pending_batch=%d",
+                len(new_processed_ids),
+                updated_count,
+                len(pending_df),
+            )
+    finally:
+        pl_conn.close()
+
+
+def _try_validate_predictions_once(
+    *,
+    bet_cache: Dict[str, List[datetime]],
+    force_finalize: bool,
+    cycle_start_mono: float,
+) -> None:
+    """Run Phase B without affecting alert validation."""
+    budget = float(getattr(config, "PREDICTION_VALIDATION_CYCLE_BUDGET_SECONDS", 20.0))
+    try:
+        validate_predictions_once(
+            bet_cache=bet_cache,
+            force_finalize=force_finalize,
+            cycle_start_mono=cycle_start_mono,
+            budget_seconds=budget,
+        )
+    except Exception as exc:
+        logger.warning("[validator][prediction] cycle failed (non-blocking): %s", exc)
+
+
+# ------------------ Main loop ------------------
+def validate_once(conn: sqlite3.Connection, force_finalize: bool = False, existing_results_cache: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
+    cycle_start_mono = time.perf_counter()
+    bet_cache: Dict[str, List[datetime]] = {}
+    try:
+        _validate_alerts_once(
+            conn,
+            force_finalize=force_finalize,
+            existing_results_cache=existing_results_cache,
+            bet_cache=bet_cache,
+        )
+    finally:
+        _try_validate_predictions_once(
+            bet_cache=bet_cache,
+            force_finalize=force_finalize,
+            cycle_start_mono=cycle_start_mono,
+        )
+
+
+def _validate_alerts_once(
+    conn: sqlite3.Connection,
+    *,
+    force_finalize: bool,
+    existing_results_cache: Optional[Dict[str, Dict[str, Any]]],
+    bet_cache: Dict[str, List[datetime]],
+) -> None:
+    cycle_stage_seconds: Dict[str, float] = {}
+    now_hk = datetime.now(HK_TZ)
+    t_sqlite = time.perf_counter()
+    prune_validator_retention(conn, now_hk)
+    cycle_stage_seconds["sqlite"] = time.perf_counter() - t_sqlite
+
+    t_sqlite = time.perf_counter()
+    alerts = parse_alerts(conn)
+    cycle_stage_seconds["sqlite"] += time.perf_counter() - t_sqlite
+    if alerts.empty:
+        logger.debug("[validator] No alerts to validate")
+        _emit_validator_perf_summary(cycle_stage_seconds)
+        return
+
+    t_sqlite = time.perf_counter()
+    processed = {str(bid) for bid in load_processed(conn)}
+    cycle_stage_seconds["sqlite"] += time.perf_counter() - t_sqlite
+    alerts["bet_id_str"] = alerts["bet_id"].astype(str)
+    pending_all = alerts[~alerts["bet_id_str"].isin(processed)].copy()
+    if pending_all.empty:
+        logger.debug("[validator] Alerts: %d, Pending: 0 (all processed)", len(alerts))
+        _emit_validator_perf_summary(cycle_stage_seconds)
+        return
+
+    freshness_buffer_min = getattr(config, "VALIDATOR_FRESHNESS_BUFFER_MINUTES", 2)
+    wait_minutes = config.LABEL_LOOKAHEAD_MIN + max(0, freshness_buffer_min)
+    cutoff = now_hk - timedelta(minutes=wait_minutes)
+    finality_cutoff = now_hk - timedelta(hours=getattr(config, 'VALIDATOR_FINALITY_HOURS', 1))
+
+    effective_ts = pd.to_datetime(pending_all["bet_ts"].fillna(pending_all["ts"]))
+    if effective_ts.dt.tz is None:
+        effective_ts = effective_ts.dt.tz_localize(HK_TZ)
+    else:
+        effective_ts = effective_ts.dt.tz_convert(HK_TZ)
+
+    # Debug: bet_ts and effective_ts range for pending alerts (diagnose "all too recent")
+    bet_ts_ser = pending_all["bet_ts"]
+    if bet_ts_ser.notna().any():
+        bet_ts_valid = pd.to_datetime(bet_ts_ser.dropna())
+        if bet_ts_valid.dt.tz is None:
+            bet_ts_valid = bet_ts_valid.dt.tz_localize(HK_TZ)
+        else:
+            bet_ts_valid = bet_ts_valid.dt.tz_convert(HK_TZ)
+        logger.debug(
+            "[validator] pending_all: n=%d, bet_ts min=%s, bet_ts max=%s, effective_ts min=%s, effective_ts max=%s, cutoff=%s (wait_min=%s)",
+            len(pending_all), bet_ts_valid.min(), bet_ts_valid.max(),
+            effective_ts.min(), effective_ts.max(), cutoff, wait_minutes,
+        )
+    else:
+        logger.debug(
+            "[validator] pending_all: n=%d, bet_ts all NaT (using ts); effective_ts min=%s, max=%s, cutoff=%s (wait_min=%s)",
+            len(pending_all), effective_ts.min(), effective_ts.max(), cutoff, wait_minutes,
+        )
+
+    pending = pending_all[effective_ts <= cutoff].copy()
+    if pending.empty:
+        logger.debug("[validator] %d pending, but all are too recent (<%sm)", len(pending_all), wait_minutes)
+        _emit_validator_perf_summary(cycle_stage_seconds)
+        return
+
+    if force_finalize:
+        logger.warning("[validator] running with --force-finalize; PENDING candidates will be finalized now")
+
+    logger.debug("[validator] Processing %d alerts (including re-checks)...", len(pending))
+
+    t_sqlite = time.perf_counter()
+    # DB-first: load SQLite deltas into a fresh dict, then merge in-process cache keys
+    # only when absent from DB (avoids stale cache overwriting DB rows).
+    cache_before = len(existing_results_cache) if existing_results_cache else 0
+    existing_results = load_existing_results_incremental(
+        conn,
+        {},
+        warm_cache=existing_results_cache if existing_results_cache else None,
+    )
+    if existing_results_cache:
+        for _k, _v in existing_results_cache.items():
+            if _k not in existing_results:
+                existing_results[_k] = _v
+    if existing_results_cache is not None:
+        existing_results_cache.clear()
+        existing_results_cache.update(existing_results)
+    removed = 0
+    if _should_run_cache_prune():
+        removed = _prune_existing_results_cache(existing_results, now_hk=now_hk)
+        _mark_cache_prune_done()
+    logger.debug(
+        "[validator] existing_results cache: before=%d after_load=%d pruned=%d",
+        cache_before,
+        len(existing_results),
+        removed,
+    )
+    cycle_stage_seconds["sqlite"] += time.perf_counter() - t_sqlite
+
+    # Build canonical_id → [player_ids] mapping from all relevant alerts (step 8)
+    cid_to_pids = _build_cid_to_player_ids(alerts)
+
+    player_ids = (
+        pending.loc[pending["player_id"].notna(), "player_id"]
+        .astype(int)
+        .unique()
+        .tolist()
+    )
+    try:
+        processed_players = (
+            alerts[alerts["bet_id_str"].isin(processed)]["player_id"]
+            .dropna()
+            .astype(int)
+            .unique()
+            .tolist()
+        )
+        for pid in processed_players:
+            if pid not in player_ids:
+                player_ids.append(pid)
+    except Exception:
+        pass
+
+    bet_cache.clear()
+    # Phase 1 (Task 3): keep validate_alert_row signature compatibility, but
+    # disable session fetch/query path in validator cycle to cut ClickHouse load.
+    session_cache_disabled: Dict[str, List[Dict]] = {}
+    if player_ids or cid_to_pids:
+        if get_clickhouse_client is None:
+            raise RuntimeError(
+                "Validator requires ClickHouse to fetch bets/sessions for validation; "
+                "get_clickhouse_client is unavailable. Run as package (e.g. python -m trainer.validator)."
+            )
+        pending_min_ts = effective_ts[pending.index].min()
+        pre_context_min = _safe_int_config("VALIDATOR_FETCH_PRE_CONTEXT_MINUTES", 60, min_value=0)
+        max_lookback_min = _safe_int_config("VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES", 180, min_value=1)
+        cap_min = _safe_int_config("VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES_CAP", 24 * 60, min_value=1)
+        if max_lookback_min > cap_min:
+            global _WARNED_TASK9_LOOKBACK_CLAMPED
+            if not _WARNED_TASK9_LOOKBACK_CLAMPED:
+                logger.warning(
+                    "[validator] VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES=%s exceeds cap %s; clamping",
+                    max_lookback_min,
+                    cap_min,
+                )
+                _WARNED_TASK9_LOOKBACK_CLAMPED = True
+            max_lookback_min = cap_min
+
+        policy_late_min = int(config.LABEL_LOOKAHEAD_MIN + max(0, freshness_buffer_min))
+        ext_wait_min = _safe_int_config("VALIDATOR_EXTENDED_WAIT_MINUTES", 15, min_value=0)
+        required_min = policy_late_min + ext_wait_min + pre_context_min
+        if max_lookback_min < required_min:
+            global _WARNED_TASK9_LOOKBACK_TOO_SMALL
+            if not _WARNED_TASK9_LOOKBACK_TOO_SMALL:
+                logger.warning(
+                    "[validator] VALIDATOR_FETCH_MAX_LOOKBACK_MINUTES=%s too small for policy (%s) + extended_wait (%s) + pre_context (%s); using %s",
+                    max_lookback_min,
+                    policy_late_min,
+                    ext_wait_min,
+                    pre_context_min,
+                    required_min,
+                )
+                _WARNED_TASK9_LOOKBACK_TOO_SMALL = True
+            max_lookback_min = required_min
+
+        candidate_start = pending_min_ts - timedelta(minutes=pre_context_min)
+        hard_floor = now_hk - timedelta(minutes=max_lookback_min)
+        fetch_start = max(candidate_start, hard_floor)
+        fetch_end = now_hk
+        logger.debug(
+            "[validator] CH bet fetch window: pending_min_ts=%s candidate_start=%s hard_floor=%s fetch_start=%s fetch_end=%s (policy_late_min=%s ext_wait_min=%s pre_context_min=%s max_lookback_min=%s cap_min=%s)",
+            pending_min_ts,
+            candidate_start,
+            hard_floor,
+            fetch_start,
+            fetch_end,
+            policy_late_min,
+            ext_wait_min,
+            pre_context_min,
+            max_lookback_min,
+            cap_min,
+        )
+        try:
+            t_clickhouse = time.perf_counter()
+            # R41: errors propagate so the cycle aborts rather than producing false MISSes
+            fetched = fetch_bets_by_canonical_id(cid_to_pids, fetch_start, fetch_end)
+            bet_cache.update(fetched)
+            cycle_stage_seconds["clickhouse"] = time.perf_counter() - t_clickhouse
+        except Exception as exc:
+            logger.warning("[validator] DB fetch error — skipping alert validation this cycle: %s", exc)
+            _emit_validator_perf_summary(cycle_stage_seconds)
+            return
+
+    new_processed_ids: List = []
+    updated_count = 0
+    # bet_id (str) -> verdict reason for one INFO summary line this cycle
+    cycle_bet_to_reason: Dict[str, str] = {}
+
+    for bid in list(processed):
+        key = str(bid)
+        if key not in existing_results:
+            try:
+                match = alerts[alerts["bet_id_str"] == key]
+                if not match.empty:
+                    r = validate_alert_row(
+                        match.iloc[0],
+                        bet_cache,
+                        session_cache_disabled,
+                        force_finalize=force_finalize,
+                    )
+                    if r.get("result") is not None:
+                        existing_results[key] = r
+            except Exception:
+                continue
+
+    for key, saved_row in list(existing_results.items()):
+        try:
+            if saved_row.get("reason") == "PENDING":
+                pending_bid = saved_row.get("bet_id")
+                match = (
+                    alerts[alerts["bet_id_str"] == str(pending_bid)]
+                    if pd.notna(pending_bid)
+                    else pd.DataFrame()
+                )
+                if not match.empty:
+                    newr = validate_alert_row(
+                        match.iloc[0],
+                        bet_cache,
+                        session_cache_disabled,
+                        force_finalize=force_finalize,
+                    )
+                    if newr.get("result") is not None and (newr.get("reason") != "PENDING"):
+                        existing_results[key] = newr
+                        updated_count += 1
+                        _pb = newr.get("bet_id")
+                        if _pb is None:
+                            _pb = saved_row.get("bet_id")
+                        if _pb is not None and pd.notna(_pb):
+                            cycle_bet_to_reason[str(_pb)] = str(newr.get("reason", "UNKNOWN"))
+        except Exception:
+            continue
+
+    no_bet_pending_rows: List[pd.Series] = []
+    for _, row in pending.iterrows():
+        res = validate_alert_row(
+            row,
+            bet_cache,
+            session_cache_disabled,
+            force_finalize=force_finalize,
+        )
+        if res.get("result") is None:
+            if bool(res.get("_no_bet_data")):
+                no_bet_pending_rows.append(row.copy())
+            continue
+        # is_upgrade / pending-finalize semantics are preserved in helper.
+        # stored_is_match / is_upgrade semantics are preserved in helper.
+        updated_delta, processed_added = _apply_pending_validation_result(
+            row=row,
+            res=res,
+            existing_results=existing_results,
+            processed=processed,
+            finality_cutoff=finality_cutoff,
+        )
+        updated_count += updated_delta
+        if processed_added:
+            cycle_bet_to_reason[str(row["bet_id"])] = str(res.get("reason", "UNKNOWN"))
+            new_processed_ids.append(row["bet_id"])
+
+    # Task 9B: targeted retry for rows that hit "No bet data" this cycle.
+    retry_limit = _safe_int_config("VALIDATOR_NO_BET_RETRY_MAX_ALERTS", 50, min_value=1)
+    if no_bet_pending_rows:
+        global _NO_BET_RETRY_ROT_OFFSET
+        ext_wait_min = _safe_int_config("VALIDATOR_EXTENDED_WAIT_MINUTES", 15, min_value=0)
+        pre_context_min = _safe_int_config("VALIDATOR_FETCH_PRE_CONTEXT_MINUTES", 60, min_value=0)
+        n_nb = len(no_bet_pending_rows)
+        rot_start = _NO_BET_RETRY_ROT_OFFSET % n_nb
+        retry_slice = (no_bet_pending_rows[rot_start:] + no_bet_pending_rows[:rot_start])[:retry_limit]
+        _NO_BET_RETRY_ROT_OFFSET = (rot_start + len(retry_slice)) % max(n_nb, 1)
+        retry_cache, retry_stats = _fetch_bets_for_no_bet_rows(
+            retry_slice,
+            pre_context_min=pre_context_min,
+            freshness_buffer_min=max(0, int(freshness_buffer_min)),
+            extended_wait_min=ext_wait_min,
+            max_alerts=max(1, len(retry_slice)),
+        )
+        for cid, vals in retry_cache.items():
+            bet_cache.setdefault(cid, [])
+            bet_cache[cid].extend(vals)
+            bet_cache[cid] = sorted(set(bet_cache[cid]))
+
+        logger.debug(
+            "[validator] no-bet retry summary: before=%s selected=%s queries=%s rows=%s failed_queries=%s "
+            "bet_id_chunks=%s bet_id_rows_raw=%s bet_id_hits=%s bet_id_failed=%s "
+            "resolved_cache_cids=%s limit=%s rot_start=%s",
+            len(no_bet_pending_rows),
+            retry_stats.get("selected", 0),
+            retry_stats.get("queries", 0),
+            retry_stats.get("rows", 0),
+            retry_stats.get("failed_queries", 0),
+            retry_stats.get("bet_id_chunks", 0),
+            retry_stats.get("bet_id_rows_raw", 0),
+            retry_stats.get("bet_id_hits", 0),
+            retry_stats.get("bet_id_failed_queries", 0),
+            len(retry_cache),
+            retry_limit,
+            rot_start,
+        )
+
+        for row in retry_slice:
+            res = validate_alert_row(
+                row,
+                bet_cache,
+                session_cache_disabled,
+                force_finalize=force_finalize,
+            )
+            if res.get("result") is None:
+                continue
+            updated_delta, processed_added = _apply_pending_validation_result(
+                row=row,
+                res=res,
+                existing_results=existing_results,
+                processed=processed,
+                finality_cutoff=finality_cutoff,
+            )
+            updated_count += updated_delta
+            if processed_added:
+                cycle_bet_to_reason[str(row["bet_id"])] = str(res.get("reason", "UNKNOWN"))
+                new_processed_ids.append(row["bet_id"])
+
+    if cycle_bet_to_reason:
+        _vc = Counter(cycle_bet_to_reason.values())
+        _parts = ", ".join(f"{_r}={_vc[_r]}" for _r in sorted(_vc.keys()))
+        logger.info(
+            "[validator] This cycle: %d alert(s) verified — %s",
+            len(cycle_bet_to_reason),
+            _parts,
+        )
+
+    if existing_results:
+        final_df = pd.DataFrame(list(existing_results.values()))
+        # Ensure all expected columns are present (fill missing with None)
+        for col in VALIDATION_COLUMNS:
+            if col not in final_df.columns:
+                final_df[col] = None
+        final_df = final_df[VALIDATION_COLUMNS]
+
+        kpi_df = final_df[~final_df["reason"].isin(IGNORED_REASONS)]
+        finalized_or_old = kpi_df[kpi_df["reason"] != "PENDING"].copy()
+        # Upper bound for rolling KPI: cycle end, not cycle start (validated_at is per-row "now").
+        kpi_now_hk = datetime.now(HK_TZ)
+        precision_15m, matches_15m, total_15m = _rolling_precision_by_validated_at(
+            finalized_or_old, now_hk=kpi_now_hk, window=timedelta(minutes=15)
+        )
+        precision_1h, matches_1h, total_1h = _rolling_precision_by_validated_at(
+            finalized_or_old, now_hk=kpi_now_hk, window=timedelta(hours=1)
+        )
+        logger.info(
+            "[validator] Cumulative Precision (15m window, by validated_at): %.2f%% (%d/%d)",
+            precision_15m * 100,
+            matches_15m,
+            total_15m,
+        )
+        logger.info(
+            "[validator] Cumulative Precision (1h window, by validated_at): %.2f%% (%d/%d)",
+            precision_1h * 100,
+            matches_1h,
+            total_1h,
+        )
+
+        try:
+            _mv = _latest_model_version_from_alerts(alerts)
+            _append_validator_metrics(
+                conn,
+                recorded_at=kpi_now_hk.isoformat(),
+                model_version=_mv,
+                precision=float(precision_15m),
+                total=int(total_15m),
+                matches=int(matches_15m),
+            )
+        except Exception as exc:
+            logger.warning("[validator] validator_metrics insert failed: %s", exc)
+
+        final_df["alert_ts_dt"] = pd.to_datetime(final_df["alert_ts"])
+        final_df = final_df.sort_values("alert_ts_dt").drop(columns=["alert_ts_dt"])
+        t_sqlite = time.perf_counter()
+        save_validation_results(conn, final_df)
+        cycle_stage_seconds["sqlite"] += time.perf_counter() - t_sqlite
+        logger.debug(
+            "[validator] Saved %d total validations to SQLite (Updated %d, Finalized %d)",
+            len(final_df), updated_count, len(new_processed_ids),
+        )
+
+    t_sqlite = time.perf_counter()
+    mark_processed(conn, new_processed_ids)
+    cycle_stage_seconds["sqlite"] += time.perf_counter() - t_sqlite
+    if existing_results_cache is not None:
+        existing_results_cache.clear()
+        existing_results_cache.update(existing_results)
+    _emit_validator_perf_summary(cycle_stage_seconds)
+
+
+def run_validator_loop(
+    interval_seconds: int = 60,
+    once: bool = False,
+    force_finalize: bool = False,
+) -> None:
+    """Run the validator loop (no argparse). Used by package/deploy/main.py.
+    Uses STATE_DB_PATH from env if set.
+    Runs ClickHouse data preflight once before the first poll (same contract as CLI ``main()``).
+    """
+    run_cross_entry_data_preflight(
+        entry="validator",
+        use_local_parquet=False,
+        logger=logger,
+    )
+    conn = get_db_conn()
+    existing_results_cache: Dict[str, Dict[str, Any]] = {}
+    while True:
+        start_time = time.time()
+        try:
+            validate_once(
+                conn,
+                force_finalize=force_finalize,
+                existing_results_cache=existing_results_cache,
+            )
+        except Exception as exc:
+            logger.exception("[validator] ERROR: %s", exc)
+        if once:
+            break
+        elapsed = time.time() - start_time
+        sleep_time = max(0, interval_seconds - elapsed)
+        time.sleep(sleep_time)
+
+
+def main():
+    # Ensure console logs include timestamp (when not already set by deploy main)
+    if not logging.root.handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    parser = argparse.ArgumentParser(description="Validate alerts against realized walkaways")
+    parser.add_argument("--interval", type=int, default=60, help="Polling interval in seconds")
+    parser.add_argument("--once", action="store_true", help="Run a single validation pass and exit")
+    parser.add_argument("--force-finalize", action="store_true", help="Force-finalize PENDING candidates immediately (for manual runs)")
+    parser.add_argument(
+        "--backfill-prediction-log-bet-ts",
+        action="store_true",
+        help="One-shot: backfill prediction_log.bet_ts from ClickHouse and exit",
+    )
+    args = parser.parse_args()
+
+    if args.backfill_prediction_log_bet_ts:
+        from trainer_hightier.serving.prediction_log import backfill_prediction_log_bet_ts
+
+        pl_path = getattr(config, "PREDICTION_LOG_DB_PATH", None)
+        if pl_path is None:
+            raise SystemExit("prediction_log_db_path is disabled (None)")
+        stats = backfill_prediction_log_bet_ts(pl_path)
+        logger.info("[validator] backfill complete: %s", stats)
+        return
+
+    try:
+        run_cross_entry_data_preflight(
+            entry="validator",
+            use_local_parquet=False,
+            logger=logger,
+        )
+    except Exception as exc:
+        logger.warning("[validator] ClickHouse preflight skipped (%s)", exc)
+
+    conn = get_db_conn()
+    interval = args.interval
+    existing_results_cache: Dict[str, Dict[str, Any]] = {}
+
+    while True:
+        start_time = time.time()
+        try:
+            validate_once(
+                conn,
+                force_finalize=args.force_finalize,
+                existing_results_cache=existing_results_cache,
+            )
+        except Exception as exc:
+            logger.exception("[validator] ERROR: %s", exc)
+        if args.once:
+            break
+        # Sleep to next tick (preventing overlap)
+        elapsed = time.time() - start_time
+        sleep_time = max(0, interval - elapsed)
+        time.sleep(sleep_time)
+
+
+if __name__ == "__main__":
+    main()

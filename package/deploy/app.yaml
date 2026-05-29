@@ -1,7 +1,0 @@
-# Deploy config (GAE-style). Not used by gcloud; for documentation and tooling.
-# Runtime: Python 3.9+
-# Entrypoint: python main.py
-# Port: 8001 (override with PORT or ML_API_PORT env)
-
-runtime: python39
-entrypoint: python main.py

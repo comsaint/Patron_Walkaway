@@ -70,6 +70,7 @@ httplib2==0.31.2
 httptools==0.7.1
 httpx==0.28.1
 huey==2.6.0
+ibis-framework[duckdb]>=11.0.0,<12
 idna==3.11
 importlib_metadata==8.7.1
 importlib_resources==6.5.2

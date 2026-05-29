@@ -1,0 +1,75 @@
+# Slow patron features: 180 calendar-day lookback, monthly snapshot (trainer_hightier)
+#
+# Production/training contract (month-turn):
+#   - slow_anchor_target = last full calendar month before run/serving context day.
+#   - Gap day (first gaming_day epoch in calendar month): read slow_anchor_effective
+#     (prior published month-end snapshot) while Feast builds the target snapshot.
+#   - Post-gap (second+ gaming_day epoch): require slow_anchor_target; missing target
+#     hard-stops the entire scorer.
+#
+# Grain: canonical_id + anchor_gaming_day_event (one active anchor row per patron in deploy artifacts).
+
+registry_id: slow_patron_180d_monthly_snapshot
+registry_version: v0.2
+
+semantics:
+  canonical_space: Sessions and metrics are aggregated in ``canonical_id`` (via player mapping).
+  monthly_anchor: >-
+    Active snapshot anchor is the global calendar month-end ``slow_anchor_required`` for the run
+    context (target on post-gap days; prior published month-end on gap days). Sessions are filtered
+    to ``gaming_day <= slow_anchor_required``. This replaces per-patron ``MAX(gaming_day)`` within
+    each calendar month.
+  lookback_window: >-
+    Inclusive calendar dates: ``gaming_day`` in ``[anchor - (lookback_days - 1), anchor]``.
+    Default ``lookback_days`` is 180.
+  session_aggregates:
+    total_theo_win: SUM(theo_win) over sessions in the window.
+    unique_gaming_days: COUNT(DISTINCT gaming_day) in the window.
+    adt: total_theo_win / unique_gaming_days when the latter > 0; else NULL.
+  bet_assignment: >-
+    Training attaches slow features at canonical grain (static per canonical_id for the active
+    anchor). Serving joins canonical snapshot rows on ``canonical_id`` for the required anchor;
+    no per-bet ASOF drift within a month-turn phase.
+
+source_artifacts:
+  cleaned_session:
+    relative_to_repo: trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_session.parquet
+  canonical_mapping:
+    relative_to_repo: trainer_hightier/artifacts/mapping/canonical_player_mapping.parquet
+
+materialized_artifact:
+  relative_to_repo: trainer_hightier/artifacts/feast/slow_patron_180d_monthly.parquet
+
+implementation:
+  module: trainer_hightier.utils.slow_patron_180d_monthly
+  entrypoint: materialize_slow_patron_canonical_active_month
+  lookback_days_default: 180
+
+manifest_keys:
+  slow_anchor_target: slow_anchor_target
+  slow_anchor_effective: slow_anchor_effective
+  slow_month_turn_phase: slow_month_turn_phase
+  slow_snapshot_scope: slow_snapshot_scope
+  slow_snapshot_grain: canonical_active_month
+
+features:
+  - feature_id: patron__theo_win_sum__w180d_m1snap
+    type: float
+  - feature_id: patron__gaming_days_cnt__w180d_m1snap
+    type: int
+  - feature_id: patron__adt__w180d_m1snap
+    type: float
+
+feast:
+  feature_view: slow_patron_180d_monthly_features
+  feature_service: walkaway_canonical_slow_snap_v1
+  entity: canonical_patron
+  join_key: canonical_id
+  timestamp_field: event_timestamp
+  offline_training_attach: >-
+    Step 3 projects canonical slow onto bet entities via DuckDB (see 03_build_training_data);
+    do not use bet-grain Feast historical for slow.
+
+notes:
+  - Multi-anchor backfill artifacts must use ``snapshot_scope=diagnostic`` and must not ship in deploy_inputs.
+  - Gap/post-gap resolution lives in ``trainer_hightier.utils.slow_month_turn``.

@@ -1,0 +1,55 @@
+# Trial: 1-hour clock lookback bet behavior features (trainer_hightier / Feast)
+#
+# Grain: one row per bet_id; PIT 時間欄與清洗檔一致：`prediction_visible_ts_cf`、
+# `__etl_insert_Dtm_synthetic`（見 time_semantics_and_feast_mapping.md）。
+#
+# 窗口語意：以 `payout_complete_dtm` 排序，對同一 `player_id` 僅統計嚴格早於當筆、且
+# `payout_complete_dtm` 落在 [當筆 − 1h, 當筆) 內的注單（與 feature_candidates 中
+# execution.time_column 精神一致，改為時鐘 1h 而非 ROWS）。
+
+registry_id: trial_bet_behavior_1h
+registry_version: v0.1
+lookback: 1h
+partition_keys:
+  - player_id
+order_by: payout_complete_dtm ASC, bet_id ASC
+
+source_artifact:
+  relative_to_repo: trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet
+materialized_artifact:
+  relative_to_repo: trainer_hightier/artifacts/feast/trial_bet_behavior_1h.parquet
+
+implementation:
+  module: trainer_hightier.utils.trial_bet_behavior_1h
+  entrypoint: materialize_trial_bet_behavior_1h
+
+features:
+  - feature_id: bet__bets_cnt__w1h
+    inspiration:
+      candidate_file: trainer/feature_spec/feature_candidates.yaml
+      concept_from: bets_cnt_w20
+    type: int
+    description: 同一 player 在當筆 payout 前 1 小時內（不含當筆）的注單筆數。
+  - feature_id: bet__wager_sum__w1h
+    inspiration:
+      candidate_file: trainer/feature_spec/feature_candidates.yaml
+      concept_from: wager_sum_in_run_so_far
+    type: float
+    description: 上述窗口內 `wager` 總和（活動強度）。
+  - feature_id: bet__back_bet_ratio__w1h
+    inspiration:
+      candidate_file: trainer/feature_spec/feature_candidates.yaml
+      concept_from: back_bet_pct_w20
+    type: float
+    description: 窗口內 `is_back_bet=1` 的筆數占比（0–1）；無前序時為 0。
+  - feature_id: bet__payout_odds_avg__w1h
+    inspiration:
+      candidate_file: trainer/feature_spec/feature_candidates.yaml
+      concept_from: avg_payout_odds_currentrun
+    type: float
+    description: 窗口內 `payout_odds` 平均；無前序時為 0。
+
+feast:
+  feature_view: trial_bet_behavior_1h_features
+  feature_service: walkaway_bet_trial_v1
+  entity: bet

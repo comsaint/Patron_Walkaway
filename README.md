@@ -28,6 +28,7 @@ ClickHouse ──► trainer.py ──► models/ (model.pkl, …)
 ```
 
 - **`trainer/`** — `config.py`、`db_conn.py`、`trainer.py`、`identity.py`、`labels.py`、`features.py`、`time_fold.py`、`backtester.py`、`scorer.py`、`validator.py`、`api_server.py`、`status_server.py`，以及 ETL 與腳本。
+- **`trainer_hightier/`** — 高階客群離線訓練與 **scorer v2 production deploy**（Feast online mid/long、post-startup refresh supervisor）；見 [`trainer_hightier/README.md`](trainer_hightier/README.md)。
 - **`trainer/frontend/`** — 儀表板 SPA（地圖、告警、驗證趨勢、人流），**可選**；部署包可僅含 API（無前端），若需儀表板再自 repo 另行部署或建包時一併帶出。詳見 PROJECT.md「前端與部署」。
 - **`tests/`** — 單元與整合測試（pytest）。
 - **`doc/`** — 規格、發現、API 協定。**`schema/`** — 資料表/欄位字典與 DQ 提示。
@@ -119,7 +120,7 @@ python -m trainer.trainer --recent-chunks 3 --use-local-parquet --sample-rated 1
 
 **ETL / profile**：`trainer/etl_player_profile.py` 用於 profile 回填；`python -m trainer.scripts.auto_build_player_profile --start-date ... --end-date ...` 用於排程建置，詳見腳本說明。
 
-**部署**：訓練完成後可建置可部署套件（scorer + validator + Flask GET /alerts、GET /validation），從專案根目錄執行 `python -m package.build_deploy_package` 產出 `deploy_dist/`（可加 `--archive` 產出 zip）。目標機複製後 `pip install -r requirements.txt`、設定 `.env`、執行 `python main.py`。詳見 `package/README.md` 與 `.cursor/plans/DEPLOY_PLAN.md`。
+**部署**：訓練完成後可建置可部署套件（scorer + validator + Flask GET /alerts、GET /validation），從專案根目錄執行 `python -m package.build_deploy_package` 產出 `deploy_dist/`（可加 `--archive` 產出 zip）。高階客群 scorer v2 請改用 `python -m trainer_hightier.build_deploy_package`（見 [`trainer_hightier/README.md`](trainer_hightier/README.md)）。目標機複製後 `pip install -r requirements.txt`、設定 `.env`、執行 `python main.py`。詳見 `package/README.md` 與 `.cursor/plans/DEPLOY_PLAN.md`。
 
 ### Trainer 指令參數（cmd flags）
 
