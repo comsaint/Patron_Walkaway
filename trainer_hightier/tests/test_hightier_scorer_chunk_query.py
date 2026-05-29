@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from typing import Any
 
@@ -217,6 +218,57 @@ def test_compute_scorer_cycle_sleep_seconds_backlog_and_steady() -> None:
 
     cfg_off = replace(cfg, scorer_backlog_no_sleep_enabled=False)
     assert compute_scorer_cycle_sleep_seconds(batch_rows=2000, cfg=cfg_off) == 30.0
+
+
+def test_log_scorer_cycle_summary_emits_one_info_line(caplog: pytest.LogCaptureFixture) -> None:
+    from trainer_hightier.serving.scorer import _log_scorer_cycle_summary
+
+    cfg = HightierServingConfig(
+        hightier_scorer_max_bets_per_cycle=2000,
+        scorer_feast_lookup_latency_warn_ms=500.0,
+    )
+    with caplog.at_level(logging.INFO, logger="trainer_hightier.serving.scorer"):
+        _log_scorer_cycle_summary(
+            cycle_num=3,
+            metrics={
+                "cycle_readiness": {
+                    "n_scored": 42,
+                    "n_skipped_entity_missing": 0,
+                    "lookup_latency_ms": 61.2,
+                },
+                "n_alerts": 1,
+                "n_batch_rows": 42,
+                "queue_drained": True,
+            },
+            sleep_s=30.0,
+            elapsed_s=12.5,
+            cfg=cfg,
+        )
+    assert any("cycle#3 scored=42 alerts=1" in r.message for r in caplog.records)
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+def test_log_scorer_cycle_summary_warns_on_high_latency(caplog: pytest.LogCaptureFixture) -> None:
+    from trainer_hightier.serving.scorer import _log_scorer_cycle_summary
+
+    cfg = HightierServingConfig(
+        hightier_scorer_max_bets_per_cycle=2000,
+        scorer_feast_lookup_latency_warn_ms=500.0,
+    )
+    with caplog.at_level(logging.WARNING, logger="trainer_hightier.serving.scorer"):
+        _log_scorer_cycle_summary(
+            cycle_num=1,
+            metrics={
+                "cycle_readiness": {"n_scored": 10, "lookup_latency_ms": 900.0},
+                "n_alerts": 0,
+                "n_batch_rows": 10,
+                "queue_drained": True,
+            },
+            sleep_s=0.0,
+            elapsed_s=1.0,
+            cfg=cfg,
+        )
+    assert any("latency_ms=900.0 exceeds warn threshold" in r.message for r in caplog.records)
 
 
 def test_build_allowlist_external_data_tsv_payload() -> None:

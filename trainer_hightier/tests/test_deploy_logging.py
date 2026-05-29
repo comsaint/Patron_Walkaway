@@ -59,6 +59,14 @@ def _isolate_root_logging() -> None:
     root.setLevel(saved_level)
 
 
+def test_configure_deploy_log_noise_filters_lowers_feast_verbosity() -> None:
+    feast_logger = logging.getLogger("feast.infra.registry")
+    prior = feast_logger.level
+    deploy_main._configure_deploy_log_noise_filters()
+    assert feast_logger.level == logging.WARNING
+    feast_logger.setLevel(prior)
+
+
 def test_init_deploy_logging_creates_stream_and_file_handlers(
     tmp_path: Path,
     bundle_rel: dict[str, str],

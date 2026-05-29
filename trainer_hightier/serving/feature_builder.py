@@ -647,7 +647,7 @@ def attach_short_term_pit_features(
             f"{missing[:12]}"
         )
     merged = staged.merge(feats.loc[:, keep], on="bet_id", how="left")
-    logger.info(
+    logger.debug(
         "[feature_builder] attached short_term PIT cols=%d pool_rows=%d staged_rows=%d",
         len(columns),
         len(pool),
@@ -708,7 +708,7 @@ def attach_mid_term_composite_columns(
             (odds - avg_odds) / std_odds,
             np.nan,
         )
-    logger.info("[feature_builder] attached mid_term composite cols=%d", len(columns))
+    logger.debug("[feature_builder] attached mid_term composite cols=%d", len(columns))
     return out
 
 

@@ -60,7 +60,7 @@ def load_adt_allowlist_ids(path: Path) -> frozenset[int]:
         raise FileNotFoundError(p)
     df = pd.read_parquet(p, columns=["player_id"])
     s = pd.to_numeric(df["player_id"], errors="coerce").dropna()
-    return frozenset(int(x) for x in s.astype("int64", copy=False).tolist())
+    return frozenset(int(x) for x in s.astype("int64").tolist())
 
 
 def resolve_adt_allowlist_path(

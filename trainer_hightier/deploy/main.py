@@ -15,6 +15,7 @@ import os
 import sys
 import threading
 import time
+import warnings
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -167,6 +168,14 @@ def _root_has_file_handler(root: logging.Logger, path: Path) -> bool:
     return False
 
 
+def _configure_deploy_log_noise_filters() -> None:
+    """Reduce third-party chatter; keep deploy-owned INFO lines readable."""
+    warnings.filterwarnings("ignore", message="The copy keyword is deprecated")
+    for name in ("feast", "feast.infra", "feast.infra.registry"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
+
 def _init_deploy_logging(
     bundle_root: Path,
     rel: dict[str, Any],
@@ -216,6 +225,7 @@ def _init_deploy_logging(
         file_path if file_path is not None else "disabled",
         len(root.handlers),
     )
+    _configure_deploy_log_noise_filters()
     return file_path
 
 
@@ -1032,7 +1042,7 @@ def _feast_refresh_supervisor_once(
         cfg, readiness, require_slow=require_slow
     )
     if not mid_needed and not slow_needed:
-        logging.info(
+        logging.debug(
             "[deploy] feast refresh supervisor: not needed mid=%s slow=%s",
             mid_reason,
             slow_reason,
@@ -1043,7 +1053,7 @@ def _feast_refresh_supervisor_once(
         wait_seconds=int(cfg.feast_background_refresh_lock_wait_seconds),
     )
     if fd is None:
-        logging.info(
+        logging.debug(
             "[deploy] feast refresh supervisor: refresh skipped; lock held elsewhere"
         )
         return

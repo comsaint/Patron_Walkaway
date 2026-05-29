@@ -133,6 +133,10 @@ PRODUCTION_MID_ASOF_BACKFILL_DAYS: Final[int] = 30
 PRODUCTION_MID_FEAST_BOOTSTRAP_ANCHOR_DAYS: Final[int] = PRODUCTION_MID_ASOF_BACKFILL_DAYS
 #: Hard-fail when sampled mid Feast columns exceed this null fraction (aligns with training ~5%).
 SCORER_FEAST_MID_CELL_NULL_FAIL_FRACTION: Final[float] = 0.05
+#: Log WARNING when a scorer cycle Feast online lookup exceeds this latency (ms).
+SCORER_FEAST_LOOKUP_LATENCY_WARN_MS: Final[float] = 500.0
+#: Validator INFO heartbeat when no alerts are verified in a cycle.
+DEPLOY_VALIDATOR_HEARTBEAT_SECONDS: Final[int] = 300
 #: Informational allowlist coverage target for ops dashboards (not enforced as a hard gate).
 SCORER_FEAST_MID_TARGET_CANONICAL_COVERAGE_FRACTION: Final[float] = 0.95
 #: Shipped in deploy bundles for Feast bootstrap seed (training mid snapshot copy).
@@ -565,6 +569,8 @@ class HightierServingConfig:
     bet_avail_delay_min: int = 1
     session_avail_delay_min: int = 15
     scorer_poll_interval_seconds: float = 30.0
+    scorer_feast_lookup_latency_warn_ms: float = SCORER_FEAST_LOOKUP_LATENCY_WARN_MS
+    deploy_validator_heartbeat_seconds: int = DEPLOY_VALIDATOR_HEARTBEAT_SECONDS
     #: When True and a cycle hits ``hightier_scorer_max_bets_per_cycle``, skip poll sleep (drain backlog).
     scorer_backlog_no_sleep_enabled: bool = True
     #: Allowlist incremental fetch: ``external_input`` (single JOIN query) or legacy ``chunk`` IN-lists.

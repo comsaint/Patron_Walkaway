@@ -59,6 +59,7 @@ _NO_BET_RETRY_ROT_OFFSET: int = 0
 
 # Throttle O(n) in-memory cache prune (see VALIDATOR_CACHE_PRUNE_INTERVAL_SECONDS).
 _CACHE_PRUNE_LAST_MONO: float = 0.0
+_VALIDATOR_HEARTBEAT_LAST_MONO: float = 0.0
 
 
 def _safe_int_config(name: str, default: int, *, min_value: int) -> int:
@@ -1791,6 +1792,61 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False, existi
         )
 
 
+def _maybe_emit_validator_heartbeat(
+    conn: sqlite3.Connection,
+    *,
+    alerts: pd.DataFrame,
+    verified_this_cycle: int,
+) -> None:
+    """Periodic INFO when no alerts were verified this cycle (operator visibility)."""
+    global _VALIDATOR_HEARTBEAT_LAST_MONO
+    if verified_this_cycle > 0:
+        _VALIDATOR_HEARTBEAT_LAST_MONO = time.perf_counter()
+        return
+    interval = float(getattr(config, "deploy_validator_heartbeat_seconds", 300))
+    now_mono = time.perf_counter()
+    if now_mono - _VALIDATOR_HEARTBEAT_LAST_MONO < interval:
+        return
+    _VALIDATOR_HEARTBEAT_LAST_MONO = now_mono
+
+    n_alerts = int(len(alerts))
+    n_pending = 0
+    if not alerts.empty:
+        processed = {str(bid) for bid in load_processed(conn)}
+        n_pending = int((~alerts["bet_id"].astype(str).isin(processed)).sum())
+
+    precision_1h, matches_1h, total_1h = 0.0, 0, 0
+    existing = load_existing_results(conn)
+    if existing:
+        final_df = pd.DataFrame(list(existing.values()))
+        for col in VALIDATION_COLUMNS:
+            if col not in final_df.columns:
+                final_df[col] = None
+        kpi_df = final_df[~final_df["reason"].isin(IGNORED_REASONS)]
+        finalized = kpi_df[kpi_df["reason"] != "PENDING"].copy()
+        precision_1h, matches_1h, total_1h = _rolling_precision_by_validated_at(
+            finalized,
+            now_hk=datetime.now(HK_TZ),
+            window=timedelta(hours=1),
+        )
+
+    if total_1h > 0:
+        logger.info(
+            "[validator] heartbeat alerts=%d pending=%d precision_1h=%.2f%% (%d/%d)",
+            n_alerts,
+            n_pending,
+            precision_1h * 100,
+            matches_1h,
+            total_1h,
+        )
+    else:
+        logger.info(
+            "[validator] heartbeat alerts=%d pending=%d precision_1h=n/a (0/0)",
+            n_alerts,
+            n_pending,
+        )
+
+
 def _validate_alerts_once(
     conn: sqlite3.Connection,
     *,
@@ -1799,6 +1855,7 @@ def _validate_alerts_once(
     bet_cache: Dict[str, List[datetime]],
 ) -> None:
     cycle_stage_seconds: Dict[str, float] = {}
+    verified_this_cycle = 0
     now_hk = datetime.now(HK_TZ)
     t_sqlite = time.perf_counter()
     prune_validator_retention(conn, now_hk)
@@ -1809,6 +1866,7 @@ def _validate_alerts_once(
     cycle_stage_seconds["sqlite"] += time.perf_counter() - t_sqlite
     if alerts.empty:
         logger.debug("[validator] No alerts to validate")
+        _maybe_emit_validator_heartbeat(conn, alerts=alerts, verified_this_cycle=0)
         _emit_validator_perf_summary(cycle_stage_seconds)
         return
 
@@ -1819,6 +1877,7 @@ def _validate_alerts_once(
     pending_all = alerts[~alerts["bet_id_str"].isin(processed)].copy()
     if pending_all.empty:
         logger.debug("[validator] Alerts: %d, Pending: 0 (all processed)", len(alerts))
+        _maybe_emit_validator_heartbeat(conn, alerts=alerts, verified_this_cycle=0)
         _emit_validator_perf_summary(cycle_stage_seconds)
         return
 
@@ -1855,6 +1914,7 @@ def _validate_alerts_once(
     pending = pending_all[effective_ts <= cutoff].copy()
     if pending.empty:
         logger.debug("[validator] %d pending, but all are too recent (<%sm)", len(pending_all), wait_minutes)
+        _maybe_emit_validator_heartbeat(conn, alerts=alerts, verified_this_cycle=0)
         _emit_validator_perf_summary(cycle_stage_seconds)
         return
 
@@ -1981,6 +2041,7 @@ def _validate_alerts_once(
             cycle_stage_seconds["clickhouse"] = time.perf_counter() - t_clickhouse
         except Exception as exc:
             logger.warning("[validator] DB fetch error — skipping alert validation this cycle: %s", exc)
+            _maybe_emit_validator_heartbeat(conn, alerts=alerts, verified_this_cycle=0)
             _emit_validator_perf_summary(cycle_stage_seconds)
             return
 
@@ -2121,11 +2182,12 @@ def _validate_alerts_once(
                 new_processed_ids.append(row["bet_id"])
 
     if cycle_bet_to_reason:
+        verified_this_cycle = len(cycle_bet_to_reason)
         _vc = Counter(cycle_bet_to_reason.values())
         _parts = ", ".join(f"{_r}={_vc[_r]}" for _r in sorted(_vc.keys()))
         logger.info(
-            "[validator] This cycle: %d alert(s) verified — %s",
-            len(cycle_bet_to_reason),
+            "[validator] This cycle: %d alert(s) verified - %s",
+            verified_this_cycle,
             _parts,
         )
 
@@ -2189,6 +2251,11 @@ def _validate_alerts_once(
     if existing_results_cache is not None:
         existing_results_cache.clear()
         existing_results_cache.update(existing_results)
+    _maybe_emit_validator_heartbeat(
+        conn,
+        alerts=alerts,
+        verified_this_cycle=verified_this_cycle,
+    )
     _emit_validator_perf_summary(cycle_stage_seconds)
 
 

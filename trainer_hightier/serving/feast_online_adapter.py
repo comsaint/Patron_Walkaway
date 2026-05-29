@@ -350,7 +350,7 @@ class FeastSdkOnlineAdapter:
             entity_rows=_feast_entity_rows(ids),
         ).to_df()
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
-        logger.info(
+        logger.debug(
             "[feast_adapter] lookup n=%d cols=%d latency_ms=%.3f",
             len(ids),
             len(wanted),

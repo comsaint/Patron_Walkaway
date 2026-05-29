@@ -158,7 +158,7 @@ def init_state_db(path: Optional[Path] = None) -> Path:
         _init_runtime_rated_threshold(conn)
         _meta_set_if_missing(conn, META_KEY_SCHEMA_VERSION, STATE_SCHEMA_VERSION)
         conn.commit()
-    logger.info("[state_db] initialized %s", db_path)
+    logger.debug("[state_db] initialized %s", db_path)
     return db_path
 
 

@@ -161,6 +161,56 @@ def compute_scorer_cycle_sleep_seconds(
     return float(c.scorer_poll_interval_seconds)
 
 
+def _log_scorer_cycle_summary(
+    *,
+    cycle_num: int,
+    metrics: dict[str, Any],
+    sleep_s: float,
+    elapsed_s: float | None,
+    cfg: HightierServingConfig,
+) -> None:
+    """One INFO line per scorer cycle for operator visibility."""
+    cr = dict(metrics.get("cycle_readiness") or {})
+    n_scored = int(cr.get("n_scored") or metrics.get("n_batch_rows") or 0)
+    n_skipped = int(cr.get("n_skipped_entity_missing") or 0)
+    n_alerts = int(metrics.get("n_alerts") or 0)
+    latency_ms = float(cr.get("lookup_latency_ms") or 0.0)
+    queue_drained = bool(metrics.get("queue_drained", True))
+    batch_rows = int(metrics.get("n_batch_rows") or 0)
+    cap = int(cfg.hightier_scorer_max_bets_per_cycle)
+    elapsed_part = f" elapsed_s={elapsed_s:.1f}" if elapsed_s is not None else ""
+    logger.info(
+        "[hightier_scorer] cycle#%d scored=%d alerts=%d skipped=%d latency_ms=%.1f "
+        "queue_drained=%s batch_rows=%d cap=%d sleep_s=%s%s",
+        cycle_num,
+        n_scored,
+        n_alerts,
+        n_skipped,
+        latency_ms,
+        queue_drained,
+        batch_rows,
+        cap,
+        sleep_s,
+        elapsed_part,
+    )
+    warn_ms = float(cfg.scorer_feast_lookup_latency_warn_ms)
+    if latency_ms > warn_ms:
+        logger.warning(
+            "[hightier_scorer] cycle#%d feast lookup latency_ms=%.1f exceeds warn threshold=%.1f",
+            cycle_num,
+            latency_ms,
+            warn_ms,
+        )
+    if n_skipped > 0:
+        rate = float(cr.get("entity_missing_rate") or 0.0)
+        logger.warning(
+            "[hightier_scorer] cycle#%d entity_missing skipped=%d rate=%.4f",
+            cycle_num,
+            n_skipped,
+            rate,
+        )
+
+
 UTC_TZ = timezone.utc
 
 
@@ -445,7 +495,7 @@ def _fetch_bets_incremental_allowlist_chunk(
                     f"{cap} ({total_so_far} rows after chunk {i + 1}/{len(chunks)})"
                 )
     bets = merge_incremental_chunk_frames(frames, lim)
-    logger.info(
+    logger.debug(
         "[hightier_scorer] fetch_bets_incremental allowlist_chunks=%d chunk_size=%d merged_rows=%d final_k=%d",
         len(chunks),
         chunk_sz,
@@ -487,7 +537,7 @@ def _fetch_bets_incremental_allowlist_external(
         LIMIT %(lim)s
     """
     bets = client.query_df(q, parameters=params, external_data=external)
-    logger.info(
+    logger.debug(
         "[hightier_scorer] fetch_bets_incremental allowlist_external_input n_allowlist=%d rows=%d final_k=%d",
         len(allowlist_player_ids),
         len(bets),
@@ -690,7 +740,7 @@ def fetch_bet_pool_window(
     if getattr(_etl.dt, "tz", None) is None:
         _etl = _etl.dt.tz_localize(UTC_TZ, ambiguous="NaT", nonexistent="shift_forward")
     bets["__etl_insert_Dtm"] = _etl.dt.tz_convert(ZoneInfo(HK_TZ))
-    logger.info(
+    logger.debug(
         "[hightier_scorer] fetch_bet_pool_window chunks=%d chunk_size=%d unique_players=%d rows=%d",
         n_chunks,
         chunk_sz,
@@ -1068,7 +1118,7 @@ def score_once(
         feast_diag=feast_diag,
     )
     cycle_log = cycle_summary.to_log_dict()
-    logger.info("[hightier_scorer] cycle_readiness %s", cycle_log)
+    logger.debug("[hightier_scorer] cycle_readiness %s", cycle_log)
     scored_at_iso = datetime.now(ZoneInfo(HK_TZ)).isoformat()
     pl_path = cfg.prediction_log_db_path
     if skipped.shape[0] and pl_path is not None and str(pl_path).strip():
@@ -1362,7 +1412,10 @@ def score_once(
         n_batch_rows=n_batch_rows,
         queue_drained=queue_drained,
     )
-    logger.info("[hightier_scorer] wrote %d alerts (threshold=%.6f)", n, thr)
+    if n > 0:
+        logger.info("[hightier_scorer] wrote %d alerts (threshold=%.6f)", n, thr)
+    else:
+        logger.debug("[hightier_scorer] wrote %d alerts (threshold=%.6f)", n, thr)
     return n
 
 
@@ -1465,9 +1518,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     _log_scorer_readiness_summary(bundle=bundle, supplier_plan=supplier_plan)
     al_cache: dict[str, Any] = {}
     boot_logged = False
+    cycle_num = 0
     cycle_t0 = time.perf_counter() if args.dry_run_report is not None else None
 
     while True:
+        cycle_num += 1
+        cycle_loop_t0 = time.perf_counter()
         sleep_s = float(cfg.scorer_poll_interval_seconds)
         conn = connect_state_db(Path(cfg.state_db_path))
         try:
@@ -1526,12 +1582,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             metrics = get_last_scorer_cycle_metrics() or {}
             batch_rows = int(metrics.get("n_batch_rows") or 0)
             sleep_s = compute_scorer_cycle_sleep_seconds(batch_rows=batch_rows, cfg=cfg)
-            logger.info(
-                "[hightier_scorer] cycle_sleep batch_rows=%d cap=%d queue_drained=%s sleep_seconds=%s",
-                batch_rows,
-                int(cfg.hightier_scorer_max_bets_per_cycle),
-                bool(metrics.get("queue_drained", True)),
-                sleep_s,
+            elapsed_s = round(time.perf_counter() - cycle_loop_t0, 1)
+            _log_scorer_cycle_summary(
+                cycle_num=cycle_num,
+                metrics=metrics,
+                sleep_s=sleep_s,
+                elapsed_s=elapsed_s,
+                cfg=cfg,
             )
         finally:
             conn.close()
