@@ -1,6 +1,9 @@
 # Deploy E2E gate orchestration tests (local_cleaned startup path regression).
 name: trainer-hightier-deploy-e2e-gate
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main, master]
