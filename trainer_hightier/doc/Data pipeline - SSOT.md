@@ -46,8 +46,9 @@
 - 訓練視窗策略實驗必須固定同一 eval 區間（val/test）比較，不允許因切分改變造成不公平結論。
 - 若縮短訓練資料準備範圍，必須滿足 `train_start - max_lookback - safety_buffer` 的資料覆蓋規則。
 - 產出的 training set 必須攜帶 manifest，記錄來源、版本、列數、特徵服務與關鍵參數。
-- training set 必須提供 Step 4 所需 split keys（`canonical_id`、`gaming_day`）以支援時序切分與可追溯檢核。
+- training set 必須提供 Step 4 所需 split keys（`canonical_id`、`gaming_day_event`）以支援時序切分與可追溯檢核。
 - Step 4 必須只承擔 deterministic 前處理（欄位裁切、型別轉換、切分標記）；任何需從資料學習參數的轉換不得在 split 前執行。
+- Day 1 遷移採全歷史回填，分區鍵同步切換到 `gaming_day_event` 語意；舊分區鍵產物不得作為新語意流程輸入。
 - 管線必須在一般筆電資源下可執行，不允許預設流程依賴超大記憶體一次載入全量資料。
 - 實驗結果必須納入營運承接容量護欄：`val alerts/hour` 平均不得超過 **120**（約 2 alerts/min）；超限必須觸發告警並在決策中標註。
 - 候選特徵篩選（Gate 0/1/2）與訓練視窗策略升級之**定量門檻**採 **v0**（與 `Feature experimentation - WORKING_PLAN.md` §1.4 一致）；調整門檻需更新該文件並於本文件 **決策紀錄** bump 版本說明。
@@ -64,7 +65,13 @@
 - **Feature Quality Gate（FQG）**：以 **欄位（feature column）** 為粒度、跨 **train/val/test（或等價 split）** 之離線品質檢查；**L1** 為全候選欄位必跑之輕量檢查；**L2** 為僅對「擬入模之候選欄位」執行之較重檢查（分布漂移、時間穩定性等）。狀態：**PASS**（可進後續 gate）、**WARN**（需顯式核准）、**BLOCK**（不得進訓練，流程預設 **fail-fast**）。
 - **FQG allowlist / blocklist**：由 FQG 產出之機讀清單；訓練與實驗 runner 僅允許使用 allowlist 內欄位（WARN 僅在核准 metadata 存在時列入 allowlist）。
 - Training window strategy：訓練樣本時間範圍政策（全歷史、固定 rolling window、時間衰減權重）。
-- Val sub-slices（穩健性評估）：在**固定 val 日期區間**內，依 `gaming_day` 切成 **K 個連續、不重疊**之子區間（v0 預設 **K=4**、等天數；資料不足則 **K 為可切之最大整數** 且 **K≥2**，並於報表揭露），用於計算指標分佈與 **P25**。
+- `gaming_day_event`：跨表統一事件日欄位（`t_bet`、`t_session` 等），定義為「事件時間轉換至 `Asia/Hong_Kong` 後的日曆日（00:00 切日）」；為本專案唯一日級切分語意，全面取代舊 `gaming_day`。
+- **遷移政策**：採 **Day 1 full migration**，不採雙寫／雙讀；新流程僅接受 `gaming_day_event`。
+- **時間欄位標準化**：cleansing 階段將**所有 timestamp 欄位（含 Included 與 Excluded）**統一轉為 `Asia/Hong_Kong` 且以 **HK tz-aware** 型態落盤；重跑同一輸入必須維持 idempotent（不得二次位移）。
+- **日期欄位規則**：`DATE` 類欄位不做 timezone 轉換；僅由新規則衍生 `gaming_day_event`。
+- **事件時間白名單（v1）**：`t_bet.event_time = payout_complete_dtm`（NULL 直接 drop）；`t_session.event_time = session_end_dtm`（NULL 直接忽略，不做 fallback）。
+- **早期健全性檢查（hard-fail）**：在資料管線前段檢查 `__etl_insert_Dtm >= event_time`；任何 `__etl_insert_Dtm < event_time` 的列皆視為契約違反並中止流程。
+- Val sub-slices（穩健性評估）：在**固定 val 日期區間**內，依 `gaming_day_event` 切成 **K 個連續、不重疊**之子區間（v0 預設 **K=4**、等天數；資料不足則 **K 為可切之最大整數** 且 **K≥2**，並於報表揭露），用於計算指標分佈與 **P25**。
 - P25 容忍（v0）：於上述子區間上，相對 benchmark baseline（預設 **all history** 訓練政策）之 **ΔAP**、**ΔR@Pmin** 的 **median 與第 25 百分位數**須滿足 `Feature experimentation - WORKING_PLAN.md` §1.4 之數值（其中 **ΔR@Pmin 相關門檻採嚴格上升**，即 **> 0**）；用以避免「中位數改善但尾部切片顯著劣化」之策略過關。
 - PIT correctness：每筆實體（entity）僅能看到當時可見的歷史特徵，避免資料洩漏。
 
@@ -155,7 +162,11 @@
 - 採用「分區驅動 + 增量重算」而非每次全量 materialization。
 - 採用「DuckDB + dbt-duckdb + DVC + Feast」的分層組合，而非單一工具承擔全部責任。
 - Feast 定位為特徵契約與取用層，不承擔中間資料工程快取管理。
-- Step 3 在最終輸出層補齊 Step 4 split keys（`canonical_id`、`gaming_day`），避免 Step 4 每次重做大表回接，同時維持 Feast retrieval cache 邏輯不變。
+- Step 3 在最終輸出層補齊 Step 4 split keys（`canonical_id`、`gaming_day_event`），避免 Step 4 每次重做大表回接，同時維持 Feast retrieval cache 邏輯不變。
+- 時間語意遷移採 Day 1 full migration：全表 timestamp（含 Excluded）統一為 HK tz-aware；`DATE` 欄位不做時區轉換，僅衍生 `gaming_day_event`。
+- 事件時間白名單 v1：`t_bet` 用 `payout_complete_dtm`（NULL drop）；`t_session` 用 `session_end_dtm`（NULL ignore，與 `schema/time_semantics_registry.yaml` 對齊）。
+- 導入早期 hard-fail sanity gate：`__etl_insert_Dtm < event_time` 即中止管線；`__etl_insert_Dtm >= event_time` 視為合法。
+- 遷移批次一次性清空並重建 cache/manifest，避免舊語意 artifact 混入。
 - Step 4 為訓練前資料整理與切分專屬階段，目標為「同一批玩家的未來預測」（時間泛化優先）。
 - `trainer.py` 提供 `--start-from-features` 作為流程入口控制：允許跳過 Step 1-3，直接以既有 training parquet 啟動 Step 4。
 - 候選特徵實驗採 group-first 策略：先比較群組增量，再做群內去冗餘，不做預設全組合。

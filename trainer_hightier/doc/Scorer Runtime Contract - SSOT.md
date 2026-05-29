@@ -71,7 +71,7 @@ Production deploy（`trainer_hightier.deploy.main`）在 scorer-capable 模式�
 
 **Option B 首次 deploy／bootstrap**：
 
-- mid layer：`--bootstrap-mid`；seed **僅涵蓋 N 個 gaming day 的 anchor 歷史**（治理值 N=30，見 §設定 SSOT），不得將 unlimited 歷史 carry-forward 寫入 online store。
+- mid layer：`--bootstrap-mid`；seed **僅涵蓋 N 個 event day 的 anchor 歷史**（治理值 N=30，見 §設定 SSOT），不得將 unlimited 歷史 carry-forward 寫入 online store。
 - 日常 incremental：`--skip-apply`；merge 路徑，避免 reset 後只 materialize 單日導致覆蓋崩塌。
 
 ---
@@ -86,7 +86,7 @@ Scorer **不得**靜默補齊缺失的 model 特徵：
 - 未實作的 short-term `fe__*` 為 hard failure。
 - prediction log 須暴露 snapshot freshness／degraded 與 missing 計數。
 
-**Mid-term 觀測（P1）**：`prediction_log` 記錄 `mid_term_anchor_gaming_day_max`、`mid_term_snapshot_age_days`、`mid_null_top_features_json`；`feast_online_readiness.json` mid 層記錄 `anchor_gaming_day_max`、`expected_anchor_gaming_day`、`snapshot_age_days`、smoke 的 `cell_null_counts`。
+**Mid-term 觀測（P1）**：`prediction_log` 記錄 `mid_term_anchor_gaming_day_event_max`、`mid_term_snapshot_age_days`、`mid_null_top_features_json`；`feast_online_readiness.json` mid 層記錄 `anchor_gaming_day_event_max`、`expected_anchor_gaming_day_event`、`snapshot_age_days`、smoke 的 `cell_null_counts`。
 
 ---
 
@@ -100,7 +100,7 @@ Scorer **不得**靜默補齊缺失的 model 特徵：
 
 | 常數／概念 | 治理值 | 說明 |
 |-----------|--------|------|
-| **N**（bounded ASOF 窗寬） | **30** gaming days | 訓練與 serving 共用；實作落地時建議命名如 `production_mid_asof_backfill_days` |
+| **N**（bounded ASOF 窗寬） | **30** event days | 訓練與 serving 共用；實作落地時建議命名如 `production_mid_asof_backfill_days` |
 | `MID_TERM_SNAPSHOT_MAX_LOOKBACK_DAYS` | **32** | materialize 用 bet 回看（w30d + buffer）；須 **≥ N** |
 | `PRODUCTION_MID_FEAST_BOOTSTRAP_ANCHOR_DAYS` | **30**（對齊 N） | 首次 bootstrap materialize 的 anchor 天數上限 |
 | `MID_TERM_STALE_HARD_CAP_DAYS` | **3** | **營運層**：全庫 `anchor_max` 相對預期 D−1 的 refresh SLA；**與 N 分離** |
@@ -109,20 +109,27 @@ Scorer **不得**靜默補齊缺失的 model 特徵：
 
 #### Anchor 有效區間（訓練與線上須一致）
 
-對每一筆 bet，令 `G = gaming_day`，`A = anchor_gaming_day`（prior gaming day 結束後的 daily snapshot）：
+`gaming_day_event` 採 **Day 1 full migration**：訓練、refresh、readiness、scorer 一律使用 `gaming_day_event` / `anchor_gaming_day_event`，不保留 `gaming_day` 相容分支。
 
-- **有效** iff `A < G` 且 `A ∈ [G − N, G − 1]`（gaming day 閉區間）。
+- 時間欄位契約：上游 cleansing 將所有 timestamp 欄位（含 Excluded）統一為 `Asia/Hong_Kong` 且為 HK tz-aware；`DATE` 欄位不做 timezone 轉換，只衍生 `gaming_day_event`。
+- 資料時間健全性：`__etl_insert_Dtm < event_time` 視為契約違反並 hard-fail；`__etl_insert_Dtm >= event_time` 視為合法。
+- Key 命名契約：mid readiness / prediction log / audit 僅使用 `*_gaming_day_event*` 命名，不保留 legacy key。
+- Anchor 時間語意維持不變：`anchor_gaming_day_event` 對應 Feast `event_timestamp` 為該日 HK **23:59:59**。
+
+對每一筆 bet，令 `G = gaming_day_event`，`A = anchor_gaming_day_event`（prior event day 結束後的 daily snapshot）：
+
+- **有效** iff `A < G` 且 `A ∈ [G − N, G − 1]`（event day 閉區間）。
 - 等價：`snapshot_age_days = G − A` 須滿足 **1 ≤ snapshot_age_days ≤ N**。
-- `A = G`（同日）視為 **無效**（與 `anchor < gaming_day` 一致）。
+- `A = G`（同日）視為 **無效**（與 `anchor < gaming_day_event` 一致）。
 
 #### 訓練（Training）
 
 | 面向 | 契約 |
 |------|------|
 | Mid supplier | Step 3.5 `mid_term_daily_snapshot` + Step 4 `dataset_enrich` **bounded ASOF** |
-| ASOF SQL | `anchor_gaming_day < gaming_day`，且 `anchor_gaming_day >= gaming_day - N`；取最新一筆 |
+| ASOF SQL | `anchor_gaming_day_event < gaming_day_event`，且 `anchor_gaming_day_event >= gaming_day_event - N`；取最新一筆 |
 | Baseline mid `fe__*` | 六欄重新啟用：`fe__bets_cnt__w1d`、`fe__wager_sum__w15m_over_w1d`、`fe__wager_cv_w7d`、`fe__payout_odds_z_prior_w30d`、`fe__interarrival__last_gap_z__w7d`、`fe__odds__payout_odds_z__w7d` |
-| Audit（**進 model**） | `mid_term_anchor_gaming_day`、`mid_term_snapshot_age_days`、`mid_term_snapshot_missing_flag` |
+| Audit（**進 model**） | `mid_term_anchor_gaming_day_event`、`mid_term_snapshot_age_days`、`mid_term_snapshot_missing_flag` |
 | 窗外／無 anchor | mid primitive 與 composite **null**；`mid_term_snapshot_missing_flag = 1`；audit 仍寫實際 age（若有 A） |
 
 訓練分佈預期：bounded N=30 下 mid 相關 null 率約 **~15%** 量級（高於舊 unlimited ASOF ~5%）；屬契約取捨，非單純 bug。
@@ -133,11 +140,11 @@ Scorer **不得**靜默補齊缺失的 model 特徵：
 |------|------|
 | Mid supplier | Feast online `mid_term_daily_spike_features`（refresh 後） |
 | Serving 模式 | **A**：Feast 存每 canonical **最新** anchor 列；scorer 在 Feast attach **之後**依每筆 bet 的 `G` 做窗檢查 |
-| Anchor 來源 | Feast online 須可提供 `anchor_gaming_day`（欄位或自 `event_timestamp` 等價反推）；與訓練 audit 公式一致 |
+| Anchor 來源 | Feast online 須可提供 `anchor_gaming_day_event`（欄位或自 `event_timestamp` 等價反推）；與訓練 audit 公式一致 |
 | 窗外／無 anchor | 將該列 **mid primitive + composite** 清為 null；`missing_flag=1`；**仍允許** `predict_proba`（cell null 政策） |
 | Composite 順序 | 先 bounded null-out mid primitive，再 `attach_mid_term_composite_columns` |
 | 覆蓋 | allowlist canonical Feast 列數 **≥ 95%** |
-| 營運 freshness | `anchor_gaming_day_max` vs `expected_anchor_gaming_day`；逾 **3 天** hard cap → 停打；其間可 degraded |
+| 營運 freshness | `anchor_gaming_day_event_max` vs `expected_anchor_gaming_day_event`；逾 **3 天** hard cap → 停打；其間可 degraded |
 
 **禁止**：僅改 production 為 finite N、未 retrain 的 unlimited-ASOF 權重（分佈漂移）。  
 **禁止**：production 使用 training `bet_id` parquet 或 unlimited carry-forward 當 bounded 契約的替身。
@@ -159,7 +166,7 @@ Scorer **不得**靜默補齊缺失的 model 特徵：
 
 | 面向 | 訓練 | Production |
 |------|------|------------|
-| ASOF | 全歷史 `anchor < gaming_day`，無 N 上限 | Carry-forward：每 canonical 最新 anchor；bootstrap + incremental merge |
+| ASOF | 全歷史 `anchor < gaming_day_event`，無 N 上限 | Carry-forward：每 canonical 最新 anchor；bootstrap + incremental merge |
 | 與 Option B 差異 | 分佈較「新鮮」 | 若僅 finite-N refresh 無 carry-forward，會大量 null |
 
 **勿**將 Option B 權重部署在 Option A serving 語意上，或反之。  
@@ -175,13 +182,13 @@ Scorer **不得**靜默補齊缺失的 model 特徵：
 |----|----------|----------|----------|----------------------|
 | **raw** | `wager`, `bet_type`, … | 當筆注單 | Step 3 cleaned | ClickHouse／scoring 輸入 |
 | **short** | `bet__*__w1h` + short `fe__*`（15m/1h/today 等） | **Event-level PIT**：每筆 `bet_id` 僅用可見時間前歷史 | 見下「離線 PIT cache」 | **Bounded on-the-fly PIT**（主路徑） |
-| **mid** | `fe__bets_cnt__w1d`、composite `fe__*__w7d`、audit | Prior gaming day 日快照 ASOF | `mid_term_daily_snapshot` + enrich | Feast online + Option B 窗檢查 |
+| **mid** | `fe__bets_cnt__w1d`、composite `fe__*__w7d`、audit | Prior event day 日快照 ASOF | `mid_term_daily_snapshot` + enrich | Feast online + Option B 窗檢查 |
 | **long** | `patron__*__w180d_m1snap` | 月快照 ASOF | Feast slow | Feast online slow |
 
 ### Short 只有一層（勿再分 Short-T / Short-PIT）
 
 - **`bet__*`** 與 short **`fe__*`** 皆為 **short-term PIT**；差異僅實作模組（1h 四聚合 vs derived SQL），**不是**兩個時間層。
-- 各欄位仍有各自的語意窗口（例如 15m、1h、當 gaming day 累計）；hot pool 邊界（預設 6h + 當日開盤）由 `compute_hot_pool_window_start` 決定，**不等於**「所有 short 共用同一個 lookback 小時數」。
+- 各欄位仍有各自的語意窗口（例如 15m、1h、當 `gaming_day_event` 累計）；hot pool 邊界（預設 6h + `gaming_day_event` 當日 00:00）由 `compute_hot_pool_window_start` 決定，**不等於**「所有 short 共用同一個 lookback 小時數」。
 
 ### 「離線 PIT cache」≠ 非 PIT、≠ 可給未見 bet 查表
 
@@ -192,7 +199,7 @@ Scorer **不得**靜默補齊缺失的 model 特徵：
 | 是否 PIT？ | **是**。對訓練集內每個 `bet_id` 用 bounded hot pool **離線算一次**與 scorer 對齊的 PIT 值，再 join 進 `training_set_fe_enriched.parquet`。 |
 | 為何要 parquet？ | **效能**：上百萬列重跑 DuckDB 成本高；非因「可預先算一張與 bet 無關的全局表」。 |
 | Production 新 bet 能用嗎？ | **不能**用訓練 cache。新 `bet_id` 須 **即時 PIT**（scorer）或 **production 專用** rolling cache（Route B，僅含 mirror 內已存在列）。 |
-| 與 mid 日快照差異 | Mid 為 `canonical_id + anchor_gaming_day` **可重用聚合**；short cache 為 **bet_id → 該筆 PIT 結果** 之一對一。 |
+| 與 mid 日快照差異 | Mid 為 `canonical_id + anchor_gaming_day_event` **可重用聚合**；short cache 為 **bet_id → 該筆 PIT 結果** 之一對一。 |
 
 ### Short-term 供應路徑（現行）
 
@@ -262,4 +269,4 @@ Production scorer v2 **不得** fallback 至 `fe_derived_parquet`、`fe_short_te
 | 2026-05-22 | Option A carry-forward 修復 unlimited-ASOF **已部署** 模型之 serving（事故閉環） |
 | 2026-05（本 SSOT） | **未來模型預設 Option B**：N=30、Feast + scorer 窗檢查、六 mid + 三 audit 進 baseline、營運 stale hard cap 維持 3 天與 N 分離 |
 
-**程式對齊狀態（Option B）**：`config` 常數 N=30／bootstrap=30、`dataset_enrich` bounded ASOF、`apply_mid_term_bounded_asof`（scorer／offline replay）、Feast FV `anchor_gaming_day`、registry baseline 六 mid + 三 audit、Step 6 `hard_fail_all_feature_gate` 預設為 true。Promotion 前仍需新一輪 retrain 與 `deploy_e2e_gate` 驗收。
+**程式對齊狀態（Option B）**：`config` 常數 N=30／bootstrap=30、`dataset_enrich` bounded ASOF、`apply_mid_term_bounded_asof`（scorer／offline replay）、Feast FV `anchor_gaming_day_event`、registry baseline 六 mid + 三 audit、Step 6 `hard_fail_all_feature_gate` 預設為 true。Promotion 前仍需新一輪 retrain 與 `deploy_e2e_gate` 驗收。
