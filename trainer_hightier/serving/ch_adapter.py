@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import threading
+import warnings
 from typing import Any, Dict, Final, Optional
 
 try:
@@ -36,6 +38,45 @@ CH_TBET_GAMING_DAY_EVENT_NOT_NULL_PRED: Final[str] = f"{CH_TBET_GAMING_DAY_EVENT
 CH_TSESSION_GAMING_DAY_EVENT_EXPR: Final[str] = "toDate(toTimeZone(COALESCE(session_end_dtm, lud_dtm), 'Asia/Hong_Kong'))"
 
 _thread_local = threading.local()
+_LOG_NOISE_FILTERS_APPLIED = False
+
+
+def apply_serving_log_noise_filters() -> None:
+    """Suppress noisy third-party warnings (pandas 3 ``Pandas4Warning`` / clickhouse_connect).
+
+    Idempotent; safe to call from deploy bootstrap and on ``ch_adapter`` import.
+    """
+    global _LOG_NOISE_FILTERS_APPLIED
+    if _LOG_NOISE_FILTERS_APPLIED:
+        return
+    _LOG_NOISE_FILTERS_APPLIED = True
+
+    warnings.filterwarnings(
+        "ignore",
+        message=r"The copy keyword is deprecated.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        module=r"clickhouse_connect\.driver\.npquery",
+    )
+    pandas4: type[Warning] | None = None
+    try:
+        from pandas.errors import Pandas4Warning as _p4  # type: ignore[attr-defined]
+
+        pandas4 = _p4
+    except ImportError:
+        try:
+            from pandas import Pandas4Warning as _p4  # type: ignore[attr-defined]
+
+            pandas4 = _p4
+        except ImportError:
+            pandas4 = None
+    if pandas4 is not None:
+        warnings.filterwarnings("ignore", category=pandas4)
+
+    for name in ("feast", "feast.infra", "feast.infra.registry"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 
 def get_clickhouse_client():
@@ -67,3 +108,6 @@ def query_df(sql: str, parameters: Optional[Dict[str, Any]] = None):
     """Run ``query_df`` on the shared thread-local client."""
     client = get_clickhouse_client()
     return client.query_df(sql, parameters=parameters or {})
+
+
+apply_serving_log_noise_filters()

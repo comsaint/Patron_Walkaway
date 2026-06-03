@@ -952,11 +952,20 @@ CH_PASS=
     )
 
 
+def _pip_freeze_package_name(line: str) -> str:
+    """Lowercase distribution name from a ``pip freeze`` line (``==`` or ``@ file://``)."""
+    head = line.strip().split(" @ ", 1)[0].split("==", 1)[0].strip()
+    if "[" in head:
+        head = head.split("[", 1)[0].strip()
+    return head.lower().replace("_", "-")
+
+
 def _freeze_wheel_transitive_requirements(wheel_path: Path) -> list[str]:
     """Install *wheel_path* into a temp venv and return pinned ``pip freeze`` lines."""
     wheel_path = Path(wheel_path).resolve()
     if not wheel_path.is_file():
         raise FileNotFoundError(f"trainer_hightier wheel missing for requirements freeze: {wheel_path}")
+    skip_packages = frozenset({"pip", "setuptools", "trainer-hightier"})
     with tempfile.TemporaryDirectory(prefix="trainer_hightier_req_freeze_") as tmp:
         venv_dir = Path(tmp) / "venv"
         subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
@@ -976,8 +985,7 @@ def _freeze_wheel_transitive_requirements(wheel_path: Path) -> list[str]:
         line = raw.strip()
         if not line or line.startswith("-e "):
             continue
-        pkg = line.split("==", 1)[0].strip().lower()
-        if pkg in {"pip", "setuptools", "trainer-hightier"}:
+        if _pip_freeze_package_name(line) in skip_packages:
             continue
         lines.append(line)
     return sorted(lines, key=str.lower)

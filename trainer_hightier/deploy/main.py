@@ -15,7 +15,6 @@ import os
 import sys
 import threading
 import time
-import warnings
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -72,6 +71,17 @@ def _parse_deploy_args(argv: list[str] | None) -> argparse.Namespace:
         "--no-feast-refresh-supervisor",
         action="store_true",
         help="Disable post-startup Feast refresh supervisor daemon (debug only).",
+    )
+    pr.add_argument(
+        "--record-production-flight",
+        action="store_true",
+        help="Enable production flight recorder (shadow hooks for scorer and validator).",
+    )
+    pr.add_argument(
+        "--recording-config",
+        type=Path,
+        default=None,
+        help="Flight recording YAML (default: bundle local_state/flight_recording_config.yaml).",
     )
     return pr.parse_args(argv)
 
@@ -170,10 +180,9 @@ def _root_has_file_handler(root: logging.Logger, path: Path) -> bool:
 
 def _configure_deploy_log_noise_filters() -> None:
     """Reduce third-party chatter; keep deploy-owned INFO lines readable."""
-    warnings.filterwarnings("ignore", message="The copy keyword is deprecated")
-    for name in ("feast", "feast.infra", "feast.infra.registry"):
-        logging.getLogger(name).setLevel(logging.WARNING)
-    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+    from trainer_hightier.serving.ch_adapter import apply_serving_log_noise_filters
+
+    apply_serving_log_noise_filters()
 
 
 def _init_deploy_logging(
@@ -1236,6 +1245,20 @@ def main(argv: list[str] | None = None) -> int:
         )
     _preflight_feature_supplyability(br, rel)
     _emit_deploy_boot_info(br, cfg, rel)
+
+    if bool(args.record_production_flight):
+        from trainer_hightier.serving.flight_recorder.attach import attach_production_flight_recorders
+
+        rec_ctx = attach_production_flight_recorders(
+            br,
+            config_path=args.recording_config,
+            export_sqlite=True,
+        )
+        logging.info(
+            "[deploy] production flight recorder enabled root=%s model_version=%s",
+            rec_ctx.recording.root,
+            rec_ctx.recording.model_version,
+        )
 
     if mode == "api":
         from trainer_hightier.serving import api_server

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import warnings
 from pathlib import Path
 from unittest.mock import patch
 
@@ -65,6 +66,16 @@ def test_configure_deploy_log_noise_filters_lowers_feast_verbosity() -> None:
     deploy_main._configure_deploy_log_noise_filters()
     assert feast_logger.level == logging.WARNING
     feast_logger.setLevel(prior)
+
+
+def test_configure_deploy_log_noise_filters_suppresses_copy_deprecation_message() -> None:
+    deploy_main._configure_deploy_log_noise_filters()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.warn(
+            "The copy keyword is deprecated and will be removed in a future version.",
+            FutureWarning,
+        )
+    assert len(caught) == 0
 
 
 def test_init_deploy_logging_creates_stream_and_file_handlers(

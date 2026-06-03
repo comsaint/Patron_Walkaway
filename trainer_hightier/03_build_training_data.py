@@ -790,8 +790,8 @@ def _join_labels_to_features(
 ) -> int | None:
     """Merge Feast features with labels and split keys for downstream Step 4.
 
-    Adds ``canonical_id`` from ``walkaway_labels`` and ``gaming_day_event`` from cleaned
-    bet (DATE) via ``bet_id``; no change to Feast retrieval.
+    Adds ``canonical_id`` from ``walkaway_labels`` and ``player_id`` / ``game_id`` /
+    ``gaming_day_event`` from cleaned bet via ``bet_id``; no change to Feast retrieval.
     """
 
     f_esc = _path_posix(features_parquet).replace("'", "''")
@@ -805,7 +805,9 @@ COPY (
     y.label AS walkaway_label,
     y.censored AS walkaway_censored,
     y.canonical_id AS canonical_id,
-    b.gaming_day_event AS gaming_day_event
+    b.gaming_day_event AS gaming_day_event,
+    b.player_id AS player_id,
+    b.game_id AS game_id
   FROM read_parquet('{f_esc}') h
   LEFT JOIN (
     SELECT
@@ -818,7 +820,9 @@ COPY (
   LEFT JOIN (
     SELECT
       TRY_CAST(bet_id AS DOUBLE) AS bet_id,
-      MIN(CAST(gaming_day_event AS DATE)) AS gaming_day_event
+      MIN(CAST(gaming_day_event AS DATE)) AS gaming_day_event,
+      MIN(TRY_CAST(player_id AS BIGINT)) AS player_id,
+      MIN(TRY_CAST(game_id AS DOUBLE)) AS game_id
     FROM {bet_from} AS _cbd
     WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
     GROUP BY 1

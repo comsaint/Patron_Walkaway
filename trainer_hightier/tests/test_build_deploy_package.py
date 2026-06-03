@@ -14,7 +14,10 @@ import pandas as pd
 import pytest
 from sklearn.dummy import DummyClassifier
 
-from trainer_hightier.build_deploy_package import build_deploy_package
+from trainer_hightier.build_deploy_package import (
+    _pip_freeze_package_name,
+    build_deploy_package,
+)
 from trainer_hightier.config import FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME
 from trainer_hightier.core.model_bundle_paths import DEPLOY_E2E_GATE_REPORT_FILENAME
 from trainer_hightier.serving.adt_allowlist import sha256_file
@@ -997,7 +1000,21 @@ def test_build_bundle_rewrites_manifest_relative_paths(tmp_path: Path) -> None:
     assert whls, "expected trainer_hightier wheel under bundle wheels/"
     req_txt = (out / "requirements.txt").read_text(encoding="utf-8")
     assert whls[0].name in req_txt
+    assert req_txt.strip().splitlines()[3] == f"wheels/{whls[0].name}"
+    assert "file://" not in req_txt.lower()
+    assert " @ " not in req_txt
     assert "six==" in req_txt
+
+
+def test_pip_freeze_package_name_handles_direct_url() -> None:
+    """``pip freeze`` after ``pip install /abs/path.whl`` uses ``@ file://``, not ``==``."""
+    line = (
+        "trainer-hightier @ file:///C:/Users/longp/Patron_Walkaway/out/deploy/wheels/"
+        "trainer_hightier-0.2.8-py3-none-any.whl#sha256=abc"
+    )
+    assert _pip_freeze_package_name(line) == "trainer-hightier"
+    assert _pip_freeze_package_name("Flask==3.1.3") == "flask"
+    assert _pip_freeze_package_name("ibis-framework[duckdb]==11.0.0") == "ibis-framework"
 
 
 def test_build_bundle_archive_zip(tmp_path: Path) -> None:

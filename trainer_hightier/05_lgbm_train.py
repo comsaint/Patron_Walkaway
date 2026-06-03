@@ -38,7 +38,11 @@ _PACKAGE_ROOT = Path(__file__).resolve().parent
 
 PAYOUT_TS_COLUMN: Final[str] = "payout_complete_dtm"
 LABEL_COLUMN: Final[str] = "walkaway_label"
+PLAYER_ID_COLUMN: Final[str] = "player_id"
+GAME_ID_COLUMN: Final[str] = "game_id"
 CAT_COLUMNS: Final[frozenset[str]] = frozenset({"bet_type", "type_of_bet"})
+STEP5_GROUP_COLUMNS: Final[frozenset[str]] = frozenset({PLAYER_ID_COLUMN, GAME_ID_COLUMN})
+EVALUATION_GRAIN_PLAYER_GAME: Final[str] = "player_game"
 
 DEFAULT_MODEL_FILENAME: Final[str] = "model.pkl"
 DEFAULT_METRICS_FILENAME: Final[str] = "training_metrics.json"
@@ -64,6 +68,17 @@ class Step5Result:
     metrics_path: Path
     report: dict[str, Any]
     threshold: float
+
+
+@dataclass(frozen=True)
+class PlayerGameAggregationResult:
+    """Bet rows aggregated to ``player_id + game_id`` for evaluation."""
+
+    y_true: np.ndarray
+    scores: np.ndarray
+    excluded_bets: int
+    player_game_count: int
+    bet_count: int
 
 
 def split_window_hours_from_parquet(
@@ -117,9 +132,78 @@ def _validate_parquet_schema(parquet_path: Path, required: frozenset[str]) -> No
 
 
 def _load_split_frame(parquet_path: Path, *, feature_columns: tuple[str, ...]) -> pd.DataFrame:
-    cols = list(feature_columns) + [LABEL_COLUMN, PAYOUT_TS_COLUMN]
+    cols = list(feature_columns) + [LABEL_COLUMN, PAYOUT_TS_COLUMN, PLAYER_ID_COLUMN, GAME_ID_COLUMN]
     _validate_parquet_schema(parquet_path, frozenset(cols))
     return pd.read_parquet(Path(parquet_path).resolve(), columns=cols)
+
+
+def aggregate_bets_to_player_game(
+    df: pd.DataFrame,
+    scores: np.ndarray,
+    *,
+    split_name: str,
+) -> PlayerGameAggregationResult:
+    """Aggregate bet-level scores/labels to one row per ``player_id + game_id``.
+
+    Score uses ``max``; label uses ``max`` (any positive within the game).
+    Rows with null keys or non-finite scores are excluded with a warning.
+    """
+
+    if len(df) != int(len(scores)):
+        raise ValueError(
+            f"aggregate_bets_to_player_game: df length {len(df)} != scores length {len(scores)} "
+            f"(split={split_name!r})",
+        )
+    for col in STEP5_GROUP_COLUMNS:
+        if col not in df.columns:
+            raise ValueError(
+                f"aggregate_bets_to_player_game missing column {col!r}; "
+                f"split={split_name!r}, got {list(df.columns)!r}",
+            )
+    work = df[[PLAYER_ID_COLUMN, GAME_ID_COLUMN, LABEL_COLUMN]].copy()
+    work["_score"] = np.asarray(scores, dtype=np.float64).reshape(-1)
+    pid = pd.to_numeric(work[PLAYER_ID_COLUMN], errors="coerce")
+    gid = pd.to_numeric(work[GAME_ID_COLUMN], errors="coerce")
+    lbl = pd.to_numeric(work[LABEL_COLUMN], errors="coerce")
+    valid = (
+        pid.notna()
+        & gid.notna()
+        & lbl.notna()
+        & np.isfinite(work["_score"].to_numpy())
+    )
+    excluded = int((~valid).sum())
+    if excluded > 0:
+        logger.warning(
+            "Step 5 %s: excluded %d bet rows with null player_id/game_id/label or non-finite score",
+            split_name,
+            excluded,
+        )
+    work = work.loc[valid]
+    if work.empty:
+        return PlayerGameAggregationResult(
+            y_true=np.array([], dtype=np.int8),
+            scores=np.array([], dtype=np.float64),
+            excluded_bets=excluded,
+            player_game_count=0,
+            bet_count=0,
+        )
+    grouped = (
+        work.groupby([PLAYER_ID_COLUMN, GAME_ID_COLUMN], as_index=False, dropna=True)
+        .agg(
+            player_game_score=("_score", "max"),
+            player_game_label=(LABEL_COLUMN, "max"),
+            bet_count=(LABEL_COLUMN, "count"),
+        )
+    )
+    y_pg = np.asarray(grouped["player_game_label"], dtype=np.int8)
+    s_pg = np.asarray(grouped["player_game_score"], dtype=np.float64)
+    return PlayerGameAggregationResult(
+        y_true=y_pg,
+        scores=s_pg,
+        excluded_bets=excluded,
+        player_game_count=int(len(grouped)),
+        bet_count=int(len(work)),
+    )
 
 
 def _prepare_xy(df: pd.DataFrame, *, feature_columns: tuple[str, ...]) -> tuple[pd.DataFrame, np.ndarray]:
@@ -504,9 +588,10 @@ def train_lgbm_from_splits(
             early_stopping_rounds=int(cfg.early_stopping_rounds),
         )
         val_scores = model.predict_proba(X_va)[:, 1]
+        val_pg = aggregate_bets_to_player_game(df_va, val_scores, split_name="val")
         pick = pick_threshold_precision_floor(
-            y_va,
-            val_scores,
+            val_pg.y_true,
+            val_pg.scores,
             min_precision=float(objective_min_precision),
         )
         objective_val: float
@@ -610,12 +695,38 @@ def train_lgbm_from_splits(
         )
 
     thr = float(val_pick.threshold)
-    block_tr = _split_metrics_block("train", y_tr, train_scores, thr, window_hours=wh_train)
-    block_va = _split_metrics_block("val", y_va, val_scores, thr, window_hours=wh_val)
-    block_te = _split_metrics_block("test", y_te, test_scores, thr, window_hours=wh_test)
+    pg_tr = aggregate_bets_to_player_game(df_tr, train_scores, split_name="train")
+    pg_va = aggregate_bets_to_player_game(df_va, val_scores, split_name="val")
+    pg_te = aggregate_bets_to_player_game(df_te, test_scores, split_name="test")
+    block_tr_pg = _split_metrics_block(
+        "train_player_game", pg_tr.y_true, pg_tr.scores, thr, window_hours=wh_train,
+    )
+    block_va_pg = _split_metrics_block(
+        "val_player_game", pg_va.y_true, pg_va.scores, thr, window_hours=wh_val,
+    )
+    block_te_pg = _split_metrics_block(
+        "test_player_game", pg_te.y_true, pg_te.scores, thr, window_hours=wh_test,
+    )
+    block_tr_bl = _split_metrics_block(
+        "train_bet_level", y_tr, train_scores, thr, window_hours=wh_train,
+    )
+    block_va_bl = _split_metrics_block(
+        "val_bet_level", y_va, val_scores, thr, window_hours=wh_val,
+    )
+    block_te_bl = _split_metrics_block(
+        "test_bet_level", y_te, test_scores, thr, window_hours=wh_test,
+    )
+    block_tr_main = _split_metrics_block("train", pg_tr.y_true, pg_tr.scores, thr, window_hours=wh_train)
+    block_va_main = _split_metrics_block("val", pg_va.y_true, pg_va.scores, thr, window_hours=wh_val)
+    block_te_main = _split_metrics_block("test", pg_te.y_true, pg_te.scores, thr, window_hours=wh_test)
 
     elapsed = round(time.perf_counter() - t0, 3)
     report: dict[str, Any] = {
+        "evaluation_grain": EVALUATION_GRAIN_PLAYER_GAME,
+        "player_game_group_key": [PLAYER_ID_COLUMN, GAME_ID_COLUMN],
+        "score_aggregation": "max",
+        "label_aggregation": "max",
+        "step5_threshold_grain": EVALUATION_GRAIN_PLAYER_GAME,
         "step5_seconds": elapsed,
         "step5_feature_columns": list(feat_cols),
         "step5_threshold": thr,
@@ -627,9 +738,21 @@ def train_lgbm_from_splits(
         "step5_refit_train_plus_val": bool(cfg.refit_train_plus_val),
         "step5_refit_rows": int(len(y_tr) + len(y_va)) if bool(cfg.refit_train_plus_val) else int(len(y_tr)),
         "step5_refit_best_iteration": refit_best_iteration,
-        **block_tr,
-        **block_va,
-        **block_te,
+        "train_excluded_bets_player_game": pg_tr.excluded_bets,
+        "val_excluded_bets_player_game": pg_va.excluded_bets,
+        "test_excluded_bets_player_game": pg_te.excluded_bets,
+        "train_player_game_count": pg_tr.player_game_count,
+        "val_player_game_count": pg_va.player_game_count,
+        "test_player_game_count": pg_te.player_game_count,
+        **block_tr_main,
+        **block_va_main,
+        **block_te_main,
+        **block_tr_pg,
+        **block_va_pg,
+        **block_te_pg,
+        **block_tr_bl,
+        **block_va_bl,
+        **block_te_bl,
     }
     report.update(study_summary)
 

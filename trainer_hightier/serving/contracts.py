@@ -19,8 +19,18 @@ NEW_ALERT_COLUMNS: Final[tuple[tuple[str, str], ...]] = (
     ("casino_player_id", "TEXT"),
 )
 
+#: Player-game alert metadata (representative ``bet_id`` remains primary key).
+PLAYER_GAME_ALERT_COLUMNS: Final[tuple[tuple[str, str], ...]] = (
+    ("game_id", "TEXT"),
+    ("player_game_score", "REAL"),
+    ("player_game_bet_count", "INTEGER"),
+)
+
 #: Alerts ALTER list for validator-first DB — mirrors ``trainer.serving.validator._ALERTS_MIGRATION_COLS``.
-ALERTS_MIGRATION_COLUMNS: Final[tuple[tuple[str, str], ...]] = NEW_ALERT_COLUMNS
+ALERTS_MIGRATION_COLUMNS: Final[tuple[tuple[str, str], ...]] = (
+    *NEW_ALERT_COLUMNS,
+    *PLAYER_GAME_ALERT_COLUMNS,
+)
 
 #: validation_results legacy migration — mirrors ``trainer.serving.scorer._VALIDATION_RESULTS_MIGRATION_COLS``.
 VALIDATION_RESULTS_BASE_MIGRATION_COLUMNS: Final[tuple[tuple[str, str], ...]] = (("bet_ts", "TEXT"),)

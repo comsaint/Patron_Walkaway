@@ -5,10 +5,12 @@ from __future__ import annotations
 import importlib
 
 import numpy as np
+import pandas as pd
 import pytest
 
 _b5 = importlib.import_module("trainer_hightier.05_lgbm_train")
 pick_threshold_precision_floor = _b5.pick_threshold_precision_floor
+aggregate_bets_to_player_game = _b5.aggregate_bets_to_player_game
 
 
 def test_pick_threshold_feasible_prefers_max_recall() -> None:
@@ -63,4 +65,53 @@ def test_pick_threshold_all_negative_early_exit() -> None:
     rep = pick_threshold_precision_floor(y, scores, min_precision=0.8)
     assert not rep.feasible
     assert rep.alert_count == 0
+
+
+def test_aggregate_bets_to_player_game_max_score_and_label() -> None:
+    """Same player-game aggregates with max score and any-positive label."""
+
+    df = pd.DataFrame(
+        {
+            "player_id": [1, 1, 1, 2],
+            "game_id": [100.0, 100.0, 200.0, 100.0],
+            "walkaway_label": [0, 1, 0, 0],
+        }
+    )
+    scores = np.array([0.3, 0.9, 0.4, 0.2], dtype=np.float64)
+    out = aggregate_bets_to_player_game(df, scores, split_name="val")
+    assert out.player_game_count == 3
+    assert out.bet_count == 4
+    assert out.excluded_bets == 0
+    assert set(out.y_true.tolist()) <= {0, 1}
+    assert float(out.scores.max()) == pytest.approx(0.9)
+    pos_games = int(np.sum(out.y_true == 1))
+    assert pos_games == 1
+
+
+def test_aggregate_bets_to_player_game_excludes_invalid_keys() -> None:
+    """Null player_id/game_id rows are excluded from player-game metrics."""
+
+    df = pd.DataFrame(
+        {
+            "player_id": [1, None],
+            "game_id": [100.0, 100.0],
+            "walkaway_label": [0, 1],
+        }
+    )
+    scores = np.array([0.5, 0.8], dtype=np.float64)
+    out = aggregate_bets_to_player_game(df, scores, split_name="test")
+    assert out.excluded_bets == 1
+    assert out.player_game_count == 1
+    assert len(out.scores) == 1
+
+
+def test_player_game_metrics_at_threshold_counts_groups() -> None:
+    """At a fixed threshold, alert_count equals player-game rows above threshold."""
+
+    y = np.array([1, 0], dtype=np.int8)
+    scores = np.array([0.95, 0.85], dtype=np.float64)
+    prec, rec, _f1, alerts = _b5._metrics_at_threshold(y, scores, threshold=0.8)
+    assert alerts == 2
+    assert prec == pytest.approx(0.5)
+    assert rec == pytest.approx(1.0)
 

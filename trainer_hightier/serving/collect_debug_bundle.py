@@ -313,6 +313,22 @@ def run_production_audit(ctx: CollectContext, audit_csv: Path | None) -> None:
         )
 
 
+def copy_flight_recording_pointer(ctx: CollectContext) -> None:
+    """Copy flight recorder ``MANIFEST.json`` into staging when present (fail-open)."""
+    step_name = "copy_flight_recording_manifest"
+    ls = str(ctx.rel.get("local_state_dir", "local_state"))
+    src = ctx.bundle_root / ls / "flight_recording" / "MANIFEST.json"
+    if not src.is_file():
+        _append_step(ctx, StepRecord(step_name, "skipped", detail="no flight_recording MANIFEST"))
+        return
+    dst = ctx.staging_dir / "flight_recording" / "MANIFEST.json"
+    if _copy_if_exists(src, dst):
+        _record_file(ctx, dst)
+        _append_step(ctx, StepRecord(step_name, "ok", detail=str(src)))
+    else:
+        _append_step(ctx, StepRecord(step_name, "skipped", detail="copy failed"))
+
+
 def run_supplier_audit(ctx: CollectContext, audit_csv: Path | None) -> None:
     """Run supplier root-cause audit (fail-open)."""
     step_name = "audit_supplier_root_cause"
@@ -457,6 +473,7 @@ def collect_debug_bundle(
         export_sqlite_db(ctx, ls_path / "feature_state.db", db_label="feature_state")
         audit_csv = write_prediction_log_audit_csv(ctx, ls_path / "prediction_log.db")
         copy_identity_and_runtime(ctx)
+        copy_flight_recording_pointer(ctx)
         run_production_audit(ctx, audit_csv)
         run_supplier_audit(ctx, audit_csv)
         build_manifest(

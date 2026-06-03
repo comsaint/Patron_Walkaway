@@ -1,0 +1,204 @@
+"""ClickHouse time-machine: scheduled requery and diff reports."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+from trainer_hightier.serving.flight_recorder.ch_requery import (
+    execute_query,
+    rebuild_query_record,
+)
+from trainer_hightier.serving.flight_recorder.config import (
+    DEFAULT_CONFIG_REL,
+    FlightRecorderConfig,
+)
+from trainer_hightier.serving.flight_recorder.diff import diff_dataframes, write_diff_report
+from trainer_hightier.serving.flight_recorder.window_registry import (
+    list_windows,
+    mark_capture_done,
+    pending_capture_labels,
+)
+
+logger = logging.getLogger(__name__)
+
+_SYSTEM_TABLE_PROBES: tuple[str, ...] = (
+    "system.query_log",
+    "system.parts",
+    "system.mutations",
+    "system.part_log",
+)
+
+
+def probe_system_tables(bundle_dir: Path, recording_root: Path) -> Path:
+    """Probe read access to ClickHouse system tables."""
+    out_dir = recording_root / "permissions"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report_path = out_dir / "clickhouse_system_table_permissions.json"
+    results: list[dict[str, Any]] = []
+    try:
+        from trainer_hightier.serving.ch_adapter import get_clickhouse_client
+
+        client = get_clickhouse_client()
+    except Exception as exc:
+        payload = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "tables": results}
+        report_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return report_path
+    for table in _SYSTEM_TABLE_PROBES:
+        entry: dict[str, Any] = {"table": table}
+        try:
+            client.query(f"SELECT 1 FROM {table} LIMIT 1")
+            entry["status"] = "ok"
+        except Exception as exc:
+            entry["status"] = "error"
+            entry["error"] = f"{type(exc).__name__}: {exc}"
+        results.append(entry)
+    payload = {
+        "ok": any(r.get("status") == "ok" for r in results),
+        "probed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "bundle_dir": str(bundle_dir),
+        "tables": results,
+    }
+    report_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return report_path
+
+
+def _schedule_label_to_minutes(label: str) -> int:
+    """Map capture label to schedule minutes."""
+    if label == "t0":
+        return 0
+    if label.startswith("t_plus_") and label.endswith("m"):
+        return int(label.removeprefix("t_plus_").removesuffix("m"))
+    return 0
+
+
+def _capture_dir(recording_root: Path, window_id: str, label: str) -> Path:
+    """Return capture subdirectory for one schedule point."""
+    return recording_root / "ch_time_machine" / window_id / f"capture_{label}"
+
+
+def run_window_capture(
+    recording_root: Path,
+    window: dict[str, Any],
+    label: str,
+    *,
+    include_non_final: bool,
+) -> None:
+    """Execute one scheduled capture and write diffs vs t0."""
+    window_id = str(window["window_id"])
+    fetch = str(window.get("fetch", ""))
+    query_meta = rebuild_query_record(fetch, dict(window.get("query_meta") or {}))
+    cap_dir = _capture_dir(recording_root, window_id, label)
+    cap_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "window_id": window_id,
+        "capture_label": label,
+        "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+        "fetch": fetch,
+        "query_meta": query_meta,
+    }
+    (cap_dir / "query_manifest.json").write_text(
+        json.dumps(manifest, indent=2, default=str),
+        encoding="utf-8",
+    )
+    final_df = execute_query(query_meta, use_final=True)
+    final_df.to_parquet(cap_dir / "t_bet.final.parquet", index=False)
+    if include_non_final:
+        non_final_df = execute_query(query_meta, use_final=False)
+        non_final_df.to_parquet(cap_dir / "t_bet.non_final.parquet", index=False)
+        diff_ff = diff_dataframes(final_df, non_final_df, business_key="bet_id")
+        write_diff_report(cap_dir.parent / "diffs" / "final_vs_non_final.json", diff_ff)
+    t0_path = window.get("t0_final_parquet")
+    if t0_path:
+        t0_file = recording_root / str(t0_path)
+        if t0_file.is_file():
+            t0_df = pd.read_parquet(t0_file)
+            diff_t0 = diff_dataframes(t0_df, final_df, business_key="bet_id")
+            write_diff_report(
+                cap_dir.parent / "diffs" / f"t0_vs_{label}.json",
+                diff_t0,
+            )
+    mark_capture_done(recording_root, window_id, label)
+
+
+def run_pending_captures(
+    recording_root: Path,
+    config: FlightRecorderConfig,
+) -> int:
+    """Process all windows with pending schedule labels; return capture count."""
+    if not config.capture_ch_diagnostic_requery:
+        return 0
+    count = 0
+    schedule = config.requery_schedule_minutes
+    for window in list_windows(recording_root):
+        window_id = str(window["window_id"])
+        registered = datetime.fromisoformat(str(window["registered_at_utc"]).replace("Z", "+00:00"))
+        for label in pending_capture_labels(window, schedule):
+            offset_min = _schedule_label_to_minutes(label)
+            due_at = registered.timestamp() + offset_min * 60
+            if time.time() < due_at:
+                continue
+            try:
+                run_window_capture(
+                    recording_root,
+                    window,
+                    label,
+                    include_non_final=config.include_non_final_diagnostics,
+                )
+                count += 1
+            except Exception as exc:
+                logger.warning(
+                    "[ch_time_machine] capture failed window=%s label=%s: %s",
+                    window_id,
+                    label,
+                    exc,
+                )
+    return count
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry for ClickHouse time-machine daemon."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    parser = argparse.ArgumentParser(description="ClickHouse flight recorder time machine")
+    parser.add_argument("--bundle-dir", type=Path, required=True)
+    parser.add_argument("--recording-root", type=Path, default=None)
+    parser.add_argument("--config", type=Path, default=None)
+    parser.add_argument("--once", action="store_true", help="run one pending pass then exit")
+    parser.add_argument("--interval-seconds", type=int, default=300)
+    parser.add_argument("--no-system-probe", action="store_true")
+    args = parser.parse_args(argv)
+    bundle_dir = args.bundle_dir.resolve()
+    cfg_path = args.config or (bundle_dir / DEFAULT_CONFIG_REL)
+    config = (
+        FlightRecorderConfig.from_yaml_path(cfg_path)
+        if cfg_path.is_file()
+        else FlightRecorderConfig()
+    )
+    recording_root = (
+        args.recording_root.resolve()
+        if args.recording_root is not None
+        else config.resolve_recording_root(bundle_dir)
+    )
+    recording_root.mkdir(parents=True, exist_ok=True)
+    if not args.no_system_probe and config.include_system_table_probes:
+        probe_system_tables(bundle_dir, recording_root)
+    if args.once:
+        n = run_pending_captures(recording_root, config)
+        logger.info("[ch_time_machine] once pass completed captures=%d root=%s", n, recording_root)
+        return 0
+    while True:
+        n = run_pending_captures(recording_root, config)
+        logger.info("[ch_time_machine] cycle captures=%d", n)
+        time.sleep(max(30, int(args.interval_seconds)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

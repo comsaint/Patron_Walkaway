@@ -25,6 +25,7 @@ except Exception:
 _HK_TZ_INFO = ZoneInfo(HK_TZ)
 
 _PREDICTION_LOG_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("game_id", "TEXT"),
     ("bet_ts", "TEXT"),
     ("threshold", "REAL"),
     ("features_json", "TEXT"),
@@ -113,6 +114,10 @@ def ensure_prediction_log_table(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_prediction_log_bet_ts ON prediction_log(bet_ts)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prediction_log_player_game "
+        "ON prediction_log(player_id, game_id)"
     )
 
 
@@ -324,6 +329,7 @@ def append_hightier_prediction_log(
                 _str_or_none(row.get("bet_id")),
                 _str_or_none(row.get("session_id")),
                 _str_or_none(row.get("player_id")),
+                _str_or_none(row.get("game_id")),
                 _str_or_none(row.get("canonical_id")),
                 _str_or_none(row.get("casino_player_id")),
                 _str_or_none(row.get("table_id")),
@@ -359,14 +365,14 @@ def append_hightier_prediction_log(
         conn.executemany(
             """
             INSERT INTO prediction_log (
-                scored_at, bet_ts, bet_id, session_id, player_id, canonical_id,
+                scored_at, bet_ts, bet_id, session_id, player_id, game_id, canonical_id,
                 casino_player_id, table_id, model_version, score, margin,
                 is_alert, is_rated_obs, threshold, features_json, fe_features_missing,
                 snapshot_version, mid_term_freshness_status, slow_freshness_status,
                 snapshot_scoring_degraded, scoring_status, model_features_missing,
                 missing_family_json, mid_term_anchor_gaming_day_event_max,
                 mid_term_snapshot_age_days, mid_null_top_features_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )

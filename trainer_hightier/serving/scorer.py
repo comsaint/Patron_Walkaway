@@ -424,6 +424,7 @@ def _incremental_bet_select_list(*, casino_player_id_select: str) -> str:
                 {CH_TBET_GAMING_DAY_EVENT_SELECT},
                 session_id,
                 player_id,
+                game_id,
                 table_id,
                 position_idx,
                 {_TBET_WAGER_SELECT},
@@ -697,6 +698,7 @@ def fetch_bet_pool_window(
                 {CH_TBET_GAMING_DAY_EVENT_SELECT},
                 session_id,
                 player_id,
+                game_id,
                 table_id,
                 position_idx,
                 {_TBET_WAGER_SELECT},
@@ -854,6 +856,8 @@ class _ScoringBatch:
     bets: pd.DataFrame
     cursor: pd.Series
     pool: pd.DataFrame
+    pool_window_start: datetime | None = None
+    pool_window_end: datetime | None = None
 
 
 def _fetch_scoring_batch(
@@ -929,7 +933,13 @@ def _fetch_scoring_batch(
         pids = pids[:fan_cap]
     pool = fetch_bet_pool_window(player_ids=pids, window_start=pool_start, window_end=pool_end)
     pool = attach_synthetic_etl_and_prediction_visible(pool)
-    return _ScoringBatch(bets=bets, cursor=cursor, pool=pool)
+    return _ScoringBatch(
+        bets=bets,
+        cursor=cursor,
+        pool=pool,
+        pool_window_start=pool_start,
+        pool_window_end=pool_end,
+    )
 
 
 def _build_staged_features(
@@ -1051,6 +1061,98 @@ def _commit_scoring_cursor(
         set_last_processed_etl_insert(conn, max_cursor.to_pydatetime())
 
 
+def _build_player_game_alert_frame(
+    staged: pd.DataFrame,
+    prob: np.ndarray,
+    *,
+    threshold: float,
+    scored_at_iso: str,
+    model_version: str,
+) -> tuple[pd.DataFrame, int]:
+    """One alert row per ``player_id + game_id`` when ``max(score) >= threshold``."""
+
+    if staged.empty:
+        return pd.DataFrame(), 0
+    for col in ("player_id", "game_id", "bet_id", "payout_complete_dtm"):
+        if col not in staged.columns:
+            raise ValueError(
+                f"_build_player_game_alert_frame missing column {col!r}; got {list(staged.columns)!r}",
+            )
+    work = staged.copy()
+    work["_score"] = np.asarray(prob, dtype=np.float64).reshape(-1)
+    pid = pd.to_numeric(work["player_id"], errors="coerce")
+    gid = pd.to_numeric(work["game_id"], errors="coerce")
+    valid = pid.notna() & gid.notna() & np.isfinite(work["_score"].to_numpy())
+    excluded = int((~valid).sum())
+    if excluded > 0:
+        logger.warning(
+            "[hightier_scorer] excluded %d scored bets with null player_id/game_id or non-finite score",
+            excluded,
+        )
+    work = work.loc[valid]
+    if work.empty:
+        return pd.DataFrame(), excluded
+    work["_bet_id_sort"] = pd.to_numeric(work["bet_id"], errors="coerce").fillna(-1)
+    work = work.sort_values(
+        by=["_score", "payout_complete_dtm", "_bet_id_sort"],
+        ascending=[False, True, True],
+    )
+    rep = work.groupby(["player_id", "game_id"], as_index=False, dropna=True).first()
+    counts = work.groupby(["player_id", "game_id"], dropna=True).size().reset_index(name="player_game_bet_count")
+    rep = rep.merge(counts, on=["player_id", "game_id"], how="left")
+    rep["player_game_score"] = rep["_score"]
+    thr = float(threshold)
+    alerted = rep.loc[rep["player_game_score"] >= thr].copy()
+    if alerted.empty:
+        return pd.DataFrame(), excluded
+    nom = (
+        alerted["casino_player_id"]
+        if "casino_player_id" in alerted.columns
+        else pd.Series("", index=alerted.index)
+    )
+    rated = nom.notna() & (nom.astype(str).str.strip() != "")
+    alerts = pd.DataFrame(
+        {
+            "bet_id": alerted["bet_id"].astype(str),
+            "ts": scored_at_iso,
+            "bet_ts": alerted["payout_complete_dtm"],
+            "player_id": alerted["player_id"],
+            "casino_player_id": nom,
+            "table_id": alerted["table_id"] if "table_id" in alerted.columns else None,
+            "position_idx": alerted["position_idx"] if "position_idx" in alerted.columns else None,
+            "visit_start_ts": None,
+            "visit_end_ts": None,
+            "session_count": None,
+            "bet_count": alerted["player_game_bet_count"],
+            "visit_avg_bet": alerted["wager"] if "wager" in alerted.columns else None,
+            "historical_avg_bet": None,
+            "score": alerted["player_game_score"],
+            "session_id": alerted["session_id"] if "session_id" in alerted.columns else None,
+            "loss_streak": 0,
+            "bets_last_5m": 0.0,
+            "bets_last_15m": 0.0,
+            "bets_last_30m": 0.0,
+            "wager_last_10m": 0.0,
+            "wager_last_30m": 0.0,
+            "cum_bets": 0.0,
+            "cum_wager": 0.0,
+            "avg_wager_sofar": alerted["wager"] if "wager" in alerted.columns else None,
+            "session_duration_min": 0.0,
+            "bets_per_minute": 0.0,
+            "canonical_id": alerted["canonical_id"] if "canonical_id" in alerted.columns else None,
+            "is_rated_obs": np.where(rated, 1, 0),
+            "reason_codes": None,
+            "model_version": model_version,
+            "margin": alerted["player_game_score"] - thr,
+            "scored_at": scored_at_iso,
+            "game_id": alerted["game_id"],
+            "player_game_score": alerted["player_game_score"],
+            "player_game_bet_count": alerted["player_game_bet_count"],
+        }
+    )
+    return alerts, excluded
+
+
 def score_once(
     conn: sqlite3.Connection,
     bundle: HightierModelBundle,
@@ -1062,14 +1164,23 @@ def score_once(
     allowlist_ids: frozenset[int],
 ) -> int:
     """One incremental scoring cycle; returns number of alerts written."""
+    from trainer_hightier.serving.flight_recorder import scorer_hooks as _flight_rec
+
     cfg = default_hightier_serving_config()
     cap = int(cfg.hightier_scorer_max_bets_per_cycle)
+    last_etl = get_last_processed_etl_insert(conn)
+    _flight_rec.on_score_once_begin(
+        high_adt_only=high_adt_only,
+        allowlist_ids=allowlist_ids,
+        last_etl=last_etl,
+    )
     batch = _fetch_scoring_batch(
         conn,
         high_adt_only=high_adt_only,
         allowlist_ids=allowlist_ids,
     )
     if batch is None:
+        _flight_rec.on_score_once_empty()
         _record_scorer_cycle_metrics(
             model_version=str(bundle.model_version),
             cycle_readiness={},
@@ -1078,6 +1189,16 @@ def score_once(
             queue_drained=True,
         )
         return 0
+    pool_ws = batch.pool_window_start or datetime.now(ZoneInfo(HK_TZ))
+    pool_we = batch.pool_window_end or datetime.now(ZoneInfo(HK_TZ))
+    _flight_rec.on_batch_ready(
+        batch,
+        last_etl=last_etl,
+        high_adt_only=high_adt_only,
+        allowlist_ids=allowlist_ids,
+        pool_window_start=pool_ws,
+        pool_window_end=pool_we,
+    )
     n_batch_rows = len(batch.bets)
     queue_drained = _queue_drained_from_batch_rows(n_batch_rows, cap=cap)
 
@@ -1089,6 +1210,7 @@ def score_once(
         mapping_parquet=mapping_parquet,
         supplier_plan=supplier_plan,
     )
+    _flight_rec.on_stage(staged, "stage_05_staged_features")
     n_before_feast = len(staged)
     fail_frac = float(cfg.scorer_feast_entity_missing_fail_fraction)
     staged, skipped, feast_diag = _attach_feast_mid_slow(
@@ -1098,6 +1220,7 @@ def score_once(
         slow_columns=supplier_plan.feast_slow_cols,
         fail_fraction=fail_frac,
     )
+    _flight_rec.on_stage(staged, "stage_06_feast_mid_slow_lookup")
     from trainer_hightier.serving.mid_term_bounded_asof import apply_mid_term_bounded_asof
 
     staged = apply_mid_term_bounded_asof(
@@ -1106,6 +1229,7 @@ def score_once(
         n_days=int(cfg.production_mid_asof_backfill_days),
     )
     staged = attach_mid_term_composite_columns(staged, supplier_plan.mid_composite_cols)
+    _flight_rec.on_stage(staged, "stage_07_after_composite_features")
     cycle_summary = build_cycle_readiness_summary(
         supplier_routes=scorer_supplier_route_counts(supplier_plan),
         feast_mid_columns=supplier_plan.feast_mid_cols,
@@ -1140,6 +1264,17 @@ def score_once(
     if staged.empty:
         _commit_scoring_cursor(conn, batch.cursor, batch.bets.index)
         conn.commit()
+        _flight_rec.on_score_once_end(
+            n_batch_rows=n_batch_rows,
+            n_alerts=0,
+            prob=None,
+            staged=staged,
+            features=None,
+            feature_columns=bundle.feature_columns,
+            supplier_plan=supplier_plan,
+            row_audits=None,
+            cycle_readiness=cycle_log,
+        )
         _record_scorer_cycle_metrics(
             model_version=str(bundle.model_version),
             cycle_readiness=cycle_log,
@@ -1288,6 +1423,7 @@ def score_once(
         categorical_columns=bundle.categorical_columns,
         category_categories=dict(bundle.category_categories),
     )
+    _flight_rec.on_stage(X, "stage_08_model_feature_matrix")
     prob = bundle.model.predict_proba(X)[:, 1]
     thr = float(bundle.threshold)
     row_audits = compute_row_missing_audits(
@@ -1347,12 +1483,32 @@ def score_once(
         except Exception as exc:
             logger.warning("[hightier_scorer] prediction_log write failed: %s", exc)
 
-    m = prob >= thr
-    n = int(m.sum())
+    alerts, excluded_pg = _build_player_game_alert_frame(
+        staged,
+        prob,
+        threshold=thr,
+        scored_at_iso=scored_at_iso,
+        model_version=str(bundle.model_version),
+    )
+    n = int(len(alerts))
     scored_indices = staged.index
+    if excluded_pg > 0:
+        cycle_log = dict(cycle_log)
+        cycle_log["excluded_bets_player_game"] = excluded_pg
     if n == 0:
         _commit_scoring_cursor(conn, batch.cursor, scored_indices)
         conn.commit()
+        _flight_rec.on_score_once_end(
+            n_batch_rows=n_batch_rows,
+            n_alerts=0,
+            prob=prob,
+            staged=staged,
+            features=X,
+            feature_columns=bundle.feature_columns,
+            supplier_plan=supplier_plan,
+            row_audits=row_audits,
+            cycle_readiness=cycle_log,
+        )
         _record_scorer_cycle_metrics(
             model_version=str(bundle.model_version),
             cycle_readiness=cycle_log,
@@ -1361,50 +1517,20 @@ def score_once(
             queue_drained=queue_drained,
         )
         return 0
-    out = staged.loc[m].copy()
-    out["score"] = prob[m]
-    now_iso = scored_at_iso
-    nom = out["casino_player_id"] if "casino_player_id" in out.columns else pd.Series("", index=out.index)
-    rated = nom.notna() & (nom.astype(str).str.strip() != "")
-    alerts = pd.DataFrame(
-        {
-            "bet_id": out["bet_id"].astype(str),
-            "ts": now_iso,
-            "bet_ts": out["payout_complete_dtm"],
-            "player_id": out["player_id"],
-            "casino_player_id": nom,
-            "table_id": out["table_id"],
-            "position_idx": out["position_idx"],
-            "visit_start_ts": None,
-            "visit_end_ts": None,
-            "session_count": None,
-            "bet_count": None,
-            "visit_avg_bet": out["wager"],
-            "historical_avg_bet": None,
-            "score": out["score"],
-            "session_id": out["session_id"],
-            "loss_streak": 0,
-            "bets_last_5m": 0.0,
-            "bets_last_15m": 0.0,
-            "bets_last_30m": 0.0,
-            "wager_last_10m": 0.0,
-            "wager_last_30m": 0.0,
-            "cum_bets": 0.0,
-            "cum_wager": 0.0,
-            "avg_wager_sofar": out["wager"],
-            "session_duration_min": 0.0,
-            "bets_per_minute": 0.0,
-            "canonical_id": out["canonical_id"],
-            "is_rated_obs": np.where(rated, 1, 0),
-            "reason_codes": None,
-            "model_version": bundle.model_version,
-            "margin": out["score"] - thr,
-            "scored_at": now_iso,
-        }
-    )
     append_alerts(conn, alerts)
     _commit_scoring_cursor(conn, batch.cursor, scored_indices)
     conn.commit()
+    _flight_rec.on_score_once_end(
+        n_batch_rows=n_batch_rows,
+        n_alerts=n,
+        prob=prob,
+        staged=staged,
+        features=X,
+        feature_columns=bundle.feature_columns,
+        supplier_plan=supplier_plan,
+        row_audits=row_audits,
+        cycle_readiness=cycle_log,
+    )
     _record_scorer_cycle_metrics(
         model_version=str(bundle.model_version),
         cycle_readiness=cycle_log,

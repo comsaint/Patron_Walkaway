@@ -87,6 +87,7 @@ def _alerts_to_protocol_records(df: pd.DataFrame) -> list[dict]:
         "ts",
         "bet_ts",
         "player_id",
+        "game_id",
         "casino_player_id",
         "table_id",
         "position_idx",
@@ -96,7 +97,16 @@ def _alerts_to_protocol_records(df: pd.DataFrame) -> list[dict]:
     ]
     out = pd.DataFrame(index=df.index)
     out["ts"] = _format_ts_hk_iso(ts_ser).replace("NaT", None)
-    for k in ["bet_id", "bet_ts", "player_id", "table_id", "position_idx", "session_id", "visit_avg_bet"]:
+    for k in [
+        "bet_id",
+        "bet_ts",
+        "player_id",
+        "game_id",
+        "table_id",
+        "position_idx",
+        "session_id",
+        "visit_avg_bet",
+    ]:
         out[k] = df[k] if k in df.columns else None
     if "bet_ts" in df.columns:
         bet_ts_dt = pd.to_datetime(out["bet_ts"], errors="coerce")

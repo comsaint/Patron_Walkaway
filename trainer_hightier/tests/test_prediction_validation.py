@@ -8,6 +8,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pytest
 
 from trainer_hightier.serving import validator as hv
 from trainer_hightier.serving.prediction_log import (
@@ -246,3 +247,60 @@ def test_prediction_phase_errors_do_not_break_alert_save(tmp_path) -> None:
             n = c2.execute("SELECT COUNT(*) FROM validation_results").fetchone()[0]
         conn.close()
     assert n >= 1
+
+
+def test_cumulative_precision_overall_and_last_day_by_bet_ts() -> None:
+    hk = ZoneInfo("Asia/Hong_Kong")
+    now = datetime(2026, 6, 3, 12, 0, tzinfo=hk)
+    rows = [
+        {
+            "bet_ts": (now - timedelta(hours=2)).isoformat(),
+            "alert_ts": (now - timedelta(hours=2)).isoformat(),
+            "validated_at": now.isoformat(),
+            "reason": "MATCH",
+        },
+        {
+            "bet_ts": (now - timedelta(hours=3)).isoformat(),
+            "alert_ts": (now - timedelta(hours=3)).isoformat(),
+            "validated_at": now.isoformat(),
+            "reason": "NO_MATCH",
+        },
+        {
+            "bet_ts": (now - timedelta(days=2)).isoformat(),
+            "alert_ts": (now - timedelta(days=2)).isoformat(),
+            "validated_at": now.isoformat(),
+            "reason": "MATCH",
+        },
+    ]
+    df = pd.DataFrame(rows)
+
+    p_all, m_all, t_all, rate_all = hv._cumulative_precision_overall(df)
+    assert t_all == 3
+    assert m_all == 2
+    assert p_all == pytest.approx(2 / 3)
+    span_h = (now - timedelta(hours=2) - (now - timedelta(days=2))).total_seconds() / 3600.0
+    assert rate_all == pytest.approx(3 / span_h)
+
+    p_1d, m_1d, t_1d, rate_1d = hv._cumulative_precision_last_day_by_bet_ts(df, now_hk=now)
+    assert t_1d == 2
+    assert m_1d == 1
+    assert p_1d == 0.5
+    assert rate_1d == pytest.approx(2 / 24.0)
+
+
+def test_cumulative_precision_last_day_uses_alert_ts_when_bet_ts_missing() -> None:
+    hk = ZoneInfo("Asia/Hong_Kong")
+    now = datetime(2026, 6, 3, 12, 0, tzinfo=hk)
+    df = pd.DataFrame(
+        [
+            {
+                "bet_ts": None,
+                "alert_ts": (now - timedelta(hours=1)).isoformat(),
+                "validated_at": now.isoformat(),
+                "reason": "MATCH",
+            },
+        ]
+    )
+    _, m_1d, t_1d, _ = hv._cumulative_precision_last_day_by_bet_ts(df, now_hk=now)
+    assert t_1d == 1
+    assert m_1d == 1

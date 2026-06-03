@@ -220,6 +220,7 @@ def _sample_bets_two_rows() -> tuple[pd.DataFrame, pd.Timestamp]:
             "gaming_day_event": pd.to_datetime(["2025-06-01", "2025-06-01"]),
             "session_id": ["s1", "s2"],
             "player_id": [10, 11],
+            "game_id": [1001.0, 1002.0],
             "table_id": [1, 1],
             "position_idx": [1, 2],
             "wager": [100.0, 200.0],
@@ -591,6 +592,7 @@ def test_score_once_mock_e2e_entity_missing_writes_skipped_log(
             "gaming_day_event": pd.to_datetime(["2025-06-01"] * n_rows),
             "session_id": [f"s{i}" for i in range(n_rows)],
             "player_id": list(range(10, 10 + n_rows)),
+            "game_id": [float(5000 + i) for i in range(n_rows)],
             "table_id": [1] * n_rows,
             "position_idx": list(range(1, n_rows + 1)),
             "wager": [100.0] * n_rows,
@@ -1405,6 +1407,41 @@ def test_feast_readiness_rejects_training_scope_mid() -> None:
     )
     assert gate.ok is False
     assert "training-scoped" in (gate.hard_failure_reason or "")
+
+
+def test_build_player_game_alert_frame_dedupes_same_game() -> None:
+    """Multiple high-score bets in one player-game produce a single alert row."""
+
+    from trainer_hightier.serving.scorer import _build_player_game_alert_frame
+
+    hk = ZoneInfo("Asia/Hong_Kong")
+    ts = pd.Timestamp("2025-06-01 10:00:00", tz=hk)
+    staged = pd.DataFrame(
+        {
+            "bet_id": [1.0, 2.0, 3.0],
+            "player_id": [10, 10, 10],
+            "game_id": [900.0, 900.0, 900.0],
+            "payout_complete_dtm": [ts, ts + pd.Timedelta(seconds=1), ts + pd.Timedelta(seconds=2)],
+            "table_id": [1, 1, 1],
+            "position_idx": [1, 2, 3],
+            "wager": [100.0, 200.0, 50.0],
+            "session_id": ["s1", "s1", "s1"],
+            "canonical_id": ["c10", "c10", "c10"],
+        }
+    )
+    prob = np.array([0.91, 0.95, 0.88], dtype=np.float64)
+    alerts, excluded = _build_player_game_alert_frame(
+        staged,
+        prob,
+        threshold=0.5,
+        scored_at_iso=ts.isoformat(),
+        model_version="test",
+    )
+    assert excluded == 0
+    assert len(alerts) == 1
+    assert float(alerts.iloc[0]["player_game_score"]) == pytest.approx(0.95)
+    assert float(alerts.iloc[0]["bet_id"]) == pytest.approx(2.0)
+    assert int(alerts.iloc[0]["player_game_bet_count"]) == 3
 
 
 def test_scorer_v2_alerts_validator_and_api_compatible(
