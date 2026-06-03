@@ -285,7 +285,31 @@ def test_cumulative_precision_overall_and_last_day_by_bet_ts() -> None:
     assert t_1d == 2
     assert m_1d == 1
     assert p_1d == 0.5
-    assert rate_1d == pytest.approx(2 / 24.0)
+    assert rate_1d == pytest.approx(2 / 1.0)  # min(24h, 3h-2h span) = 1h
+
+
+def test_cumulative_precision_last_day_alert_rate_uses_shorter_bet_span() -> None:
+    hk = ZoneInfo("Asia/Hong_Kong")
+    now = datetime(2026, 6, 3, 12, 0, tzinfo=hk)
+    df = pd.DataFrame(
+        [
+            {
+                "bet_ts": (now - timedelta(hours=8)).isoformat(),
+                "alert_ts": (now - timedelta(hours=8)).isoformat(),
+                "validated_at": now.isoformat(),
+                "reason": "MATCH",
+            },
+            {
+                "bet_ts": (now - timedelta(hours=2)).isoformat(),
+                "alert_ts": (now - timedelta(hours=2)).isoformat(),
+                "validated_at": now.isoformat(),
+                "reason": "NO_MATCH",
+            },
+        ]
+    )
+    _, _, t_1d, rate_1d = hv._cumulative_precision_last_day_by_bet_ts(df, now_hk=now)
+    assert t_1d == 2
+    assert rate_1d == pytest.approx(2 / 6.0)  # min(24h, 6h bet span)
 
 
 def test_cumulative_precision_last_day_uses_alert_ts_when_bet_ts_missing() -> None:

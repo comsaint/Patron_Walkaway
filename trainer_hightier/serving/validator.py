@@ -227,21 +227,33 @@ def _effective_bet_ts_hk(df: pd.DataFrame) -> pd.Series:
 def _alerts_per_hour_from_bet_ts(
     df: pd.DataFrame,
     *,
-    fixed_window_hours: float | None = None,
+    max_window_hours: float | None = None,
 ) -> float | None:
-    """Average alerts per hour from ``bet_ts`` span (or a fixed window when set)."""
+    """Average alerts per hour using ``bet_ts`` min–max span as the window base.
+
+    When *max_window_hours* is set (e.g. 24 for last-day KPI), the denominator is
+    ``min(max_window_hours, span_h)`` so short bet histories are not diluted by a
+    full 24h cap. A single timestamp uses *max_window_hours* when provided.
+    """
     if df.empty:
         return None
     n = len(df)
-    if fixed_window_hours is not None and fixed_window_hours > 0:
-        return float(n) / float(fixed_window_hours)
     ts = _effective_bet_ts_hk(df).dropna()
-    if len(ts) < 2:
+    if ts.empty:
         return None
-    span_h = (ts.max() - ts.min()).total_seconds() / 3600.0
-    if span_h <= 0:
+    span_h = 0.0
+    if len(ts) >= 2:
+        span_h = (ts.max() - ts.min()).total_seconds() / 3600.0
+    if max_window_hours is not None and max_window_hours > 0:
+        cap = float(max_window_hours)
+        window_h = min(cap, span_h) if span_h > 0 else cap
+    elif span_h > 0:
+        window_h = span_h
+    else:
         return None
-    return float(n) / span_h
+    if window_h <= 0:
+        return None
+    return float(n) / window_h
 
 
 def _cumulative_precision_overall(
@@ -267,7 +279,7 @@ def _cumulative_precision_last_day_by_bet_ts(
     cutoff = now_hk - timedelta(days=1)
     sub = finalized_df[(bt >= cutoff) & (bt <= now_hk)]
     precision, matches, total = _match_precision_stats(sub)
-    rate = _alerts_per_hour_from_bet_ts(sub, fixed_window_hours=24.0) if total > 0 else None
+    rate = _alerts_per_hour_from_bet_ts(sub, max_window_hours=24.0) if total > 0 else None
     return precision, matches, total, rate
 
 
