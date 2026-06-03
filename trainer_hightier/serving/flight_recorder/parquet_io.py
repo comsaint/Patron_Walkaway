@@ -132,10 +132,9 @@ _TRACE_STRING_COLS: frozenset[str] = frozenset(
         "cycle",
     }
 )
-_TRACE_BOOL_COLS: frozenset[str] = frozenset(
+_TRACE_BOOL_COLS: frozenset[str] = frozenset({"result", "is_null"})
+_TRACE_INT_COUNT_COLS: frozenset[str] = frozenset(
     {
-        "result",
-        "is_null",
         "model_features_missing",
         "feast_mid_missing",
         "feast_slow_missing",
@@ -172,6 +171,8 @@ def _coerce_object_series(series: pd.Series) -> pd.Series:
 
 def _coerce_series(name: str, series: pd.Series) -> pd.Series:
     """Coerce one column using schema hints and defensive fallbacks."""
+    if name in _TRACE_INT_COUNT_COLS:
+        return pd.to_numeric(series, errors="coerce").astype("Int64")
     if name in _TRACE_BOOL_COLS:
         return series.astype("boolean")
     if name in _TRACE_STRING_COLS or name in _TBET_STRING_COLS or name in _TSESSION_STRING_COLS:

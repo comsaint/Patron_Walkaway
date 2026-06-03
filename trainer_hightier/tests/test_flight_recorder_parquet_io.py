@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from trainer_hightier.serving.feast_online_adapter import RowMissingAudit
 from trainer_hightier.serving.feature_supply import ScorerSupplierPlan
 from trainer_hightier.serving.flight_recorder.parquet_io import (
     prepare_dataframe_for_parquet,
@@ -101,6 +102,42 @@ def test_provenance_mixed_feature_values(tmp_path: Path) -> None:
     loaded = pd.read_parquet(out)
     assert loaded.loc[loaded["feature_id"] == "bet_type", "feature_value"].iloc[0] == "SMALL_DRAGON"
     assert loaded.loc[loaded["feature_id"] == "wager", "feature_value"].iloc[0] == "100.0"
+
+
+def test_provenance_missing_count_columns_gt_one(tmp_path: Path) -> None:
+    """RowMissingAudit counts > 1 must not be coerced as boolean (finish_cycle hook)."""
+    staged = pd.DataFrame({"bet_id": ["1"], "canonical_id": ["c1"]})
+    features = pd.DataFrame({"wager": [100.0], "fe__bets_cnt__w1d": [None]})
+    audits = [
+        RowMissingAudit(
+            model_features_missing=3,
+            fe_features_missing=1,
+            feast_mid_missing=2,
+            feast_slow_missing=0,
+            short_term_missing=1,
+        )
+    ]
+    prov = build_feature_missing_provenance(
+        staged,
+        features,
+        feature_columns=("wager", "fe__bets_cnt__w1d"),
+        supplier_plan=ScorerSupplierPlan(
+            baseline_cols=("wager",),
+            feast_trial_cols=(),
+            feast_mid_cols=("fe__bets_cnt__w1d",),
+            feast_slow_cols=(),
+            mid_composite_cols=(),
+            short_term_cols=("wager",),
+            unknown_cols=(),
+        ),
+        row_audits=audits,
+    )
+    out = tmp_path / "feature_missing_provenance.parquet"
+    write_parquet_safe(out, prov)
+    loaded = pd.read_parquet(out)
+    row = loaded.iloc[0]
+    assert int(row["model_features_missing"]) == 3
+    assert int(row["feast_mid_missing"]) == 2
 
 
 def test_decision_trace_bool_result(tmp_path: Path) -> None:

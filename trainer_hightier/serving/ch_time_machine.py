@@ -29,6 +29,32 @@ from trainer_hightier.serving.flight_recorder.window_registry import (
 
 logger = logging.getLogger(__name__)
 
+
+def _bootstrap_bundle_clickhouse(bundle_dir: Path) -> None:
+    """Load bundle ``.env`` and serving CH config (same contract as deploy ``main``)."""
+    from trainer_hightier.config import (
+        apply_hightier_serving_environ_overrides,
+        default_hightier_serving_config,
+        set_hightier_serving_deploy_override,
+    )
+    from trainer_hightier.deploy.main import (
+        _load_dotenv_if_present,
+        _load_rel_paths,
+        _serving_config_for_bundle,
+    )
+    from trainer_hightier.serving.ch_adapter import get_clickhouse_client
+
+    _load_dotenv_if_present(bundle_dir)
+    try:
+        rel = _load_rel_paths(bundle_dir)
+        cfg = _serving_config_for_bundle(bundle_dir, rel)
+    except FileNotFoundError:
+        cfg = default_hightier_serving_config()
+    cfg = apply_hightier_serving_environ_overrides(cfg)
+    set_hightier_serving_deploy_override(cfg)
+    get_clickhouse_client.cache_clear()  # type: ignore[attr-defined]
+
+
 _SYSTEM_TABLE_PROBES: tuple[str, ...] = (
     "system.query_log",
     "system.parts",
@@ -175,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-system-probe", action="store_true")
     args = parser.parse_args(argv)
     bundle_dir = args.bundle_dir.resolve()
+    _bootstrap_bundle_clickhouse(bundle_dir)
     cfg_path = args.config or (bundle_dir / DEFAULT_CONFIG_REL)
     config = (
         FlightRecorderConfig.from_yaml_path(cfg_path)
