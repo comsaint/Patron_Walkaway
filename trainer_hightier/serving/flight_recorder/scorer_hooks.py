@@ -26,6 +26,7 @@ from trainer_hightier.serving.flight_recorder.ch_capture import (
 )
 from trainer_hightier.serving.flight_recorder.config import FlightRecorderConfig
 from trainer_hightier.serving.flight_recorder.context import RecorderContext
+from trainer_hightier.serving.flight_recorder.failure import cycle_policy_fields, handle_recorder_failure
 from trainer_hightier.serving.flight_recorder.manifest import RecordingRoot
 from trainer_hightier.serving.flight_recorder.provenance import build_feature_missing_provenance
 from trainer_hightier.serving.flight_recorder.parquet_io import write_parquet_safe
@@ -68,11 +69,27 @@ class ScorerCycleRecorder:
             enabled=capture,
         )
 
-    def _fail_open(self, step: str, exc: BaseException) -> None:
-        """Record a partial failure without raising to the scorer loop."""
+    def _mark_partial(self, step: str) -> None:
+        """Record a partial failure for fail-open debug runs."""
         self.partial = True
         self.failed_steps.append(step)
-        logger.warning("[flight_recorder] scorer hook %s failed: %s", step, exc)
+
+    def _on_failure(
+        self,
+        step: str,
+        exc: BaseException,
+        *,
+        artifact_path: Path | None = None,
+    ) -> None:
+        """Apply configured fail-fast or fail-open policy."""
+        handle_recorder_failure(
+            role="scorer",
+            step=step,
+            exc=exc,
+            config=self.config,
+            mark_partial=lambda: self._mark_partial(step),
+            artifact_path=artifact_path,
+        )
 
     def begin_cycle(
         self,
@@ -101,6 +118,7 @@ class ScorerCycleRecorder:
                 sub["audits"],
             )
             manifest = {
+                **cycle_policy_fields(self.config),
                 "role": "scorer",
                 "started_at_utc": datetime.now(timezone.utc).isoformat(),
                 "hostname": socket.gethostname(),
@@ -116,7 +134,7 @@ class ScorerCycleRecorder:
             path = self.cycle_dir / "cycle_manifest.json"
             path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         except Exception as exc:
-            self._fail_open("begin_cycle", exc)
+            self._on_failure("begin_cycle", exc, artifact_path=self.cycle_dir)
 
     def capture_batch(
         self,
@@ -135,11 +153,13 @@ class ScorerCycleRecorder:
             return
         allowlist_arg: Optional[frozenset[int]] = allowlist_ids if high_adt_only else None
         try:
+            svc_cfg = default_hightier_serving_config()
             inc_meta = build_incremental_query_record(
                 last_etl=last_etl,
                 lookback_hours=lookback_hours,
                 limit_rows=limit_rows,
                 allowlist_player_ids=allowlist_arg,
+                allowlist_join_mode=str(svc_cfg.scorer_allowlist_join_mode),
             )
             save_clickhouse_capture(
                 self.ch_dir,
@@ -183,7 +203,7 @@ class ScorerCycleRecorder:
             self.record_stage("stage_00_raw_clickhouse_bets", batch.bets)
             self.record_stage("stage_04_short_term_pool", batch.pool)
         except Exception as exc:
-            self._fail_open("capture_batch", exc)
+            self._on_failure("capture_batch", exc, artifact_path=self.ch_dir)
 
     def record_stage(self, filename: str, frame: pd.DataFrame) -> None:
         """Write one stage Parquet under ``stages/``."""
@@ -193,7 +213,7 @@ class ScorerCycleRecorder:
             out = self.stages_dir / f"{filename}.parquet"
             write_parquet_safe(out, frame if frame is not None else pd.DataFrame())
         except Exception as exc:
-            self._fail_open(filename, exc)
+            self._on_failure(filename, exc, artifact_path=self.stages_dir)
 
     def finish_cycle(
         self,
@@ -276,7 +296,7 @@ class ScorerCycleRecorder:
             if self.partial:
                 self.recording.partial = True
         except Exception as exc:
-            self._fail_open("finish_cycle", exc)
+            self._on_failure("finish_cycle", exc, artifact_path=self.cycle_dir)
 
 
 def on_score_once_empty(*, model_version: str) -> None:

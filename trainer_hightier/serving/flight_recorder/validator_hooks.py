@@ -23,6 +23,7 @@ from trainer_hightier.serving.flight_recorder.ch_capture import (
 )
 from trainer_hightier.serving.flight_recorder.config import FlightRecorderConfig
 from trainer_hightier.serving.flight_recorder.context import RecorderContext
+from trainer_hightier.serving.flight_recorder.failure import cycle_policy_fields, handle_recorder_failure
 from trainer_hightier.serving.flight_recorder.manifest import RecordingRoot
 from trainer_hightier.serving.flight_recorder.session import get_active_validator_recorder
 from trainer_hightier.serving.flight_recorder.parquet_io import write_parquet_safe
@@ -66,11 +67,27 @@ class ValidatorCycleRecorder:
         capture = ctx.config.capture_validator_stages and ctx.config.enabled
         return cls(recording=ctx.recording, config=ctx.config, enabled=capture)
 
-    def _fail_open(self, step: str, exc: BaseException) -> None:
-        """Record partial failure without aborting validator."""
+    def _mark_partial(self, step: str) -> None:
+        """Record a partial failure for fail-open debug runs."""
         self.partial = True
         self.failed_steps.append(step)
-        logger.warning("[flight_recorder] validator hook %s failed: %s", step, exc)
+
+    def _on_failure(
+        self,
+        step: str,
+        exc: BaseException,
+        *,
+        artifact_path: Path | None = None,
+    ) -> None:
+        """Apply configured fail-fast or fail-open policy."""
+        handle_recorder_failure(
+            role="validator",
+            step=step,
+            exc=exc,
+            config=self.config,
+            mark_partial=lambda: self._mark_partial(step),
+            artifact_path=artifact_path,
+        )
 
     def begin_cycle(self, *, n_alerts: int, n_pending: int) -> None:
         """Allocate validator cycle directories."""
@@ -91,6 +108,7 @@ class ValidatorCycleRecorder:
                 sub["decisions"],
             )
             manifest = {
+                **cycle_policy_fields(self.config),
                 "role": "validator",
                 "started_at_utc": datetime.now(timezone.utc).isoformat(),
                 "hostname": socket.gethostname(),
@@ -105,7 +123,7 @@ class ValidatorCycleRecorder:
                 encoding="utf-8",
             )
         except Exception as exc:
-            self._fail_open("begin_cycle", exc)
+            self._on_failure("begin_cycle", exc, artifact_path=self.cycle_dir)
 
     def capture_pending_alerts(self, pending: pd.DataFrame) -> None:
         """Write pending alerts consumed this cycle."""
@@ -115,13 +133,13 @@ class ValidatorCycleRecorder:
             out = self.alerts_dir / "pending_alerts.parquet"
             write_parquet_safe(out, pending)
         except Exception as exc:
-            self._fail_open("capture_pending_alerts", exc)
+            self._on_failure("capture_pending_alerts", exc, artifact_path=self.alerts_dir)
 
     def capture_canonical_fetch(
         self,
         raw_frames: list[pd.DataFrame],
         *,
-        n_players: int,
+        player_ids: list[int],
         fetch_start: datetime,
         fetch_end: datetime,
     ) -> None:
@@ -135,7 +153,7 @@ class ValidatorCycleRecorder:
                 else pd.DataFrame()
             )
             meta = build_validator_canonical_query_record(
-                n_players=n_players,
+                player_ids=player_ids,
                 start=fetch_start,
                 end=fetch_end,
             )
@@ -159,13 +177,13 @@ class ValidatorCycleRecorder:
                     t0_final_parquet=rel_t0,
                 )
         except Exception as exc:
-            self._fail_open("capture_canonical_fetch", exc)
+            self._on_failure("capture_canonical_fetch", exc, artifact_path=self.ch_dir)
 
     def capture_bet_id_lookup(
         self,
         raw_frames: list[pd.DataFrame],
         *,
-        n_bet_ids: int,
+        bet_ids: list[int],
     ) -> None:
         """Store no-bet ``bet_id`` lookup query + raw rows."""
         if not self.enabled or self.ch_dir is None:
@@ -176,15 +194,28 @@ class ValidatorCycleRecorder:
                 if raw_frames
                 else pd.DataFrame()
             )
-            meta = build_validator_bet_id_query_record(n_bet_ids=n_bet_ids)
+            meta = build_validator_bet_id_query_record(bet_ids=bet_ids)
             save_clickhouse_capture(
                 self.ch_dir,
                 "validator_no_bet_bet_id_lookup",
                 merged,
                 meta,
             )
+            if self.config.capture_ch_diagnostic_requery and self.cycle_dir is not None:
+                from trainer_hightier.serving.flight_recorder.window_registry import register_window
+
+                rel_t0 = (
+                    self.ch_dir / "validator_no_bet_bet_id_lookup.final.parquet"
+                ).relative_to(self.recording.root).as_posix()
+                register_window(
+                    self.recording.root,
+                    source=f"{self.cycle_dir.relative_to(self.recording.root).as_posix()}/clickhouse",
+                    fetch=str(meta.get("fetch", "fetch_bet_payout_times_by_bet_ids")),
+                    query_meta=meta,
+                    t0_final_parquet=rel_t0,
+                )
         except Exception as exc:
-            self._fail_open("capture_bet_id_lookup", exc)
+            self._on_failure("capture_bet_id_lookup", exc, artifact_path=self.ch_dir)
 
     def record_decision(self, res: dict[str, Any]) -> None:
         """Append one alert decision (including PENDING) to in-memory trace."""
@@ -230,7 +261,7 @@ class ValidatorCycleRecorder:
             if self.partial:
                 self.recording.partial = True
         except Exception as exc:
-            self._fail_open("finish_cycle", exc)
+            self._on_failure("finish_cycle", exc, artifact_path=self.cycle_dir)
 
 
 def on_validate_begin(*, n_alerts: int, n_pending: int, pending: pd.DataFrame) -> None:
@@ -245,7 +276,7 @@ def on_validate_begin(*, n_alerts: int, n_pending: int, pending: pd.DataFrame) -
 def on_canonical_fetch(
     raw_frames: list[pd.DataFrame],
     *,
-    n_players: int,
+    player_ids: list[int],
     fetch_start: datetime,
     fetch_end: datetime,
 ) -> None:
@@ -255,18 +286,18 @@ def on_canonical_fetch(
         return
     rec.capture_canonical_fetch(
         raw_frames,
-        n_players=n_players,
+        player_ids=player_ids,
         fetch_start=fetch_start,
         fetch_end=fetch_end,
     )
 
 
-def on_bet_id_lookup(raw_frames: list[pd.DataFrame], *, n_bet_ids: int) -> None:
+def on_bet_id_lookup(raw_frames: list[pd.DataFrame], *, bet_ids: list[int]) -> None:
     """Hook after no-bet ``bet_id`` lookup."""
     rec = get_active_validator_recorder()
     if rec is None:
         return
-    rec.capture_bet_id_lookup(raw_frames, n_bet_ids=n_bet_ids)
+    rec.capture_bet_id_lookup(raw_frames, bet_ids=bet_ids)
 
 
 def on_alert_decision(res: dict[str, Any]) -> None:

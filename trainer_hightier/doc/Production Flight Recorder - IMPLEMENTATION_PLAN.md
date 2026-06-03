@@ -31,6 +31,7 @@ The recorder must answer, with evidence:
 - Diagnostic superset: record additional ClickHouse, Feast, and stage artifacts beyond the production path when they help explain hazards.
 - Row-level evidence: aggregate warnings are insufficient. Every scored row and alert must be traceable through source rows, stage outputs, model matrix, score, and validation.
 - Replayable offline: the shipped bundle must support both direct Parquet/JSON analysis and local replay using the captured bundle code and artifacts.
+- Fail-fast in production: when production flight recording is enabled, recorder failures are production failures. The deploy process must halt instead of continuing with incomplete evidence.
 - No credentials in artifacts: store connection aliases, query metadata, permission results, and credential fingerprints only.
 
 ## Current Runtime Facts
@@ -67,6 +68,8 @@ Implement three cooperating components:
 
 The components can be deployed together or separately. For incident investigations, run both `live_recorder` and `ch_time_machine` on the deploy machine.
 
+Production deploys that enable `live_recorder` must use fail-fast mode by default. A run that cannot write required recording artifacts is not considered a valid production evidence run, because continuing would create a false sense of auditability. Fail-open behavior is allowed only for explicit local development or debug runs and must be visible in config, logs, and cycle manifests.
+
 ## Component 1: Live Recorder
 
 ### Responsibilities
@@ -98,6 +101,19 @@ The recorder should integrate around existing functions rather than reimplementi
 - Validator `fetch_bets_by_canonical_id`.
 - Validator no-bet retry lookup by `bet_id`.
 - Validator final decision write.
+
+### Failure Semantics
+
+The production recorder is part of the serving correctness contract when `--record-production-flight` is enabled:
+
+- Default mode is `fail_fast=true`.
+- Any required recorder write failure, manifest validation failure, redaction failure, query-manifest contract failure, or recording-root initialization failure must raise and stop the deploy process.
+- Scorer and validator hooks must not silently mark `recorder_partial=true` and continue in production fail-fast mode.
+- `recorder_partial=true` is reserved for explicit fail-open debug runs, and those runs are not acceptable as production evidence.
+- Failure logs must include the recorder step name, target artifact path when available, and exception class/message.
+- Shutdown should prefer a clear fatal exit over attempting to keep scorer, validator, or API threads alive without recording.
+
+The intent is deliberately strict: if recording is enabled to investigate production behavior, missing evidence is itself a blocking defect.
 
 ### Scorer Stage Artifacts
 
@@ -146,6 +162,25 @@ cycles/scorer/cycle_000001/
 - Query ids when available.
 - All SQL text and parameters, with secrets redacted.
 
+### Query Manifest Contract
+
+ClickHouse query manifests are replay contracts, not human-only summaries. Any manifest registered for time-machine requery must contain enough information for a later standalone process to reproduce the same logical query without access to in-memory scorer or validator state.
+
+Every registered ClickHouse window must include:
+
+- `fetch`: stable fetch type, for example `fetch_bets_incremental`, `fetch_bet_pool_window`, or `fetch_bets_by_canonical_id`.
+- `source_table` and `result_table`: usually `t_bet`, but explicit for future `t_session` / `t_game` captures.
+- `business_key`: the key used for diffing this result set.
+- `requeryable`: boolean.
+- `skip_reason`: required when `requeryable = false`.
+- `sql_final`: executable ClickHouse SQL for the production-exact `FINAL` query.
+- `sql_non_final`: executable ClickHouse SQL for diagnostic non-`FINAL`, or an explicit reason why non-`FINAL` is not meaningful.
+- `parameters`: complete parameter values needed by both SQL variants, with secrets redacted.
+- `external_inputs`: serialized non-secret inputs needed to reproduce the query, such as allowlist player ids.
+- `t0_final_parquet`: relative path to the production-exact t0 result.
+
+The recorder must never register pseudo SQL such as `SELECT ...` or SQL that depends on an in-memory external table without also storing the external input payload. If a query cannot be made replayable in the first implementation, it must be registered with `requeryable = false` and a concrete `skip_reason`; the time machine must then write a skipped-capture report instead of attempting execution.
+
 ### Feature Provenance
 
 For each scored row and each model feature, record:
@@ -192,6 +227,54 @@ T0 + 72h
 
 The schedule should be configurable, but these defaults should be used for incident capture.
 
+### Window Registry Contract
+
+The shared `ch_time_machine/windows.json` registry is generated at runtime by the live recorder. It is not shipped in the deploy bundle. It coordinates which t0 captures should be rechecked by the time-machine process.
+
+Each registry entry must be self-describing and must not require code-specific guesses to decide whether it can run:
+
+```json
+{
+  "window_id": "window_000001",
+  "source": "cycles/scorer/cycle_000001/clickhouse",
+  "fetch": "fetch_bets_incremental",
+  "registered_at_utc": "...",
+  "query_meta": {
+    "requeryable": true,
+    "business_key": ["bet_id"],
+    "sql_final": "SELECT ... FROM db.t_bet FINAL ...",
+    "sql_non_final": "SELECT ... FROM db.t_bet ...",
+    "parameters": {},
+    "external_inputs": {}
+  },
+  "t0_final_parquet": "...",
+  "captures": {"t0": true}
+}
+```
+
+If `requeryable = false`, `query_meta.skip_reason` is required. Examples:
+
+- `allowlist_external_input_missing_payload`
+- `placeholder_sql_not_executable`
+- `business_key_not_defined`
+- `unsupported_fetch_type`
+
+The time machine must use this explicit contract. It must not infer replayability from `fetch` names alone, and it must not attempt to execute windows marked non-requeryable.
+
+### Fetch-Specific Requery Contracts
+
+The first production-ready implementation must support these contracts:
+
+| Fetch | Required result columns | Business key | Replay requirement |
+|-------|-------------------------|--------------|--------------------|
+| `fetch_bets_incremental` global | `bet_id`, `player_id`, `game_id`, `payout_complete_dtm`, `__etl_insert_Dtm`, CDC/version columns where available | `["bet_id"]` | Store executable `FINAL` and non-`FINAL` SQL plus all scalar parameters. |
+| `fetch_bets_incremental` allowlist | same as global | `["bet_id"]` | Store the exact allowlist player ids used by the production query, or store a replayable equivalent `IN (...)` / temporary-table payload. Storing only `allowlist_size` is invalid. |
+| `fetch_bet_pool_window` | same t_bet row contract as production pool fetch | `["bet_id"]` | Store full executable SQL. Placeholder SQL such as `SELECT bet_id, ...` is invalid. Store the actual player ids or a replayable equivalent. |
+| `fetch_bets_by_canonical_id` | `bet_id`, `player_id`, `payout_complete_dtm`, validation-relevant columns | `["bet_id"]` unless explicitly changed | If validator semantics only need player/time rows, define a composite key such as `["player_id", "payout_complete_dtm"]`; otherwise include `bet_id`. |
+| `fetch_bet_payout_times_by_bet_ids` | `bet_id`, `player_id`, `payout_complete_dtm` | `["bet_id"]` | Store the exact bet ids or mark non-requeryable. |
+
+Any future `t_session` or `t_game` windows must define their own business key before registration. A window with no business key is not eligible for diffing.
+
 ### Tables and Windows
 
 Record diagnostic extracts for:
@@ -215,15 +298,19 @@ For each relevant ClickHouse query, capture both:
 - Production-exact `FINAL` result.
 - Diagnostic non-`FINAL` result.
 
+The non-`FINAL` SQL must be produced from the same replay contract as the `FINAL` SQL. It is not enough to remove the word `FINAL` from arbitrary stored text if the stored text is not executable.
+
 Compare:
 
 - Row count.
-- Business key count.
+- Business key count, using the per-window `business_key`.
 - Duplicate business key count.
 - Added / removed / changed business keys.
 - Latest-row selection by version columns.
 - Per-column hashes.
 - Schema fingerprints.
+
+The diff engine must read the business key from the window registry. It must not hard-code `bet_id` for every window. If either t0 or recaptured results do not contain the declared business key columns, the time machine must write a structured `business_key_missing` report and mark the capture as partial rather than raising an unhandled exception.
 
 ### Late Arrival and Mutation Reports
 
@@ -397,6 +484,8 @@ Avoid environment-variable-only behavior. Provide a Python or YAML config file i
 Recommended config fields:
 
 - recording enabled / disabled
+- fail-fast mode (`fail_fast`, default `true` for deploy `--record-production-flight`)
+- optional fail-open mode for local/debug only (`fail_fast=false`, must mark all manifests as non-production evidence)
 - recording root directory
 - capture scorer stages
 - capture validator stages
@@ -449,22 +538,37 @@ python main.py --bundle-dir /path/to/deploy_bundle --mode all --record-productio
 ### Unit Tests
 
 - Query manifest serialization redacts secrets.
+- Query manifest serialization rejects pseudo SQL such as `SELECT ...`.
+- Every registered requeryable window has `business_key`, executable `sql_final`, executable `sql_non_final` or an explicit non-`FINAL` skip reason, complete parameters, and required external inputs.
+- Allowlist incremental manifests include exact allowlist player ids or an equivalent replayable payload; `allowlist_size` alone is insufficient.
+- Pool-window manifests include full production-equivalent SQL and actual player ids; placeholder SQL is invalid.
+- Validator canonical manifests either include `bet_id` or declare a composite business key and have matching diff tests.
 - Stable row fingerprints are deterministic under row ordering differences.
-- `FINAL` vs non-`FINAL` diff logic detects duplicate keys and changed values.
+- `FINAL` vs non-`FINAL` diff logic detects duplicate keys and changed values using the per-window business key.
+- Non-requeryable windows are skipped with a structured report and do not count as capture failures.
 - Feature provenance writer handles nulls, decimals, timestamps, and categorical values.
 - Replay analyzer detects score mismatches and attributes them to feature matrix differences.
+- Fail-fast recorder mode raises on required artifact write failures and does not emit a successful/partial production cycle.
+- Fail-open debug mode may mark `recorder_partial=true`, but the manifest must be clearly non-production evidence.
 
 ### Integration Tests
 
 - Run recorder against local cleaned Parquet / mocked ClickHouse client.
 - Run scorer shadow mode for a tiny fixture and verify all expected stage artifacts exist.
 - Run validator shadow capture for a fixture alert and verify ground-truth query output is captured.
+- Inject recorder filesystem failures in scorer and validator hooks and assert fail-fast deploy exits with a fatal error.
+- Run time machine against mocked ClickHouse for each supported fetch type and assert `windows.json -> rebuild_query_record -> execute_query -> diff` succeeds.
+- Run time machine against non-requeryable windows and assert skipped-capture reports are written without warnings.
 - Run replay analyzer and assert score/validator replay matches production fixture outputs.
 
 ### Production Dry Run
 
 - Deploy a model in non-serving / shadow-only mode.
 - Run recorder for at least one scorer cycle and one validator cycle.
+- Confirm production recording config has `fail_fast=true`, then simulate an unwritable recording root and verify deploy halts before continuing scorer cycles.
+- Inspect `ch_time_machine/windows.json` and confirm every requeryable window has executable SQL and a declared business key.
+- Run time machine once after the 15-minute schedule point and confirm at least one requeryable window writes `capture_t_plus_15m/` and `diffs/t0_vs_t_plus_15m.json`.
+- Confirm non-requeryable windows are reported as skipped with explicit reasons, not as capture failures.
 - Confirm the bundle can be opened locally and replayed without production credentials.
 
 ## Rollout Plan
@@ -478,9 +582,13 @@ python main.py --bundle-dir /path/to/deploy_bundle --mode all --record-productio
 
 ### Phase 2: ClickHouse Time Machine
 
+- Define and enforce the window registry replay contract.
+- Make each supported fetch type produce executable query manifests.
+- Store allowlist and player-id external inputs needed to replay production-equivalent queries.
 - Add repeated requery scheduler.
 - Add `FINAL` vs non-`FINAL` captures.
 - Add row/key/value diff reports.
+- Add skipped-capture reports for explicitly non-requeryable windows.
 - Add system table permission probes and optional metadata capture.
 
 ### Phase 3: Replay Analyzer
@@ -492,7 +600,7 @@ python main.py --bundle-dir /path/to/deploy_bundle --mode all --record-productio
 ### Phase 4: Deploy Integration
 
 - Add deploy CLI flags for shadow recording.
-- Add safe defaults and runbook.
+- Add fail-fast production defaults and runbook instructions for intentional debug-only fail-open runs.
 - Add debug bundle compatibility so `collect_debug_bundle.py` can include recording manifests when present.
 
 ## Risks and Mitigations
@@ -500,7 +608,10 @@ python main.py --bundle-dir /path/to/deploy_bundle --mode all --record-productio
 - High storage usage: accepted for investigation, but manifest every file with size/hash so partial bundles remain auditable.
 - Production ClickHouse load: configurable schedule and query scopes; default can be heavy for incident mode, but must be explicit.
 - Credential leakage: never persist credentials; redact SQL connection strings and environment-derived secrets.
+- Recorder failure while enabled: fail fast by default so serving does not continue without the evidence chain operators expected to capture.
 - Non-replayable environment: capture wheel, package freeze, model hash, registry hash, and runtime config.
+- Non-replayable query manifests: treat this as a blocking defect for any window marked `requeryable = true`; pseudo SQL, missing external inputs, and missing business keys must fail tests before release.
+- Misleading time-machine success: distinguish successful captures, skipped non-requeryable windows, partial captures, and failed captures in logs and reports.
 - Incomplete provenance for existing composite features: start with feature source layer and upstream feature ids; refine null reasons incrementally.
 - Validator drift during recording: record every validator cycle input/output and pending transitions, not only final results.
 

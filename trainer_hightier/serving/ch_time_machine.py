@@ -15,6 +15,7 @@ import pandas as pd
 from trainer_hightier.serving.flight_recorder.ch_requery import (
     execute_query,
     rebuild_query_record,
+    requery_skip_reason,
 )
 from trainer_hightier.serving.flight_recorder.config import (
     DEFAULT_CONFIG_REL,
@@ -110,6 +111,82 @@ def _capture_dir(recording_root: Path, window_id: str, label: str) -> Path:
     return recording_root / "ch_time_machine" / window_id / f"capture_{label}"
 
 
+def _base_readiness_summary(
+    recording_root: Path,
+    config: FlightRecorderConfig,
+) -> dict[str, Any]:
+    """Return common readiness fields for zero-capture diagnostics."""
+    registry_path = recording_root / "ch_time_machine" / "windows.json"
+    return {
+        "capture_ch_diagnostic_requery": bool(config.capture_ch_diagnostic_requery),
+        "recording_root": str(recording_root),
+        "registry_exists": registry_path.is_file(),
+        "windows": 0,
+        "pending_labels": 0,
+        "due_labels": 0,
+        "next_due_in_seconds": None,
+    }
+
+
+def _readiness_reason(*, pending_count: int, due_count: int) -> str:
+    """Classify pending capture state for operator logs."""
+    if due_count > 0:
+        return "due_captures_available"
+    if pending_count == 0:
+        return "no_pending_labels"
+    return "pending_not_due_yet"
+
+
+def _capture_readiness_counts(
+    recording_root: Path,
+    config: FlightRecorderConfig,
+    *,
+    now_ts: float,
+) -> dict[str, Any]:
+    """Count windows, pending labels, due labels, and next due delay."""
+    next_due_in: float | None = None
+    due_count = 0
+    pending_count = 0
+    windows = list_windows(recording_root)
+    for window in windows:
+        registered = datetime.fromisoformat(str(window["registered_at_utc"]).replace("Z", "+00:00"))
+        for label in pending_capture_labels(window, config.requery_schedule_minutes):
+            pending_count += 1
+            due_at = registered.timestamp() + _schedule_label_to_minutes(label) * 60
+            remaining = due_at - now_ts
+            if remaining <= 0:
+                due_count += 1
+            elif next_due_in is None or remaining < next_due_in:
+                next_due_in = remaining
+    return {
+        "windows": len(windows),
+        "pending_labels": pending_count,
+        "due_labels": due_count,
+        "next_due_in_seconds": None if next_due_in is None else int(max(0, next_due_in)),
+        "reason": _readiness_reason(pending_count=pending_count, due_count=due_count),
+    }
+
+
+def summarize_capture_readiness(
+    recording_root: Path,
+    config: FlightRecorderConfig,
+    *,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    """Summarize why a time-machine pass may have no due captures."""
+    registry_path = recording_root / "ch_time_machine" / "windows.json"
+    summary = _base_readiness_summary(recording_root, config)
+    if not config.capture_ch_diagnostic_requery:
+        summary["reason"] = "capture_ch_diagnostic_requery_disabled"
+        return summary
+    if not registry_path.is_file():
+        summary["reason"] = "window_registry_missing"
+        return summary
+    now = time.time() if now_ts is None else float(now_ts)
+    summary.update(_capture_readiness_counts(recording_root, config, now_ts=now))
+    return summary
+
+
 def run_window_capture(
     recording_root: Path,
     window: dict[str, Any],
@@ -130,23 +207,47 @@ def run_window_capture(
         "fetch": fetch,
         "query_meta": query_meta,
     }
+    skip_reason = requery_skip_reason(query_meta)
+    if skip_reason is not None:
+        manifest["requery_skipped"] = skip_reason
     (cap_dir / "query_manifest.json").write_text(
         json.dumps(manifest, indent=2, default=str),
         encoding="utf-8",
     )
+    if skip_reason is not None:
+        diffs_dir = cap_dir.parent / "diffs"
+        diffs_dir.mkdir(parents=True, exist_ok=True)
+        write_diff_report(
+            diffs_dir / f"t0_vs_{label}.json",
+            {
+                "skipped": True,
+                "skip_reason": skip_reason,
+                "capture_label": label,
+                "fetch": fetch,
+            },
+        )
+        mark_capture_done(recording_root, window_id, label)
+        logger.info(
+            "[ch_time_machine] skipped requery window=%s label=%s reason=%s",
+            window_id,
+            label,
+            skip_reason,
+        )
+        return
+    business_key = str(query_meta.get("business_key") or "bet_id")
     final_df = execute_query(query_meta, use_final=True)
     final_df.to_parquet(cap_dir / "t_bet.final.parquet", index=False)
     if include_non_final:
         non_final_df = execute_query(query_meta, use_final=False)
         non_final_df.to_parquet(cap_dir / "t_bet.non_final.parquet", index=False)
-        diff_ff = diff_dataframes(final_df, non_final_df, business_key="bet_id")
+        diff_ff = diff_dataframes(final_df, non_final_df, business_key=business_key)
         write_diff_report(cap_dir.parent / "diffs" / "final_vs_non_final.json", diff_ff)
     t0_path = window.get("t0_final_parquet")
     if t0_path:
         t0_file = recording_root / str(t0_path)
         if t0_file.is_file():
             t0_df = pd.read_parquet(t0_file)
-            diff_t0 = diff_dataframes(t0_df, final_df, business_key="bet_id")
+            diff_t0 = diff_dataframes(t0_df, final_df, business_key=business_key)
             write_diff_report(
                 cap_dir.parent / "diffs" / f"t0_vs_{label}.json",
                 diff_t0,
@@ -218,11 +319,23 @@ def main(argv: list[str] | None = None) -> int:
         probe_system_tables(bundle_dir, recording_root)
     if args.once:
         n = run_pending_captures(recording_root, config)
-        logger.info("[ch_time_machine] once pass completed captures=%d root=%s", n, recording_root)
+        if n == 0:
+            logger.info(
+                "[ch_time_machine] once pass completed captures=0 readiness=%s",
+                summarize_capture_readiness(recording_root, config),
+            )
+        else:
+            logger.info("[ch_time_machine] once pass completed captures=%d root=%s", n, recording_root)
         return 0
     while True:
         n = run_pending_captures(recording_root, config)
-        logger.info("[ch_time_machine] cycle captures=%d", n)
+        if n == 0:
+            logger.info(
+                "[ch_time_machine] cycle captures=0 readiness=%s",
+                summarize_capture_readiness(recording_root, config),
+            )
+        else:
+            logger.info("[ch_time_machine] cycle captures=%d", n)
         time.sleep(max(30, int(args.interval_seconds)))
     return 0
 

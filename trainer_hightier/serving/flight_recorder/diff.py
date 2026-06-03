@@ -41,10 +41,18 @@ def diff_dataframes(
 ) -> dict[str, Any]:
     """Compare *left* (baseline) vs *right* by *business_key*."""
     version_columns = tuple(version_columns or _DEFAULT_VERSION_COLS)
-    if business_key not in left.columns and business_key not in right.columns:
+    left_has = business_key in left.columns
+    right_has = business_key in right.columns
+    if not left_has or not right_has:
         return {
             "business_key": business_key,
-            "error": f"business_key {business_key!r} missing in both frames",
+            "error": "business_key_missing",
+            "left_has_key": left_has,
+            "right_has_key": right_has,
+            "left_rows": int(len(left)),
+            "right_rows": int(len(right)),
+            "left_columns": list(left.columns),
+            "right_columns": list(right.columns),
         }
     left = left.copy()
     right = right.copy()

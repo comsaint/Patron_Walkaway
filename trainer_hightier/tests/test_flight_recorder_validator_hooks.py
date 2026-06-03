@@ -40,7 +40,7 @@ def test_validator_cycle_recorder_writes_tree(tmp_path: Path) -> None:
     ch_df = pd.DataFrame(
         {"player_id": [1], "payout_complete_dtm": [now]},
     )
-    rec.capture_canonical_fetch([ch_df], n_players=1, fetch_start=now, fetch_end=now)
+    rec.capture_canonical_fetch([ch_df], player_ids=[1], fetch_start=now, fetch_end=now)
     rec.record_decision(
         {
             "bet_id": "101",

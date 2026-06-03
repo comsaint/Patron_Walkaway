@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from trainer_hightier.serving.flight_recorder.config import FlightRecorderConfig
 from trainer_hightier.serving.flight_recorder.manifest import RecordingRoot

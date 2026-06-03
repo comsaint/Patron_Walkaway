@@ -29,3 +29,13 @@ def test_diff_detects_added_removed_changed() -> None:
     assert report["changed_keys_count"] == 1
     assert report["added_keys_sample"] == ["3"]
     assert report["removed_keys_sample"] == ["1"]
+
+
+def test_diff_missing_business_key_does_not_raise() -> None:
+    """Empty requery frame (no columns) vs t0 with bet_id must not KeyError."""
+    left = pd.DataFrame({"bet_id": ["1"], "wager": [10.0]})
+    right = pd.DataFrame()
+    report = diff_dataframes(left, right, business_key="bet_id")
+    assert report["error"] == "business_key_missing"
+    assert report["left_has_key"] is True
+    assert report["right_has_key"] is False

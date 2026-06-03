@@ -97,6 +97,13 @@ def test_scorer_cycle_recorder_writes_tree(tmp_path: Path) -> None:
     ch_dir = rec.cycle_dir / "clickhouse"
     assert (ch_dir / "incremental_t_bet.final.parquet").is_file()
     assert (ch_dir / "incremental_t_bet.query.json").is_file()
+    inc_query = json.loads((ch_dir / "incremental_t_bet.query.json").read_text(encoding="utf-8"))
+    assert inc_query["requeryable"] is True
+    assert "..." not in inc_query["sql_final"]
+    assert inc_query["external_inputs"]["allowlist_player_ids"] == [10, 20]
+    pool_query = json.loads((ch_dir / "short_term_pool_t_bet.query.json").read_text(encoding="utf-8"))
+    assert pool_query["requeryable"] is True
+    assert "..." not in pool_query["sql_final"]
     assert (rec.cycle_dir / "stages" / "stage_05_staged_features.parquet").is_file()
     assert (rec.cycle_dir / "stages" / "stage_09_scores.parquet").is_file()
     assert (rec.cycle_dir / "audits" / "feature_missing_provenance.parquet").is_file()

@@ -1255,9 +1255,12 @@ def main(argv: list[str] | None = None) -> int:
             export_sqlite=True,
         )
         logging.info(
-            "[deploy] production flight recorder enabled root=%s model_version=%s",
+            "[deploy] production flight recorder enabled root=%s model_version=%s "
+            "fail_fast=%s evidence_grade=%s",
             rec_ctx.recording.root,
             rec_ctx.recording.model_version,
+            rec_ctx.config.fail_fast,
+            rec_ctx.config.evidence_grade,
         )
 
     if mode == "api":

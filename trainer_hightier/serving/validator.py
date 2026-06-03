@@ -805,7 +805,7 @@ def _fetch_bets_for_no_bet_rows(
             if _bid_capture is not None:
                 from trainer_hightier.serving.flight_recorder.validator_hooks import on_bet_id_lookup
 
-                on_bet_id_lookup(_bid_capture, n_bet_ids=len(unique_bids))
+                on_bet_id_lookup(_bid_capture, bet_ids=[int(x) for x in unique_bids])
             bet_id_hits = len(bid_map)
             for bid_str, (payout_hk, ch_pid) in bid_map.items():
                 alert_player_id = bet_to_alert_pid.get(bid_str)
@@ -2169,7 +2169,7 @@ def _validate_alerts_once(
             if ch_capture_frames is not None:
                 on_canonical_fetch(
                     ch_capture_frames,
-                    n_players=len(all_pids),
+                    player_ids=sorted(all_pids),
                     fetch_start=fetch_start,
                     fetch_end=fetch_end,
                 )

@@ -30,6 +30,7 @@
 - **Feast**：deploy 啟動時可跑 startup refresh；另有 post-startup Feast refresh supervisor（[`deploy/main.py`](../deploy/main.py)）。
 - **不打包 credentials**：只存 connection alias、query manifest、permission probe 結果、hash/fingerprint。
 - **可本機重播與分析**：bundle 含 package freeze、identity hashes、replay CLI；分析可不依賴 production 連線。
+- **Production fail-fast**：只要 `--record-production-flight` 啟用，recorder 寫入、manifest、redaction 或 query contract 失敗都要讓 deploy 停止；不允許 production 在缺證據鏈狀態下繼續跑。
 
 ### CDC / 業務鍵假設（recorder 必須遵守）
 
@@ -44,7 +45,8 @@
 - 不複製 scorer / validator 業務邏輯；只在既有函數邊界 **hook + 寫 artifact**，避免 drift。
 - 不把 recorder 行為塞進環境變數；使用 bundle 內 `recording_config.yaml`（或 Python dataclass + YAML loader）。
 - 每個寫入檔案登記 `MANIFEST.json`：`path`, `sha256`, `size_bytes`, `row_count`（若適用）。
-- Shadow mode 預設 **fail-open on recorder I/O**（記錄失敗不應停 scorer），但必須在 cycle manifest 標 `recorder_partial=true` 與失敗步驟。
+- Production recording 預設 **fail-fast**：`--record-production-flight` 啟用時，required artifact 寫入失敗、schema/manifest validation 失敗、redaction 失敗、query manifest contract 失敗，都必須 raise fatal error 並停止 deploy。
+- Fail-open 只允許在明確 debug/local config 下使用；必須在 logs 與 manifest 標 `recorder_partial=true`、`fail_fast=false`、`evidence_grade=debug_only`，不得作為 production incident evidence。
 - ClickHouse time-machine 與 live recorder **可並行 process**；透過 shared `recording_root` + window registry 協調。
 - 第一版允許大體積；不為 size 做抽樣省略（incident mode）。
 
@@ -130,6 +132,8 @@ flowchart TD
 | FR-P0-4 | SQL / env redaction | `serving/flight_recorder/redact.py` | FR-P0-2 | 單元測試：password、host、token 不出現在輸出 |
 | FR-P0-5 | SQLite export 輔助（reuse collect_debug_bundle 邏輯） | `serving/flight_recorder/state_export.py` | FR-P0-2 | 匯出 `state.db` / `prediction_log.db` / `feature_state.db` 至 recording root |
 | FR-P0-6 | `pack_flight_recording` CLI 骨架 | `serving/pack_flight_recording.py` | FR-P0-2 | 產 zip 或 tar；保留 `MANIFEST.json` |
+| FR-P0-7 | Query manifest / window registry schema | `serving/flight_recorder/ch_capture.py`, `serving/flight_recorder/window_registry.py` | FR-P0-2, FR-P0-4 | Schema 強制 `requeryable`, `business_key`, executable `sql_final`, `sql_non_final` 或 skip reason；禁止 pseudo SQL |
+| FR-P0-8 | Fail-fast / fail-open failure policy | `serving/flight_recorder/config.py`, `context.py`, hooks 共用 helper | FR-P0-1, FR-P0-2 | `fail_fast=true` 為 production default；required recorder failure 會 raise；debug fail-open manifest 標 `evidence_grade=debug_only` |
 
 **Iteration FR-A exit**：`pytest tests/test_flight_recorder_manifest.py tests/test_flight_recorder_redact.py` 綠；空 recording root 可初始化並寫 identity。
 
@@ -153,13 +157,16 @@ flowchart TD
 | ID | Task | Files | Dependencies | Definition of Done |
 |----|------|-------|--------------|-------------------|
 | FR-P1-1 | `RecorderContext` + cycle 目錄配置 | `serving/flight_recorder/context.py` | FR-P0-1 | 每 cycle 一個 `cycles/scorer/cycle_NNNNNN/` |
-| FR-P1-2 | 包裝 ClickHouse query：存 SQL+params+result Parquet | `serving/flight_recorder/ch_capture.py` | FR-P0-4, FR-P1-1 | 對 incremental + pool 各一份 manifest |
+| FR-P1-2 | 包裝 ClickHouse query：存 replayable SQL+params+external inputs+result Parquet | `serving/flight_recorder/ch_capture.py` | FR-P0-4, FR-P0-7, FR-P1-1 | incremental + pool manifest 都符合 query replay contract |
+| FR-P1-2a | Allowlist incremental replay payload | `ch_capture.py`, scorer hook allowlist plumbing | FR-P1-2 | `allowlist_external_input` 不得只存 `allowlist_size`；需存實際 player ids 或 mark `requeryable=false` |
+| FR-P1-2b | Pool window executable query manifest | `ch_capture.py` | FR-P1-2 | 不得出現 `SELECT ...` placeholder；需存完整 SQL 與實際 player ids |
 | FR-P1-3 | Stage snapshot hooks（00–09） | `serving/flight_recorder/scorer_hooks.py`, 修改 `scorer.py` | FR-P1-1 | 開關 `capture_scorer_stages`；關閉時零開銷路徑可測 |
 | FR-P1-4 | `feature_missing_provenance.parquet` | `serving/flight_recorder/provenance.py` | FR-P1-3 | 每 model feature：source layer、null reason、upstream ids |
 | FR-P1-5 | Cycle 結束寫 `row_counts.json` + score distribution | `scorer_hooks.py` | FR-P1-3 | 與 prediction_log 行數可對帳 |
-| FR-P1-6 | Shadow CLI：`production_flight_recorder --mode shadow` | `serving/production_flight_recorder.py` | FR-P1-1–P1-5 | 可 attach 到 deploy 行程（見 FR-P5） |
+| FR-P1-6 | Scorer hook fail-fast propagation | `scorer_hooks.py`, `context.py` | FR-P0-8, FR-P1-1–P1-5 | mock artifact write failure 時 scorer cycle 不繼續；error 含 step + path + exception |
+| FR-P1-7 | Shadow CLI：`production_flight_recorder --mode shadow` | `serving/production_flight_recorder.py` | FR-P1-1–P1-6 | 可 attach 到 deploy 行程（見 FR-P5） |
 
-**Iteration FR-B exit**：fixture 跑 1 個 scorer cycle → 目錄樹含 `clickhouse/`、`stages/stage_08_model_feature_matrix.parquet`、`audits/`；manifest 有 model_version hash。
+**Iteration FR-B exit**：fixture 跑 1 個 scorer cycle → 目錄樹含 `clickhouse/`、`stages/stage_08_model_feature_matrix.parquet`、`audits/`；manifest 有 model_version hash；`windows.json` 中 scorer windows 若 `requeryable=true`，必須可由 time-machine fixture 重放；注入 scorer recorder 寫入失敗時 production fail-fast 測試必須停止 cycle。
 
 ---
 
@@ -179,12 +186,13 @@ flowchart TD
 | ID | Task | Files | Dependencies | Definition of Done |
 |----|------|-------|--------------|-------------------|
 | FR-P2-1 | Validator cycle manifest | `serving/flight_recorder/validator_hooks.py` | FR-P0-1 | `cycles/validator/cycle_NNNNNN/` |
-| FR-P2-2 | 存 `fetch_bets_by_canonical_id` query + result | `validator_hooks.py` | FR-P0-4 | 與 production SQL 一致（`FINAL`） |
-| FR-P2-3 | 存 no-bet `bet_id` lookup query + result | `validator_hooks.py` | FR-P0-4 | 對照 `VALIDATOR_NO_BET_BET_ID_LOOKUP` 路徑 |
+| FR-P2-2 | 存 `fetch_bets_by_canonical_id` query + result | `validator_hooks.py` | FR-P0-4, FR-P0-7 | 與 production SQL 一致（`FINAL`）；manifest 有 `business_key`，若用 `bet_id` diff 必須 select `bet_id` |
+| FR-P2-3 | 存 no-bet `bet_id` lookup query + result | `validator_hooks.py` | FR-P0-4, FR-P0-7 | 對照 `VALIDATOR_NO_BET_BET_ID_LOOKUP` 路徑；存實際 bet ids 或 mark non-requeryable |
 | FR-P2-4 | Per-alert decision trace（含 PENDING） | `validator_hooks.py` | FR-P2-1 | 欄位含 `result`, `reason`, `gap_start`, `gap_minutes`, `validated_at` |
-| FR-P2-5 | Validator shadow 接入 `production_flight_recorder` | `production_flight_recorder.py` | FR-P2-1–P2-4 | 與 scorer 共用 recording root |
+| FR-P2-5 | Validator hook fail-fast propagation | `validator_hooks.py`, `context.py` | FR-P0-8, FR-P2-1–P2-4 | ground-truth / decision artifact 寫入失敗時 validator 不繼續產生未記錄 verdict |
+| FR-P2-6 | Validator shadow 接入 `production_flight_recorder` | `production_flight_recorder.py` | FR-P2-1–P2-5 | 與 scorer 共用 recording root |
 
-**Iteration FR-C exit**：fixture alert 跑一輪 validator → ground-truth Parquet 可重播 `validate_alert_row` 輸入。
+**Iteration FR-C exit**：fixture alert 跑一輪 validator → ground-truth Parquet 可重播 `validate_alert_row` 輸入；validator windows 的 business key 與輸出欄位一致；注入 validator recorder 寫入失敗時 production fail-fast 測試必須停止 validator cycle。
 
 ---
 
@@ -194,15 +202,18 @@ flowchart TD
 
 | ID | Task | Files | Dependencies | Definition of Done |
 |----|------|-------|--------------|-------------------|
-| FR-P3-1 | Window registry（由 scorer/validator cycle 註冊） | `serving/flight_recorder/window_registry.py` | FR-P1, FR-P2 | 每 window 有 stable `window_id` |
-| FR-P3-2 | Scheduled requery runner | `serving/ch_time_machine.py` | FR-P3-1, FR-P0-1 | 預設 schedule：0m, 15m, 1h, 6h, 24h, 72h |
-| FR-P3-3 | `FINAL` + non-`FINAL` 雙份 capture | `ch_time_machine.py` | FR-P3-2 | 每 capture 子目錄各一份 Parquet |
-| FR-P3-4 | Diff engine：key add/remove/change + column hash | `serving/flight_recorder/diff.py` | FR-P3-3 | 輸出 `diffs/t0_vs_t_plus_*.json` 等 |
-| FR-P3-5 | `t_session` / `t_game` context extracts | `ch_time_machine.py` | FR-P3-2 | session 用 validator dedup 政策；game 用 referenced `game_id` |
-| FR-P3-6 | System table permission probe | `ch_time_machine.py` | FR-P0-1 | 寫 `permissions/clickhouse_system_table_permissions.json` |
-| FR-P3-7 | Optional：attach `system.query_log` metadata | `ch_time_machine.py` | FR-P3-6 | 有權限則寫；無權限則記錄 failure |
+| FR-P3-1 | Window registry（由 scorer/validator cycle 註冊） | `serving/flight_recorder/window_registry.py` | FR-P0-7, FR-P1, FR-P2 | 每 window 有 stable `window_id`、`requeryable`、`business_key`、`skip_reason`（如不可重查） |
+| FR-P3-2 | Query rebuild contract | `serving/flight_recorder/ch_requery.py` | FR-P3-1 | `windows.json -> rebuild_query_record` 不靠 fetch-name guess；讀取 explicit replay contract |
+| FR-P3-3 | Scheduled requery runner | `serving/ch_time_machine.py` | FR-P3-1, FR-P3-2, FR-P0-1 | 預設 schedule：0m, 15m, 1h, 6h, 24h, 72h；0 capture 時輸出 readiness reason |
+| FR-P3-4 | `FINAL` + non-`FINAL` 雙份 capture | `ch_time_machine.py` | FR-P3-3 | 只對 `requeryable=true` window 執行；每 capture 子目錄各一份 Parquet |
+| FR-P3-5 | Non-requeryable skipped reports | `ch_time_machine.py` | FR-P3-3 | non-requeryable window 寫 skipped report，不記為 failure |
+| FR-P3-6 | Diff engine：per-window business key add/remove/change + column hash | `serving/flight_recorder/diff.py` | FR-P3-4 | 輸出 `diffs/t0_vs_t_plus_*.json`；不得 hard-code `bet_id` |
+| FR-P3-7 | Business-key validation report | `diff.py`, `ch_time_machine.py` | FR-P3-6 | key 欄位缺失時寫 structured `business_key_missing`，不拋未處理 exception |
+| FR-P3-8 | `t_session` / `t_game` context extracts | `ch_time_machine.py` | FR-P3-3 | session / game window 需先定義 business key；game 用 referenced `game_id` |
+| FR-P3-9 | System table permission probe | `ch_time_machine.py` | FR-P0-1 | 寫 `permissions/clickhouse_system_table_permissions.json` |
+| FR-P3-10 | Optional：attach `system.query_log` metadata | `ch_time_machine.py` | FR-P3-9 | 有權限則寫；無權限則記錄 failure |
 
-**Iteration FR-D exit**：fixture 兩份 `t_bet` Parquet（模擬 late row）→ diff 報告顯示 added keys + version 欄位變化。
+**Iteration FR-D exit**：fixture registry 覆蓋 supported fetch types 與 non-requeryable windows → `windows.json -> rebuild_query_record -> execute_query -> diff` 綠；模擬 late row 的 diff 報告顯示 added keys + version 欄位變化；不可重查 window 有 skipped report 且沒有 warning。
 
 ---
 
@@ -229,10 +240,11 @@ flowchart TD
 
 | ID | Task | Files | Dependencies | Definition of Done |
 |----|------|-------|--------------|-------------------|
-| FR-P5-1 | `deploy/main.py` 增加 `--record-production-flight` | [`deploy/main.py`](../deploy/main.py) | FR-P1-6, FR-P2-5 | 與 `mode=all` 相容；預設關閉 |
-| FR-P5-2 | Runbook：新模型 deploy + recording | `doc/Production Flight Recorder - RUNBOOK.md`（新建） | FR-P5-1 | 含雙 process、建議錄製時長、pack 指令 |
-| FR-P5-3 | `collect_debug_bundle.py` 可選納入 recording manifest | [`collect_debug_bundle.py`](../serving/collect_debug_bundle.py) | FR-P0-6 | zip 內有 `flight_recording/MANIFEST.json` 指標 |
-| FR-P5-4 | Production dry-run checklist | RUNBOOK + 本文件 §驗收 | FR-P1–P4 | 至少 1 scorer + 1 validator cycle；本機 replay 成功 |
+| FR-P5-1 | `deploy/main.py` 增加 `--record-production-flight` | [`deploy/main.py`](../deploy/main.py) | FR-P1-7, FR-P2-6 | 與 `mode=all` 相容；預設關閉 |
+| FR-P5-2 | Deploy fail-fast default wiring | [`deploy/main.py`](../deploy/main.py), `serving/flight_recorder/attach.py` | FR-P0-8, FR-P5-1 | `--record-production-flight` 預設 `fail_fast=true`；recording root 不可寫時 deploy 立即退出 |
+| FR-P5-3 | Runbook：新模型 deploy + recording | `doc/Production Flight Recorder - RUNBOOK.md`（新建） | FR-P5-1, FR-P5-2 | 含雙 process、建議錄製時長、pack 指令、fail-fast 故障處理 |
+| FR-P5-4 | `collect_debug_bundle.py` 可選納入 recording manifest | [`collect_debug_bundle.py`](../serving/collect_debug_bundle.py) | FR-P0-6 | zip 內有 `flight_recording/MANIFEST.json` 指標 |
+| FR-P5-5 | Production dry-run checklist | RUNBOOK + 本文件 §驗收 | FR-P1–P4, FR-P5-2 | 至少 1 scorer + 1 validator cycle；本機 replay 成功；fail-fast 故障演練完成 |
 
 ### Production 使用摘要（新模型 deploy）
 
@@ -255,6 +267,25 @@ python -m trainer_hightier.serving.ch_time_machine \
 - **最短**：覆蓋 scoring 活躍期 + validator horizon（45–60 分鐘）+ 2–4 小時 buffer。
 - **查 late arrival**：至少 **24–72 小時** 保持 time-machine 運行。
 - **Incident 深度調查**：2–3 天（size 不限制時）。
+
+time-machine dry-run 最低檢查：
+
+```bash
+python -m trainer_hightier.serving.ch_time_machine \
+  --bundle-dir . \
+  --recording-root local_state/flight_recording \
+  --config local_state/flight_recording_config.yaml \
+  --once
+```
+
+驗收 log 必須能區分：
+
+- successful captures
+- skipped non-requeryable windows with explicit `skip_reason`
+- partial captures（例如 business key missing）
+- failed captures
+
+`captures=0` 必須附 readiness reason（例如 no registry、pending not due、no pending labels），不能只印裸數字。
 
 打包：
 
@@ -279,14 +310,20 @@ python -m trainer_hightier.serving.replay_recording_bundle \
 | 層級 | 範圍 |
 |------|------|
 | Unit | redaction、manifest、fingerprint、diff、provenance serialization |
-| Integration | mock CH + 小 fixture：1 scorer cycle + 1 validator cycle + replay |
-| Production dry-run | 真實 deploy bundle + CH credentials；不打包 secret；驗證 pack/replay |
+| Unit | query manifest schema：拒絕 pseudo SQL、`allowlist_size` only、缺 business key |
+| Unit | fail-fast policy：required artifact 寫入失敗會 raise；debug fail-open 只產生 `evidence_grade=debug_only` |
+| Integration | mock CH + 小 fixture：1 scorer cycle + 1 validator cycle + time-machine replay + replay analyzer |
+| Integration | scorer / validator hook 注入 recorder failure；production fail-fast 必須停止流程 |
+| Production dry-run | 真實 deploy bundle + CH credentials；不打包 secret；驗證 pack/replay；檢查 `windows.json` 可重放契約 |
+| Production dry-run | recording root 不可寫或 manifest validation 失敗時，deploy 必須 fail before continuing scorer cycles |
 
 建議新增測試檔：
 
 - `tests/test_flight_recorder_manifest.py`
 - `tests/test_flight_recorder_redact.py`
 - `tests/test_flight_recorder_diff.py`
+- `tests/test_flight_recorder_query_manifest.py`
+- `tests/test_ch_time_machine_replay_contract.py`
 - `tests/test_flight_recorder_scorer_hooks.py`（mock）
 - `tests/test_flight_recorder_replay.py`（fixture bundle）
 
@@ -299,9 +336,9 @@ python -m trainer_hightier.serving.replay_recording_bundle \
 - [ ] FR-P0：config + manifest + identity + pack CLI 可用。
 - [ ] FR-P1：至少 1 個真實或整合測試 scorer cycle 產出完整 `cycles/scorer/` 樹。
 - [ ] FR-P2：至少 1 個 validator cycle 產出 ground-truth + decision trace。
-- [ ] FR-P3：time-machine 對同一 window 產出 `t0_vs_t_plus_*` diff。
+- [ ] FR-P3：time-machine 對 requeryable window 產出 `t0_vs_t_plus_*` diff；non-requeryable window 產出 skipped report；不得有 pseudo SQL 或 hard-coded `bet_id` 假設。
 - [ ] FR-P4：replay 產出 `score_replay_diff_report.json` 與 `validator_replay_diff_report.json`。
-- [ ] FR-P5：RUNBOOK 與 `--record-production-flight` 文件化；dry-run 檢查表完成一次。
+- [ ] FR-P5：RUNBOOK 與 `--record-production-flight` 文件化；dry-run 檢查表完成一次；production fail-fast 故障演練通過。
 - [ ] 全程 **無 credentials** 寫入 recording root（自動掃描測試）。
 
 ### 建議本機驗收命令（實作完成後）
@@ -311,6 +348,8 @@ export PYTHONUTF8=1
 pytest tests/test_flight_recorder_manifest.py \
   tests/test_flight_recorder_redact.py \
   tests/test_flight_recorder_diff.py \
+  tests/test_flight_recorder_query_manifest.py \
+  tests/test_ch_time_machine_replay_contract.py \
   tests/test_flight_recorder_scorer_hooks.py \
   tests/test_flight_recorder_replay.py -q
 ```
@@ -321,10 +360,14 @@ pytest tests/test_flight_recorder_manifest.py \
 
 | 風險 | 緩解 |
 |------|------|
-| Recorder I/O 拖慢 scorer | fail-open + 可關 `capture_scorer_stages`；磁碟寫入非同步或 batch flush（若需要） |
+| Recorder I/O 拖慢 scorer | production fail-fast 下視為部署風險；先用 dry-run 量測，必要時降低 capture 範圍或暫停 production recorder，不用 silent fail-open |
+| Recorder artifact 寫入失敗但 serving 繼續 | `fail_fast=true` 為 production default；required failure 直接 halt；fail-open 僅限 debug/local 並標 `evidence_grade=debug_only` |
 | CH 負載過高 | time-machine schedule 可調；incident 模式才開 full population baseline |
 | 磁碟爆滿 | manifest 逐檔 size；支援按日輪轉 recording root |
 | 無法讀 `system.*` | permission report 記錄失敗；不依賴 system tables 才能跑核心 replay |
+| Query manifest 不可重放 | `requeryable=true` 但缺 executable SQL、external inputs、business key 時視為 release-blocking；測試拒絕 pseudo SQL |
+| Time-machine 成功/略過/失敗混淆 | logs 與 diff reports 必須分開 successful、skipped、partial、failed；`captures=0` 必須有 readiness reason |
+| Allowlist external input 遺失 | registry 必須保存實際 allowlist ids 或 mark non-requeryable；只存 `allowlist_size` 禁止 release |
 | Composite feature null reason 不全 | 第一版記 source layer + upstream ids；迭代補 reason enum |
 | Validator PENDING 遺失 | FR-P2-4 強制記錄每輪 trace，不只 final row |
 
@@ -344,6 +387,8 @@ pytest tests/test_flight_recorder_manifest.py \
 | Full population baseline | **allowlist-exact path + 可選 full diagnostic window**（config 開關） |
 | `t_game` 預設範圍 | **僅 referenced `game_id`**；全 gaming_day slice 用 config 顯式開啟 |
 | 輸出 zip vs 目錄 | **目錄為主**；`pack_flight_recording` 產 zip |
+| Non-requeryable windows 是否登記 | **可以登記**，但必須 `requeryable=false` + `skip_reason`；time-machine 不得嘗試執行 |
+| Validator canonical window business key | **優先 include `bet_id`**；若 production verdict 只需 player/time，需明確宣告 composite key 並測試 diff |
 
 ## 與 Implementation Plan 的對照
 

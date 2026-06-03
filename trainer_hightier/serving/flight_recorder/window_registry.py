@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from trainer_hightier.serving.flight_recorder.ch_capture import finalize_query_manifest
+
 
 def _registry_path(recording_root: Path) -> Path:
     """Return path to ``ch_time_machine/windows.json``."""
@@ -45,7 +47,7 @@ def register_window(
         "source": source,
         "fetch": fetch,
         "registered_at_utc": datetime.now(timezone.utc).isoformat(),
-        "query_meta": query_meta,
+        "query_meta": finalize_query_manifest({**query_meta, "fetch": fetch}),
         "t0_final_parquet": t0_final_parquet,
         "captures": {"t0": True} if t0_final_parquet else {},
     }

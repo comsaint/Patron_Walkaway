@@ -12,6 +12,7 @@ from trainer_hightier.serving.flight_recorder.config import (
 )
 from trainer_hightier.serving.flight_recorder.context import RecorderContext
 from trainer_hightier.serving.flight_recorder.identity import capture_identity
+from trainer_hightier.serving.flight_recorder.failure import validate_recording_root_writable
 from trainer_hightier.serving.flight_recorder.state_export import export_state_databases
 
 
@@ -43,6 +44,8 @@ def init_recording_root(
 ) -> RecorderContext:
     """Create recording layout, identity snapshot, optional SQLite exports."""
     bundle_root = bundle_root.resolve()
+    recording_root = config.resolve_recording_root(bundle_root)
+    validate_recording_root_writable(recording_root, fail_fast=bool(config.fail_fast))
     rel = _load_rel_paths(bundle_root)
     model_version = _load_model_version(bundle_root, rel)
     if write_default_config:

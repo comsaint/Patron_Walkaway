@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from trainer_hightier.serving.flight_recorder.failure import (
+    EVIDENCE_GRADE_DEBUG_ONLY,
+    EVIDENCE_GRADE_PRODUCTION,
+)
 
 FLIGHT_RECORDER_SCHEMA_VERSION: str = "flight_recorder_v1"
 DEFAULT_RECORDING_ROOT_REL: str = "local_state/flight_recording"
@@ -18,6 +23,8 @@ class FlightRecorderConfig:
     """Recording behavior for production flight recorder."""
 
     enabled: bool = True
+    fail_fast: bool = True
+    evidence_grade: str = EVIDENCE_GRADE_PRODUCTION
     recording_root: str = DEFAULT_RECORDING_ROOT_REL
     capture_scorer_stages: bool = True
     capture_validator_stages: bool = True
@@ -54,8 +61,16 @@ class FlightRecorderConfig:
             schedule_tuple = tuple(int(x) for x in schedule)
         else:
             schedule_tuple = cls().requery_schedule_minutes
+        fail_fast = bool(data.get("fail_fast", True))
+        grade_raw = data.get("evidence_grade")
+        if grade_raw is not None and str(grade_raw).strip():
+            evidence_grade = str(grade_raw).strip()
+        else:
+            evidence_grade = EVIDENCE_GRADE_PRODUCTION if fail_fast else EVIDENCE_GRADE_DEBUG_ONLY
         return cls(
             enabled=bool(data.get("enabled", True)),
+            fail_fast=fail_fast,
+            evidence_grade=evidence_grade,
             recording_root=str(data.get("recording_root", DEFAULT_RECORDING_ROOT_REL)),
             capture_scorer_stages=bool(data.get("capture_scorer_stages", True)),
             capture_validator_stages=bool(data.get("capture_validator_stages", True)),
@@ -98,6 +113,8 @@ class FlightRecorderConfig:
         """Serialize config to a JSON/YAML-safe mapping (no secrets)."""
         return {
             "enabled": self.enabled,
+            "fail_fast": self.fail_fast,
+            "evidence_grade": self.evidence_grade,
             "recording_root": self.recording_root,
             "capture_scorer_stages": self.capture_scorer_stages,
             "capture_validator_stages": self.capture_validator_stages,

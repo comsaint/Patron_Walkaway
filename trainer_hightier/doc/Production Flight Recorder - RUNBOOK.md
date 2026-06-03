@@ -35,10 +35,23 @@
 
 首次啟用若無 YAML，執行 init 會寫入預設 `flight_recording_config.yaml`。
 
-### 建議設定片段
+### Fail-fast 政策（production 預設）
+
+當使用 `--record-production-flight` 時，**錄製失敗 = deploy 必須停止**。缺證據鏈的 production run 不可視為有效 incident evidence。
+
+| 設定 | 行為 |
+|------|------|
+| `fail_fast: true`（**預設**） | 任一 required recorder 寫入 / manifest / query contract 失敗 → raise `FlightRecorderFatalError`，scorer / validator 不繼續 |
+| `fail_fast: false` | 僅供 **本機除錯**；允許繼續 serving，但必須標 `evidence_grade: debug_only`，**不得**當 production 證據 |
+
+每個 `cycle_manifest.json` 會寫入 `fail_fast` 與 `evidence_grade`，方便事後辨識是否為 production-grade 錄製。
+
+### 建議設定片段（production）
 
 ```yaml
 enabled: true
+fail_fast: true
+evidence_grade: production
 recording_root: local_state/flight_recording
 capture_scorer_stages: true
 capture_validator_stages: true
@@ -46,6 +59,13 @@ capture_ch_diagnostic_requery: true
 requery_schedule_minutes: [0, 15, 60, 360, 1440, 4320]
 include_non_final_diagnostics: true
 include_system_table_probes: true
+```
+
+本機除錯（**非 production evidence**）：
+
+```yaml
+fail_fast: false
+evidence_grade: debug_only
 ```
 
 關閉錄製：設 `enabled: false` 或不要傳 `--record-production-flight`。
@@ -65,9 +85,17 @@ python main.py --bundle-dir . --mode all \
 
 效果：
 
+- 驗證 `recording_root` 可寫（`fail_fast=true` 時失敗會立即退出）
 - 初始化 `local_state/flight_recording/`（identity、manifest、可選 SQLite 匯出）
 - Attach **scorer + validator** shadow recorders（依 YAML 的 `capture_*` 開關）
 - 照常啟動 API / validator thread / scorer foreground
+- 任一 required recorder 步驟失敗時，process 會以 fatal error 結束（不會 silent `recorder_partial` 後繼續）
+
+啟動 log 應包含：
+
+```text
+[deploy] production flight recorder enabled root=... fail_fast=True evidence_grade=production
+```
 
 ### 替代：僅 init / shadow attach（除錯）
 
@@ -78,7 +106,7 @@ python -m trainer_hightier.serving.production_flight_recorder \
   --config local_state/flight_recording_config.yaml
 ```
 
-再手動啟動 `main.py`（需同一 process 才保留 attach；**生產環境請用 `--record-production-flight`**）。
+再手動啟動 `main.py`（需同一 process 才保留 attach；**生產 incident 錄製請用 `--record-production-flight` 且 `fail_fast: true`**）。
 
 ## Terminal 2：ClickHouse time machine
 
@@ -100,7 +128,7 @@ python -m trainer_hightier.serving.ch_time_machine \
   --recording-root local_state/flight_recording
 ```
 
-**限制（第一版）**：allowlist `external_input` JOIN 查詢暫不重查（僅記錄 t0 Parquet）；global / validator canonical 路徑可重查。
+**注意**：`windows.json` 中 `requeryable=true` 的 window 才會執行重查；舊版 pseudo SQL / 缺 external inputs 的 window 會寫 skipped report。新版 recorder 會存完整 allowlist player ids 與 pool SQL。
 
 ## 建議錄製時長
 
@@ -153,11 +181,13 @@ python -m trainer_hightier.serving.replay_recording_bundle \
 
 在正式 incident 錄製前，可於 **staging bundle** 跑一輪：
 
-- [ ] `flight_recording_config.yaml` 存在且 `enabled: true`
-- [ ] `python main.py ... --record-production-flight` 啟動無錯
+- [ ] `flight_recording_config.yaml` 存在且 `enabled: true`、`fail_fast: true`
+- [ ] `python main.py ... --record-production-flight` 啟動無錯，log 顯示 `fail_fast=True`
 - [ ] 至少產生 `cycles/scorer/cycle_000001/`（含 `clickhouse/`、`stages/stage_08_*.parquet`）
 - [ ] 至少產生 `cycles/validator/cycle_000001/`（含 `decisions/decision_trace.parquet`）
-- [ ] `MANIFEST.json` 中 `recorder_partial` 為 false（或已知失敗步驟可接受）
+- [ ] `cycle_manifest.json` 中 `fail_fast=true`、`evidence_grade=production`
+- [ ] `MANIFEST.json` 中 `recorder_partial` 為 false
+- [ ] **故障演練**：將 `recording_root` 設為不可寫目錄，確認 deploy **啟動即失敗**（fail-fast init）
 - [ ] `replay_recording_bundle --full-analysis` 在測試機成功
 - [ ] debug zip 內可選看到 `flight_recording/MANIFEST.json` 指標
 - [ ] 確認錄製根目錄 **無** password / connection string（僅 redacted query）
@@ -166,18 +196,22 @@ python -m trainer_hightier.serving.replay_recording_bundle \
 
 | 現象 | 處置 |
 |------|------|
+| deploy 啟動即退出，`FlightRecorderFatalError` | `fail_fast=true` 且 recording root 不可寫、磁碟滿、或權限不足；修正路徑/磁碟後重啟 |
+| scorer / validator 中途 crash，`flight recorder ... failed` | production fail-fast：查 log 中 step 名與 `path=`；修正 Parquet/磁碟問題後重啟 deploy |
 | 無 `cycles/scorer/` | 確認 `--record-production-flight` 與 `capture_scorer_stages: true`；scorer 是否有增量 bet |
 | 無 `cycles/validator/` | 確認 `capture_validator_stages: true`；是否有 pending alert 過 freshness |
-| `recorder_partial: true` | 查 deploy log 中 `[flight_recorder]` warning；磁碟滿或 Parquet 寫入失敗 |
+| `recorder_partial: true` 且 `evidence_grade=debug_only` | 預期行為：為 fail-open 除錯 run，**不可**當 production 證據 |
+| `recorder_partial: true` 但 `evidence_grade=production` | 不應在 `fail_fast=true` 出現；若出現代表舊版或設定不一致，視為無效錄製 |
 | Score replay 缺報告 | 需 `--model-bundle-dir` 指向含 `model.pkl` 的目錄 |
 | Validator replay 0 compared | 無 decision trace 或 pending 與 trace 的 `bet_id` 對不上 |
-| Time-machine 無 diff | window 尚未到期（見 `registered_at_utc` + schedule）；或 allowlist external 路徑 |
+| Time-machine 無 diff | window 尚未到期；或 `requeryable=false`（見 skipped report） |
+| Time-machine `captures=0` | 看 log 的 `readiness=`：registry 缺失、pending 未到期、或 requery 關閉 |
 
 ## 安全與合規
 
 - 錄製 bundle **不得**含 ClickHouse 帳密；僅 connection alias、redacted SQL、permission probe 結果。
 - 第一版 **不抽樣**；請監控 `local_state/flight_recording` 磁碟。
-- Recorder I/O 為 **fail-open**：寫入失敗不應停止 scorer，但會標 `recorder_partial`。
+- Production 錄製為 **fail-fast**：寫入失敗會停止 deploy，避免在缺證據狀態下繼續 serving。
 
 ## 相關指令速查
 
@@ -189,5 +223,5 @@ python -m trainer_hightier.serving.production_flight_recorder --bundle-dir . --m
 python -m trainer_hightier.serving.collect_debug_bundle --bundle-dir .
 
 # 單元測試（開發機）
-pytest trainer_hightier/tests/test_flight_recorder_*.py -q
+pytest trainer_hightier/tests/test_flight_recorder_*.py trainer_hightier/tests/test_flight_recorder_fail_fast.py -q
 ```
