@@ -25,6 +25,7 @@ from trainer_hightier.serving.flight_recorder.config import FlightRecorderConfig
 from trainer_hightier.serving.flight_recorder.context import RecorderContext
 from trainer_hightier.serving.flight_recorder.manifest import RecordingRoot
 from trainer_hightier.serving.flight_recorder.session import get_active_validator_recorder
+from trainer_hightier.serving.flight_recorder.parquet_io import write_parquet_safe
 
 logger = logging.getLogger(__name__)
 
@@ -112,10 +113,7 @@ class ValidatorCycleRecorder:
             return
         try:
             out = self.alerts_dir / "pending_alerts.parquet"
-            if pending.empty:
-                pd.DataFrame().to_parquet(out, index=False)
-            else:
-                pending.to_parquet(out, index=False)
+            write_parquet_safe(out, pending)
         except Exception as exc:
             self._fail_open("capture_pending_alerts", exc)
 
@@ -205,7 +203,7 @@ class ValidatorCycleRecorder:
             if self.decisions_dir is not None:
                 trace = pd.DataFrame(self._decision_rows)
                 trace_path = self.decisions_dir / "decision_trace.parquet"
-                trace.to_parquet(trace_path, index=False)
+                write_parquet_safe(trace_path, trace)
             summary = {
                 "verified_this_cycle": verified_count,
                 "n_decisions_recorded": len(self._decision_rows),

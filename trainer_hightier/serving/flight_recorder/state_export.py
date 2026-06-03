@@ -9,6 +9,7 @@ from typing import Any
 import pandas as pd
 
 from trainer_hightier.serving.flight_recorder.manifest import RecordingRoot
+from trainer_hightier.serving.flight_recorder.parquet_io import write_parquet_safe
 
 _STATE_DB_LABELS: tuple[tuple[str, str], ...] = (
     ("state_db", "state.db"),
@@ -53,7 +54,7 @@ def _export_one_db(
             for table in tables:
                 frame = pd.read_sql_query(f'SELECT * FROM "{table}"', conn)
                 out_path = out_dir / f"{table}.parquet"
-                frame.to_parquet(out_path, index=False)
+                write_parquet_safe(out_path, frame)
                 recording.register_file(out_path, row_count=int(len(frame)))
         recording.append_step(
             step_name,

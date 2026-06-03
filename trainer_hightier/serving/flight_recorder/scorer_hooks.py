@@ -28,6 +28,7 @@ from trainer_hightier.serving.flight_recorder.config import FlightRecorderConfig
 from trainer_hightier.serving.flight_recorder.context import RecorderContext
 from trainer_hightier.serving.flight_recorder.manifest import RecordingRoot
 from trainer_hightier.serving.flight_recorder.provenance import build_feature_missing_provenance
+from trainer_hightier.serving.flight_recorder.parquet_io import write_parquet_safe
 from trainer_hightier.serving.flight_recorder.session import get_active_scorer_recorder
 
 logger = logging.getLogger(__name__)
@@ -190,10 +191,7 @@ class ScorerCycleRecorder:
             return
         try:
             out = self.stages_dir / f"{filename}.parquet"
-            if frame is None or frame.empty:
-                pd.DataFrame().to_parquet(out, index=False)
-            else:
-                frame.to_parquet(out, index=False)
+            write_parquet_safe(out, frame if frame is not None else pd.DataFrame())
         except Exception as exc:
             self._fail_open(filename, exc)
 
@@ -256,7 +254,7 @@ class ScorerCycleRecorder:
                     row_audits=row_audits,
                 )
                 prov_path = self.audits_dir / "feature_missing_provenance.parquet"
-                prov.to_parquet(prov_path, index=False)
+                write_parquet_safe(prov_path, prov)
             if cycle_readiness:
                 (self.audits_dir / "feature_supplier_diagnostics.json").write_text(
                     json.dumps(cycle_readiness, indent=2, default=str),

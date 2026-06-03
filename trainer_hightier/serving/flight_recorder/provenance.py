@@ -45,6 +45,21 @@ def _source_layer_for_feature(
     return "raw_bet"
 
 
+def _serialize_feature_value(val: Any) -> str | None:
+    """Serialize one feature cell for Parquet (categorical-safe string column)."""
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return None
+    if pd.isna(val):
+        return None
+    if isinstance(val, (bool, np.bool_)):
+        return "true" if bool(val) else "false"
+    if isinstance(val, (int, np.integer)) and not isinstance(val, (bool, np.bool_)):
+        return str(int(val))
+    if isinstance(val, (float, np.floating)):
+        return str(float(val))
+    return str(val)
+
+
 def build_feature_missing_provenance(
     staged: pd.DataFrame,
     features: pd.DataFrame,
@@ -77,9 +92,7 @@ def build_feature_missing_provenance(
                     "bet_id": bet_ids[i],
                     "canonical_id": canonical[i],
                     "feature_id": feat,
-                    "feature_value": None if is_null else float(val)
-                    if isinstance(val, (int, float, np.floating))
-                    else val,
+                    "feature_value": _serialize_feature_value(val) if not is_null else None,
                     "is_null": bool(is_null),
                     "null_reason": _null_reason_for_feature(feat, plan=supplier_plan)
                     if is_null
@@ -91,4 +104,7 @@ def build_feature_missing_provenance(
                     "short_term_missing": audit.short_term_missing if audit else None,
                 }
             )
-    return pd.DataFrame(rows)
+    frame = pd.DataFrame(rows)
+    if not frame.empty and "feature_value" in frame.columns:
+        frame["feature_value"] = frame["feature_value"].astype("string")
+    return frame

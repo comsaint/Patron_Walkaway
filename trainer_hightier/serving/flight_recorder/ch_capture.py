@@ -20,6 +20,7 @@ from trainer_hightier.serving.ch_adapter import (
     ch_tbet_gaming_day_event_sql,
 )
 from trainer_hightier.serving.flight_recorder.redact import redact_sql, redact_value
+from trainer_hightier.serving.flight_recorder.parquet_io import write_parquet_safe
 
 _TBET_CASINO_PLAYER_ID_SELECT = "casino_player_id"
 
@@ -224,7 +225,4 @@ def save_clickhouse_capture(
     query_path = ch_dir / f"{basename}.query.json"
     query_path.write_text(json.dumps(query_record, indent=2, default=str), encoding="utf-8")
     parquet_path = ch_dir / f"{basename}.final.parquet"
-    if frame is None or frame.empty:
-        pd.DataFrame().to_parquet(parquet_path, index=False)
-    else:
-        frame.to_parquet(parquet_path, index=False)
+    write_parquet_safe(parquet_path, frame if frame is not None else pd.DataFrame())

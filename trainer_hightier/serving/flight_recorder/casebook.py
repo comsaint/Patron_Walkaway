@@ -7,6 +7,8 @@ from typing import Any
 
 import pandas as pd
 
+from trainer_hightier.serving.flight_recorder.parquet_io import write_parquet_safe
+
 
 def build_high_score_casebook(recording_root: Path, *, top_n: int = 500) -> pd.DataFrame:
     """Collect high-score rows from scorer ``stage_09_scores`` across cycles."""
@@ -62,10 +64,10 @@ def write_casebooks(output_dir: Path, recording_root: Path) -> dict[str, Any]:
     paths: dict[str, Any] = {}
     if not high.empty:
         p = output_dir / "high_score_casebook.parquet"
-        high.to_parquet(p, index=False)
+        write_parquet_safe(p, high)
         paths["high_score_casebook"] = str(p)
     if not fp.empty:
         p = output_dir / "false_positive_casebook.parquet"
-        fp.to_parquet(p, index=False)
+        write_parquet_safe(p, fp)
         paths["false_positive_casebook"] = str(p)
     return {"paths": paths, "n_high_score": len(high), "n_false_positive": len(fp)}
