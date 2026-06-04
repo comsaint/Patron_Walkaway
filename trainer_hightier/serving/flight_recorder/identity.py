@@ -19,12 +19,10 @@ _IDENTITY_FILES: tuple[str, ...] = (
 )
 
 _MODEL_IDENTITY_FILES: tuple[str, ...] = (
-    "run_summary.json",
-    "metrics_detailed.json",
+    "run_report.json",
     "model_version",
     "feature_parity_verification.json",
     "training_metrics.json",
-    "run_report.json",
 )
 
 

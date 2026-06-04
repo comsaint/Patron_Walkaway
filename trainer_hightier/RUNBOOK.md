@@ -82,7 +82,7 @@
 
 - **`python -m trainer_hightier.trainer` 的 Step 5** 會讀 `trainer_hightier/contracts/feature_candidate_registry.yaml`（或 `--feature-candidate-registry`），以台帳中 **可選 baseline** 欄位（`status` 為 `active|experimental` 且 `enabled_for` 含 `baseline`）作為 `feature_columns`。
 - **單一真相**：baseline / candidate / ablation 選欄皆以 [`feature_candidate_registry.yaml`](trainer_hightier/contracts/feature_candidate_registry.yaml) 為準；baseline 列为 YAML 順序下 `enabled_for` 含 **`baseline`** 且 `status` 為 `active` 或 `experimental` 的列（**不可**對 `fe__*` 使用 baseline 槽）。主線 Step 5 與實驗皆由 `candidate_registry_loader` 載入。
-- **`run_report.json`** 會多出 `candidate_registry`：`registry_version`、`resolved_path`、`n_baseline_features` 等；Step 5 成功且凍結台帳時另有 **`feature_candidate_registry_snapshot`** / **`feature_candidate_registry_sha256`** / **`feature_candidate_registry_frozen_from`**（與 `training_metrics.json` 可對齊）。另含 **`feast_auto_apply`**：`feast_auto_apply_attempted`、`feast_apply_wall_sec`、`feast_registry_path`（Step 3 前 registry 準備紀錄），便於對齊實驗與主線。
+- **`run_report.json`**（schema `trainer_hightier.run_report.v1`）巢狀含 **`summary`**（跨 run 比較）、**`evaluation_detail`**、**`pipeline_debug`**、**`gates`**、**`artifacts`**。`evaluation_detail.candidate_registry` 與 `pipeline_debug.feast_auto_apply` 等取代舊版 flat dump；registry SHA 仍以 **`training_metrics.json`** 為 deploy 契約。
 
 **常見錯誤**
 
@@ -177,7 +177,7 @@ python -m trainer_hightier.trainer --partition-snapshot-dir "D:/exports/my_snaps
 
 - **訓練集**：`trainer_hightier/artifacts/training_data/training_set.parquet`  
 - **版本保留**：`trainer_hightier/artifacts/training_data/versions/training_set_*.parquet`（預設保留最近 10 個；`03_build_training_data.py` 的 `--training-retention`）  
-- **Run 報表**：成功且 Step 5 有跑時在 **`out/models_high_tier_mvp/<model_version>/run_report.json`**；內含 `model_version`、`model_bundle_dir`、`partition_snapshot_dir_effective`、`partition_inventory_baseline_path`、耗時、cache hit、partition fingerprint、`partition_recompute_months`、`feast_auto_apply` 等
+- **Run 報表**：**`run_report.json`**（巢狀 schema；見 [`doc/Training logs - TEMPLATE.md`](doc/Training%20logs%20-%20TEMPLATE.md)）。工程 lineage 在 **`pipeline_debug`**；核心 val/test 指標在 **`summary.metrics`** 與 **`training_metrics.json`**。
 
 ### 2.3 僅重跑 Step 3（preprocess 已完成時）
 
@@ -223,14 +223,14 @@ python -m trainer_hightier.trainer
 | Run artifacts 目錄前綴 | `trainer_hightier.config.MLFLOW_HIGHTIER_ARTIFACT_PREFIX`（預設 `hightier_run/`） |
 | 環境 | `credential/mlflow.env` 或 `local_state/mlflow.env`（載入 `MLFLOW_TRACKING_URI` 等；見 main trainer 慣例） |
 
-每次完整跑會上傳**最小白名單**（檔案存在才傳）：bundle 內 **`run_report.json`**、**`training_metrics.json`**、**`model.pkl`**，以及 **`step4_split_report`** 指向之 `split_report.json`。**不**整包上傳 `artifacts/` 或大 Parquet，避免筆電/網路耗時。
+每次完整跑會上傳 writer 註冊的 **JSON**（含 **`run_report.json`**、**`training_metrics.json`**、**`split_report.json`**、Step 6 gate 檔）以及 **`model.pkl`**。**不**整包上傳 `artifacts/` 或大 Parquet。
 
 **查核清單（成功）**
 
 - [ ] MLflow UI / API 可見單一 run，`tags.status` 終態為 **`SUCCESS`**。
 - [ ] Params 含 `pipeline=trainer_hightier`、`run_profile`（對應 `--run-profile`）、`feature_candidate_registry_path`；Step 5 成功時多有 `model_version`、`model_bundle_dir`。
-- [ ] Metrics 含 `step5_seconds` 與 val/test 品質指標（來源：`run_report.json` 的可數值化欄位）。
-- [ ] Artifacts 下 `hightier_run/` 至少含 `run_report.json`；Step 5 有跑時應另有 metrics JSON 與 model pickle。
+- [ ] Metrics 含 `step5_seconds` 與 val/test 品質（MLflow scalar 來自 in-memory metrics；詳情見 `run_report.json` → `summary.metrics`）。
+- [ ] Artifacts 下 `hightier_run/` 含 writer 註冊之 JSON + `model.pkl`（Step 5 有跑時應有 `training_metrics.json`）。
 
 **查核清單（失敗）**
 

@@ -14,7 +14,11 @@ import pytest
 
 from trainer_hightier.bet_contract import BET_INGEST_READ_COLS_ORDERED
 
-from trainer_hightier.config import BetPreprocessConfig, DuckDbRuntimeConfig
+from trainer_hightier.config import (
+    BetPreprocessConfig,
+    DuckDbRuntimeConfig,
+    L0_PREPROCESS_DATA_SCOPE_TEST_UNBOUNDED,
+)
 from trainer_hightier.preprocess_bet_fix_registry import (
     load_preprocess_bet_ingestion_fix_registry,
     resolve_bet_ingest_fix004_cap_binding,
@@ -111,7 +115,7 @@ def test_preprocess_bet_dedup_keeps_latest_synthetic(registry_path: Path, tmp_pa
     _, _bet_b = _hpre.preprocess_bets_from_parquet_streaming(
         raw,
         out,
-        cfg=BetPreprocessConfig(preprocess_registry_yaml=registry_path),
+        cfg=BetPreprocessConfig(data_scope=L0_PREPROCESS_DATA_SCOPE_TEST_UNBOUNDED,preprocess_registry_yaml=registry_path),
     )
     got = read_cleaned_bet_dataset(out)
     assert len(got) == 1
@@ -136,7 +140,7 @@ def test_preprocess_bet_synthetic_caps_after_event(registry_path: Path, cap_sec:
     _, _bet_b = _hpre.preprocess_bets_from_parquet_streaming(
         raw,
         out,
-        cfg=BetPreprocessConfig(preprocess_registry_yaml=registry_path),
+        cfg=BetPreprocessConfig(data_scope=L0_PREPROCESS_DATA_SCOPE_TEST_UNBOUNDED,preprocess_registry_yaml=registry_path),
     )
     got = read_cleaned_bet_dataset(out)
     assert len(got) == 1
@@ -160,7 +164,7 @@ def test_preprocess_bet_prediction_visible_ts_cf(registry_path: Path, tmp_path) 
     _, _bet_b = _hpre.preprocess_bets_from_parquet_streaming(
         raw,
         out,
-        cfg=BetPreprocessConfig(
+        cfg=BetPreprocessConfig(data_scope=L0_PREPROCESS_DATA_SCOPE_TEST_UNBOUNDED,
             preprocess_registry_yaml=registry_path,
             dedup_hash_buckets=1,
         ),
@@ -213,7 +217,7 @@ def test_preprocess_bet_drops_zero_wager(registry_path: Path, tmp_path) -> None:
     _, _bet_b = _hpre.preprocess_bets_from_parquet_streaming(
         raw,
         out,
-        cfg=BetPreprocessConfig(preprocess_registry_yaml=registry_path),
+        cfg=BetPreprocessConfig(data_scope=L0_PREPROCESS_DATA_SCOPE_TEST_UNBOUNDED,preprocess_registry_yaml=registry_path),
     )
     got = read_cleaned_bet_dataset(out)
     assert len(got) == 0
@@ -230,7 +234,7 @@ def test_bulk_episode_day_tags(registry_path: Path, tmp_path) -> None:
     _, _bet_b = _hpre.preprocess_bets_from_parquet_streaming(
         raw,
         out,
-        cfg=BetPreprocessConfig(preprocess_registry_yaml=registry_path),
+        cfg=BetPreprocessConfig(data_scope=L0_PREPROCESS_DATA_SCOPE_TEST_UNBOUNDED,preprocess_registry_yaml=registry_path),
     )
     got = read_cleaned_bet_dataset(out)
     assert len(got) == 1
@@ -268,7 +272,7 @@ def test_preprocess_bet_hash_buckets_matches_single_pass(registry_path: Path, tm
     _, b1 = _hpre.preprocess_bets_from_parquet_streaming(
         raw,
         out1,
-        cfg=BetPreprocessConfig(
+        cfg=BetPreprocessConfig(data_scope=L0_PREPROCESS_DATA_SCOPE_TEST_UNBOUNDED,
             preprocess_registry_yaml=registry_path,
             dedup_hash_buckets=1,
         ),
@@ -276,7 +280,7 @@ def test_preprocess_bet_hash_buckets_matches_single_pass(registry_path: Path, tm
     _, b8 = _hpre.preprocess_bets_from_parquet_streaming(
         raw,
         out8,
-        cfg=BetPreprocessConfig(
+        cfg=BetPreprocessConfig(data_scope=L0_PREPROCESS_DATA_SCOPE_TEST_UNBOUNDED,
             preprocess_registry_yaml=registry_path,
             dedup_hash_buckets=8,
         ),
@@ -319,7 +323,7 @@ def test_preprocess_bet_dedup_prefers_newer_raw_etl_when_synthetic_tied(
     _, _bet_b = _hpre.preprocess_bets_from_parquet_streaming(
         raw,
         out,
-        cfg=BetPreprocessConfig(preprocess_registry_yaml=registry_path, dedup_hash_buckets=3),
+        cfg=BetPreprocessConfig(data_scope=L0_PREPROCESS_DATA_SCOPE_TEST_UNBOUNDED,preprocess_registry_yaml=registry_path, dedup_hash_buckets=3),
     )
     got = read_cleaned_bet_dataset(out)
     assert len(got) == 1
@@ -372,7 +376,7 @@ def test_preprocess_bet_adt_segment_keeps_only_top_quantile_patrons(registry_pat
     _, _bet_b = _hpre.preprocess_bets_from_parquet_streaming(
         raw,
         out,
-        cfg=BetPreprocessConfig(
+        cfg=BetPreprocessConfig(data_scope=L0_PREPROCESS_DATA_SCOPE_TEST_UNBOUNDED,
             preprocess_registry_yaml=registry_path,
             adt_filter_quantile=0.99,
             patron_profile_csv=profile_csv,
@@ -804,7 +808,7 @@ def test_metamorphic_overlap_invariant_full_vs_player_subset(registry_path: Path
 
     out_full = tmp_path / "clean_full_ds"
     out_sub = tmp_path / "clean_sub_ds"
-    cfg = BetPreprocessConfig(preprocess_registry_yaml=registry_path)
+    cfg = BetPreprocessConfig(data_scope=L0_PREPROCESS_DATA_SCOPE_TEST_UNBOUNDED,preprocess_registry_yaml=registry_path)
     _, _bet_b = _hpre.preprocess_bets_from_parquet_streaming(raw_full, out_full, cfg=cfg)
     _, _bet_b2 = _hpre.preprocess_bets_from_parquet_streaming(raw_sub, out_sub, cfg=cfg)
 
@@ -841,7 +845,7 @@ def test_metamorphic_threshold_expand_stable_bids_subset(registry_path: Path, tm
     raw = tmp_path / "gmwds_t_bet.parquet"
     pq.write_table(pa.Table.from_pandas(df), raw)
     base = tmp_path / "clean_base_ds"
-    cfg = BetPreprocessConfig(preprocess_registry_yaml=registry_path)
+    cfg = BetPreprocessConfig(data_scope=L0_PREPROCESS_DATA_SCOPE_TEST_UNBOUNDED,preprocess_registry_yaml=registry_path)
     _, _bet_b = _hpre.preprocess_bets_from_parquet_streaming(raw, base, cfg=cfg)
 
     allowed_old = tmp_path / "allow_old.parquet"

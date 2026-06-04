@@ -3,7 +3,9 @@
 No standalone CLI — invoked from :mod:`trainer_hightier.trainer`. Reads
 ``train.parquet`` / ``val.parquet`` / ``test.parquet`` under the Step 4 splits
 directory; picks a validation threshold under ``HighTierObjectiveConfig.min_precision``;
-writes ``model.pkl`` + ``training_metrics.json`` under the given ``output_dir`` (bundle dir when called from ``run_training``).
+writes ``model.pkl`` under the given ``output_dir`` (bundle dir when called from ``run_training``).
+``training_metrics.json`` is written when ``persist_training_metrics=True`` (feature experiments);
+main trainer passes ``False`` and uses :class:`~trainer_hightier.reporting.writer.BundleReportWriter`.
 
 Numeric prefix matches steps 1–4; use :func:`importlib.import_module` if importing
 from code.
@@ -27,7 +29,7 @@ import optuna
 from optuna.trial import TrialState
 import pandas as pd
 import pyarrow.parquet as pq
-from sklearn.metrics import average_precision_score
+from trainer_hightier.evaluation.metrics_blocks import split_metrics_block
 
 from trainer_hightier.config import (
     DuckDbRuntimeConfig,
@@ -316,65 +318,6 @@ def pick_threshold_precision_floor(
     )
 
 
-def _metrics_at_threshold(
-    y_true: np.ndarray,
-    scores: np.ndarray,
-    threshold: float,
-) -> tuple[float, float, float, int]:
-    """Return precision, recall, f1, alert_count for ``scores >= threshold``."""
-
-    y = np.asarray(y_true, dtype=np.int8).reshape(-1)
-    s = np.asarray(scores, dtype=np.float64).reshape(-1)
-    if not math.isfinite(float(threshold)):
-        return 0.0, 0.0, 0.0, 0
-    pred = (s >= float(threshold)).astype(np.int8)
-    tp = int(np.sum((pred == 1) & (y == 1)))
-    fp = int(np.sum((pred == 1) & (y == 0)))
-    fn = int(np.sum((pred == 0) & (y == 1)))
-    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
-    alerts = int(np.sum(pred == 1))
-    return float(prec), float(rec), float(f1), alerts
-
-
-def _split_metrics_block(
-    split: str,
-    y_true: np.ndarray,
-    scores: np.ndarray,
-    threshold: float,
-    *,
-    window_hours: float | None,
-) -> dict[str, Any]:
-    """Build flat metrics keys aligned with main ``trainer`` density naming."""
-
-    y = np.asarray(y_true, dtype=np.int8).reshape(-1)
-    s = np.asarray(scores, dtype=np.float64).reshape(-1)
-    n = int(len(y))
-    n_pos = int(np.sum(y == 1))
-    n_neg = int(np.sum(y == 0))
-    has_both = n_pos >= 1 and n_neg >= 1 and np.isfinite(s).all()
-    ap = float(average_precision_score(y, s)) if has_both else 0.0
-    prec, rec, f1, alerts = _metrics_at_threshold(y, s, threshold)
-    out: dict[str, Any] = {
-        f"{split}_ap": ap,
-        f"{split}_precision": prec,
-        f"{split}_recall": rec,
-        f"{split}_f1": f1,
-        f"{split}_samples": n,
-        f"{split}_positives": n_pos,
-        f"{split}_alerts": alerts,
-        f"{split}_window_hours": float(window_hours) if window_hours is not None else None,
-        f"{split}_alerts_per_hour": None,
-        f"{split}_true_labels_per_hour": None,
-    }
-    if window_hours is not None and math.isfinite(float(window_hours)) and float(window_hours) > 0:
-        wh = float(window_hours)
-        out[f"{split}_alerts_per_hour"] = float(alerts) / wh
-        out[f"{split}_true_labels_per_hour"] = float(n_pos) / wh
-    return out
-
-
 def _lgb_fixed_params(cfg: Step5TrainConfig, seed: int) -> dict[str, Any]:
     """Return non-tuned LightGBM kwargs from :attr:`Step5TrainConfig.lgb_fixed`."""
 
@@ -542,6 +485,7 @@ def train_lgbm_from_splits(
     step5: Step5TrainConfig | None = None,
     output_dir: Path,
     feature_columns: tuple[str, ...],
+    persist_training_metrics: bool = True,
 ) -> Step5Result:
     """Train LightGBM on Step 4 splits; optional Optuna; pick threshold on val; write artifacts.
 
@@ -733,27 +677,27 @@ def train_lgbm_from_splits(
     pg_tr = aggregate_bets_to_player_game(df_tr, train_scores, split_name="train")
     pg_va = aggregate_bets_to_player_game(df_va, val_scores, split_name="val")
     pg_te = aggregate_bets_to_player_game(df_te, test_scores, split_name="test")
-    block_tr_pg = _split_metrics_block(
+    block_tr_pg = split_metrics_block(
         "train_player_game", pg_tr.y_true, pg_tr.scores, thr, window_hours=wh_train,
     )
-    block_va_pg = _split_metrics_block(
+    block_va_pg = split_metrics_block(
         "val_player_game", pg_va.y_true, pg_va.scores, thr, window_hours=wh_val,
     )
-    block_te_pg = _split_metrics_block(
+    block_te_pg = split_metrics_block(
         "test_player_game", pg_te.y_true, pg_te.scores, thr, window_hours=wh_test,
     )
-    block_tr_bl = _split_metrics_block(
+    block_tr_bl = split_metrics_block(
         "train_bet_level", y_tr, train_scores, thr, window_hours=wh_train,
     )
-    block_va_bl = _split_metrics_block(
+    block_va_bl = split_metrics_block(
         "val_bet_level", y_va, val_scores, thr, window_hours=wh_val,
     )
-    block_te_bl = _split_metrics_block(
+    block_te_bl = split_metrics_block(
         "test_bet_level", y_te, test_scores, thr, window_hours=wh_test,
     )
-    block_tr_main = _split_metrics_block("train", pg_tr.y_true, pg_tr.scores, thr, window_hours=wh_train)
-    block_va_main = _split_metrics_block("val", pg_va.y_true, pg_va.scores, thr, window_hours=wh_val)
-    block_te_main = _split_metrics_block("test", pg_te.y_true, pg_te.scores, thr, window_hours=wh_test)
+    block_tr_main = split_metrics_block("train", pg_tr.y_true, pg_tr.scores, thr, window_hours=wh_train)
+    block_va_main = split_metrics_block("val", pg_va.y_true, pg_va.scores, thr, window_hours=wh_val)
+    block_te_main = split_metrics_block("test", pg_te.y_true, pg_te.scores, thr, window_hours=wh_test)
 
     elapsed = round(time.perf_counter() - t0, 3)
     report: dict[str, Any] = {
@@ -815,7 +759,8 @@ def train_lgbm_from_splits(
     metrics_path = (out_dir / DEFAULT_METRICS_FILENAME).resolve()
     report["training_metrics_path"] = str(metrics_path)
     report["step5_training_metrics_path"] = str(metrics_path)
-    metrics_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    if persist_training_metrics:
+        metrics_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
 
     logger.info(
         "Step 5 trained LightGBM in %.3fs; threshold=%.6f feasible=%s val recall=%.4f prec=%.4f refit_train_plus_val=%s → %s",

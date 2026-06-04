@@ -23,6 +23,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from trainer_hightier.schema_normalize import normalize_bets_sessions
 from trainer_hightier.config import (
+    L0PreprocessDataScopeConfig,
     PREPROCESS_DEDUP_BUCKET_ESCALATION_CEILING,
     DuckDbRuntimeConfig,
     SessionPreprocessConfig,
@@ -36,6 +37,7 @@ from trainer_hightier.utils.hk_time_semantics import (
     T_SESSION_TIMESTAMP_COLUMNS,
     assert_no_etl_before_event_violations,
     duckdb_gaming_day_event_sql,
+    duckdb_gaming_day_event_scope_and_sql,
     duckdb_quote_ident as _hk_quote_ident,
 )
 
@@ -212,6 +214,7 @@ def _duckdb_session_clean_pipeline_select_sql(
     read_cols_ordered: tuple[str, ...],
     dedup_bucket_id: int | None = None,
     dedup_buckets: int = 1,
+    data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> str:
     """Single-scan pipeline: L0 gate → impute → synthetic → FND-01 → FND-04.
 
@@ -237,7 +240,18 @@ def _duckdb_session_clean_pipeline_select_sql(
     names = frozenset(read_cols_ordered)
     l0w = _l0_gate_where_sql(names)
     s1b = _s1_cte_sql(names)
-    s2b = _build_s2_cte_sql(names)
+    scope = data_scope if data_scope is not None else L0PreprocessDataScopeConfig()
+    scope_and = duckdb_gaming_day_event_scope_and_sql(
+        min_day=scope.gaming_day_event_min,
+        max_day=scope.gaming_day_event_max,
+    )
+    hk_source = "hk_scoped" if scope_and else "hk"
+    hk_scoped_cte = (
+        f"hk_scoped AS (SELECT * FROM hk WHERE TRUE{scope_and}),\n"
+        if scope_and
+        else ""
+    )
+    s2b = _build_s2_cte_sql(names, source_alias=hk_source)
     ord_clause = _fnd01_order_sql(names)
     act = _fnd04_activity_sql(names)
     l0_projection = ", ".join(_duckdb_quote_ident(c) for c in read_cols_ordered)
@@ -252,7 +266,7 @@ hk AS (
     {_session_hk_norm_select_list(read_cols_ordered)}
   FROM s1 AS s1
 ),
-{s2b},
+{hk_scoped_cte}{s2b},
 d AS (
   SELECT
     s2.*,
@@ -276,6 +290,8 @@ def _preprocess_sessions_duckdb_single_copy(
     output_path: Path,
     duckdb_cfg: DuckDbRuntimeConfig,
     dedup_hash_buckets: int,
+    *,
+    data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> None:
     """Run DuckDB ``COPY``; optional hash buckets + merge (matches bet preprocess pattern)."""
 
@@ -305,6 +321,7 @@ def _preprocess_sessions_duckdb_single_copy(
     schema_names = frozenset(pq.read_schema(Path(session_sources[0])).names)
     read_ordered = _session_preprocess_read_columns_ordered(schema_names)
     out_p = _path_posix(out).replace("'", "''")
+    scope = data_scope if data_scope is not None else L0PreprocessDataScopeConfig()
 
     if n == 1:
         inner = _duckdb_session_clean_pipeline_select_sql(
@@ -312,6 +329,7 @@ def _preprocess_sessions_duckdb_single_copy(
             read_cols_ordered=read_ordered,
             dedup_bucket_id=None,
             dedup_buckets=1,
+            data_scope=scope,
         )
         sql = f"COPY ({inner}) TO '{out_p}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
         execute_sql_with_progress_oom_retry(
@@ -329,6 +347,7 @@ def _preprocess_sessions_duckdb_single_copy(
                     read_cols_ordered=read_ordered,
                     dedup_bucket_id=b,
                     dedup_buckets=n,
+                    data_scope=scope,
                 )
                 part_p = parts_dir / f"part_{b:04d}.parquet"
                 part_esc = _path_posix(part_p).replace("'", "''")
@@ -415,13 +434,19 @@ def _preprocess_sessions_pandas_shard_batches(
             len(shard_files),
             out,
         )
-        _merge_session_shards_duckdb(globs, out_posix, shard_files[0], duckdb_runtime=duckdb_cfg)
+        _merge_session_shards_duckdb(
+            globs,
+            out_posix,
+            shard_files[0],
+            duckdb_runtime=duckdb_cfg,
+            data_scope=cfg.data_scope,
+        )
 
 # ``tables.t_session`` → ``SESSION-INGEST-FIX-001`` / ``synthetic_observed_at_contract.ingest_delay_cap_sec``
 _SESSION_INGEST_DELAY_CAP_SEC = 636
 
 # Bump when cache record schema or semantics change (invalidates old sidecars).
-_SESSION_CLEAN_CACHE_MANIFEST_VERSION = 6
+_SESSION_CLEAN_CACHE_MANIFEST_VERSION = 7
 
 
 def _filter_session_l0_deleted_canceled(chunk: pd.DataFrame) -> pd.DataFrame:
@@ -620,9 +645,15 @@ def _merge_session_shards_duckdb(
     sample_shard: Path,
     *,
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
+    data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> None:
     """FND-01 window dedup + FND-04 filter; write single Parquet via DuckDB ``COPY``."""
     order_clause = _dedupe_order_clause_from_shard(sample_shard)
+    scope = data_scope if data_scope is not None else L0PreprocessDataScopeConfig()
+    scope_and = duckdb_gaming_day_event_scope_and_sql(
+        min_day=scope.gaming_day_event_min,
+        max_day=scope.gaming_day_event_max,
+    )
     sql = f"""
     COPY (
       WITH d AS (
@@ -642,7 +673,7 @@ def _merge_session_shards_duckdb(
         AND (
           COALESCE(try_cast("turnover" AS DOUBLE), 0) > 0
           OR COALESCE(try_cast("num_games_with_wager" AS DOUBLE), 0) > 0
-        )
+        ){scope_and}
     ) TO '{output_path_posix}' (FORMAT PARQUET, COMPRESSION SNAPPY);
     """
     ddb = duckdb_runtime if duckdb_runtime is not None else DuckDbRuntimeConfig()
@@ -700,6 +731,12 @@ def preprocess_sessions_from_parquet_streaming(
     _cfg = cfg if cfg is not None else SessionPreprocessConfig()
     _ddb = duckdb_runtime if duckdb_runtime is not None else DuckDbRuntimeConfig()
     _nb = int(_cfg.dedup_hash_buckets)
+    if _cfg.data_scope.gaming_day_event_min is not None or _cfg.data_scope.gaming_day_event_max is not None:
+        logger.info(
+            "[Step 2] session L0 data scope gaming_day_event [%s, %s]",
+            _cfg.data_scope.gaming_day_event_min,
+            _cfg.data_scope.gaming_day_event_max,
+        )
     if len(sources) > 1 and _cfg.engine != "duckdb":
         raise ValueError("extra_partition_sources require SessionPreprocessConfig(engine='duckdb')")
     if _nb < 1:
@@ -715,7 +752,13 @@ def preprocess_sessions_from_parquet_streaming(
                 out,
             )
             try:
-                _preprocess_sessions_duckdb_single_copy(sources, out, _ddb, dedup_hash_buckets=b)
+                _preprocess_sessions_duckdb_single_copy(
+                    sources,
+                    out,
+                    _ddb,
+                    dedup_hash_buckets=b,
+                    data_scope=_cfg.data_scope,
+                )
             except duckdb.OutOfMemoryException as exc:
                 if b >= ceiling_eff:
                     logger.warning(
@@ -755,7 +798,12 @@ def preprocess_sessions_from_parquet_streaming(
     return out, int(eff_buckets)
 
 
-def preprocess_sessions_from_parquet(session_parquet: Path) -> pd.DataFrame:
+def preprocess_sessions_from_parquet(
+    session_parquet: Path,
+    *,
+    cfg: SessionPreprocessConfig | None = None,
+    duckdb_runtime: DuckDbRuntimeConfig | None = None,
+) -> pd.DataFrame:
     """Return cleaned sessions in a DataFrame (small data / tests only).
 
     Uses :func:`preprocess_sessions_from_parquet_streaming` to a temp file then
@@ -765,7 +813,12 @@ def preprocess_sessions_from_parquet(session_parquet: Path) -> pd.DataFrame:
     """
     with tempfile.TemporaryDirectory(prefix="hightier_sess_df_") as tmp:
         tpath = Path(tmp) / "cleaned.parquet"
-        preprocess_sessions_from_parquet_streaming(session_parquet, tpath)[0]
+        preprocess_sessions_from_parquet_streaming(
+            session_parquet,
+            tpath,
+            cfg=cfg,
+            duckdb_runtime=duckdb_runtime,
+        )[0]
         return pd.read_parquet(tpath)
 
 
@@ -797,6 +850,7 @@ def build_session_clean_cache_record(
     dedup_hash_buckets: int | None = None,
     extra_source_session_parquets: tuple[Path, ...] | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> dict[str, Any]:
     """Fingerprint: source L0 stats + row count + this module's source hash + dedup buckets."""
 
@@ -828,6 +882,7 @@ def build_session_clean_cache_record(
         "manifest_version": _SESSION_CLEAN_CACHE_MANIFEST_VERSION,
         "preprocess_py_sha256": _session_l0_preprocess_py_sha256(),
         "session_dedup_hash_buckets": _nb,
+        "l0_data_scope": (data_scope or SessionPreprocessConfig().data_scope).manifest_block(),
     }
     if len(merged) == 1:
         body["source_session"] = stats[0]
@@ -875,6 +930,7 @@ def session_clean_cache_is_hit(
     dedup_hash_buckets: int | None = None,
     extra_source_session_parquets: tuple[Path, ...] | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> bool:
     """Return True if cleaned parquet exists and manifest matches current fingerprint."""
 
@@ -899,6 +955,7 @@ def session_clean_cache_is_hit(
                 dedup_hash_buckets=nb,
                 extra_source_session_parquets=extra_source_session_parquets,
                 partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+                data_scope=data_scope,
             )
 
         return _session_manifest_matches_with_bucket_alias(
@@ -917,6 +974,7 @@ def write_session_clean_cache_manifest(
     dedup_hash_buckets: int | None = None,
     extra_source_session_parquets: tuple[Path, ...] | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> Path:
     """Write cache sidecar after a successful cleaned parquet write."""
 
@@ -925,6 +983,7 @@ def write_session_clean_cache_manifest(
         dedup_hash_buckets=dedup_hash_buckets,
         extra_source_session_parquets=extra_source_session_parquets,
         partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+        data_scope=data_scope,
     )
     mp = session_clean_cache_manifest_path(Path(cleaned_parquet))
     mp.parent.mkdir(parents=True, exist_ok=True)

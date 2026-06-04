@@ -76,10 +76,12 @@ from trainer_hightier.core.mlflow_adapter import (
 )
 from trainer_hightier.core.model_bundle_paths import (
     DEPLOY_E2E_GATE_REPORT_FILENAME,
+    FEATURE_PARITY_REPORT_FILENAME,
     model_bundle_report_path,
     safe_version_subdirectory,
     write_latest_model_manifest,
 )
+from trainer_hightier.reporting.writer import BundleReportWriter
 from trainer_hightier.utils.canonical_mapping import (
     build_canonical_mapping_from_cleaned_session_parquet,
     default_canonical_mapping_parquet_path,
@@ -112,11 +114,6 @@ _b5 = importlib.import_module("trainer_hightier.05_lgbm_train")
 
 
 logger = logging.getLogger("trainer_hightier")
-
-RUN_SUMMARY_FILENAME: Final[str] = "run_summary.json"
-METRICS_DETAILED_FILENAME: Final[str] = "metrics_detailed.json"
-PIPELINE_DEBUG_FILENAME: Final[str] = "pipeline_debug.json"
-SPLIT_REPORT_FILENAME: Final[str] = "split_report.json"
 
 _STEP5_CONFIG_DEFAULTS = Step5TrainConfig()
 _STEP6_CONFIG_DEFAULTS = Step6ParityConfig()
@@ -258,56 +255,6 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def _epoch_ms_to_iso_z(epoch_ms: int | None) -> str | None:
-    """Render epoch milliseconds as UTC ISO-8601 ``…Z`` string."""
-
-    if epoch_ms is None:
-        return None
-    try:
-        ms = int(epoch_ms)
-    except (TypeError, ValueError):
-        return None
-    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _resolved_patron_sampling_ratio(args: HighTierTrainArgs) -> tuple[float | None, str]:
-    """Return ``(ratio, source)`` for run-summary ``data_scope`` (explicit vs ADT-derived)."""
-
-    if args.patron_sampling_ratio is not None:
-        return float(args.patron_sampling_ratio), "explicit"
-    if args.filter_bets_by_adt_quantile:
-        q = float(args.objective.theo_train_quantile)
-        if 0.0 < q < 1.0:
-            return round(1.0 - q, 8), "adt_quantile_derived"
-    return None, "unknown"
-
-
-def _feature_list_sha256_hex(columns: object) -> str | None:
-    """Stable SHA256 over sorted feature column names (hex digest, no prefix)."""
-
-    if not isinstance(columns, list):
-        return None
-    names = [str(x) for x in columns]
-    payload = json.dumps(sorted(names), separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _path_relative_to_repo(path_str: str | None, *, repo_root: Path) -> str | None:
-    """Best-effort repo-relative path string for logs."""
-
-    if path_str is None:
-        return None
-    raw = str(path_str).strip()
-    if not raw:
-        return None
-    try:
-        p = Path(raw).resolve()
-        rel = p.relative_to(repo_root.resolve())
-        return str(rel).replace("\\", "/")
-    except ValueError:
-        return raw.replace("\\", "/")
-
-
 def _step4_gaming_day_periods_from_report(report: dict[str, Any]) -> dict[str, Any] | None:
     """Extract train/val/test ``gaming_day`` date ranges from Step 4 report (``split_report.json`` body)."""
 
@@ -337,212 +284,26 @@ def _step4_gaming_day_periods_from_report(report: dict[str, Any]) -> dict[str, A
     }
 
 
-def build_run_summary(metrics: dict[str, Any], args: HighTierTrainArgs) -> dict[str, Any]:
-    """Build compact ``run_summary.json`` payload (cross-run comparison)."""
+def _get_report_writer(metrics: dict[str, Any]) -> BundleReportWriter | None:
+    """Return the active :class:`BundleReportWriter` when attached to *metrics*."""
 
-    repo_root = _repo_root()
-    run_id = str(metrics.get("model_version") or "").strip() or "unknown_run"
-    started = _epoch_ms_to_iso_z(metrics.get("start_epoch_ms")) if isinstance(metrics.get("start_epoch_ms"), int) else None
-    finished = _epoch_ms_to_iso_z(metrics.get("finish_epoch_ms")) if isinstance(metrics.get("finish_epoch_ms"), int) else None
-    duration_sec = metrics.get("run_training_total_seconds")
-    patron_ratio, patron_src = _resolved_patron_sampling_ratio(args)
-    warn_keys = ("val_ap", "val_precision", "test_ap", "test_precision")
-    for wk in warn_keys:
-        if wk not in metrics:
-            logger.warning("[run_summary] missing metrics[%r]; cross-run comparison degraded.", wk)
-    feat_cols = metrics.get("step5_feature_columns")
-    n_feat = len(feat_cols) if isinstance(feat_cols, list) else None
-    feat_hash = _feature_list_sha256_hex(feat_cols) if isinstance(feat_cols, list) else None
-    thr = metrics.get("step5_threshold")
-    if "step5_optuna_skipped" not in metrics:
-        opt_enabled = False
-    else:
-        opt_enabled = not bool(metrics.get("step5_optuna_skipped"))
-    summary = {
-        "run_id": run_id,
-        "started_at": started,
-        "finished_at": finished,
-        "duration_sec": float(duration_sec) if isinstance(duration_sec, (int, float)) else None,
-        "data_scope": {
-            "population_scope": "adt_filtered_bets_when_enabled",
-            "filter_bets_by_adt_quantile": bool(args.filter_bets_by_adt_quantile),
-            "theo_train_quantile": float(args.objective.theo_train_quantile),
-            "patron_sampling_ratio": patron_ratio,
-            "patron_sampling_ratio_source": patron_src,
-        },
-        "model": {"algorithm": "lightgbm", "n_features_used": n_feat, "feature_list_sha256_hex": feat_hash},
-        "thresholding": {
-            "policy": "min_precision",
-            "policy_param": {"min_precision": float(args.objective.min_precision)},
-            "selected_threshold": float(thr) if isinstance(thr, (int, float)) else None,
-        },
-        "metrics": {
-            "val": {
-                "ap": metrics.get("val_ap"),
-                "precision": metrics.get("val_precision"),
-                "recall": metrics.get("val_recall"),
-                "f1": metrics.get("val_f1"),
-                "samples": metrics.get("val_samples"),
-                "positives": metrics.get("val_positives"),
-                "alerts": metrics.get("val_alerts"),
-                "alerts_per_hour": metrics.get("val_alerts_per_hour"),
-            },
-            "test": {
-                "ap": metrics.get("test_ap"),
-                "precision": metrics.get("test_precision"),
-                "recall": metrics.get("test_recall"),
-                "f1": metrics.get("test_f1"),
-                "samples": metrics.get("test_samples"),
-                "positives": metrics.get("test_positives"),
-                "alerts": metrics.get("test_alerts"),
-                "alerts_per_hour": metrics.get("test_alerts_per_hour"),
-            },
-        },
-        "optimization": {
-            "enabled": opt_enabled,
-            "backend": "optuna",
-            "max_time_sec_configured": metrics.get("optuna_max_time_sec_configured"),
-            "max_trials_configured": metrics.get("optuna_max_trials_configured"),
-            "wall_time_sec_actual": metrics.get("optuna_wall_time_sec_actual"),
-            "trials_completed": metrics.get("optuna_trials_completed"),
-            "trials_total": metrics.get("optuna_trials_total"),
-            "stopping_reason": metrics.get("optuna_stopping_reason"),
-            "best_value": metrics.get("optuna_best_value"),
-        },
-        "git_commit_short": _git_short_head(repo_root),
-        "run_profile": str(args.run_profile_name),
-        "split_periods": metrics.get("step4_split_periods"),
-    }
-    if patron_ratio is None and patron_src == "unknown":
-        logger.warning(
-            "[run_summary] patron_sampling_ratio unknown; set HighTierTrainArgs.patron_sampling_ratio "
-            "or enable filter_bets_by_adt_quantile with theo_train_quantile in (0,1).",
-        )
-    return summary
+    writer = metrics.get("report_writer")
+    return writer if isinstance(writer, BundleReportWriter) else None
 
 
-def build_metrics_detailed(metrics: dict[str, Any]) -> dict[str, Any]:
-    """Build ``metrics_detailed.json`` (train/val/test blocks + feature list)."""
-
-    run_id = str(metrics.get("model_version") or "").strip() or "unknown_run"
-
-    def _split(prefix: str) -> dict[str, Any]:
-        keys = ("ap", "precision", "recall", "f1")
-        return {k: metrics.get(f"{prefix}_{k}") for k in keys}
-
-    return {
-        "run_id": run_id,
-        "split_metrics": {"train": _split("train"), "val": _split("val"), "test": _split("test")},
-        "threshold_analysis": {
-            "selection_policy": f"min_precision={metrics.get('step5_min_precision')}",
-            "selected_threshold": metrics.get("step5_threshold"),
-            "val_pick_feasible": metrics.get("step5_val_pick_feasible"),
-        },
-        "budget_points": {
-            "alerts_per_hour": {
-                "train": metrics.get("train_alerts_per_hour"),
-                "val": metrics.get("val_alerts_per_hour"),
-                "test": metrics.get("test_alerts_per_hour"),
-            }
-        },
-        "feature_columns": metrics.get("step5_feature_columns"),
-        "candidate_registry": metrics.get("candidate_registry"),
-        "split_periods": metrics.get("step4_split_periods"),
-    }
-
-
-def build_pipeline_debug(metrics: dict[str, Any]) -> dict[str, Any]:
-    """Build ``pipeline_debug.json`` (timings, caches, lineage paths)."""
-
-    repo_root = _repo_root()
-    run_id = str(metrics.get("model_version") or "").strip() or "unknown_run"
-    return {
-        "run_id": run_id,
-        "cache": {
-            "session_clean_cache_hit": metrics.get("session_clean_cache_hit"),
-            "bet_base_clean_cache_hit": metrics.get("bet_base_clean_cache_hit"),
-            "bet_segment_clean_cache_hit": metrics.get("bet_segment_clean_cache_hit"),
-            "bet_clean_cache_hit": metrics.get("bet_clean_cache_hit"),
-        },
-        "partition": {
-            "inventory_fingerprint_sha256_hex": metrics.get("partition_inventory_fingerprint_sha256_hex"),
-            "recompute_months": metrics.get("partition_recompute_months"),
-            "snapshot_dir_effective": metrics.get("partition_snapshot_dir_effective"),
-            "inventory_baseline_path": metrics.get("partition_inventory_baseline_path"),
-        },
-        "timings_sec": {
-            "prepare_training_frame": metrics.get("prepare_training_frame_seconds"),
-            "build_training_dataset": metrics.get("build_training_dataset_seconds"),
-            "step4": metrics.get("step4_seconds"),
-            "step5": metrics.get("step5_seconds"),
-            "run_training_total": metrics.get("run_training_total_seconds"),
-            "main_trainer_fe_materialize": metrics.get("main_trainer_fe_materialize_sec"),
-            "main_trainer_fe_enrich": metrics.get("main_trainer_fe_enrich_sec"),
-        },
-        "feast_auto_apply": metrics.get("feast_auto_apply"),
-        "split_periods": metrics.get("step4_split_periods"),
-        "artifacts": {
-            "model_path": _path_relative_to_repo(
-                str(metrics.get("model_path") or metrics.get("step5_model_path") or ""),
-                repo_root=repo_root,
-            ),
-            "training_metrics_path": _path_relative_to_repo(
-                str(metrics.get("training_metrics_path") or metrics.get("step5_training_metrics_path") or ""),
-                repo_root=repo_root,
-            ),
-            "step4_split_report": _path_relative_to_repo(
-                str(metrics.get("step4_split_report_bundle") or metrics.get("step4_split_report") or ""),
-                repo_root=repo_root,
-            ),
-            "step4_splits_dir": _path_relative_to_repo(str(metrics.get("step4_splits_dir") or ""), repo_root=repo_root),
-            "main_trainer_training_parquet_for_step4": _path_relative_to_repo(
-                str(metrics.get("main_trainer_training_parquet_for_step4") or ""),
-                repo_root=repo_root,
-            ),
-        },
-        "session_dedup_hash_buckets_effective": metrics.get("session_dedup_hash_buckets_effective"),
-        "bet_dedup_hash_buckets_effective": metrics.get("bet_dedup_hash_buckets_effective"),
-    }
-
-
-def _materialize_split_report_in_bundle(
-    bundle_dir: Path,
+def _finalize_training_reports(
+    args: HighTierTrainArgs,
+    metrics: dict[str, Any],
+    writer: BundleReportWriter,
     *,
-    source_report: str | Path | None,
-) -> Path | None:
-    """Copy Step 4 ``split_report.json`` into the model bundle directory."""
+    status: str,
+    error: str | None = None,
+) -> Path:
+    """Write nested ``run_report.json`` via the bundle report writer."""
 
-    if source_report is None:
-        return None
-    src = Path(source_report).resolve()
-    if not src.is_file():
-        logger.warning("[Step 7] split report missing at %s; skip bundle copy.", src)
-        return None
-    dest = Path(bundle_dir).resolve() / SPLIT_REPORT_FILENAME
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dest)
-    logger.info("[Step 7] copied split report to %s", dest.resolve())
-    return dest
-
-
-def write_hightier_training_logs(parent_dir: Path, metrics: dict[str, Any], args: HighTierTrainArgs) -> None:
-    """Write ``run_summary.json``, ``metrics_detailed.json``, ``pipeline_debug.json`` under ``parent_dir``."""
-
-    pd = Path(parent_dir).resolve()
-    pd.mkdir(parents=True, exist_ok=True)
-    rs = build_run_summary(metrics, args)
-    md = build_metrics_detailed(metrics)
-    dbg = build_pipeline_debug(metrics)
-    (pd / RUN_SUMMARY_FILENAME).write_text(json.dumps(rs, indent=2, default=str), encoding="utf-8")
-    (pd / METRICS_DETAILED_FILENAME).write_text(json.dumps(md, indent=2, default=str), encoding="utf-8")
-    (pd / PIPELINE_DEBUG_FILENAME).write_text(json.dumps(dbg, indent=2, default=str), encoding="utf-8")
-    logger.info(
-        "[Step 7b] wrote %s, %s, %s under %s",
-        RUN_SUMMARY_FILENAME,
-        METRICS_DETAILED_FILENAME,
-        PIPELINE_DEBUG_FILENAME,
-        pd,
-    )
+    path = writer.finalize(metrics, args, status=status, error=error)
+    logger.info("[Step 7] wrote %s status=%s", path.resolve(), status)
+    return path
 
 
 def _git_short_head(repo_root: Path) -> str:
@@ -650,34 +411,24 @@ def _mlflow_scalar_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _log_mlflow_whitelist_artifacts(args: HighTierTrainArgs, metrics: dict[str, Any]) -> None:
-    """Log minimal training artifacts under :data:`MLFLOW_HIGHTIER_ARTIFACT_PREFIX`."""
+def _log_mlflow_whitelist_artifacts(
+    args: HighTierTrainArgs,
+    metrics: dict[str, Any],
+    writer: BundleReportWriter | None = None,
+) -> None:
+    """Log registered JSON artifacts and ``model.pkl`` under :data:`MLFLOW_HIGHTIER_ARTIFACT_PREFIX`."""
 
     prefix = MLFLOW_HIGHTIER_ARTIFACT_PREFIX
-    mbd = metrics.get("model_bundle_dir")
-    rp = Path(mbd).resolve() / "run_report.json" if mbd else Path(args.output_dir).resolve() / "run_report.json"
-    if rp.is_file():
-        log_artifact_safe(rp, artifact_path=prefix)
-    smp = metrics.get("training_metrics_path") or metrics.get("step5_training_metrics_path")
-    if smp:
-        p = Path(str(smp))
-        if p.is_file():
-            log_artifact_safe(p, artifact_path=prefix)
+    active_writer = writer or _get_report_writer(metrics)
+    if active_writer is not None:
+        for path in active_writer.registered_json_paths():
+            if path.is_file():
+                log_artifact_safe(path, artifact_path=prefix)
     smp_model = metrics.get("model_path") or metrics.get("step5_model_path")
     if smp_model:
         pm = Path(str(smp_model))
         if pm.is_file():
             log_artifact_safe(pm, artifact_path=prefix)
-    sr = metrics.get("step4_split_report_bundle") or metrics.get("step4_split_report")
-    if sr:
-        sp = Path(str(sr))
-        if sp.is_file():
-            log_artifact_safe(sp, artifact_path=prefix)
-    bundle_root = rp.parent
-    for fname in (RUN_SUMMARY_FILENAME, METRICS_DETAILED_FILENAME, PIPELINE_DEBUG_FILENAME):
-        aux = bundle_root / fname
-        if aux.is_file():
-            log_artifact_safe(aux, artifact_path=prefix)
 
 
 def _resolve_splits_dir(args: HighTierTrainArgs) -> Path:
@@ -767,9 +518,11 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
         dedup_hash_buckets=args.session_preprocess.dedup_hash_buckets,
         extra_source_session_parquets=session_extras or None,
         partition_inventory_fingerprint_sha256_hex=inv_fp,
+        data_scope=args.session_preprocess.data_scope,
     )
     if metrics is not None:
         metrics["session_clean_cache_hit"] = bool(ses_cache_ok)
+        metrics["l0_preprocess_data_scope"] = args.session_preprocess.data_scope.manifest_block()
         metrics["partition_inventory_fingerprint_sha256_hex"] = inv_fp
         metrics["partition_recompute_months"] = list(recompute_months)
         metrics["partition_snapshot_dir_effective"] = str(snap_dir.resolve())
@@ -797,10 +550,12 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
             dedup_hash_buckets=int(session_dedup_effective),
             extra_source_session_parquets=session_extras or None,
             partition_inventory_fingerprint_sha256_hex=inv_fp,
+            data_scope=args.session_preprocess.data_scope,
         )
         n_clean = int(pq.ParquetFile(out_parquet).metadata.num_rows) if pq.ParquetFile(out_parquet).metadata else 0
         logger.info(
-            "[Step 2] session preprocess OK (full table, no time window): cleaned rows=%d; written %s",
+            "[Step 2] session preprocess OK (gaming_day_event scope=%s): cleaned rows=%d; written %s",
+            args.session_preprocess.data_scope.manifest_block(),
             n_clean,
             out_parquet,
         )
@@ -914,6 +669,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 dedup_hash_buckets=base_bet_cfg.dedup_hash_buckets,
                 cleaned_session_parquet=cleaned_path,
                 partition_inventory_fingerprint_sha256_hex=inv_fp,
+                data_scope=base_bet_cfg.data_scope,
             )
             seg_hit = use_preprocess_caches and _hbet.bet_clean_cache_is_hit(
                 bet_primary,
@@ -928,6 +684,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 extra_source_bet_parquets=bet_extras_arg,
                 bet_base_cleaned_parquet=base_bet_path,
                 partition_inventory_fingerprint_sha256_hex=inv_fp,
+                data_scope=effective_bet_cfg.data_scope,
             )
             if metrics is not None:
                 metrics["bet_base_clean_cache_hit"] = bool(base_hit)
@@ -958,6 +715,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                         dedup_hash_buckets=int(bet_dedup_eff),
                         cleaned_session_parquet=cleaned_path,
                         partition_inventory_fingerprint_sha256_hex=inv_fp,
+                        data_scope=base_bet_cfg.data_scope,
                     )
                 elif not seg_hit and mf_bkt is None:
                     logger.warning(
@@ -984,6 +742,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     extra_source_bet_parquets=bet_extras_arg,
                     bet_base_cleaned_parquet=base_bet_path,
                     partition_inventory_fingerprint_sha256_hex=inv_fp,
+                    data_scope=effective_bet_cfg.data_scope,
                 )
                 n_b = _hbet.partitioned_cleaned_bet_total_rows(cleaned_bet_path)
                 logger.info(
@@ -1006,6 +765,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 adt_allowed_players_parquet=effective_bet_cfg.adt_allowed_players_parquet,
                 extra_source_bet_parquets=bet_extras_arg,
                 partition_inventory_fingerprint_sha256_hex=inv_fp,
+                data_scope=effective_bet_cfg.data_scope,
             )
             if metrics is not None:
                 metrics["bet_clean_cache_hit"] = bool(bet_cache_ok)
@@ -1034,6 +794,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     adt_allowed_players_parquet=effective_bet_cfg.adt_allowed_players_parquet,
                     extra_source_bet_parquets=bet_extras_arg,
                     partition_inventory_fingerprint_sha256_hex=inv_fp,
+                    data_scope=effective_bet_cfg.data_scope,
                 )
                 n_b = _hbet.partitioned_cleaned_bet_total_rows(out_b)
                 logger.info(
@@ -1531,6 +1292,7 @@ def fit_model(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None)
             step5=args.step5,
             output_dir=step5_out_dir,
             feature_columns=feat_cols,
+            persist_training_metrics=False,
         )
         logger.info(
             "[Step 5] train_lgbm_from_splits finished (model=%s, threshold=%s).",
@@ -1544,6 +1306,12 @@ def fit_model(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None)
         raise
     if metrics is not None:
         metrics.update(result.report)
+        writer = _get_report_writer(metrics)
+        if writer is not None:
+            tm_path = writer.write_training_metrics(result.report)
+            metrics["training_metrics_path"] = str(tm_path.resolve())
+            metrics["step5_training_metrics_path"] = str(tm_path.resolve())
+        metrics["model_path"] = str(result.model_path.resolve())
         metrics["candidate_registry"] = reg_echo
         _freeze_feature_registry_snapshot(
             bundle_dir=Path(step5_out_dir),
@@ -1574,14 +1342,21 @@ def _freeze_feature_registry_snapshot(
     metrics["feature_candidate_registry_snapshot"] = dest.name
     metrics["feature_candidate_registry_sha256"] = digest
     metrics["feature_candidate_registry_frozen_from"] = str(src)[:500]
+    patch = {
+        "feature_candidate_registry_snapshot": dest.name,
+        "feature_candidate_registry_sha256": digest,
+        "feature_candidate_registry_frozen_from": str(src)[:500],
+    }
+    writer = _get_report_writer(metrics)
+    if writer is not None:
+        writer.patch_training_metrics(patch)
+        return
     tm_path = bd / _b5.DEFAULT_METRICS_FILENAME
     if tm_path.is_file():
         try:
             body = json.loads(tm_path.read_text(encoding="utf-8"))
             if isinstance(body, dict):
-                body["feature_candidate_registry_snapshot"] = dest.name
-                body["feature_candidate_registry_sha256"] = digest
-                body["feature_candidate_registry_frozen_from"] = str(src)[:500]
+                body.update(patch)
                 tm_path.write_text(json.dumps(body, indent=2, default=str), encoding="utf-8")
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             logger.warning("[registry_frozen] skip training_metrics merge: %s", exc)
@@ -1619,6 +1394,11 @@ def _persist_adt_allowlist_sha(
     if allow_dest.is_file():
         al_sha = sha256_file(allow_dest)
         metrics["adt_allowlist_sha256"] = al_sha
+        writer = _get_report_writer(metrics)
+        if writer is not None:
+            writer.patch_training_metrics({"adt_allowlist_sha256": al_sha})
+            logger.info("[deploy_inputs] merged adt_allowlist_sha256 into training_metrics.json")
+            return al_sha
         tm_path = bundle_dir / training_metrics_rel
         if tm_path.is_file():
             try:
@@ -1975,7 +1755,6 @@ def _run_step6_parity_gate(
     test_parquet = _resolve_step6_test_parquet(args, repo)
     cleaned_bet = repo / "trainer_hightier" / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet"
     feast_repo = repo / "trainer_hightier" / "feast_repo"
-    out_json = Path(bundle_dir).resolve() / "feature_parity_verification.json"
     report = step06_mod.build_report_from_config(
         model_dirs=[Path(bundle_dir).resolve()],
         test_parquet=test_parquet,
@@ -1984,7 +1763,12 @@ def _run_step6_parity_gate(
         as_of_date=_date_cls.today(),
         parity_cfg=args.step6,
     )
-    out_json.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    writer = _get_report_writer(metrics)
+    if writer is not None:
+        out_json = writer.write_gate_report(FEATURE_PARITY_REPORT_FILENAME, report)
+    else:
+        out_json = Path(bundle_dir).resolve() / FEATURE_PARITY_REPORT_FILENAME
+        out_json.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     metrics["feature_parity_verification_json"] = str(out_json.resolve())
     metrics["step6_slow_gate_failed"] = int(report.get("n_failed_slow_gate", 0))
     metrics["step6_all_feature_gate_failed"] = int(report.get("n_failed_all_feature_gate", 0))
@@ -2078,6 +1862,10 @@ def _run_step6_deploy_e2e_gate(
             verdict = "fail"
     metrics["step6_deploy_e2e_verdict"] = verdict
     logger.info("[Step 6] deploy_e2e verdict=%s report=%s", verdict, e2e_report_path.name)
+
+    writer = _get_report_writer(metrics)
+    if writer is not None and e2e_report_path.is_file():
+        writer.register_existing_json(e2e_report_path)
 
     if exit_code != 0 or (args.step6.hard_fail_deploy_e2e_gate and verdict != "pass"):
         raise RuntimeError(
@@ -2211,6 +1999,9 @@ def run_training(args: HighTierTrainArgs) -> None:
             log_tags_safe({"status": "RUNNING"})
             log_params_safe(_mlflow_initial_string_params(exec_args))
             metrics: dict[str, Any] = {"start_epoch_ms": int(time.time() * 1000)}
+            report_parent = exec_args.step5_bundle_dir.resolve() if exec_args.step5_bundle_dir else versions_root
+            writer = BundleReportWriter(report_parent)
+            metrics["report_writer"] = writer
             if exec_args.step5_bundle_dir is not None:
                 metrics["model_version"] = model_version
                 metrics["model_bundle_dir"] = str(exec_args.step5_bundle_dir.resolve())
@@ -2218,13 +2009,9 @@ def run_training(args: HighTierTrainArgs) -> None:
                 _run_training_execute_steps(exec_args, metrics)
                 metrics["finish_epoch_ms"] = int(time.time() * 1000)
                 metrics["run_training_total_seconds"] = round(time.perf_counter() - t0, 3)
-                if exec_args.step5_bundle_dir is not None:
-                    bundle_sr = _materialize_split_report_in_bundle(
-                        exec_args.step5_bundle_dir.resolve(),
-                        source_report=metrics.get("step4_split_report"),
-                    )
-                    if bundle_sr is not None:
-                        metrics["step4_split_report_bundle"] = str(bundle_sr.resolve())
+                bundle_sr = writer.copy_split_report(metrics.get("step4_split_report"))
+                if bundle_sr is not None:
+                    metrics["step4_split_report_bundle"] = str(bundle_sr.resolve())
                 if (
                     exec_args.step5_bundle_dir is not None
                     and (exec_args.step5_bundle_dir.resolve() / _b5.DEFAULT_MODEL_FILENAME).is_file()
@@ -2240,14 +2027,10 @@ def run_training(args: HighTierTrainArgs) -> None:
                         metrics,
                         bundle_dir=exec_args.step5_bundle_dir.resolve(),
                     )
-                rp_parent = exec_args.step5_bundle_dir.resolve() if exec_args.step5_bundle_dir else versions_root
-                rp = rp_parent / "run_report.json"
-                rp.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-                logger.info("[Step 7] run_training skeleton finished (report %s)", rp.resolve())
-                write_hightier_training_logs(rp_parent, metrics, exec_args)
+                _finalize_training_reports(exec_args, metrics, writer, status="SUCCESS")
                 log_params_safe(_mlflow_post_run_string_params(metrics))
                 log_metrics_safe(_mlflow_scalar_metrics(metrics))
-                _log_mlflow_whitelist_artifacts(exec_args, metrics)
+                _log_mlflow_whitelist_artifacts(exec_args, metrics, writer)
                 if (
                     exec_args.step5_bundle_dir is not None
                     and (exec_args.step5_bundle_dir.resolve() / _b5.DEFAULT_MODEL_FILENAME).is_file()
@@ -2255,6 +2038,18 @@ def run_training(args: HighTierTrainArgs) -> None:
                     write_latest_model_manifest(versions_root, model_version, exec_args.step5_bundle_dir.resolve())
                 log_tags_safe({"status": "SUCCESS"})
             except Exception as e:
+                metrics["finish_epoch_ms"] = int(time.time() * 1000)
+                metrics["run_training_total_seconds"] = round(time.perf_counter() - t0, 3)
+                _finalize_training_reports(
+                    exec_args,
+                    metrics,
+                    writer,
+                    status="FAILED",
+                    error=str(e)[:500],
+                )
+                log_params_safe(_mlflow_post_run_string_params(metrics))
+                log_metrics_safe(_mlflow_scalar_metrics(metrics))
+                _log_mlflow_whitelist_artifacts(exec_args, metrics, writer)
                 log_tags_safe({"status": "FAILED", "error": str(e)[:500]})
                 raise
     finally:
@@ -2401,7 +2196,7 @@ def _build_argparser() -> argparse.ArgumentParser:
         dest="patron_sampling_ratio",
         metavar="FRACTION",
         help=(
-            "Optional explicit patron sampling ratio recorded in run_summary.json "
+            "Optional explicit patron sampling ratio recorded in run_report.json summary "
             "(e.g. 0.01 vs 0.10). When omitted, ratio may be derived from "
             "HighTierObjectiveConfig.theo_train_quantile when ADT bet filtering is enabled."
         ),

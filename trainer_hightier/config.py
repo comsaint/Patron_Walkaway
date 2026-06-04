@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Final
 
@@ -29,6 +29,8 @@ DEFAULT_DEPLOY_OUTPUT_ROOT: Final[Path] = _REPO_ROOT / "out" / "deploy_hightier"
 DEFAULT_RANDOM_SEED: Final[int] = 42
 # Step 3 Feast feature service wired by :mod:`trainer_hightier.trainer`.
 DEFAULT_TRAINING_FEATURE_SERVICE: Final[str] = "walkaway_bet_trial_v1"
+# Inclusive lower bound on ``gaming_day_event`` for L0 session/bet preprocess (2024 shards excluded).
+DEFAULT_L0_PREPROCESS_GAMING_DAY_EVENT_MIN: Final[date] = date(2025, 1, 1)
 
 # --- Shared domain constants (keep aligned with defaults in ``HightierServingConfig``) ---
 HK_TZ: Final[str] = "Asia/Hong_Kong"
@@ -83,7 +85,7 @@ SHORT_TERM_PIT_CACHE_DEPLOY_BASENAME: Final[str] = FE_SHORT_TERM_DEPLOY_PARQUET_
 TRAINING_SHORT_TERM_PIT_CACHE_BASENAME: Final[str] = "_main_trainer_fe_short_term.parquet"
 # Feature-experiment Wave 1b: ``t_casino_txn`` txn_lite (BUYIN/CASHOUT only; see FND-19).
 DEFAULT_T_CASINO_TXN_RAW_PARQUET: Final[Path] = (
-    _REPO_ROOT / "data" / "new tables" / "t_casino_txn__part_202605.parquet"
+    _REPO_ROOT / "data" / "new tables" / "partition_202605"
 )
 TXN_LITE_CLEANING_POLICY_ID: Final[str] = "t_casino_txn_v0_fnd19"
 TXN_LITE_SOURCE_CONTRACT_REF: Final[str] = "doc/FINDINGS.md#FND-19"
@@ -288,6 +290,32 @@ class DuckDbRuntimeConfig:
 
 
 @dataclass(frozen=True)
+class L0PreprocessDataScopeConfig:
+    """Inclusive ``gaming_day_event`` bounds applied when cleaning raw L0 Parquet."""
+
+    gaming_day_event_min: date | None = DEFAULT_L0_PREPROCESS_GAMING_DAY_EVENT_MIN
+    gaming_day_event_max: date | None = None
+
+    def manifest_block(self) -> dict[str, str | None]:
+        """JSON-serializable fragment for preprocess cache manifests."""
+        return {
+            "gaming_day_event_min": (
+                self.gaming_day_event_min.isoformat() if self.gaming_day_event_min is not None else None
+            ),
+            "gaming_day_event_max": (
+                self.gaming_day_event_max.isoformat() if self.gaming_day_event_max is not None else None
+            ),
+        }
+
+
+# Unbounded scope for unit tests that use synthetic pre-2025 fixtures.
+L0_PREPROCESS_DATA_SCOPE_TEST_UNBOUNDED: Final[L0PreprocessDataScopeConfig] = L0PreprocessDataScopeConfig(
+    gaming_day_event_min=None,
+    gaming_day_event_max=None,
+)
+
+
+@dataclass(frozen=True)
 class SessionPreprocessConfig:
     """L0 ``t_session`` → cleaned Parquet: engine choice and pandas-shard batching only.
 
@@ -304,6 +332,8 @@ class SessionPreprocessConfig:
     dedup_hash_buckets: int = 8
     # Only for ``pandas_shards``: concatenate this many row groups per shard file.
     row_groups_per_shard: int = 8
+    #: Drop rows outside inclusive ``gaming_day_event`` bounds after HK day derivation.
+    data_scope: L0PreprocessDataScopeConfig = field(default_factory=L0PreprocessDataScopeConfig)
 
 
 @dataclass(frozen=True)
@@ -331,6 +361,8 @@ class BetPreprocessConfig:
     patron_profile_csv: Path | None = None
     canonical_mapping_parquet: Path | None = None
     adt_allowed_players_parquet: Path | None = None
+    #: Drop rows outside inclusive ``gaming_day_event`` bounds after HK day derivation.
+    data_scope: L0PreprocessDataScopeConfig = field(default_factory=L0PreprocessDataScopeConfig)
 
 
 @dataclass(frozen=True)

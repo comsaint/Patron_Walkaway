@@ -38,7 +38,7 @@ ranked AS (
       ORDER BY t.__etl_insert_Dtm DESC NULLS LAST,
                t.updated_dtm DESC NULLS LAST
     ) AS rn
-  FROM read_parquet('{raw}') AS t
+  FROM {raw} AS t
 ),
 clean_base AS (
   SELECT *
@@ -81,16 +81,39 @@ def _path_esc(path: Path) -> str:
     return str(Path(path).resolve()).replace("\\", "/").replace("'", "''")
 
 
-def parquet_fingerprint(path: Path) -> str:
-    """Return a short SHA-256 hex digest of file bytes (for artifact metadata)."""
+def resolve_raw_casino_txn_read_sql(path: Path) -> str:
+    """Return a DuckDB ``read_parquet`` source for a file or hive-style part directory."""
 
     p = Path(path).resolve()
-    if not p.is_file():
-        raise FileNotFoundError(f"Parquet not found for fingerprint: {p}")
+    if p.is_file():
+        return f"read_parquet('{_path_esc(p)}')"
+    if p.is_dir():
+        parts = sorted(p.glob("*.parquet"))
+        if not parts:
+            raise FileNotFoundError(f"No parquet parts under raw_casino_txn directory: {p}")
+        glob_path = _path_esc(p / "*.parquet")
+        return f"read_parquet('{glob_path}')"
+    raise FileNotFoundError(f"raw_casino_txn path not found: {p}")
+
+
+def parquet_fingerprint(path: Path) -> str:
+    """Return a short SHA-256 hex digest of raw input bytes (file or part directory)."""
+
+    p = Path(path).resolve()
     digest = hashlib.sha256()
-    with p.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
+    if p.is_file():
+        files = [p]
+    elif p.is_dir():
+        files = sorted(p.glob("*.parquet"))
+        if not files:
+            raise FileNotFoundError(f"No parquet parts under: {p}")
+    else:
+        raise FileNotFoundError(f"Parquet source not found for fingerprint: {p}")
+    for fp in files:
+        digest.update(fp.name.encode("utf-8"))
+        with fp.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
     return digest.hexdigest()[:16]
 
 
@@ -117,15 +140,14 @@ def materialize_txn_lite_parquet(
     raw = Path(raw_casino_txn_parquet).resolve()
     train = Path(training_parquet_for_bet_ids).resolve()
     out = Path(out_parquet).resolve()
-    if not raw.is_file():
-        raise FileNotFoundError(f"raw_casino_txn_parquet missing: {raw}")
+    raw_read = resolve_raw_casino_txn_read_sql(raw)
     if not train.is_file():
         raise FileNotFoundError(f"training_parquet_for_bet_ids missing: {train}")
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    rq, tq, oq = _path_esc(raw), _path_esc(train), _path_esc(out)
+    tq, oq = _path_esc(train), _path_esc(out)
     inner = f"""
-WITH {_CLEAN_BASE_CTE.format(raw=rq)},
+WITH {_CLEAN_BASE_CTE.format(raw=raw_read)},
 train_rows AS (
   SELECT
     TRY_CAST(bet_id AS DOUBLE) AS bet_id,
@@ -191,10 +213,10 @@ FROM ({inner}) AS agg
         apply_duckdb_runtime_pragmas(con, duckdb_runtime)
         con.execute(f"COPY ({copy_sql}) TO '{oq}' (FORMAT PARQUET, COMPRESSION SNAPPY)")
         raw_n = int(con.execute(
-            f"SELECT COUNT(*) FROM read_parquet('{rq}')",
+            f"SELECT COUNT(*) FROM {raw_read}",
         ).fetchone()[0])
         valid_n = int(con.execute(
-            f"WITH {_CLEAN_BASE_CTE.format(raw=rq)} SELECT COUNT(*) FROM txn_valid",
+            f"WITH {_CLEAN_BASE_CTE.format(raw=raw_read)} SELECT COUNT(*) FROM txn_valid",
         ).fetchone()[0])
         train_n = int(con.execute(
             f"SELECT COUNT(*) FROM read_parquet('{tq}')",
@@ -214,6 +236,8 @@ FROM ({inner}) AS agg
         "types_excluded_note": "CHANGE, TD_FILL, TD_CREDIT, TRANSFER, UPDATE_OWNER excluded v0",
         "pit_event_time": "start_dtm",
         "join_grain": "player_id x payout_complete_dtm (strictly before)",
+        "raw_input_path": str(raw),
+        "raw_read_sql": raw_read,
         "raw_input_fingerprint": parquet_fingerprint(raw),
         "materialized_artifact_fingerprint": parquet_fingerprint(out),
         "raw_row_count": raw_n,

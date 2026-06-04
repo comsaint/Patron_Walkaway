@@ -11,7 +11,7 @@
 
 - Production `prediction_log.features_json` 顯示 `fe__*` 大量為 null，`fe_features_missing = 18` 幾乎固定。
 - `patron__*__w180d_m1snap` slow features 也大量為 null。
-- Alert volume 與離線 `run_summary.json` 分佈嚴重偏離。
+- Alert volume 與離線 `run_report.json` → `summary.metrics` 分佈嚴重偏離。
 
 ## Issue-by-Issue Closure
 

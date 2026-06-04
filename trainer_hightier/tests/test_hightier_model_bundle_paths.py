@@ -87,12 +87,15 @@ def test_run_training_success_writes_latest_manifest_resolve(
     resolved = resolve_model_bundle_dir(vr)
     assert (resolved / "model.pkl").is_file()
     assert (resolved / "run_report.json").is_file()
-    assert (resolved / "run_summary.json").is_file()
-    assert (resolved / "metrics_detailed.json").is_file()
-    assert (resolved / "pipeline_debug.json").is_file()
+    assert not (resolved / "run_summary.json").exists()
     assert (resolved / "split_report.json").is_file()
     report = json.loads((resolved / "run_report.json").read_text(encoding="utf-8"))
-    assert report.get("step4_split_report_bundle") == str((resolved / "split_report.json").resolve())
+    assert report.get("schema") == "trainer_hightier.run_report.v1"
+    assert report.get("status") == "SUCCESS"
+    assert isinstance(report.get("summary"), dict)
+    assert isinstance(report.get("evaluation_detail"), dict)
+    assert isinstance(report.get("pipeline_debug"), dict)
+    assert report.get("artifacts", {}).get("split_report_path") == str((resolved / "split_report.json").resolve())
 
 
 def test_run_training_raises_when_existing_model_under_version(

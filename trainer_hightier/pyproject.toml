@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trainer-hightier"
-version = "0.3.7"
+version = "0.3.8"
 description = "trainer_hightier: serving runtime (scorer, validator, API) plus shared top-level modules; training-heavy subpackages omitted from wheel."
 readme = "README.md"
 requires-python = ">=3.9"

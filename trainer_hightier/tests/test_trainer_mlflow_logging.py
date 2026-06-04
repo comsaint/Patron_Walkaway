@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
@@ -50,9 +51,14 @@ def test_run_training_mlflow_success_path_logs_success_tag_and_run_report_artifa
     def fake_execute(args: HighTierTrainArgs, metrics: dict) -> None:
         _inject_metrics(args, metrics)
         args.output_dir.mkdir(parents=True, exist_ok=True)
-        Path(metrics["step5_training_metrics_path"]).write_text("{}", encoding="utf-8")
+        tm_path = Path(metrics["step5_training_metrics_path"])
+        tm_path.write_text("{}", encoding="utf-8")
         Path(metrics["step5_model_path"]).write_bytes(b"x")
         Path(metrics["step4_split_report"]).write_text("{}", encoding="utf-8")
+        writer = metrics.get("report_writer")
+        if writer is not None:
+            writer.register_existing_json(tm_path)
+            writer.copy_split_report(metrics["step4_split_report"])
 
     args = HighTierTrainArgs(
         output_dir=tmp_path / "out",
@@ -71,14 +77,15 @@ def test_run_training_mlflow_success_path_logs_success_tag_and_run_report_artifa
 
     rp = tmp_path / "out" / "run_report.json"
     assert rp.is_file()
-    assert (tmp_path / "out" / "run_summary.json").is_file()
-    assert (tmp_path / "out" / "metrics_detailed.json").is_file()
-    assert (tmp_path / "out" / "pipeline_debug.json").is_file()
+    report = json.loads(rp.read_text(encoding="utf-8"))
+    assert report.get("schema") == "trainer_hightier.run_report.v1"
+    assert isinstance(report.get("summary"), dict)
 
-    artifact_paths = [c.args[0] for c in art_m.call_args_list]
-    assert any(Path(p).resolve() == rp.resolve() for p in artifact_paths)
-    rs_logged = tmp_path / "out" / "run_summary.json"
-    assert any(Path(p).resolve() == rs_logged.resolve() for p in artifact_paths)
+    artifact_paths = [Path(c.args[0]).resolve() for c in art_m.call_args_list]
+    assert any(p == rp.resolve() for p in artifact_paths)
+    split_report = tmp_path / "out" / "split_report.json"
+    assert split_report.is_file()
+    assert any(p == split_report.resolve() for p in artifact_paths)
 
     metrics_m.assert_called_once()
     logged_metrics = metrics_m.call_args[0][0]
@@ -115,3 +122,7 @@ def test_run_training_mlflow_failure_path_logs_failed_tag(
     ]
     assert len(failed_calls) >= 1
     assert "planned_failure" in failed_calls[0].get("error", "")
+    rp = tmp_path / "out" / "run_report.json"
+    assert rp.is_file()
+    report = json.loads(rp.read_text(encoding="utf-8"))
+    assert report.get("status") == "FAILED"

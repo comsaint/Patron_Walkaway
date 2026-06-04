@@ -443,7 +443,7 @@ production_flight_recording_<bundle_id>/
     model_version
     model_hashes.json
     training_metrics.json
-    run_summary.json
+    run_report.json
     feature_candidate_registry.snapshot.yaml
     runtime_config_snapshot.json
     package_freeze.txt

@@ -8,6 +8,11 @@ from pathlib import Path
 from typing import Any, Final
 
 LATEST_MODEL_MANIFEST_NAME: Final[str] = "_latest_model_manifest.json"
+TRAINING_METRICS_FILENAME: Final[str] = "training_metrics.json"
+RUN_REPORT_FILENAME: Final[str] = "run_report.json"
+SPLIT_REPORT_FILENAME: Final[str] = "split_report.json"
+TRAINING_METRICS_SCHEMA: Final[str] = "training-metrics.hightier.v1"
+RUN_REPORT_SCHEMA: Final[str] = "trainer_hightier.run_report.v1"
 FEATURE_PARITY_REPORT_FILENAME: Final[str] = "feature_parity_verification.json"
 DEPLOY_E2E_GATE_REPORT_FILENAME: Final[str] = "deploy_e2e_gate_report.json"
 OFFLINE_SERVING_BACKTEST_REPORT_FILENAME: Final[str] = "offline_serving_backtest.json"

@@ -821,8 +821,8 @@ COPY (
     SELECT
       TRY_CAST(bet_id AS DOUBLE) AS bet_id,
       MIN(CAST(gaming_day_event AS DATE)) AS gaming_day_event,
-      MIN(TRY_CAST(player_id AS BIGINT)) AS player_id,
-      MIN(TRY_CAST(game_id AS DOUBLE)) AS game_id
+      ANY_VALUE(TRY_CAST(player_id AS BIGINT)) AS player_id,
+      ANY_VALUE(TRY_CAST(game_id AS DOUBLE)) AS game_id
     FROM {bet_from} AS _cbd
     WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
     GROUP BY 1

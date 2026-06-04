@@ -13,12 +13,12 @@ from trainer_hightier.config import (
     OptunaIntParamRange,
     Step5TrainConfig,
 )
-from trainer_hightier.trainer import (
-    HighTierTrainArgs,
+from trainer_hightier.reporting.writer import (
     build_metrics_detailed,
     build_pipeline_debug,
     build_run_summary,
 )
+from trainer_hightier.trainer import HighTierTrainArgs
 
 _b5 = importlib.import_module("trainer_hightier.05_lgbm_train")
 

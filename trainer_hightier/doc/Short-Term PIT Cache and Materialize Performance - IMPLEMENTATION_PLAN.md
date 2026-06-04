@@ -120,7 +120,7 @@
 
 **Deliverables**
 
-- `run_summary` / `run_report` 新增 short cache 與 performance 欄位。
+- `run_report.json`（`summary` / `pipeline_debug` 巢狀）新增 short cache 與 performance 欄位。
 - 失效 reason code（例如 `source_changed`, `universe_changed`, `code_changed`, `schema_miss`）。
 
 ## WS-D: Validation and safe rollout

@@ -26,6 +26,7 @@ from trainer_hightier.bet_contract import BET_INGEST_READ_COLS_ORDERED
 from trainer_hightier.config import (
     BET_AVAIL_DELAY_MIN,
     DuckDbRuntimeConfig,
+    L0PreprocessDataScopeConfig,
     PREPROCESS_DEDUP_BUCKET_ESCALATION_CEILING,
     BetPreprocessConfig,
     PLACEHOLDER_PLAYER_ID,
@@ -44,12 +45,13 @@ from trainer_hightier.utils.hk_time_semantics import (
     T_BET_TIMESTAMP_COLUMNS,
     assert_no_etl_before_event_violations,
     duckdb_gaming_day_event_sql,
+    duckdb_gaming_day_event_scope_and_sql,
     duckdb_quote_ident as _hk_quote_ident,
 )
 
 logger = logging.getLogger("trainer_hightier")
 
-_BET_CLEAN_CACHE_MANIFEST_VERSION = 10
+_BET_CLEAN_CACHE_MANIFEST_VERSION = 11
 
 
 def _duckdb_quote_ident(name: str) -> str:
@@ -389,6 +391,7 @@ def _duckdb_bet_clean_pipeline_select_sql(
     adt_allowed_players_posix: str | None = None,
     bet_avail_delay_min: int | None = None,
     poll_interval_sec: int | None = None,
+    data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> str:
     """DuckSQL: optional ADT allowlist join → DQ → synthetic cap → episode tag → ``bet_id`` dedup.
 
@@ -423,6 +426,17 @@ def _duckdb_bet_clean_pipeline_select_sql(
     if poll_interval_sec < 1:
         raise ValueError(f"poll_interval_sec must be >= 1, got {poll_interval_sec}")
     l0_projection = ", ".join(_duckdb_quote_ident(c) for c in read_cols_ordered)
+    scope = data_scope if data_scope is not None else L0PreprocessDataScopeConfig()
+    scope_and = duckdb_gaming_day_event_scope_and_sql(
+        min_day=scope.gaming_day_event_min,
+        max_day=scope.gaming_day_event_max,
+    )
+    hk_source = "hk_scoped" if scope_and else "hk"
+    hk_scoped_cte = (
+        f"hk_scoped AS (SELECT * FROM hk WHERE TRUE{scope_and}),\n"
+        if scope_and
+        else ""
+    )
     if adt_allowed_players_posix is not None:
         with_lf = f"""WITH allowed AS (
   SELECT DISTINCT TRY_CAST(player_id AS BIGINT) AS player_id
@@ -464,11 +478,11 @@ hk AS (
     {_bet_hk_norm_select_list(read_cols_ordered)}
   FROM lf AS lf
 ),
-obs AS (
+{hk_scoped_cte}obs AS (
   SELECT
     hk.*,
     {syn} AS "__etl_insert_Dtm_synthetic"
-  FROM hk AS hk
+  FROM {hk_source} AS hk
 ),
 tagged AS (
   SELECT
@@ -679,6 +693,12 @@ def _preprocess_bets_duckdb_single_copy(
     adt_allowed_esc = _resolve_adt_allowed_players_posix(cfg)
     if adt_allowed_esc is not None:
         logger.info("[Step 2b] bet preprocess ADT segment: early join to allowlist Parquet")
+    if cfg.data_scope.gaming_day_event_min is not None or cfg.data_scope.gaming_day_event_max is not None:
+        logger.info(
+            "[Step 2b] bet L0 data scope gaming_day_event [%s, %s]",
+            cfg.data_scope.gaming_day_event_min,
+            cfg.data_scope.gaming_day_event_max,
+        )
 
     partition_opts = (
         "FORMAT PARQUET, COMPRESSION SNAPPY, PARTITION_BY (gaming_month, gaming_day_key), OVERWRITE_OR_IGNORE TRUE"
@@ -694,6 +714,7 @@ def _preprocess_bets_duckdb_single_copy(
             dedup_bucket_id=None,
             dedup_buckets=1,
             adt_allowed_players_posix=adt_allowed_esc,
+            data_scope=cfg.data_scope,
         )
         wrapped = _wrapped_bet_select_for_partitioned_copy(pipeline)
         sql = f"COPY ({wrapped}) TO '{out_esc}' ({partition_opts})"
@@ -718,6 +739,7 @@ def _preprocess_bets_duckdb_single_copy(
                     dedup_bucket_id=b,
                     dedup_buckets=n,
                     adt_allowed_players_posix=adt_allowed_esc,
+                    data_scope=cfg.data_scope,
                 )
                 wrapped = _wrapped_bet_select_for_partitioned_copy(pipeline)
                 bsql = f"COPY ({wrapped}) TO '{st_esc}' ({partition_opts})"
@@ -977,6 +999,7 @@ def build_bet_base_clean_cache_record(
     dedup_hash_buckets: int | None = None,
     cleaned_session_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> dict[str, Any]:
     """Fingerprint intermediate base bet (raw sources + registry; no ADT).
 
@@ -1020,6 +1043,7 @@ def build_bet_base_clean_cache_record(
         "applied_registry_fix_rules": applied,
         "preprocess_registry": _registry_stat_dict(preprocess_registry_yaml),
         "source_bets": stats,
+        "l0_data_scope": (data_scope or BetPreprocessConfig().data_scope).manifest_block(),
     }
     if partition_inventory_fingerprint_sha256_hex is not None:
         rec["partition_inventory_fingerprint_sha256_hex"] = str(
@@ -1036,6 +1060,7 @@ def bet_base_clean_cache_is_hit(
     dedup_hash_buckets: int | None = None,
     cleaned_session_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> bool:
     """Return True if base cleaned bet exists and manifest matches."""
 
@@ -1064,6 +1089,7 @@ def bet_base_clean_cache_is_hit(
                 dedup_hash_buckets=nb,
                 cleaned_session_parquet=None,
                 partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+                data_scope=data_scope,
             )
 
         return _bet_manifest_matches_with_bucket_alias(
@@ -1083,6 +1109,7 @@ def write_bet_base_clean_cache_manifest(
     dedup_hash_buckets: int | None = None,
     cleaned_session_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> Path:
     """Write manifest next to intermediate base cleaned parquet."""
 
@@ -1093,6 +1120,7 @@ def write_bet_base_clean_cache_manifest(
         dedup_hash_buckets=dedup_hash_buckets,
         cleaned_session_parquet=cleaned_session_parquet,
         partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+        data_scope=data_scope,
     )
     mp = bet_base_clean_cache_manifest_path(Path(base_cleaned_parquet))
     mp.parent.mkdir(parents=True, exist_ok=True)
@@ -1159,6 +1187,7 @@ def build_bet_clean_cache_record(
     extra_source_bet_parquets: tuple[Path, ...] | None = None,
     bet_base_cleaned_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> dict[str, Any]:
     """Fingerprint for cleaned bet parquet cache (raw t_bet + registry + optional ADT allowlist).
 
@@ -1188,6 +1217,7 @@ def build_bet_clean_cache_record(
         "bet_ingest_cap_sec": cap_sec,
         "applied_registry_fix_rules": applied,
         "preprocess_registry": _registry_stat_dict(preprocess_registry_yaml),
+        "l0_data_scope": (data_scope or BetPreprocessConfig().data_scope).manifest_block(),
     }
     if partition_inventory_fingerprint_sha256_hex is not None:
         rec["partition_inventory_fingerprint_sha256_hex"] = str(
@@ -1254,6 +1284,7 @@ def bet_clean_cache_is_hit(
     extra_source_bet_parquets: tuple[Path, ...] | None = None,
     bet_base_cleaned_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> bool:
     cleaned = Path(cleaned_parquet).resolve()
     reg = _resolve_preprocess_registry(preprocess_registry_yaml)
@@ -1284,6 +1315,7 @@ def bet_clean_cache_is_hit(
             extra_source_bet_parquets=extra_source_bet_parquets,
             bet_base_cleaned_parquet=bet_base_cleaned_parquet,
             partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+            data_scope=data_scope,
         )
 
     try:
@@ -1310,6 +1342,7 @@ def write_bet_clean_cache_manifest(
     extra_source_bet_parquets: tuple[Path, ...] | None = None,
     bet_base_cleaned_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> Path:
     reg = _resolve_preprocess_registry(preprocess_registry_yaml)
     rec = build_bet_clean_cache_record(
@@ -1324,6 +1357,7 @@ def write_bet_clean_cache_manifest(
         extra_source_bet_parquets=extra_source_bet_parquets,
         bet_base_cleaned_parquet=bet_base_cleaned_parquet,
         partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+        data_scope=data_scope,
     )
     mp = bet_clean_cache_manifest_path(Path(cleaned_parquet))
     mp.parent.mkdir(parents=True, exist_ok=True)

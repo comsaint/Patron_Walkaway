@@ -40,7 +40,7 @@ from typing import Any, Final, Iterator
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import average_precision_score
+from trainer_hightier.evaluation.metrics_blocks import split_metrics_block
 from zoneinfo import ZoneInfo
 
 from trainer_hightier.config import (
@@ -641,61 +641,6 @@ _TEST_BET_COLUMNS: tuple[str, ...] = (
 )
 
 
-def _metrics_at_threshold(
-    y_true: np.ndarray,
-    scores: np.ndarray,
-    threshold: float,
-) -> tuple[float, float, float, int]:
-    """Return precision, recall, f1, alert_count for ``scores >= threshold``."""
-    y = np.asarray(y_true, dtype=np.int8).reshape(-1)
-    s = np.asarray(scores, dtype=np.float64).reshape(-1)
-    if not math.isfinite(float(threshold)):
-        return 0.0, 0.0, 0.0, 0
-    pred = (s >= float(threshold)).astype(np.int8)
-    tp = int(np.sum((pred == 1) & (y == 1)))
-    fp = int(np.sum((pred == 1) & (y == 0)))
-    fn = int(np.sum((pred == 0) & (y == 1)))
-    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
-    return float(prec), float(rec), float(f1), int(np.sum(pred == 1))
-
-
-def _split_metrics_block(
-    split: str,
-    y_true: np.ndarray,
-    scores: np.ndarray,
-    threshold: float,
-    *,
-    window_hours: float | None,
-) -> dict[str, Any]:
-    """Build flat metrics keys aligned with ``05_lgbm_train`` naming."""
-    y = np.asarray(y_true, dtype=np.int8).reshape(-1)
-    s = np.asarray(scores, dtype=np.float64).reshape(-1)
-    n_pos = int(np.sum(y == 1))
-    n_neg = int(np.sum(y == 0))
-    has_both = n_pos >= 1 and n_neg >= 1 and np.isfinite(s).all()
-    ap = float(average_precision_score(y, s)) if has_both else 0.0
-    prec, rec, f1, alerts = _metrics_at_threshold(y, s, threshold)
-    out: dict[str, Any] = {
-        f"{split}_ap": ap,
-        f"{split}_precision": prec,
-        f"{split}_recall": rec,
-        f"{split}_f1": f1,
-        f"{split}_samples": int(len(y)),
-        f"{split}_positives": n_pos,
-        f"{split}_alerts": alerts,
-        f"{split}_window_hours": float(window_hours) if window_hours is not None else None,
-        f"{split}_alerts_per_hour": None,
-        f"{split}_true_labels_per_hour": None,
-    }
-    if window_hours is not None and math.isfinite(float(window_hours)) and float(window_hours) > 0:
-        wh = float(window_hours)
-        out[f"{split}_alerts_per_hour"] = float(alerts) / wh
-        out[f"{split}_true_labels_per_hour"] = float(n_pos) / wh
-    return out
-
-
 def _window_hours_from_payout(bets: pd.DataFrame) -> float:
     """Hours between min/max ``payout_complete_dtm`` (trainer density parity)."""
     ts = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce").dropna()
@@ -1139,7 +1084,7 @@ def evaluate_training_features_baseline(
     scores = ctx.bundle.model.predict_proba(x)[:, 1]
     thr = float(ctx.bundle.threshold)
     wh = _window_hours_from_payout(df)
-    metrics = _split_metrics_block("offline_training_features", y, scores, thr, window_hours=wh)
+    metrics = split_metrics_block("offline_training_features", y, scores, thr, window_hours=wh)
     ref = json.loads((ctx.model_dir / "training_metrics.json").read_text(encoding="utf-8"))
     deltas = {
         "ap_delta": metrics["offline_training_features_ap"] - float(ref.get("test_ap", 0.0)),
@@ -1233,7 +1178,7 @@ def evaluate_production_pipeline_on_test_split(
     labels = np.concatenate(label_parts) if label_parts else np.array([], dtype=np.int8)
     thr = float(ctx.bundle.threshold)
     wh = _window_hours_from_payout(test_df.head(len(scores)))
-    metrics = _split_metrics_block("offline_production_pipeline", labels, scores, thr, window_hours=wh)
+    metrics = split_metrics_block("offline_production_pipeline", labels, scores, thr, window_hours=wh)
     ref = json.loads((ctx.model_dir / "training_metrics.json").read_text(encoding="utf-8"))
     deltas = {
         "ap_delta": metrics["offline_production_pipeline_ap"] - float(ref.get("test_ap", 0.0)),
@@ -1477,7 +1422,7 @@ def run_labeled_gaming_day_backtest(
     labels = np.concatenate(label_parts) if label_parts else np.array([], dtype=np.int8)
     thr = float(ctx.bundle.threshold)
     wh = _window_hours_from_payout(labeled.head(len(scores)))
-    metrics = _split_metrics_block("test", labels, scores, thr, window_hours=wh)
+    metrics = split_metrics_block("test", labels, scores, thr, window_hours=wh)
     ref_path = ctx.model_dir / "training_metrics.json"
     deltas: dict[str, Any] = {}
     if ref_path.is_file():
