@@ -56,7 +56,7 @@ from trainer_hightier.core.model_bundle_paths import (
     model_bundle_report_path,
     resolve_model_bundle_for_reports,
 )
-from trainer_hightier.serving.adt_allowlist import load_adt_allowlist_ids
+from trainer_hightier.serving.adt_allowlist import load_adt_allowlist_ids, resolve_model_bundle_allowlist_parquet
 from trainer_hightier.serving.audit_production_readiness import (
     _load_bundle_rel,
     _load_dotenv,
@@ -1286,7 +1286,7 @@ def run_test_split_comparison(
     """Compare training-feature baseline vs production pipeline on the same test split."""
     mroot = Path(model_dir).resolve()
     map_p = mapping_parquet or (mroot / "deploy_inputs" / "canonical_player_mapping.parquet")
-    allow_p = allowlist_parquet or (mroot / "deploy_inputs" / "adt_allowed_players_q0p99.parquet")
+    allow_p = allowlist_parquet or resolve_model_bundle_allowlist_parquet(mroot)
     ctx = resolve_offline_context(
         bundle_dir=None,
         model_dir=mroot,

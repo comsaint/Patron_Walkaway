@@ -50,6 +50,7 @@ from trainer_hightier.core.model_bundle_paths import (
     FEATURE_PARITY_REPORT_FILENAME,
     model_bundle_report_path,
 )
+from trainer_hightier.serving.adt_allowlist import resolve_model_bundle_allowlist_parquet
 from trainer_hightier.serving.offline_serving_backtest import (
     _ScoringBatch,
     _bets_frame_from_test_batch,
@@ -575,7 +576,7 @@ def run_production_feature_replay(
         bundle_dir=None,
         model_dir=model_dir,
         mapping_parquet=model_dir / "deploy_inputs" / "canonical_player_mapping.parquet",
-        allowlist_parquet=model_dir / "deploy_inputs" / "adt_allowed_players_q0p99.parquet",
+        allowlist_parquet=resolve_model_bundle_allowlist_parquet(model_dir),
         feast_repo=feast_repo,
         slow_patron_parquet=None,
         use_feast_online=True,

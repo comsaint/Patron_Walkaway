@@ -27,6 +27,7 @@ from trainer_hightier.core.model_bundle_paths import (
 from trainer_hightier.feature_experiment.materialize_fe_derived import (
     compute_fe_derived_features_from_pool,
 )
+from trainer_hightier.serving.adt_allowlist import resolve_model_bundle_allowlist_parquet
 from trainer_hightier.serving.feature_builder import attach_canonical_id
 from trainer_hightier.serving.offline_serving_backtest import (
     _ScoringBatch,
@@ -504,7 +505,7 @@ def main() -> None:
         bundle_dir=None,
         model_dir=model_dir,
         mapping_parquet=model_dir / "deploy_inputs/canonical_player_mapping.parquet",
-        allowlist_parquet=model_dir / "deploy_inputs/adt_allowed_players_q0p99.parquet",
+        allowlist_parquet=resolve_model_bundle_allowlist_parquet(model_dir),
         feast_repo=Path(args.feast_repo).resolve(),
         slow_patron_parquet=None,
         use_feast_online=True,

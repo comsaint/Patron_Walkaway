@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 
-from trainer_hightier.config import HightierServingConfig
+from trainer_hightier.config import HightierServingConfig, default_hightier_serving_config
 from trainer_hightier.serving.feature_state_store import ActiveSnapshotManifest
 from trainer_hightier.utils.patron_session_metrics import default_adt_allowed_players_parquet_path
 
@@ -80,6 +81,27 @@ def resolve_adt_allowlist_path(
         cp = Path(cfg.adt_allowed_players_parquet).resolve()
         return cp
     return default_adt_allowed_players_parquet_path(float(cfg.adt_allowlist_quantile)).resolve()
+
+
+def resolve_model_bundle_allowlist_parquet(model_dir: Path) -> Path:
+    """Resolve ADT allowlist for a training model bundle under ``deploy_inputs/``.
+
+    Reads ``deploy_inputs/active_manifest.json`` when present so Step 6 replay matches
+    the quantile slug frozen at training time (e.g. ``q0p9`` vs ``q0p99``).
+    """
+    model_dir = Path(model_dir).resolve()
+    deploy_inputs = model_dir / "deploy_inputs"
+    manifest: ActiveSnapshotManifest | None = None
+    manifest_path = deploy_inputs / "active_manifest.json"
+    if manifest_path.is_file():
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            manifest = ActiveSnapshotManifest.from_dict(raw, manifest_dir=deploy_inputs)
+    return resolve_adt_allowlist_path(
+        default_hightier_serving_config(),
+        manifest=manifest,
+        cli_path=None,
+    )
 
 
 def check_training_allowlist_sha256(
