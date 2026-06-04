@@ -15,12 +15,45 @@ import pytest
 from sklearn.dummy import DummyClassifier
 
 from trainer_hightier.build_deploy_package import (
+    _bump_patch_version,
     _pip_freeze_package_name,
+    _read_pyproject_version,
+    _write_pyproject_version,
     build_deploy_package,
 )
 from trainer_hightier.config import FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME
 from trainer_hightier.core.model_bundle_paths import DEPLOY_E2E_GATE_REPORT_FILENAME
 from trainer_hightier.serving.adt_allowlist import sha256_file
+
+
+@pytest.fixture(autouse=True)
+def _disable_pyproject_version_bump(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests must not mutate repo ``trainer_hightier/pyproject.toml`` on every pack."""
+
+    import trainer_hightier.build_deploy_package as bdp
+
+    def _read_only_version(*, pyproj: Path | None = None) -> str:
+        path = (pyproj or bdp._REPO_ROOT / "trainer_hightier" / "pyproject.toml").expanduser().resolve()
+        return bdp._read_pyproject_version(path)
+
+    monkeypatch.setattr(bdp, "bump_pyproject_patch_version", _read_only_version)
+
+
+def test_bump_patch_version_increments_numeric_patch() -> None:
+    assert _bump_patch_version("0.3.0") == "0.3.1"
+    assert _bump_patch_version("1.2.9") == "1.2.10"
+
+
+def test_bump_pyproject_patch_version_writes_toml(tmp_path: Path) -> None:
+    pyproj = tmp_path / "pyproject.toml"
+    pyproj.write_text('[project]\nname = "trainer-hightier"\nversion = "2.4.6"\n', encoding="utf-8")
+    assert _read_pyproject_version(pyproj) == "2.4.6"
+    _write_pyproject_version(pyproj, _bump_patch_version(_read_pyproject_version(pyproj)))
+    assert _read_pyproject_version(pyproj) == "2.4.7"
+    _write_pyproject_version(pyproj, _bump_patch_version(_read_pyproject_version(pyproj)))
+    assert _read_pyproject_version(pyproj) == "2.4.8"
+    _write_pyproject_version(pyproj, "9.0.0")
+    assert _read_pyproject_version(pyproj) == "9.0.0"
 
 
 _PARQUET_MANIFEST_SUFFIX = "_parquet"

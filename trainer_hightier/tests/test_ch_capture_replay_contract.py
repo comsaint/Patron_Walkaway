@@ -29,6 +29,18 @@ def test_incremental_global_is_requeryable() -> None:
     assert "FINAL" not in meta["sql_non_final"]
 
 
+def test_incremental_uses_nullable_casino_player_id_placeholder() -> None:
+    """Replay SQL must not require optional raw ``t_bet.casino_player_id``."""
+    meta = build_incremental_query_record(
+        last_etl=None,
+        lookback_hours=6.0,
+        limit_rows=100,
+        allowlist_player_ids=None,
+    )
+    assert "CAST(NULL AS Nullable(String)) AS casino_player_id" in meta["sql_final"]
+    assert "status,\n                casino_player_id" not in meta["sql_final"]
+
+
 def test_incremental_allowlist_stores_player_ids() -> None:
     """Allowlist mode must persist ids for time-machine replay, not only size."""
     meta = build_incremental_query_record(
@@ -68,6 +80,8 @@ def test_pool_window_executable_sql() -> None:
     assert "..." not in meta["sql_final"]
     assert "5255629" in meta["sql_final"]
     assert meta["external_inputs"]["player_ids"] == [5255629, 6458461]
+    assert "CAST(NULL AS Nullable(String)) AS casino_player_id" in meta["sql_final"]
+    assert "status,\n                casino_player_id" not in meta["sql_final"]
 
 
 def test_validator_canonical_includes_bet_id() -> None:

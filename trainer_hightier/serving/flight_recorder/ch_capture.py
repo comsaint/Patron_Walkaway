@@ -20,10 +20,12 @@ from trainer_hightier.serving.ch_adapter import (
     CH_TBET_WAGER_SELECT,
     ch_tbet_gaming_day_event_sql,
 )
-from trainer_hightier.serving.flight_recorder.redact import redact_sql, redact_value
 from trainer_hightier.serving.flight_recorder.parquet_io import write_parquet_safe
+from trainer_hightier.serving.flight_recorder.redact import redact_sql, redact_value
 
-_TBET_CASINO_PLAYER_ID_SELECT = "casino_player_id"
+# ``t_bet`` does not expose loyalty/casino id in all deployed warehouses. Keep the
+# downstream replay schema stable without assuming the raw ClickHouse column exists.
+_TBET_CASINO_PLAYER_ID_SELECT = "CAST(NULL AS Nullable(String)) AS casino_player_id"
 BUSINESS_KEY_BET_ID: Final[str] = "bet_id"
 
 

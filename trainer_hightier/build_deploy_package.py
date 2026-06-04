@@ -3,7 +3,7 @@
 Layout (resolved ``--output-dir``, default ``trainer_hightier.config.DEFAULT_DEPLOY_OUTPUT_ROOT`` / bundle ``model_version``):
 
 - ``main.py`` — standalone entrypoint (``python main.py`` after ``pip install -r requirements.txt``)
-- ``wheels/trainer_hightier-*.whl`` — serving package wheel (``pip wheel --no-deps`` from ``trainer_hightier/pyproject.toml``)
+- ``wheels/trainer_hightier-*.whl`` — serving package wheel (``pip wheel --no-deps`` from ``trainer_hightier/pyproject.toml``; patch version auto-bumped unless ``--no-bump-version``)
 - ``requirements.txt`` — local wheel line (transitive deps from PyPI / internal index per wheel metadata)
 - ``.env.example`` — optional ClickHouse / log overrides for :mod:`trainer_hightier.deploy.main`
 - ``models/`` — ``model.pkl``, ``training_metrics.json``, ``feature_candidate_registry.snapshot.yaml`` (frozen feature registry YAML from Step 5), ``model_version``, …
@@ -19,6 +19,7 @@ import argparse
 import json
 import logging
 import pickle
+import re
 import shutil
 import subprocess
 import sys
@@ -163,6 +164,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--skip-deploy-e2e-gate",
         action="store_true",
         help="Skip deploy E2E gate report check (default: require pass in strict mode).",
+    )
+    pr.add_argument(
+        "--no-bump-version",
+        action="store_true",
+        help="Skip auto-incrementing trainer_hightier/pyproject.toml patch version before wheel build.",
     )
     return pr.parse_args(argv)
 
@@ -673,6 +679,7 @@ def _write_bundle_info(
     *,
     model_version: str,
     manifest_version: str,
+    package_version: str | None,
     allowlist_sha: str | None,
     slow_patron_sha: str | None,
     canonical_mapping_sha: str | None,
@@ -683,6 +690,7 @@ def _write_bundle_info(
     payload = {
         "model_version": model_version,
         "manifest_version": manifest_version,
+        "package_version": package_version,
         "allowlist_sha256": allowlist_sha,
         "slow_patron_sha256": slow_patron_sha,
         "canonical_mapping_sha256": canonical_mapping_sha,
@@ -833,6 +841,65 @@ Keep previous bundle; stop processes; swap directory; restart `python main.py --
     path.write_text(body, encoding="utf-8")
 
 
+_PYPROJECT_VERSION_LINE_RE = re.compile(
+    r'^(?P<prefix>\s*version\s*=\s*")(?P<version>[^"]+)(?P<suffix>"\s*)$',
+    re.MULTILINE,
+)
+
+
+def _read_pyproject_version(pyproj: Path) -> str:
+    """Return ``[project].version`` from *pyproj* TOML."""
+
+    text = pyproj.read_text(encoding="utf-8")
+    match = _PYPROJECT_VERSION_LINE_RE.search(text)
+    if match is None:
+        raise ValueError(f"version = \"...\" line missing in {pyproj}")
+    version = match.group("version").strip()
+    if not version:
+        raise ValueError(f"empty version in {pyproj}")
+    return version
+
+
+def _bump_patch_version(version: str) -> str:
+    """Increment semver patch (``MAJOR.MINOR.PATCH``)."""
+
+    parts = version.strip().split(".")
+    if len(parts) != 3:
+        raise ValueError(f"expected semver MAJOR.MINOR.PATCH; got {version!r}")
+    major, minor, patch = parts
+    if not (major.isdigit() and minor.isdigit() and patch.isdigit()):
+        raise ValueError(f"expected numeric semver MAJOR.MINOR.PATCH; got {version!r}")
+    return f"{major}.{minor}.{int(patch) + 1}"
+
+
+def _write_pyproject_version(pyproj: Path, version: str) -> None:
+    """Replace ``version = "..."`` in *pyproj* with *version*."""
+
+    text = pyproj.read_text(encoding="utf-8")
+    match = _PYPROJECT_VERSION_LINE_RE.search(text)
+    if match is None:
+        raise ValueError(f"version = \"...\" line missing in {pyproj}")
+    updated = _PYPROJECT_VERSION_LINE_RE.sub(
+        lambda m: f"{m.group('prefix')}{version}{m.group('suffix')}",
+        text,
+        count=1,
+    )
+    pyproj.write_text(updated, encoding="utf-8")
+
+
+def bump_pyproject_patch_version(*, pyproj: Path | None = None) -> str:
+    """Bump ``trainer_hightier`` wheel patch version in ``pyproject.toml``; return new version."""
+
+    path = (pyproj or (_REPO_ROOT / "trainer_hightier" / "pyproject.toml")).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"trainer_hightier pyproject missing: {path}")
+    current = _read_pyproject_version(path)
+    bumped = _bump_patch_version(current)
+    _write_pyproject_version(path, bumped)
+    logger.info("[pack] bumped trainer_hightier package version %s -> %s", current, bumped)
+    return bumped
+
+
 def _clean_trainer_hightier_staging_build_dir() -> None:
     """Remove package-local ``build/`` so setuptools/PyPI tooling never packs deep ``build/lib`` trees.
 
@@ -848,8 +915,8 @@ def _clean_trainer_hightier_staging_build_dir() -> None:
         )
 
 
-def _build_trainer_hightier_wheel(*, wheels_dir: Path) -> str:
-    """Build ``trainer_hightier`` wheel into *wheels_dir*; return wheel filename."""
+def _build_trainer_hightier_wheel(*, wheels_dir: Path, bump_version: bool = True) -> tuple[str, str | None]:
+    """Build ``trainer_hightier`` wheel into *wheels_dir*; return (wheel filename, package version)."""
     wheels_dir.mkdir(parents=True, exist_ok=True)
     for stale in wheels_dir.glob("trainer_hightier-*.whl"):
         stale.unlink()
@@ -857,6 +924,11 @@ def _build_trainer_hightier_wheel(*, wheels_dir: Path) -> str:
     pyproj = pkg_root / "pyproject.toml"
     if not pyproj.is_file():
         raise FileNotFoundError(f"trainer_hightier pyproject missing: {pyproj}")
+    package_version: str | None
+    if bump_version:
+        package_version = bump_pyproject_patch_version(pyproj=pyproj)
+    else:
+        package_version = _read_pyproject_version(pyproj)
     _clean_trainer_hightier_staging_build_dir()
     subprocess.run(
         [sys.executable, "-m", "pip", "wheel", ".", "-w", str(wheels_dir), "--no-deps", "--no-cache-dir"],
@@ -868,11 +940,12 @@ def _build_trainer_hightier_wheel(*, wheels_dir: Path) -> str:
         raise FileNotFoundError(f"No trainer_hightier wheel found in {wheels_dir}")
     whl_path = matches[-1]
     logger.info(
-        "[pack] serving wheel written %s (%s bytes)",
+        "[pack] serving wheel written %s (%s bytes, package_version=%s)",
         whl_path.name,
         whl_path.stat().st_size,
+        package_version,
     )
-    return whl_path.name
+    return whl_path.name, package_version
 
 
 def _write_bundle_collect_diag_py(path: Path) -> None:
@@ -1182,7 +1255,10 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     _copy_feast_repo_to_bundle(root)
     wheels_dir = root / "wheels"
-    wheel_name = _build_trainer_hightier_wheel(wheels_dir=wheels_dir)
+    wheel_name, package_version = _build_trainer_hightier_wheel(
+        wheels_dir=wheels_dir,
+        bump_version=not bool(args.no_bump_version),
+    )
     _write_bundle_main_py(root / "main.py")
     _write_bundle_collect_diag_py(root / "collect_diag.py")
     _write_dotenv_example(root / ".env.example")
@@ -1287,6 +1363,7 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
         root / "bundle_info.json",
         model_version=mver,
         manifest_version=man_version,
+        package_version=package_version,
         allowlist_sha=allow_sha,
         slow_patron_sha=slow_sha,
         canonical_mapping_sha=map_sha,
