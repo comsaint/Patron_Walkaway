@@ -287,6 +287,56 @@ WHERE TRY_CAST(gaming_day_event AS DATE) >= DATE '{day_s}'
     tmp.replace(Path(train_parquet))
 
 
+def _slice_training_parquet_by_gaming_day(
+    *,
+    in_parquet: Path,
+    out_parquet: Path,
+    min_day: date | None,
+    max_day: date | None,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> Path:
+    """Filter training rows by ``gaming_day_event`` inclusive range (experiment subset)."""
+
+    if min_day is None and max_day is None:
+        return Path(in_parquet).resolve()
+    src = Path(in_parquet).resolve()
+    if not src.is_file():
+        raise FileNotFoundError(f"training parquet missing: {src}")
+    dst = Path(out_parquet).resolve()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    iq = str(src).replace("\\", "/").replace("'", "''")
+    oq = str(dst).replace("\\", "/").replace("'", "''")
+    clauses: list[str] = ["TRY_CAST(gaming_day_event AS DATE) IS NOT NULL"]
+    if min_day is not None:
+        clauses.append(f"TRY_CAST(gaming_day_event AS DATE) >= DATE '{min_day.isoformat()}'")
+    if max_day is not None:
+        clauses.append(f"TRY_CAST(gaming_day_event AS DATE) <= DATE '{max_day.isoformat()}'")
+    where = " AND ".join(clauses)
+    inner = f"SELECT * FROM read_parquet('{iq}') WHERE {where}"
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        n_before = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{iq}')").fetchone()[0])
+        con.execute(f"COPY ({inner}) TO '{oq}' (FORMAT PARQUET, COMPRESSION SNAPPY)")
+        n_after = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{oq}')").fetchone()[0])
+    finally:
+        con.close()
+    if n_after <= 0:
+        raise ValueError(
+            f"gaming_day_event slice [{min_day}, {max_day}] yielded 0 rows from {src} "
+            f"(before={n_before})",
+        )
+    logger.info(
+        "[FE] sliced training rows by gaming_day_event [%s, %s]: %d → %d → %s",
+        min_day,
+        max_day,
+        n_before,
+        n_after,
+        dst,
+    )
+    return dst
+
+
 def prepare_matrix_from_val_split(val_df: pd.DataFrame, pkt: dict[str, Any]) -> pd.DataFrame:
     """Cast validation rows to dtypes expected by pickles written in Step 5."""
 
@@ -622,6 +672,12 @@ def main() -> None:
     tp_val = float(cfg_yaml.get("val_day_fraction", 0.15))
     min_day_raw = cfg_yaml.get("training_sample_min_gaming_day", "2025-01-01")
     min_day = date.fromisoformat(str(min_day_raw))
+    max_day_raw = cfg_yaml.get("training_sample_max_gaming_day")
+    max_day = date.fromisoformat(str(max_day_raw)) if max_day_raw not in (None, "") else None
+    if max_day is not None and max_day < min_day:
+        raise ValueError(
+            f"training_sample_max_gaming_day={max_day} must be >= training_sample_min_gaming_day={min_day}",
+        )
     svc = str(cfg_yaml.get("feature_service_name", "walkaway_bet_trial_v1"))
     rnd = int(cfg_yaml.get("random_seed", 42))
 
@@ -660,6 +716,16 @@ def main() -> None:
         )
         timing["step3_sec"] = round(time.perf_counter() - t0, 3)
         step3_in = step3_dest
+
+    if min_day is not None or max_day is not None:
+        sliced_path = (paths.run_dir / "training_set_sliced.parquet").resolve()
+        step3_in = _slice_training_parquet_by_gaming_day(
+            in_parquet=step3_in,
+            out_parquet=sliced_path,
+            min_day=min_day,
+            max_day=max_day,
+            duckdb_runtime=duck,
+        )
 
     if time.perf_counter() - t_wall0 > budget:
         raise RuntimeError(f"Exceeded single_round_budget_sec={budget} after Step 3")

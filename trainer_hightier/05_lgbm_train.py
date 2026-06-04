@@ -29,7 +29,13 @@ import pandas as pd
 import pyarrow.parquet as pq
 from sklearn.metrics import average_precision_score
 
-from trainer_hightier.config import DuckDbRuntimeConfig, Step5TrainConfig
+from trainer_hightier.config import (
+    DuckDbRuntimeConfig,
+    OptunaFloatParamRange,
+    OptunaIntParamRange,
+    Step5OptunaSearchConfig,
+    Step5TrainConfig,
+)
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
 
 logger = logging.getLogger(__name__)
@@ -369,21 +375,77 @@ def _split_metrics_block(
     return out
 
 
-def _baseline_lgb_params(cfg: Step5TrainConfig, seed: int) -> dict[str, Any]:
+def _lgb_fixed_params(cfg: Step5TrainConfig, seed: int) -> dict[str, Any]:
+    """Return non-tuned LightGBM kwargs from :attr:`Step5TrainConfig.lgb_fixed`."""
+
+    fixed = cfg.lgb_fixed
     return {
-        "objective": "binary",
-        "metric": "binary_logloss",
-        "verbosity": -1,
+        "objective": fixed.objective,
+        "metric": fixed.metric,
+        "verbosity": int(fixed.verbosity),
         "n_estimators": int(cfg.lgb_n_estimators_cap),
+        "random_state": int(seed),
+        "n_jobs": int(fixed.n_jobs),
+    }
+
+
+def _baseline_tunable_params(cfg: Step5TrainConfig) -> dict[str, Any]:
+    """Return baseline tunable LightGBM kwargs from ``baseline_*`` config fields."""
+
+    return {
         "learning_rate": float(cfg.baseline_learning_rate),
         "num_leaves": int(cfg.baseline_num_leaves),
+        "max_depth": int(cfg.baseline_max_depth),
         "min_child_samples": int(cfg.baseline_min_child_samples),
         "subsample": float(cfg.baseline_subsample),
         "colsample_bytree": float(cfg.baseline_colsample_bytree),
+        "reg_alpha": float(cfg.baseline_reg_alpha),
         "reg_lambda": float(cfg.baseline_reg_lambda),
-        "random_state": int(seed),
-        "n_jobs": 1,
     }
+
+
+def _suggest_float_param(trial: optuna.Trial, name: str, spec: OptunaFloatParamRange) -> float:
+    """Sample one float hyperparameter from config bounds."""
+
+    return float(
+        trial.suggest_float(
+            name,
+            float(spec.low),
+            float(spec.high),
+            log=bool(spec.log),
+        ),
+    )
+
+
+def _suggest_int_param(trial: optuna.Trial, name: str, spec: OptunaIntParamRange) -> int:
+    """Sample one int hyperparameter from config bounds."""
+
+    return int(
+        trial.suggest_int(
+            name,
+            int(spec.low),
+            int(spec.high),
+        ),
+    )
+
+
+def _optuna_tunable_params(trial: optuna.Trial, search: Step5OptunaSearchConfig) -> dict[str, Any]:
+    """Sample all Optuna tunable LightGBM kwargs from :class:`Step5OptunaSearchConfig`."""
+
+    return {
+        "learning_rate": _suggest_float_param(trial, "learning_rate", search.learning_rate),
+        "num_leaves": _suggest_int_param(trial, "num_leaves", search.num_leaves),
+        "max_depth": _suggest_int_param(trial, "max_depth", search.max_depth),
+        "min_child_samples": _suggest_int_param(trial, "min_child_samples", search.min_child_samples),
+        "subsample": _suggest_float_param(trial, "subsample", search.subsample),
+        "colsample_bytree": _suggest_float_param(trial, "colsample_bytree", search.colsample_bytree),
+        "reg_alpha": _suggest_float_param(trial, "reg_alpha", search.reg_alpha),
+        "reg_lambda": _suggest_float_param(trial, "reg_lambda", search.reg_lambda),
+    }
+
+
+def _baseline_lgb_params(cfg: Step5TrainConfig, seed: int) -> dict[str, Any]:
+    return {**_lgb_fixed_params(cfg, seed), **_baseline_tunable_params(cfg)}
 
 
 def _rebuild_lgb_params_from_optuna_best(
@@ -393,38 +455,11 @@ def _rebuild_lgb_params_from_optuna_best(
 ) -> dict[str, Any]:
     """Rebuild full LightGBM kwargs from Optuna ``best_params``."""
 
-    hp = dict(best_params)
-    return {
-        "objective": "binary",
-        "metric": "binary_logloss",
-        "verbosity": -1,
-        "n_estimators": int(cfg.lgb_n_estimators_cap),
-        "learning_rate": float(hp["learning_rate"]),
-        "num_leaves": int(hp["num_leaves"]),
-        "min_child_samples": int(hp["min_child_samples"]),
-        "subsample": float(hp["subsample"]),
-        "colsample_bytree": float(hp["colsample_bytree"]),
-        "reg_lambda": float(hp["reg_lambda"]),
-        "random_state": int(seed),
-        "n_jobs": 1,
-    }
+    return {**_lgb_fixed_params(cfg, seed), **dict(best_params)}
 
 
 def _suggest_lgb_params(trial: optuna.Trial, cfg: Step5TrainConfig, seed: int) -> dict[str, Any]:
-    return {
-        "objective": "binary",
-        "metric": "binary_logloss",
-        "verbosity": -1,
-        "n_estimators": int(cfg.lgb_n_estimators_cap),
-        "learning_rate": trial.suggest_float("learning_rate", 0.02, 0.2, log=True),
-        "num_leaves": trial.suggest_int("num_leaves", 16, 96),
-        "min_child_samples": trial.suggest_int("min_child_samples", 10, 300),
-        "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
-        "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 5.0, log=True),
-        "random_state": int(seed),
-        "n_jobs": 1,
-    }
+    return {**_lgb_fixed_params(cfg, seed), **_optuna_tunable_params(trial, cfg.optuna_search)}
 
 
 def _optuna_trial_debug_log(study: optuna.study.Study, trial: optuna.trial.FrozenTrial) -> None:
@@ -469,7 +504,7 @@ def _train_one_lgbm(
         X_tr,
         y_tr,
         eval_set=[(X_va, y_va)],
-        eval_metric="binary_logloss",
+        eval_metric=str(hp["metric"]),
         callbacks=callbacks,
     )
     return clf

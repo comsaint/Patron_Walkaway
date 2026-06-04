@@ -6,7 +6,13 @@ import importlib
 
 import pytest
 
-from trainer_hightier.config import DuckDbRuntimeConfig, HighTierObjectiveConfig, Step5TrainConfig
+from trainer_hightier.config import (
+    DuckDbRuntimeConfig,
+    HighTierObjectiveConfig,
+    OptunaFloatParamRange,
+    OptunaIntParamRange,
+    Step5TrainConfig,
+)
 from trainer_hightier.trainer import (
     HighTierTrainArgs,
     build_metrics_detailed,
@@ -15,6 +21,61 @@ from trainer_hightier.trainer import (
 )
 
 _b5 = importlib.import_module("trainer_hightier.05_lgbm_train")
+
+
+def test_step5_optuna_search_defaults_are_regularized() -> None:
+    """Default search bounds cap tree depth and enforce non-trivial L1/L2."""
+
+    search = Step5TrainConfig().optuna_search
+    assert search.learning_rate == OptunaFloatParamRange(0.02, 0.15, log=True)
+    assert search.num_leaves == OptunaIntParamRange(16, 31)
+    assert search.max_depth == OptunaIntParamRange(4, 10)
+    assert search.min_child_samples == OptunaIntParamRange(50, 250)
+    assert search.subsample == OptunaFloatParamRange(0.6, 0.9)
+    assert search.colsample_bytree == OptunaFloatParamRange(0.6, 0.9)
+    assert search.reg_alpha == OptunaFloatParamRange(0.0, 1.0)
+    assert search.reg_lambda == OptunaFloatParamRange(0.1, 5.0, log=True)
+
+
+def test_step5_baseline_params_inside_optuna_search() -> None:
+    """Baseline (--skip-optuna) defaults sit inside the Optuna search box."""
+
+    cfg = Step5TrainConfig()
+    search = cfg.optuna_search
+    assert search.learning_rate.low <= cfg.baseline_learning_rate <= search.learning_rate.high
+    assert search.num_leaves.low <= cfg.baseline_num_leaves <= search.num_leaves.high
+    assert search.max_depth.low <= cfg.baseline_max_depth <= search.max_depth.high
+    assert search.min_child_samples.low <= cfg.baseline_min_child_samples <= search.min_child_samples.high
+    assert search.subsample.low <= cfg.baseline_subsample <= search.subsample.high
+    assert search.colsample_bytree.low <= cfg.baseline_colsample_bytree <= search.colsample_bytree.high
+    assert search.reg_alpha.low <= cfg.baseline_reg_alpha <= search.reg_alpha.high
+    assert search.reg_lambda.low <= cfg.baseline_reg_lambda <= search.reg_lambda.high
+
+
+def test_baseline_lgb_params_comes_from_config_only() -> None:
+    """Step 5 baseline kwargs are assembled from config SSOT (no script literals)."""
+
+    cfg = Step5TrainConfig()
+    params = _b5._baseline_lgb_params(cfg, seed=7)
+    assert params["objective"] == cfg.lgb_fixed.objective
+    assert params["metric"] == cfg.lgb_fixed.metric
+    assert params["verbosity"] == cfg.lgb_fixed.verbosity
+    assert params["n_jobs"] == cfg.lgb_fixed.n_jobs
+    assert params["n_estimators"] == cfg.lgb_n_estimators_cap
+    assert params["learning_rate"] == cfg.baseline_learning_rate
+    assert params["max_depth"] == cfg.baseline_max_depth
+    assert params["reg_alpha"] == cfg.baseline_reg_alpha
+    assert params["reg_lambda"] == cfg.baseline_reg_lambda
+    assert params["random_state"] == 7
+
+
+def test_step5_optuna_search_rejects_invalid_range() -> None:
+    """Invalid low/high pairs fail fast at config construction."""
+
+    with pytest.raises(ValueError, match="OptunaIntParamRange"):
+        OptunaIntParamRange(96, 16)
+    with pytest.raises(ValueError, match="OptunaFloatParamRange"):
+        OptunaFloatParamRange(1.0, 0.5)
 
 
 def test_optuna_stopping_reason_enums() -> None:

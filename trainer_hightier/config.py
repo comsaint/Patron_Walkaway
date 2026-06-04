@@ -81,6 +81,23 @@ FE_SHORT_TERM_DEPLOY_PARQUET_BASENAME: Final[str] = "fe_short_term_features.parq
 SHORT_TERM_PIT_CACHE_DEPLOY_BASENAME: Final[str] = FE_SHORT_TERM_DEPLOY_PARQUET_BASENAME
 # Step 3.5 training artifact: per-row PIT values for training ``bet_id`` only.
 TRAINING_SHORT_TERM_PIT_CACHE_BASENAME: Final[str] = "_main_trainer_fe_short_term.parquet"
+# Feature-experiment Wave 1b: ``t_casino_txn`` txn_lite (BUYIN/CASHOUT only; see FND-19).
+DEFAULT_T_CASINO_TXN_RAW_PARQUET: Final[Path] = (
+    _REPO_ROOT / "data" / "new tables" / "t_casino_txn__part_202605.parquet"
+)
+TXN_LITE_CLEANING_POLICY_ID: Final[str] = "t_casino_txn_v0_fnd19"
+TXN_LITE_SOURCE_CONTRACT_REF: Final[str] = "doc/FINDINGS.md#FND-19"
+TXN_LITE_MATERIALIZER_VERSION: Final[str] = "txn_lite_cashflow_v0"
+TXN_LITE_INCLUDED_TYPES: Final[tuple[str, ...]] = ("BUYIN", "CASHOUT")
+TXN_LITE_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
+    "txn__has_cash_out__w15m",
+    "txn__cash_out_cnt__w1h",
+    "txn__cash_out_sum__w1h",
+    "txn__net_cash_out_flag__w1h",
+    "txn__net_cash_flow__w1h",
+    "txn__buyin_cash_sum__w1h",
+    "txn__buyin_prize_redemption_flag__w1h",
+)
 # Month-sharded short-term PIT cache under ``artifacts/training_data/cache/``.
 SHORT_TERM_PIT_CACHE_DIRNAME: Final[str] = "short_term_pit_v1"
 SHORT_TERM_PIT_CACHE_SCHEMA_VERSION: Final[int] = 1
@@ -341,7 +358,7 @@ class HighTierObjectiveConfig:
     # Quantile in (0, 1) on patron **ADT** (from ``canonical_patron_profile.csv``): bet preprocess keeps
     # only bets tied (via canonical mapping) to patrons at or above this ADT quantile (~top ``1 - q``).
     # Align naming with ``trainer.training.high_roller_segmentation`` when wiring segment thresholds.
-    theo_train_quantile: float = 0.99
+    theo_train_quantile: float = 0.95
     # Require precision >= this value on the **segment** when choosing a score threshold.
     min_precision: float = 0.60
     # Placeholder paths for later steps (Parquet / DuckDB exports).
@@ -452,12 +469,86 @@ class Step4SplitConfig:
     ``test`` receives the remainder after train and val.
     """
 
-    train_day_fraction: float = 0.80
-    val_day_fraction: float = 0.10
+    train_day_fraction: float = 0.70
+    val_day_fraction: float = 0.15
     #: When ``None``, defaults to ``trainer_hightier/artifacts/training_data/splits``.
     splits_output_dir: Path | None = None
     #: When set, drop split rows whose ``canonical_id`` is absent from this slow monthly Parquet.
     slow_patron_parquet: Path | None = None
+
+
+@dataclass(frozen=True)
+class OptunaFloatParamRange:
+    """Inclusive Optuna ``trial.suggest_float`` bounds."""
+
+    low: float
+    high: float
+    log: bool = False
+
+    def __post_init__(self) -> None:
+        if float(self.low) >= float(self.high):
+            raise ValueError(
+                f"OptunaFloatParamRange requires low < high; got low={self.low!r}, high={self.high!r}",
+            )
+
+
+@dataclass(frozen=True)
+class OptunaIntParamRange:
+    """Inclusive Optuna ``trial.suggest_int`` bounds."""
+
+    low: int
+    high: int
+
+    def __post_init__(self) -> None:
+        if int(self.low) >= int(self.high):
+            raise ValueError(
+                f"OptunaIntParamRange requires low < high; got low={self.low!r}, high={self.high!r}",
+            )
+
+
+@dataclass(frozen=True)
+class Step5LgbFixedConfig:
+    """LightGBM kwargs held fixed across baseline and Optuna runs."""
+
+    objective: str = "binary"
+    metric: str = "binary_logloss"
+    verbosity: int = -1
+    n_jobs: int = 1
+
+
+@dataclass(frozen=True)
+class Step5OptunaSearchConfig:
+    """Optuna hyperparameter search space for Step 5 LightGBM tuning.
+
+    Defaults bias toward shallower trees, larger leaf support, and non-trivial L1/L2
+    so TPE cannot explore the deep ``num_leaves`` / near-zero regularization region
+    that overfit validation recall in prior runs.
+    """
+
+    learning_rate: OptunaFloatParamRange = field(
+        default_factory=lambda: OptunaFloatParamRange(0.02, 0.15, log=True),
+    )
+    num_leaves: OptunaIntParamRange = field(
+        default_factory=lambda: OptunaIntParamRange(16, 31),
+    )
+    max_depth: OptunaIntParamRange = field(
+        default_factory=lambda: OptunaIntParamRange(4, 10),
+    )
+    min_child_samples: OptunaIntParamRange = field(
+        default_factory=lambda: OptunaIntParamRange(50, 250),
+    )
+    subsample: OptunaFloatParamRange = field(
+        default_factory=lambda: OptunaFloatParamRange(0.6, 0.9),
+    )
+    colsample_bytree: OptunaFloatParamRange = field(
+        default_factory=lambda: OptunaFloatParamRange(0.6, 0.9),
+    )
+    reg_alpha: OptunaFloatParamRange = field(
+        default_factory=lambda: OptunaFloatParamRange(0.0, 1.0),
+    )
+    reg_lambda: OptunaFloatParamRange = field(
+        default_factory=lambda: OptunaFloatParamRange(0.1, 5.0, log=True),
+    )
 
 
 @dataclass(frozen=True)
@@ -468,16 +559,23 @@ class Step5TrainConfig:
     #: When ``True``, use :data:`baseline_*` hyperparameters only (no Optuna).
     skip_optuna: bool = False
     #: ``study.optimize(..., timeout=...)`` wall-clock cap in seconds.
-    optuna_timeout_sec: float = 60 * 60 * 1  # 10-minute Optuna wall-clock budget
-    early_stopping_rounds: int = 50
+    optuna_timeout_sec: float = 60 * 60 * 3  # 10-minute Optuna wall-clock budget
+    #: Optuna TPE search bounds (ignored when ``skip_optuna`` is ``True``).
+    optuna_search: Step5OptunaSearchConfig = field(default_factory=Step5OptunaSearchConfig)
+    #: LightGBM kwargs not tuned by Optuna (objective, metric, verbosity, n_jobs).
+    lgb_fixed: Step5LgbFixedConfig = field(default_factory=Step5LgbFixedConfig)
+    early_stopping_rounds: int = 30
     #: Upper bound on boosting rounds (early stopping usually stops sooner).
     lgb_n_estimators_cap: int = 2000
+    #: Baseline LightGBM params (``--skip-optuna``); centered inside :attr:`optuna_search`.
     baseline_learning_rate: float = 0.05
-    baseline_num_leaves: int = 31
-    baseline_min_child_samples: int = 20
-    baseline_subsample: float = 0.8
-    baseline_colsample_bytree: float = 0.8
-    baseline_reg_lambda: float = 0.0
+    baseline_num_leaves: int = 24
+    baseline_max_depth: int = 8
+    baseline_min_child_samples: int = 100
+    baseline_subsample: float = 0.7
+    baseline_colsample_bytree: float = 0.7
+    baseline_reg_alpha: float = 0.1
+    baseline_reg_lambda: float = 1.0
     #: When ``True``, final artifact model refits on train+val (test remains holdout-only).
     refit_train_plus_val: bool = True
 
