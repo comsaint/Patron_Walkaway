@@ -15,8 +15,8 @@
 
 ### 1.1 本 working plan 的範圍
 
-- **In**：候選生成與 group 化管理、**特徵品質閘門 FQG（§1.5）**、Gate 0/1/2 篩選、短中長窗分級與快照物化、`feature_compute_range` / `training_sample_range` 解耦、固定 eval 下之訓練視窗策略比較、每輪實驗之報表與 go/no-go。
-- **Out**：模型家族替換決策、線上 serving infra、ClickHouse 生產變更。
+- **In**：候選生成與 group 化管理、**特徵品質閘門 FQG（§1.5）**、Gate 0/1/2 篩選、外部事件來源之 experiment-only materialization 接入、短中長窗分級與快照物化、`feature_compute_range` / `training_sample_range` 解耦、固定 eval 下之訓練視窗策略比較、每輪實驗之報表與 go/no-go。
+- **Out**：模型家族替換決策、線上 serving infra、ClickHouse 生產變更、單一 raw source 的欄位級清洗規則。
 
 ### 1.2 已鎖定的設計決策（對齊 SSOT + Implementation Plan）
 
@@ -31,6 +31,8 @@
 | 資料覆蓋 | 縮 training 準備範圍時遵守 SSOT：`train_start - max_lookback - safety_buffer` 覆蓋規則並可稽查。 |
 | Gate / 視窗 v0 | **定量門檻**見 §1.4（與 SSOT、Implementation Plan §7 對齊）。 |
 | **特徵品質閘門 FQG v0** | **L1 全量 + L2 候選**；**BLOCK = fail-fast**；**WARN 需顯式核准** 方可進 Gate 1；閾值與產物見 **§1.5**。 |
+| 外部事件來源接入 | **Source-contract-first**：experiment runner 不得直接讀 raw source table 進訓練；必須先透過 source-specific materializer 產出 cleaned / PIT-safe artifact，並在 report 落盤 source contract reference、cleaning policy id、raw input fingerprint、materialized artifact fingerprint。 |
+| `t_casino_txn` 清洗邊界 | 本 working plan 只定義執行步驟與 DoD；`t_casino_txn` 欄位級清洗依 `doc/FINDINGS.md` **[FND-19]** 與 `schema/GDP_GMWDS_Raw_Schema_Dictionary.md` **§5**，不在本檔重複。 |
 
 ### 1.4 定量門檻 v0（Gate 0/1/2 與訓練視窗穩健性）
 
@@ -45,6 +47,7 @@
 | 非法值率（NaN / Inf / 超界） | **&lt; 0.5%** | 以數值欄為準；類別欄另用 schema 檢查 |
 | PIT | **0 leakage** | 任一確認之 leakage → fail |
 | 單 group 物化時間 | **≤ 24 min** | 即不超過單 round 預算（§5：**60 min**）之 **40%** |
+| 外部來源 metadata | **必填** | 若 group 來自外部事件來源，必須有 source contract reference、cleaning policy id、raw input fingerprint、materialized artifact fingerprint |
 
 #### Gate 1（群組增量：baseline vs baseline+group，單次固定 val/test）
 
@@ -144,6 +147,28 @@
 
 - **現行常用特徵全集**：至少執行一次 **FQG L1** 盤點以建立品質基線（建議併 **Wave 0 exit** 或 Wave 1 entry，見 §2）。
 
+### 1.6 外部事件來源 artifact 契約 v0
+
+本節定義 external event source 進 feature experimentation 的最低執行契約；source-specific 清洗細節由來源文件維護，不在本 working plan 重複。
+
+#### Materialized artifact 最低欄位
+
+| 欄位類型 | 必填內容 |
+|----------|----------|
+| Join key | 與 training grain 可連接之 entity key（例如 `player_id` 或 `canonical_id`，由 source contract 指定） |
+| PIT anchor | 每列特徵對應之 event / prediction 可見時間欄位 |
+| Feature columns | Registry 宣告之 candidate feature 欄位；欄名需可追溯至 `feature_id` / `group_id` |
+| Source metadata | `source_name`、`source_contract_ref`、`cleaning_policy_id`、`raw_input_fingerprint`、`materializer_code_version`、`materialized_artifact_fingerprint` |
+| Audit counts | raw rows、dedup/cleaned rows、joined rows、dropped rows by reason（可在 sidecar JSON，而非寬表欄位） |
+
+#### Fail-fast 條件
+
+- 缺 source contract reference 或 cleaning policy id。
+- materialized artifact 沒有 PIT anchor 或 join key。
+- artifact fingerprint / raw input fingerprint 未落盤。
+- runner 嘗試直接將 raw source table join 入 training set。
+- source-specific cleaning contract 標示有 unresolved P0 DQ issue。
+
 ---
 
 ## 2) Execution waves（進場／出場條件）
@@ -200,6 +225,33 @@
 
 ---
 
+### Wave 1b — 外部事件來源最小接入（Experiment-only）
+
+**目的**：讓非既有 Feast / `fe_derived` 路徑的 raw event source 能以 source-specific materializer 進入 isolated feature experiment，而不影響 production trainer / serving。
+
+**Entry criteria**
+
+- Wave 1 **exit** 達成，或至少 FQG + Gate 0/1 runner 已可對單一 group 產出標準報表。
+- Source-specific findings / schema dictionary 已存在，並清楚標示該來源的 P0 DQ 與清洗邊界。
+- Registry 已能標記 experiment-only source（例如 `source=<external_source_name>`）與 `enabled_for: ablation` / `candidate`。
+
+**Exit criteria**
+
+- Source-specific materializer 可產出 cleaned / PIT-safe feature parquet；runner 不直接讀 raw source table。
+- Materialized artifact 具備 §1.6 最低欄位與 sidecar metadata，含 source contract reference、cleaning policy id、raw input fingerprint、materializer code version、artifact fingerprint。
+- Gate 0 能驗證 external source metadata 完整，且訓練欄位集合仍為 FQG allowlist 子集。
+- 至少 **1 個** external-source group 完成 baseline vs baseline+group dry-run；若使用小型時間切片或 subset，報表須標註 subset policy 與不可直接與全量比較。
+- External source 的欄位級清洗規則未被複製進本 working plan；報表只引用來源文件與 policy id。
+
+**產出 artifacts（最低）**
+
+- `external_sources/<source_name>/materialized_features.parquet`（或 run-scoped 等價路徑）
+- `external_sources/<source_name>/materialization_report.json`
+- `external_sources/<source_name>/source_metadata.json`
+- `screening/gate1_compare_<baseline>_vs_<external_group>_<id>.json`
+
+---
+
 ### Wave 2 — 中窗（daily）與長窗（monthly）快取路徑
 
 **目的**：把「昂贵」聚合從預設全量即時計算迁到 **分 cadence snapshot + manifest 驗證**，並保留 staleness 訊號。
@@ -248,7 +300,7 @@
 
 ## 3) 任務拆解（Task breakdown）
 
-以下依 Implementation Plan **Workstream A–E** 拆分；**Owner** 以占位表示，開始執行前指派。
+以下依 Implementation Plan **Workstream A–E**（含 **C2 外部事件來源接入**）拆分；**Owner** 以占位表示，開始執行前指派。
 
 ### Workstream A — Registry 與語意契約
 
@@ -279,6 +331,16 @@
 | C2 | Gate 1 對照 runner（單 group 增量） | TBD | A4,B* | 固定 seed/參數可重現；輸出 §6 | `gate1_compare_*.json` |
 | C3 | Gate 2 去冗餘（群聚+代表） | TBD | C2 | 淘汰清單含語意理由 | `gate2_redundancy_*.json` |
 | C4 | reason code 字典 | TBD | C1–C3 | 團隊 review | `reason_codes.md` |
+
+### Workstream C2 — 外部事件來源 Materialization 接入
+
+| Task ID | Task | Owner | 依賴 | DoD | 產出 |
+|---------|------|-------|------|-----|------|
+| CX1 | 定義 external source artifact schema 與 sidecar metadata | TBD | A1,C0 | §1.6 欄位可由 runner 驗證；缺欄 fail-fast | `external_source_artifact_schema.md` 或等價 schema |
+| CX2 | 實作 materializer 插槽 / runner hook | TBD | CX1,C2 | 可在 isolated run_dir 產出 cleaned feature parquet；不直接 join raw table | 程式變更 + 範例 artifact |
+| CX3 | Registry source mapping | TBD | A1,CX1 | external-source 欄位可用 `source`、`group_id`、`enabled_for` 被選入 candidate/ablation | registry 範例 + loader 測試 |
+| CX4 | Gate 0 external source metadata check | TBD | C1,CX1 | 缺 source contract / policy id / fingerprint 時 fail-fast | `gate0_checklist` 更新 |
+| CX5 | First external-source dry-run | TBD | CX2,CX3,CX4 | 至少 1 個 external group 完成 FQG + Gate 0 + Gate 1 dry-run | `materialization_report.json` + `gate1_compare_*.json` |
 
 ### Workstream D — Window Strategy Runner
 
@@ -328,6 +390,7 @@
 - [ ] **PIT**：entity_df 時間戳、特徵 event timestamp、ttl 配置合理；抽樣 spot-check **0 leakage**。
 - [ ] **單 group 物化時間** **≤ 24 min**（§1.4，佔 60 min round 之 40%）。
 - [ ] **文件**：registry 中該 group 之 dependency、lookback、anchor 完整。
+- [ ] 若為外部事件來源 group：已提供 source contract reference、cleaning policy id、raw input fingerprint、materialized artifact fingerprint；訓練僅使用 cleaned / PIT-safe artifact（§1.6）。
 
 **輸出**：`gate0_status` ∈ {`pass`,`fail`}；`fail` 必須有 **reason_code**。
 
@@ -338,6 +401,7 @@
 檢查項：
 
 - [ ] 訓練與推論使用之 **feature 欄位 ⊆ `feature_allowlist.json`**（§4.0）。
+- [ ] 若本輪含外部事件來源：`gate1_compare_*.json` 必須引用 materialized artifact path 與 source metadata；不得只記 raw source path。
 - [ ] 與 **同一 baseline** 對照（同 eval fingerprint、同模型搜尋 budget 或同固定超參—擇一並落盤）。
 - [ ] **ΔAP ≥ +0.003** 且 **ΔR@Pmin > 0**（單次固定 val/test；Recall 嚴格上升）。
 - [ ] **val `alerts/hour` ≤ 120**；若 **> 120**，報表必須 `capacity_alarm=true` 且預設 **no-go**（除非業務核准豁免並記錄）。
@@ -367,6 +431,7 @@
 | 淘汰（reject group） | **FQG BLOCK** 或 Gate 0 fail；或 Gate 1 未達 §1.4；或 Gate 2 顯示可由既有代表完全替代且無邊際貢獻。 |
 | 同時升級數量上限 | **每個實驗 wave 最多正式 promote 2 個新 group**（其餘標 `deferred` 排隊）；若需突破，需記錄理由與資源預算。 |
 | 回退（rollback） | 保留上一檔 `promoted_groups` 清單與完整 report；觸發條件見 **§1.4 回退（rollback）觸發 v0**（與訓練視窗策略之 P25 規則一致精神：尾部切片不可顯著劣化）。 |
+| 外部事件來源升級限制 | v0 只允許升級到 **experiment candidate / further investigation**；不得直接進 production baseline 或 serving，除非另有 production supplyability / serving implementation plan。 |
 
 ### 4.5 訓練視窗策略升級（與 group 分開）
 
@@ -393,6 +458,8 @@
 - **Cache miss 風暴**：禁止 silent fallback；需顯式選擇「延長 runtime 重算」或「中止」並記錄。
 - **PIT 疑慮**：一律 **block promote**，僅允許 `investigate` 狀態。
 - **FQG BLOCK 仍存在卻繼續訓練**：視為流程錯誤；該 round **fail**，需修正 allowlist／資料後重跑。
+- **外部來源 metadata 缺失**：缺 source contract reference、cleaning policy id、raw input fingerprint 或 artifact fingerprint 時，該 round **fail-fast**。
+- **Raw source 直連訓練集**：視為流程錯誤；該 round **fail**，需改由 cleaned / PIT-safe materialized artifact 進入 enrichment。
 
 ---
 
@@ -414,6 +481,22 @@
     "train_window_mode": "all|rolling_365d|...|recency_half_life_Xd"
   },
   "eval_fingerprint": "<hash or path to eval_fingerprint.json>",
+  "external_sources": [
+    {
+      "source_name": "<source_name>",
+      "source_contract_ref": "<doc path + section or contract id>",
+      "cleaning_policy_id": "<policy id/version>",
+      "raw_input_path": "<path>",
+      "raw_input_fingerprint": "<hash>",
+      "materializer_code_version": "<hash or module version>",
+      "materialized_artifact_path": "<path>",
+      "materialized_artifact_fingerprint": "<hash>",
+      "raw_rows": 0,
+      "cleaned_rows": 0,
+      "joined_rows": 0,
+      "dropped_rows_by_reason": {}
+    }
+  ],
   "feature_quality": {
     "fqg_version": "v0",
     "feature_quality_report_path": "<path>",
@@ -460,11 +543,13 @@
 
 - [ ] **§1.5 FQG v0** 已定義（L1/L2、PASS/WARN/BLOCK、抽樣與產物）。
 - [ ] 已涵蓋 Wave 0–3 之 entry/exit 與 artifacts（含 Wave 0 **FQG L1 基線**、Wave 1 **FQG 產物**）。
+- [ ] 已涵蓋 **Wave 1b 外部事件來源最小接入** 之 entry/exit、artifacts 與 fail-fast 條件。
 - [ ] **§4.0 FQG** 與 Gate 0/1/2 已轉為可勾選清單與必填輸出，且與 **§1.4 v0** 數值一致。
 - [ ] 訓練視窗比較報表可填 **§6** 之 `val_slice_robustness_v0`（或等價欄位）以支撐 median／P25 門檻。
 - [ ] 升級／回退／同 wave promote 上限已載明。
 - [ ] 單 round runtime ≤ 60 分鐘與資源注意事項已載明。
 - [ ] 報表模板含：`feature_quality`（FQG 路徑與狀態）、`feature_list_version`、`group_set`、`window_policy`、`AP`、`R@Pmin`、`val_alerts_per_hour`、`capacity_alarm`、`runtime`、`peak RAM`、`cache_hit_ratio`、`go/no-go` + reason。
+- [ ] 報表模板含：`external_sources` metadata（source contract、cleaning policy、raw/materialized fingerprint、artifact path、row counts）。
 - [ ] **未修改** `trainer-hightier-working-plan_c12558b9.plan.md`。
 
 ---
@@ -476,7 +561,9 @@
 | SSOT | `Data pipeline - SSOT.md` |
 | Implementation Plan | `Feature experimentation - IMPLEMENTATION_PLAN.md` |
 | Working Plan（本檔） | `Feature experimentation - WORKING_PLAN.md` |
+| Source findings | `doc/FINDINGS.md`（例如 `t_casino_txn` [FND-19]） |
+| Raw schema dictionary | `schema/GDP_GMWDS_Raw_Schema_Dictionary.md`（例如 §5 `t_casino_txn`） |
 
 ---
 
-*文件版本：依 registry / experiment 慣例自行 bump；本檔對齊 SSOT 與 Implementation Plan，並已納入 **FQG v0（§1.5、§4.0）** 之執行與驗收敘述。*
+*文件版本：依 registry / experiment 慣例自行 bump；本檔對齊 SSOT 與 Implementation Plan，並已納入 **FQG v0（§1.5、§4.0）** 與 **外部事件來源 experiment-only 接入（§1.6、Wave 1b）** 之執行與驗收敘述。*

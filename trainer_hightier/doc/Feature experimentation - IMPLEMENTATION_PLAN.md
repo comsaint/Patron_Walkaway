@@ -7,13 +7,24 @@
 
 - 對齊來源：`trainer_hightier/doc/Data pipeline - SSOT.md`
 - 實作邊界：
-  - 包含：候選生成、群組化實驗、篩選 gate、長窗快取治理、訓練視窗策略比較
-  - 不包含：模型家族替換、線上 serving 架構改造、產品策略決策
+  - 包含：候選生成、群組化實驗、篩選 gate、長窗快取治理、訓練視窗策略比較、外部事件來源之實驗接入框架
+  - 不包含：模型家族替換、線上 serving 架構改造、產品策略決策、單一來源表的欄位級清洗細節
+
+### 0.1 決策紀錄（Decision Log）
+
+| ID | 決策 | 理由 / 邊界 |
+|----|------|-------------|
+| D-001 | 沿用既有 `feature_experiment` pipeline，不另建平行 ablation pipeline。 | FQG、Gate 1、ablation、isolated artifacts 已集中在此路徑；新增資料源應擴充現有框架。 |
+| D-002 | 外部事件來源第一版採 **experiment-only** 接入，不直接改 production trainer / serving。 | 避免未經 Gate 驗證的資料源影響 baseline 或線上供應契約。 |
+| D-003 | Registry v0 仍只負責 **selection / governance**，不承載 SQL 或來源表清洗邏輯。 | 與 `Feature Candidate Registry - IMPLEMENTATION_PLAN.md` 對齊；source-specific 清洗由來源契約或 materializer 實作負責。 |
+| D-004 | 第一輪仍採 **group-first** 評估，不引入任意 feature-combo 搜尋。 | 符合本文件設計原則，並控制運算成本與結論可解釋性。 |
+| D-005 | Implementation Plan 只定義外部事件來源如何進入 feature experimentation；來源表清洗細節以來源契約 / findings / schema dictionary 為準。 | 避免本文件變成 data dictionary；例如 `t_casino_txn` 清洗依 `doc/FINDINGS.md` [FND-19] 與 `schema/GDP_GMWDS_Raw_Schema_Dictionary.md` §5。 |
 
 ## 1) 設計原則（Realization Principles）
 
 - **Group-first**：feature group 為最小實驗單位，不做預設全欄位組合暴力搜尋。
 - **PIT-first**：所有候選都必須先通過時間語義與可觀測性檢查，再進入模型評估。
+- **Source-contract-first**：外部事件來源不得由實驗 runner 直接讀 raw table 進訓練；必須先經來源契約定義的清洗、去重、PIT event-time 與有效事件規則，並產出可追溯的 cleaned/materialized artifact。
 - **Quality-first**：在進入 **Gate 1／ablation 訓練** 前，候選欄位預設通過 **FQG（L1 全量 + L2 候選）**；僅 **allowlist** 內欄位可進訓練；**BLOCK** 預設 **fail-fast**（見 Working Plan §1.5）。
 - **Cost-aware**：每輪實驗都需同時比較效能與成本（runtime / peak RAM / cache 命中）。
 - **Fair-compare**：訓練視窗策略比較時固定 eval 區間（val/test），僅改訓練資料策略。
@@ -73,6 +84,21 @@
   - `training_sample_range`：例如 `no earlier than 2025-01-01`
 - `training_sample_range` 的預設語意採「no earlier than <date>」，避免誤用「no later than <date>」導致排除近期資料。
 
+### 2.5 外部事件來源實驗接入
+
+- 支援將非既有 Feast / `fe_derived` 路徑的事件表，以 **experiment-only source** 方式接入 feature experimentation。
+- 外部事件來源必須先通過 source-specific preprocessing contract，至少明確定義：
+  - logical key 與去重策略
+  - deletion / cancellation / invalid event 處理
+  - PIT event timestamp 與資料可見性語意
+  - entity key 對齊方式（例如 `player_id` / `canonical_id` / 其他 mapping）
+  - 可進入模型的 cleaned output schema 與 source contract version
+- `feature_experiment` runner 僅消費已清洗、PIT-safe 的 materialized feature parquet，不直接把 raw source table join 入訓練集。
+- Registry v0 對外部事件特徵只宣告 `feature_id`、`group_id`、`source`、`time_horizon`、`max_lookback`、`status`、`enabled_for` 與治理註記；不重複來源表清洗規則或 SQL。
+- `t_casino_txn` 為第一個目標外部事件來源案例；其清洗細節不在本文件展開，來源依據為：
+  - `doc/FINDINGS.md` **[FND-19]**
+  - `schema/GDP_GMWDS_Raw_Schema_Dictionary.md` **§5. t_casino_txn**
+
 ## 3) 實作工作流（Workstreams）
 
 ### Workstream A: Registry 與語意契約
@@ -97,6 +123,19 @@
 - 建立群內去冗餘流程（相關群聚、代表特徵挑選、淘汰紀錄）。
 - **Baseline 盤點**：對現行常用特徵全集至少跑一次 **FQG L1**，建立初始品質基線（可併入 Wave 0/1）。
 
+### Workstream C2: 外部事件來源 Materialization 接入
+
+- 建立 source-specific materializer 插槽：在 Step 3 / FE enrichment 與 Step 4 split 之前，產出可 join 至訓練 grain 的 cleaned feature parquet。
+- Materializer 輸入必須是 raw source + source contract；輸出必須包含 join key、PIT anchor、feature columns、source metadata 與 schema/version fingerprint。
+- `run_pipeline.py` 需能在 isolated `run_dir` 下記錄：
+  - raw input path / fingerprint
+  - source contract reference / version
+  - cleaning policy id
+  - materializer code version
+  - output parquet path / row count / feature columns
+- 外部事件來源的 candidate group 仍走既有 FQG、Gate 0、Gate 1、Gate 2；不得跳過 allowlist / blocklist 約束。
+- 第一版只要求 group-first add-one / LOO 支援；任意 named arms 或 feature-combo runner 屬後續擴充，不列入本 implementation plan 的 v0 目標。
+
 ### Workstream D: Window Strategy Runner
 
 - 建立固定 eval 區間的比較框架。
@@ -109,6 +148,7 @@
 - 建立每輪固定輸出格式：
   - **FQG 產物路徑**（`feature_quality_report` / `feature_allowlist` / `feature_blocklist`）與 `fqg_status`
   - 實驗配置（feature list version、group set、window policy）
+  - 外部事件來源 metadata（若本輪使用）：source contract reference、cleaning policy id、raw input fingerprint、materialized feature artifact path
   - 指標（AP、Recall@Precision floor、alerts/hour）
   - 成本（runtime、peak RAM、cache hit ratio）
   - 決策（go/no-go + reason codes）
@@ -124,6 +164,8 @@
   - 短/中/長窗分級策略上線；中窗具 daily snapshot，長窗具 monthly snapshot + cache + as-of join 能力。
 - **M3 - Screening Pipeline Online**
   - **FQG** 可重現並輸出 `feature_quality_report.json` / `feature_allowlist.json` / `feature_blocklist.json`；Gate 0/1/2 流程可重現，並可輸出標準篩選報表；Gate 1 僅能使用 allowlist 內欄位。
+- **M3b - External Event Source Experiment Path**
+  - 至少一個外部事件來源可透過 source-specific materializer 產出 PIT-safe feature parquet，並在 isolated feature experiment run 中完成 FQG + Gate 1 評估。
 - **M4 - Window Strategy Benchmark**
   - all history vs rolling vs weighting 可在固定 eval 區間公平比較。
 - **M5 - Governance Closure**
@@ -134,6 +176,7 @@
 - D1: `feature group registry` 規格與首版內容
 - D2: 長窗 snapshot + cache manifest 規格
 - D2b: **FQG** 契約與 JSON schema（`feature_quality_report` / `feature_allowlist` / `feature_blocklist`）及 `config.py`（或單一 YAML）內 **FQG v0 閾值**集中設定
+- D2c: 外部事件來源 materialization 接入契約（cleaned artifact schema、source metadata、fingerprint 與 report 欄位）
 - D3: Gate 0/1/2 篩選報表模板
 - D4: 訓練視窗策略比較報表模板
 - D5: 每輪實驗決策紀錄模板（含 reason codes）
@@ -148,6 +191,10 @@
   - 緩解：固定 eval 區間 + 多切點對照，並記錄統計穩健性指標。
 - 風險：FQG 抽樣導致統計與全量略有偏差。
   - 緩解：固定 seed、樣本量與版本寫入 report；重大決策可選全量覆核路徑並記錄。
+- 風險：外部事件來源清洗規則漂移，導致同一 feature group 在不同 run 中語意不一致。
+  - 緩解：每次 run 落盤 source contract reference、cleaning policy id、raw input fingerprint 與 materializer code version；source-specific 細節不得只存在程式註解。
+- 風險：實驗 runner 直接讀 raw source table，繞過去重、取消/刪除處理或 PIT event-time 規則。
+  - 緩解：外部來源只能透過 materialized cleaned artifact 進入 enrichment；Gate 0 檢查須驗 source metadata 是否存在。
 - 風險：筆電資源不足造成實驗排程阻塞。
   - 緩解：採 wave 節奏（S/L/Mix），先跑 group-level 快篩，再做精篩。
 
@@ -156,6 +203,7 @@
 - 候選群組升級條件（**v0**，與 `Feature experimentation - WORKING_PLAN.md` §1.4 / §1.5 / §4 對齊）：
   - 通過 **FQG**：擬訓練欄位均為 **PASS** 或已核准之 **WARN**；無未處理之 **BLOCK**（詳 §1.5）
   - 通過 Gate 0（資料品質、非法值、常數率、PIT、單 group 物化時間上限）
+  - 若候選來自外部事件來源：必須有 source contract reference、cleaning policy id、raw input fingerprint、materialized artifact fingerprint，且 Gate 0 能確認訓練只使用 cleaned/PIT-safe output。
   - Gate 1：相對同一 baseline 之 `ΔAP ≥ +0.003` 且 `ΔR@Pmin > 0`（Recall 必須嚴格上升；單次固定 val/test 口徑與 Gate 1 報表定義一致）
   - Gate 2：完成群內去冗餘並落盤保留/淘汰理由
   - 容量護欄：`val alerts/hour ≤ 120`；若超限，必須告警並標記不通過升級（除非另有核准豁免與紀錄）
@@ -174,3 +222,4 @@
 - SSOT：定義「要做什麼與治理準則」。
 - 本文件：定義「如何在架構與工作流層落地」。
 - Working plan（後續）：定義「任務拆解、順序、依賴與 DoD」；**FQG v0 門檻**見該檔 **§1.5**。
+- Source-specific findings / schema dictionary：定義單一 raw source 的資料發現、欄位字典與清洗注意事項；例如 `t_casino_txn` 依 `doc/FINDINGS.md` **[FND-19]** 與 `schema/GDP_GMWDS_Raw_Schema_Dictionary.md` **§5**。本文件不得重複其欄位級清洗規則。
