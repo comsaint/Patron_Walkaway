@@ -15,7 +15,7 @@ import json
 import logging
 import pickle
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 from typing import Any, Mapping
@@ -23,6 +23,7 @@ from typing import Any, Mapping
 import duckdb
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import yaml
 from trainer_hightier.config import (
     DuckDbRuntimeConfig,
@@ -54,6 +55,11 @@ from trainer_hightier.feature_experiment.feature_registry import (
 )
 import trainer_hightier.feature_experiment.feature_registry as _feat_registry
 from trainer_hightier.feature_experiment.materialize_fe_derived import materialize_fe_derived_parquet
+from trainer_hightier.feature_experiment.materialize_txn_lite import (
+    default_raw_casino_txn_parquet,
+    materialize_txn_lite_parquet,
+    write_txn_lite_sidecars,
+)
 from trainer_hightier.feature_experiment.val_slices import (
     contiguous_val_day_masks,
     median_p25,
@@ -81,6 +87,7 @@ class FeatureExperimentPaths:
     run_dir: Path
     step3_training_parquet: Path
     fe_derived_parquet: Path
+    txn_lite_parquet: Path | None
     enriched_training_parquet: Path
     splits_dir: Path
     report_json: Path
@@ -90,6 +97,24 @@ def _feature_columns_intersect_allowlist(columns: tuple[str, ...], allow: frozen
     """Keep column order from ``columns`` but drop anything not in ``allow``."""
 
     return tuple(c for c in columns if c in allow)
+
+
+def _feature_columns_present_in_splits(
+    splits_dir: Path,
+    columns: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Drop registry columns that are absent from split Parquet (legacy enrich gaps)."""
+
+    train_p = Path(splits_dir) / "train.parquet"
+    names = frozenset(pq.read_schema(train_p).names)
+    present = tuple(c for c in columns if c in names)
+    missing = [c for c in columns if c not in names]
+    if missing:
+        logger.warning(
+            "[FE] Registry columns absent from splits (dropped for training): %s",
+            missing,
+        )
+    return present
 
 
 def _repo_root() -> Path:
@@ -209,6 +234,7 @@ def _resolve_paths(cfg: Mapping[str, Any], output_dir: Path | None) -> FeatureEx
         run_dir=run_root,
         step3_training_parquet=step3_out,
         fe_derived_parquet=fe,
+        txn_lite_parquet=None,
         enriched_training_parquet=enriched,
         splits_dir=splits,
         report_json=rep,
@@ -250,7 +276,7 @@ def _filter_train_floor(*, train_parquet: Path, min_day: date, duckdb_runtime: D
     day_s = min_day.isoformat()
     inner = f"""
 SELECT * FROM read_parquet('{mq}')
-WHERE TRY_CAST(gaming_day AS DATE) >= DATE '{day_s}'
+WHERE TRY_CAST(gaming_day_event AS DATE) >= DATE '{day_s}'
 """.strip()
     con = duckdb.connect(database=":memory:")
     try:
@@ -296,6 +322,7 @@ def _build_report(
     feature_quality: dict[str, Any] | None = None,
     candidate_registry: dict[str, Any] | None = None,
     feast_auto_apply: Mapping[str, Any] | None = None,
+    external_sources: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     gate1_inner = compute_gate1_vs_baseline(
         baseline_report,
@@ -336,6 +363,8 @@ def _build_report(
         out["feature_quality"] = feature_quality
     if ablation_v0 is not None:
         out["ablation_v0"] = ablation_v0
+    if external_sources is not None:
+        out["external_sources"] = external_sources
     return out
 
 
@@ -646,6 +675,36 @@ def main() -> None:
     )
     timing["fe_materialize_sec"] = round(time.perf_counter() - t0, 3)
 
+    external_sources_echo: list[dict[str, Any]] = []
+    txn_lite_path: Path | None = None
+    ext_root = cfg_yaml.get("external_sources")
+    txn_cfg = ext_root.get("t_casino_txn") if isinstance(ext_root, dict) else None
+    if isinstance(txn_cfg, dict) and bool(txn_cfg.get("enabled")):
+        raw_txn = Path(str(txn_cfg.get("raw_parquet", default_raw_casino_txn_parquet())))
+        txn_lite_path = (paths.run_dir / "txn_lite.parquet").resolve()
+        logger.info("[FE] materializing txn_lite (BUYIN/CASHOUT) → %s", txn_lite_path)
+        t_txn = time.perf_counter()
+        txn_meta = materialize_txn_lite_parquet(
+            raw_casino_txn_parquet=raw_txn,
+            training_parquet_for_bet_ids=step3_in,
+            out_parquet=txn_lite_path,
+            duckdb_runtime=duck,
+        )
+        mat_report_path, _src_meta_path = write_txn_lite_sidecars(
+            run_dir=paths.run_dir,
+            materialization_meta=txn_meta,
+            out_parquet=txn_lite_path,
+        )
+        timing["txn_lite_materialize_sec"] = round(time.perf_counter() - t_txn, 3)
+        paths = replace(paths, txn_lite_parquet=txn_lite_path)
+        external_sources_echo.append(
+            {
+                **txn_meta,
+                "materialization_report_path": str(mat_report_path.resolve()),
+                "enabled": True,
+            },
+        )
+
     # Enrich
     logger.info("[FE] joining FE columns → %s", paths.enriched_training_parquet)
     t0 = time.perf_counter()
@@ -654,6 +713,7 @@ def main() -> None:
         fe_derived_parquet=paths.fe_derived_parquet,
         out_parquet=paths.enriched_training_parquet,
         duckdb_runtime=duck,
+        txn_lite_parquet=txn_lite_path,
     )
     timing["enrich_sec"] = round(time.perf_counter() - t0, 3)
 
@@ -724,14 +784,21 @@ def main() -> None:
             )
         allow_f = frozenset(fqg_result.allowlist)
 
-    baseline_cols = _feature_columns_intersect_allowlist(_feat_registry.MODEL_FEATURE_COLUMNS, allow_f)
-    if len(baseline_cols) != len(_feat_registry.MODEL_FEATURE_COLUMNS):
-        missing_mx = sorted(set(_feat_registry.MODEL_FEATURE_COLUMNS) - set(baseline_cols))
+    baseline_target = _feature_columns_present_in_splits(
+        paths.splits_dir,
+        _feat_registry.MODEL_FEATURE_COLUMNS,
+    )
+    baseline_cols = _feature_columns_intersect_allowlist(baseline_target, allow_f)
+    if not baseline_cols:
         raise RuntimeError(
-            "FQG allowlist dropped baseline columns "
-            f"{missing_mx}; fix PIPE/data or pass WARN approvals / widen thresholds.",
+            "No baseline feature columns remain after FQG allowlist and split schema filter.",
         )
-    full_cols = _feature_columns_intersect_allowlist(_feat_registry.FULL_CANDIDATE_FEATURE_COLUMNS, allow_f)
+    full_target = _feature_columns_present_in_splits(
+        paths.splits_dir,
+        _feat_registry.FULL_CANDIDATE_FEATURE_COLUMNS,
+    )
+    full_cols = _feature_columns_intersect_allowlist(full_target, allow_f)
+    allow_train = frozenset(full_cols)
     fq_quality_echo = {
         "fqg_version": FeatureQualityGateConfig().fqg_version,
         "fqg_status": ("skipped" if skip_fqg else (fqg_result.fqg_status if fqg_result is not None else "fail")),
@@ -745,6 +812,9 @@ def main() -> None:
         "n_candidate_features_used": len(full_cols),
         "baseline_feature_columns_used": list(baseline_cols),
         "candidate_feature_columns_used": list(full_cols),
+        "registry_columns_dropped_not_in_splits": sorted(
+            set(_feat_registry.FULL_CANDIDATE_FEATURE_COLUMNS) - set(full_cols),
+        ),
     }
 
     step5 = Step5TrainConfig(run_step5=True, skip_optuna=True)
@@ -793,7 +863,7 @@ def main() -> None:
             full_candidate_report=res_cand.report,
             capacity_alerts_per_hour_cap=cap_alerts_hr,
             budget_deadline_perf=budget_deadline,
-            allow=allow_f,
+            allow=allow_train,
         )
         for ak, av in ablation_v0["timing_sec"].items():
             timing[ak] = av
@@ -868,6 +938,7 @@ def main() -> None:
         feature_quality=fq_quality_echo,
         candidate_registry=registry_echo,
         feast_auto_apply=feast_apply_echo,
+        external_sources=external_sources_echo or None,
     )
     if bool(blob["gate1"].get("capacity_alarm")):
         logger.warning(

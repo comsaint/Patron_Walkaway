@@ -62,6 +62,7 @@ ALERTS_API_PROTOCOL_COLUMNS: Final[tuple[str, ...]] = (
     "ts",
     "bet_ts",
     "player_id",
+    "game_id",
     "casino_player_id",
     "table_id",
     "position_idx",

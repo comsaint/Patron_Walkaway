@@ -115,6 +115,7 @@ def enrich_training_parquet(
     fe_derived_parquet: Path,
     out_parquet: Path,
     duckdb_runtime: DuckDbRuntimeConfig,
+    txn_lite_parquet: Path | None = None,
 ) -> Path:
     """Legacy left-join ``fe__*`` aggregates onto Step-3 training parquet (by ``bet_id``)."""
 
@@ -124,14 +125,30 @@ def enrich_training_parquet(
     out.parent.mkdir(parents=True, exist_ok=True)
     oq = _esc(out)
     experimental_cols = list(_feature_registry.EXPERIMENTAL_NUMERIC_COLUMNS)
-    fe_cols = ", ".join(f'd."{c}" AS "{c}"' for c in experimental_cols)
+    fe_only = [c for c in experimental_cols if c.startswith("fe__")]
+    fe_cols = ", ".join(f'd."{c}" AS "{c}"' for c in fe_only)
+    txn_join = ""
+    txn_cols = ""
+    if txn_lite_parquet is not None:
+        tq = _esc(txn_lite_parquet)
+        from trainer_hightier.config import TXN_LITE_FEATURE_COLUMNS
+
+        txn_cols = ",\n  " + ",\n  ".join(f't."{c}" AS "{c}"' for c in TXN_LITE_FEATURE_COLUMNS)
+        txn_join = f"""
+LEFT JOIN read_parquet('{tq}') AS t
+  ON TRY_CAST(b.bet_id AS DOUBLE) = t.bet_id"""
+    elif any(c.startswith("txn__") for c in experimental_cols):
+        raise ValueError(
+            "Registry includes txn__ candidate columns but txn_lite_parquet was not provided; "
+            "enable external_sources.t_casino_txn in experiment_config.yaml",
+        )
     inner = f"""
 SELECT
   b.*,
-  {fe_cols}
+  {fe_cols}{txn_cols}
 FROM read_parquet('{bq}') AS b
 LEFT JOIN read_parquet('{fq}') AS d
-  ON TRY_CAST(b.bet_id AS DOUBLE) = d.bet_id
+  ON TRY_CAST(b.bet_id AS DOUBLE) = d.bet_id{txn_join}
 """.strip()
     con = duckdb.connect(database=":memory:")
     try:

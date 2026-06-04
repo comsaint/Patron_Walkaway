@@ -33,6 +33,43 @@
 | **特徵品質閘門 FQG v0** | **L1 全量 + L2 候選**；**BLOCK = fail-fast**；**WARN 需顯式核准** 方可進 Gate 1；閾值與產物見 **§1.5**。 |
 | 外部事件來源接入 | **Source-contract-first**：experiment runner 不得直接讀 raw source table 進訓練；必須先透過 source-specific materializer 產出 cleaned / PIT-safe artifact，並在 report 落盤 source contract reference、cleaning policy id、raw input fingerprint、materialized artifact fingerprint。 |
 | `t_casino_txn` 清洗邊界 | 本 working plan 只定義執行步驟與 DoD；`t_casino_txn` 欄位級清洗依 `doc/FINDINGS.md` **[FND-19]** 與 `schema/GDP_GMWDS_Raw_Schema_Dictionary.md` **§5**，不在本檔重複。 |
+| **txn_lite v0 範圍** | **僅 `BUYIN` + `CASHOUT`**（player-level cashflow）；**不含 `CHANGE`**、`TD_*`、`TRANSFER`、`UPDATE_OWNER`、`QUICK_TRANSFER`。PIT anchor = `start_dtm`；join grain = training `player_id` × `payout_complete_dtm`。 |
+
+### 1.7 `t_casino_txn` txn_lite v0（Wave 1b 第一切片）
+
+**目的**：在 isolated feature experiment 中驗證 `group_txn_lite_cashflow` 是否帶來 Gate 1 增量，且不影響 production trainer。
+
+| 項目 | v0 決策 |
+|------|---------|
+| 納入 type | `BUYIN`、`CASHOUT` only |
+| 明確排除 | `CHANGE`（activity proxy，非 cashflow 方向）、`TD_FILL`、`TD_CREDIT`、`TRANSFER`、`UPDATE_OWNER` |
+| 清洗 policy | `t_casino_txn_v0_fnd19`（delete-aware dedup + type-specific status；細節見 FND-19） |
+| Registry group | `group_txn_lite_cashflow`；`enabled_for: candidate, ablation` only（**非 baseline**） |
+| 特徵前綴 | `txn__*`（7 欄，max lookback 1h） |
+| Materializer | `trainer_hightier/feature_experiment/materialize_txn_lite.py` |
+| Runner 開關 | `experiment_config.yaml` → `external_sources.t_casino_txn.enabled: true` |
+| 產出路徑 | `<run_dir>/external_sources/t_casino_txn/materialized_features.parquet` + sidecar JSON |
+
+**v0 特徵欄位（registry 對齊）**
+
+- `txn__has_cash_out__w15m`
+- `txn__cash_out_cnt__w1h`
+- `txn__cash_out_sum__w1h`
+- `txn__net_cash_out_flag__w1h`
+- `txn__net_cash_flow__w1h`
+- `txn__buyin_cash_sum__w1h`
+- `txn__buyin_prize_redemption_flag__w1h`
+
+**Smoke 指令（不跑 Step 3、不與主 trainer 搶資源）**
+
+```bash
+python -m trainer_hightier.feature_experiment.run_pipeline \
+  --skip-step3 \
+  --output-dir trainer_hightier/artifacts/feature_experiment/run_txn_lite_smoke \
+  --skip-fqg
+```
+
+（第一輪 bring-up 可 `--skip-fqg`；正式 Gate 1 dry-run 需開 FQG + `--ablation`。）
 
 ### 1.4 定量門檻 v0（Gate 0/1/2 與訓練視窗穩健性）
 
@@ -242,6 +279,7 @@
 - Gate 0 能驗證 external source metadata 完整，且訓練欄位集合仍為 FQG allowlist 子集。
 - 至少 **1 個** external-source group 完成 baseline vs baseline+group dry-run；若使用小型時間切片或 subset，報表須標註 subset policy 與不可直接與全量比較。
 - External source 的欄位級清洗規則未被複製進本 working plan；報表只引用來源文件與 policy id。
+- **`t_casino_txn` txn_lite v0**：materializer 產出僅含 **BUYIN/CASHOUT** 欄位；報表或 sidecar 可稽核 `types_included=['BUYIN','CASHOUT']`，且 **無 CHANGE 衍生欄**。
 
 **產出 artifacts（最低）**
 
@@ -337,10 +375,10 @@
 | Task ID | Task | Owner | 依賴 | DoD | 產出 |
 |---------|------|-------|------|-----|------|
 | CX1 | 定義 external source artifact schema 與 sidecar metadata | TBD | A1,C0 | §1.6 欄位可由 runner 驗證；缺欄 fail-fast | `external_source_artifact_schema.md` 或等價 schema |
-| CX2 | 實作 materializer 插槽 / runner hook | TBD | CX1,C2 | 可在 isolated run_dir 產出 cleaned feature parquet；不直接 join raw table | 程式變更 + 範例 artifact |
-| CX3 | Registry source mapping | TBD | A1,CX1 | external-source 欄位可用 `source`、`group_id`、`enabled_for` 被選入 candidate/ablation | registry 範例 + loader 測試 |
-| CX4 | Gate 0 external source metadata check | TBD | C1,CX1 | 缺 source contract / policy id / fingerprint 時 fail-fast | `gate0_checklist` 更新 |
-| CX5 | First external-source dry-run | TBD | CX2,CX3,CX4 | 至少 1 個 external group 完成 FQG + Gate 0 + Gate 1 dry-run | `materialization_report.json` + `gate1_compare_*.json` |
+| CX2 | 實作 `materialize_txn_lite.py` + `run_pipeline` hook | TBD | CX1 | `external_sources.t_casino_txn.enabled` 時產出 §1.6 artifact；PIT=`start_dtm`；types=BUYIN/CASHOUT only | `materialize_txn_lite.py` + runner |
+| CX3 | Registry：`group_txn_lite_cashflow` + `txn__*` loader | TBD | A1,CX1 | 7 欄 `candidate+ablation` only；ablation 可選 `group_txn_lite_cashflow` | `feature_candidate_registry.yaml` |
+| CX4 | Gate 0 external source metadata check | TBD | C1,CX1 | 缺 source contract / policy id / fingerprint 時 fail-fast | report `external_sources[]` |
+| CX5 | txn_lite smoke dry-run | TBD | CX2,CX3 | `--skip-step3` isolated run；可選 `--ablation` 跑 add-one | `gate1_ablation_report.json`（若開 ablation） |
 
 ### Workstream D — Window Strategy Runner
 
@@ -550,6 +588,7 @@
 - [ ] 單 round runtime ≤ 60 分鐘與資源注意事項已載明。
 - [ ] 報表模板含：`feature_quality`（FQG 路徑與狀態）、`feature_list_version`、`group_set`、`window_policy`、`AP`、`R@Pmin`、`val_alerts_per_hour`、`capacity_alarm`、`runtime`、`peak RAM`、`cache_hit_ratio`、`go/no-go` + reason。
 - [ ] 報表模板含：`external_sources` metadata（source contract、cleaning policy、raw/materialized fingerprint、artifact path、row counts）。
+- [ ] **txn_lite v0** 已鎖定 BUYIN/CASHOUT only、**不含 CHANGE**（§1.7）。
 - [ ] **未修改** `trainer-hightier-working-plan_c12558b9.plan.md`。
 
 ---
@@ -566,4 +605,4 @@
 
 ---
 
-*文件版本：依 registry / experiment 慣例自行 bump；本檔對齊 SSOT 與 Implementation Plan，並已納入 **FQG v0（§1.5、§4.0）** 與 **外部事件來源 experiment-only 接入（§1.6、Wave 1b）** 之執行與驗收敘述。*
+*文件版本：依 registry / experiment 慣例自行 bump；本檔對齊 SSOT 與 Implementation Plan，並已納入 **FQG v0（§1.5、§4.0）**、**外部事件來源 experiment-only 接入（§1.6、Wave 1b）**、以及 **txn_lite v0（§1.7，BUYIN/CASHOUT only、不含 CHANGE）** 之執行與驗收敘述。*

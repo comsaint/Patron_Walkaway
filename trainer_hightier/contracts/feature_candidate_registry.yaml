@@ -1,8 +1,8 @@
 # Feature layers (naming SSOT): raw | short (PIT per bet_id) | mid (daily snapshot ASOF) | long (monthly).
 # Short includes bet__* and short-horizon fe__*; allowed_training_supplier short_term_pit_builder.
 # source feast_trial_1h on bet__* is a legacy registry label—not a separate horizon from fe_derived short.
-registry_version: v0.6
-updated_at: '2026-05-16'
+registry_version: v0.7
+updated_at: '2026-06-04'
 features:
 - feature_id: wager
   group_id: baseline_model
@@ -1066,3 +1066,94 @@ features:
     dRecall +0.0030.'
   time_horizon: short_term
   max_lookback: PT1H
+- feature_id: txn__has_cash_out__w15m
+  group_id: group_txn_lite_cashflow
+  source: t_casino_txn
+  semantic_owner: trainer_hightier/feature_experiment/materialize_txn_lite.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: 'txn_lite v0: BUYIN/CASHOUT only; CHANGE excluded (FND-19).'
+  time_horizon: short_term
+  max_lookback: PT1H
+  allowed_training_supplier: external_txn_lite_materializer
+- feature_id: txn__cash_out_cnt__w1h
+  group_id: group_txn_lite_cashflow
+  source: t_casino_txn
+  semantic_owner: trainer_hightier/feature_experiment/materialize_txn_lite.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: null
+  time_horizon: short_term
+  max_lookback: PT1H
+  allowed_training_supplier: external_txn_lite_materializer
+- feature_id: txn__cash_out_sum__w1h
+  group_id: group_txn_lite_cashflow
+  source: t_casino_txn
+  semantic_owner: trainer_hightier/feature_experiment/materialize_txn_lite.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: null
+  time_horizon: short_term
+  max_lookback: PT1H
+  allowed_training_supplier: external_txn_lite_materializer
+- feature_id: txn__net_cash_out_flag__w1h
+  group_id: group_txn_lite_cashflow
+  source: t_casino_txn
+  semantic_owner: trainer_hightier/feature_experiment/materialize_txn_lite.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: null
+  time_horizon: short_term
+  max_lookback: PT1H
+  allowed_training_supplier: external_txn_lite_materializer
+- feature_id: txn__net_cash_flow__w1h
+  group_id: group_txn_lite_cashflow
+  source: t_casino_txn
+  semantic_owner: trainer_hightier/feature_experiment/materialize_txn_lite.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: null
+  time_horizon: short_term
+  max_lookback: PT1H
+  allowed_training_supplier: external_txn_lite_materializer
+- feature_id: txn__buyin_cash_sum__w1h
+  group_id: group_txn_lite_cashflow
+  source: t_casino_txn
+  semantic_owner: trainer_hightier/feature_experiment/materialize_txn_lite.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: null
+  time_horizon: short_term
+  max_lookback: PT1H
+  allowed_training_supplier: external_txn_lite_materializer
+- feature_id: txn__buyin_prize_redemption_flag__w1h
+  group_id: group_txn_lite_cashflow
+  source: t_casino_txn
+  semantic_owner: trainer_hightier/feature_experiment/materialize_txn_lite.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: null
+  time_horizon: short_term
+  max_lookback: PT1H
+  allowed_training_supplier: external_txn_lite_materializer
