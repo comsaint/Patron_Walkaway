@@ -591,7 +591,7 @@ class Step5TrainConfig:
     #: When ``True``, use :data:`baseline_*` hyperparameters only (no Optuna).
     skip_optuna: bool = False
     #: ``study.optimize(..., timeout=...)`` wall-clock cap in seconds.
-    optuna_timeout_sec: float = 60 * 60 * 3  # 10-minute Optuna wall-clock budget
+    optuna_timeout_sec: float = 60 * 60 * 3  # Optuna wall-clock budget
     #: Optuna TPE search bounds (ignored when ``skip_optuna`` is ``True``).
     optuna_search: Step5OptunaSearchConfig = field(default_factory=Step5OptunaSearchConfig)
     #: LightGBM kwargs not tuned by Optuna (objective, metric, verbosity, n_jobs).
