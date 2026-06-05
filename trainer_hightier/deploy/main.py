@@ -185,13 +185,60 @@ def _configure_deploy_log_noise_filters() -> None:
     apply_serving_log_noise_filters()
 
 
+class _FlushingFileHandler(logging.FileHandler):
+    """FileHandler that flushes after each record so deploy_main.log stays current."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Write *record* and flush immediately."""
+        super().emit(record)
+        self.flush()
+
+
+def _disable_windows_console_quick_edit() -> bool:
+    """Disable CMD QuickEdit on Windows so accidental selection cannot pause the process.
+
+    No-op on non-Windows or when no console is attached. Fail-open on any API error.
+
+    Returns
+    -------
+    bool
+        True when QuickEdit was successfully disabled.
+    """
+    if sys.platform != "win32":
+        return False
+
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    std_input_handle = ctypes.c_uint32(-10 & 0xFFFFFFFF)
+    enable_extended_flags = 0x0080
+    enable_quick_edit_mode = 0x0040
+
+    handle = kernel32.GetStdHandle(std_input_handle)
+    if handle in (0, -1):
+        return False
+
+    mode = ctypes.c_uint32()
+    if kernel32.GetConsoleMode(handle, ctypes.byref(mode)) == 0:
+        return False
+
+    new_mode = (mode.value | enable_extended_flags) & ~enable_quick_edit_mode
+    if kernel32.SetConsoleMode(handle, new_mode) == 0:
+        return False
+    return True
+
+
 def _init_deploy_logging(
     bundle_root: Path,
     rel: dict[str, Any],
     *,
     level: int,
 ) -> Path | None:
-    """Configure root logger with stderr + bundle-local file handlers (idempotent).
+    """Configure root logger with bundle-local file + stderr handlers (idempotent).
+
+    File handler is registered before the console handler and flushes on every
+    record so ``deploy_main.log`` stays current even when stderr blocks.
+    On Windows, QuickEdit mode is disabled before handlers are attached.
 
     File handler creation failures are fail-open: console logging remains active.
 
@@ -200,22 +247,18 @@ def _init_deploy_logging(
     Path | None
         Resolved log file path when file logging is active, else ``None``.
     """
+    quick_edit_disabled = _disable_windows_console_quick_edit()
+
     formatter = logging.Formatter(_DEPLOY_LOG_FORMAT)
     root = logging.getLogger()
     root.setLevel(level)
-
-    if not _root_has_stream_handler(root, sys.stderr):
-        stream_handler = logging.StreamHandler(sys.stderr)
-        stream_handler.setFormatter(formatter)
-        stream_handler.setLevel(level)
-        root.addHandler(stream_handler)
 
     log_path = _deploy_log_file_path(bundle_root, rel)
     file_path: Path | None = None
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         if not _root_has_file_handler(root, log_path):
-            file_handler = logging.FileHandler(log_path, encoding="utf-8")
+            file_handler = _FlushingFileHandler(log_path, encoding="utf-8")
             file_handler.setFormatter(formatter)
             file_handler.setLevel(level)
             root.addHandler(file_handler)
@@ -228,11 +271,23 @@ def _init_deploy_logging(
             exc,
         )
 
+    if not _root_has_stream_handler(root, sys.stderr):
+        stream_handler = logging.StreamHandler(sys.stderr)
+        stream_handler.setFormatter(formatter)
+        stream_handler.setLevel(level)
+        root.addHandler(stream_handler)
+
+    quick_edit_status = (
+        str(quick_edit_disabled).lower()
+        if sys.platform == "win32"
+        else "n/a"
+    )
     logging.getLogger(__name__).info(
-        "[deploy] logging initialized level=%s file=%s handlers=%d",
+        "[deploy] logging initialized level=%s file=%s handlers=%d quick_edit_disabled=%s",
         logging.getLevelName(level),
         file_path if file_path is not None else "disabled",
         len(root.handlers),
+        quick_edit_status,
     )
     _configure_deploy_log_noise_filters()
     return file_path
