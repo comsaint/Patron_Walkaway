@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 from trainer_hightier.config import default_hightier_serving_config
 from trainer_hightier.serving.ch_adapter import get_clickhouse_client
 from trainer_hightier.serving.flight_recorder.ch_capture import (
+    add_validator_canonical_key,
     build_incremental_query_record,
     build_pool_chunk_sql,
     build_pool_query_record,
@@ -218,7 +219,11 @@ def _execute_validator_canonical(client: Any, meta: dict[str, Any], *, use_final
         chunk = tuple(ids[i : i + chunk_size])
         q_params = {**params, "players": chunk}
         frames.append(client.query_df(sql, parameters=q_params))
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    business_key = str(meta.get("business_key") or "")
+    if business_key == "flight_recorder_canonical_key":
+        out = add_validator_canonical_key(out)
+    return out
 
 
 def _execute_validator_bet_ids(client: Any, meta: dict[str, Any], *, use_final: bool) -> pd.DataFrame:
@@ -242,7 +247,7 @@ def execute_query(
     *,
     use_final: bool,
 ) -> pd.DataFrame:
-    """Run stored replay contract against ClickHouse; empty frame when skipped."""
+    """Run stored replay contract against ClickHouse."""
     meta = finalize_query_manifest(dict(query_meta))
     if requery_skip_reason(meta) is not None:
         return pd.DataFrame()
@@ -252,8 +257,7 @@ def execute_query(
     try:
         client = get_clickhouse_client()
     except Exception as exc:
-        logger.warning("[ch_requery] ClickHouse client unavailable: %s", exc)
-        return pd.DataFrame()
+        raise RuntimeError(f"ClickHouse client unavailable: {exc}") from exc
     fetch = str(meta.get("fetch", ""))
     try:
         if fetch == "fetch_bets_incremental":
@@ -267,10 +271,6 @@ def execute_query(
         params = _coerce_params(dict(meta.get("parameters") or {}))
         return client.query_df(sql, parameters=params)
     except Exception as exc:
-        logger.warning(
-            "[ch_requery] query failed fetch=%s use_final=%s: %s",
-            fetch,
-            use_final,
-            exc,
-        )
-        return pd.DataFrame()
+        raise RuntimeError(
+            f"ClickHouse requery failed fetch={fetch} use_final={use_final}: {exc}"
+        ) from exc

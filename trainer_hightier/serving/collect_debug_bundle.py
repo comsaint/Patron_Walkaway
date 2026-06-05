@@ -60,6 +60,13 @@ _PREDICTION_LOG_AUDIT_COLUMNS: tuple[str, ...] = (
     "mid_term_freshness_status",
     "slow_freshness_status",
     "snapshot_scoring_degraded",
+    "alert_policy_candidate",
+    "alert_policy_raised",
+    "alert_policy_suppressed",
+    "alert_policy_suppression_reason",
+    "alert_policy_cooldown_min",
+    "alert_policy_last_raised_ts",
+    "alert_policy_decision_ts",
 )
 
 _IDENTITY_FILES: tuple[str, ...] = (

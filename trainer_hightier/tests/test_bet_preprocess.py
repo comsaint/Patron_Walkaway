@@ -23,7 +23,11 @@ from trainer_hightier.preprocess_bet_fix_registry import (
     load_preprocess_bet_ingestion_fix_registry,
     resolve_bet_ingest_fix004_cap_binding,
 )
-from trainer_hightier.utils.bet_l0_preprocess import default_preprocess_registry_yaml_path
+from trainer_hightier.utils.bet_l0_preprocess import (
+    _consolidate_staged_bucket_partition_dirs,
+    _partitioned_parquet_footer_row_count,
+    default_preprocess_registry_yaml_path,
+)
 from trainer_hightier.utils.patron_session_metrics import materialize_adt_allowed_players_parquet
 
 _hpre = importlib.import_module("trainer_hightier.02_preprocess")
@@ -985,3 +989,37 @@ def test_materialize_walkaway_labels_matches_trainer_labels(tmp_path: Path) -> N
 
     pd.testing.assert_series_equal(got["label"].reset_index(drop=True), direct["label"].reset_index(drop=True))
     pd.testing.assert_series_equal(got["censored"].reset_index(drop=True), direct["censored"].reset_index(drop=True))
+
+
+def test_consolidate_staged_bucket_partition_dirs_preserves_multi_shard_rows(tmp_path: Path) -> None:
+    """Regression: multiple staged shards per bucket/day must not overwrite each other."""
+    staged_root = tmp_path / "staged"
+    final_root = tmp_path / "final"
+    leaf = staged_root / "b0000" / "gaming_month=202606" / "gaming_day_key=2026-06-03"
+    leaf.mkdir(parents=True)
+    shard_a = leaf / "data_0.parquet"
+    shard_b = leaf / "data_1.parquet"
+    pq.write_table(
+        pa.Table.from_pandas(pd.DataFrame({"bet_id": [1, 2], "value": ["a", "b"]})),
+        shard_a,
+    )
+    pq.write_table(
+        pa.Table.from_pandas(pd.DataFrame({"bet_id": [3, 4, 5], "value": ["c", "d", "e"]})),
+        shard_b,
+    )
+    staged_rows = _partitioned_parquet_footer_row_count(staged_root)
+    assert staged_rows == 5
+
+    _consolidate_staged_bucket_partition_dirs(
+        staged_root=staged_root,
+        final_dataset_root=final_root,
+        n_buckets=1,
+    )
+
+    final_shards = sorted(final_root.rglob("*.parquet"))
+    assert len(final_shards) == 2
+    assert {p.name for p in final_shards} == {
+        "bucket_0000_part_0000.parquet",
+        "bucket_0000_part_0001.parquet",
+    }
+    assert _partitioned_parquet_footer_row_count(final_root) == staged_rows

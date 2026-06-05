@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,7 @@ import pytest
 from trainer_hightier.serving.flight_recorder.config import FlightRecorderConfig
 from trainer_hightier.serving.flight_recorder.init_recording import init_recording_root
 from trainer_hightier.serving.flight_recorder.manifest import RecordingRoot, sha256_file
+from trainer_hightier.serving.pack_flight_recording import pack_recording
 
 
 def test_recording_root_registers_files_and_manifest(tmp_path: Path) -> None:
@@ -67,3 +70,29 @@ def test_next_cycle_dirs_increment(tmp_path: Path) -> None:
     assert d2.name == "cycle_000002"
     v1 = recording.next_validator_cycle_dir()
     assert v1.name == "cycle_000001"
+
+
+def test_pack_recording_exports_existing_sqlite_siblings(tmp_path: Path) -> None:
+    """Pack-time export includes DBs created after recorder init."""
+    bundle = tmp_path / "bundle"
+    model_dir = bundle / "models"
+    local_state = bundle / "local_state"
+    model_dir.mkdir(parents=True)
+    local_state.mkdir(parents=True)
+    (model_dir / "model_version").write_text("pack-test\n", encoding="utf-8")
+    (bundle / "deploy_bundle_paths.json").write_text(
+        json.dumps({"local_state_dir": "local_state", "model_bundle_dir": "models"}),
+        encoding="utf-8",
+    )
+    config = FlightRecorderConfig(recording_root="local_state/flight_recording")
+    ctx = init_recording_root(bundle, config, export_sqlite=False)
+    for db_name in ("state.db", "prediction_log.db"):
+        with sqlite3.connect(local_state / db_name) as conn:
+            conn.execute("CREATE TABLE sample (id INTEGER PRIMARY KEY, value TEXT)")
+            conn.execute("INSERT INTO sample(value) VALUES ('ok')")
+    out_zip = tmp_path / "flight.zip"
+    pack_recording(ctx.recording.root, out_zip)
+    with zipfile.ZipFile(out_zip) as zf:
+        names = set(zf.namelist())
+    assert "state/state_db_export/sample.parquet" in names
+    assert "state/prediction_log_db_export/sample.parquet" in names

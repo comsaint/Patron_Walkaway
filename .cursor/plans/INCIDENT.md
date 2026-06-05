@@ -202,3 +202,110 @@ Scope: `package/deploy/main.py`（scorer / validator 背景執行緒）、`STATE
 
 **狀態（2026-03-26）**：Task 10 已落地（`run_scorer_loop` 之 `first_cycle_done`、`package/deploy/main.py` Event 同步與可選逾時）；驗證步驟見 [`STATUS.md`](STATUS.md) **Task 10**。
 
+---
+
+# INCIDENT — 訓練短期特徵 under-count
+
+Date: 2026-06-05  
+Scope: `trainer_hightier/utils/bet_l0_preprocess.py`（cleaned bet base 物化）、`trainer_hightier/feature_experiment/materialize_fe_derived.py`（短期 PIT 訓練特徵）、`trainer_hightier/06_verify_training_serving_parity.py`
+
+## Summary
+
+Production alert rate 遠低於預期。調查顯示 production 的 `bet__bets_cnt__w1h` 可從最新 ClickHouse / raw `t_bet` 重現，但 training artifact 對同一特徵嚴重 under-count。
+
+問題不在 rolling count 公式。根因是 bucketed L0 bet preprocess 在 partition consolidation 階段發生 overwrite bug，導致 `cleaned__gmwds_t_bet_base` 資料被截斷 / 損壞。
+
+## Impact
+
+- 訓練短期 PIT 特徵（尤其 `bet__bets_cnt__w1h`）系統性偏小。
+- 模型在不代表 production 高活躍行為的分佈上學習與選 threshold。
+- 高 `w1h` 玩家在 production 的 score 趨近 0，alert rate 極低。
+- 既有 parity check 誤判通過，因 replay 使用同一套有問題的 cleaned-bet source。
+
+## Evidence
+
+具體例子：
+
+- 目標 `bet_id=596825375`，`player_id=153949189`，`canonical_id=23059340`
+- 目標 `payout_complete_dtm=2026-06-03 09:45:20+08:00`
+- Training artifact `bet__bets_cnt__w1h = 5`
+- 同一 player / prior 1h，raw `data/partitions/t_bet__part_202606.parquet` 重算：**125 distinct bets**
+- 同一 player / prior 1h，`cleaned__gmwds_t_bet_base`：**5 distinct bets**
+
+2026-06-03 全日檢查：
+
+- Raw 經 exact DQ + per-`bet_id` dedup 後：**338,532** distinct bets
+- `cleaned__gmwds_t_bet_base`：**23,254** distinct bets
+
+Bucket 層級檢查：
+
+- Bucket 00 預期 rows：`10,467`；final cleaned shard rows：`758`
+- Bucket 01 預期 rows：`10,609`；final cleaned shard rows：`753`
+- Bucket 02 預期 rows：`10,669`；final cleaned shard rows：`704`
+
+約 6–7% 的保留率符合 consolidation overwrite，而非 feature 公式錯誤。
+
+## Root Cause
+
+`preprocess_bets_from_parquet_streaming` 在 `dedup_hash_buckets > 1` 時，將各 bucket 寫入 staged Hive-partitioned parquet tree。DuckDB 對同一 bucket / day 可能產出多個 parquet shard。
+
+`_consolidate_staged_bucket_partition_dirs` 隨後把同一 bucket / day 的所有 staged shard 搬到同一個 destination 檔名：
+
+- destination 檔名：`bucket_000X.parquet`
+- 若 destination 已存在，先 `unlink`
+- 下一個 shard 覆蓋前一個 shard
+
+因此，當 staged bucket/day 含多個 parquet 檔時，只有最後搬移的 shard 存活。`cleaned__gmwds_t_bet_base` 中大部分 rows 被靜默丟棄。
+
+問題程式碼：
+
+```python
+bucket_label = f"bucket_{b:04d}.parquet"
+for pq_src in sorted(st.rglob("*.parquet")):
+    rel_parent = pq_src.relative_to(st).parent
+    dest_dir = final_dataset_root / rel_parent
+    dest = dest_dir / bucket_label
+    if dest.is_file():
+        dest.unlink()
+    shutil.move(str(pq_src), str(dest))
+```
+
+## Why Parity Did Not Catch It
+
+`06_verify_training_serving_parity.py` 將 training artifact 與讀取同一套 flawed cleaned-bet artifact 的 offline replay 比對，形成 circular check：
+
+`bad training feature == replay from same bad cleaned pool`
+
+Suite 只證明 offline path 內部實作一致，未證明與 raw ClickHouse / production source 語意等價。
+
+## Remediation Plan
+
+### Immediate fix
+
+1. 修改 `_consolidate_staged_bucket_partition_dirs`：每個 staged parquet shard 使用唯一 deterministic 檔名，或在 move 前先 merge 同一 bucket/day 的所有 shard。
+2. Consolidation 後加入 invariant：staged input row count 必須等於 final output row count。
+3. Row count 不一致時 preprocess 必須 fail，不得寫入成功的 cache manifest。
+
+### Data repair
+
+1. 刪除 / invalidate 現有 `cleaned__gmwds_t_bet_base` 及衍生的 segmented `cleaned__gmwds_t_bet` artifacts。
+2. 從 raw `data/partitions/t_bet__part_*.parquet` 重建 cleaned bet artifacts。
+3. 重建短期 PIT training features。
+4. 重新訓練並重跑 threshold selection。
+
+### Guardrails
+
+1. 新增 regression test：staged bucket/day 含多個 parquet shard 時，final consolidated row count 必須保留全部 rows。
+2. 新增 feature sanity check：抽樣高活躍 rows，比對 training short-term features 與 raw `t_bet` 重算結果。
+3. 更新 parity verification：加入 raw-source reference check，不能只 replay cleaned training artifacts。
+
+## Status
+
+- Root cause 已確認（`_consolidate_staged_bucket_partition_dirs` overwrite）。
+- Code fix 已落地：唯一 shard 檔名 + consolidation row-count invariant。
+- Regression test 已加入 `trainer_hightier/tests/test_bet_preprocess.py`。
+- Step 06 / Step 4.5 已加入 raw-source `bet__bets_cnt__w1h` sanity check。
+- 202606 scoped probe 驗證：incident prior 1h distinct bets `5 → 125`。
+- 全量 `cleaned__gmwds_t_bet_base` / `cleaned__gmwds_t_bet` rebuild 進行中（見 `out/rebuild_bet_artifacts.log`）。
+- Short-term PIT cache 重建與 full retrain 待 rebuild 完成後執行。
+

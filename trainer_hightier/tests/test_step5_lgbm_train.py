@@ -75,6 +75,15 @@ def test_aggregate_bets_to_player_game_max_score_and_label() -> None:
             "player_id": [1, 1, 1, 2],
             "game_id": [100.0, 100.0, 200.0, 100.0],
             "walkaway_label": [0, 1, 0, 0],
+            "payout_complete_dtm": pd.to_datetime(
+                [
+                    "2026-06-01 10:00:00",
+                    "2026-06-01 10:01:00",
+                    "2026-06-01 10:02:00",
+                    "2026-06-01 11:00:00",
+                ],
+            ),
+            "bet_id": [1.0, 2.0, 3.0, 4.0],
         }
     )
     scores = np.array([0.3, 0.9, 0.4, 0.2], dtype=np.float64)
@@ -86,6 +95,19 @@ def test_aggregate_bets_to_player_game_max_score_and_label() -> None:
     assert float(out.scores.max()) == pytest.approx(0.9)
     pos_games = int(np.sum(out.y_true == 1))
     assert pos_games == 1
+    assert list(out.candidates.columns) == [
+        "player_id",
+        "game_id",
+        "player_game_score",
+        "player_game_label",
+        "bet_count",
+        "alert_ts",
+        "bet_id",
+    ]
+    game100 = out.candidates.loc[out.candidates["game_id"] == 100.0].iloc[0]
+    assert float(game100["player_game_score"]) == pytest.approx(0.9)
+    assert int(game100["player_game_label"]) == 1
+    assert float(game100["bet_id"]) == pytest.approx(2.0)
 
 
 def test_aggregate_bets_to_player_game_excludes_invalid_keys() -> None:
@@ -96,6 +118,8 @@ def test_aggregate_bets_to_player_game_excludes_invalid_keys() -> None:
             "player_id": [1, None],
             "game_id": [100.0, 100.0],
             "walkaway_label": [0, 1],
+            "payout_complete_dtm": pd.to_datetime(["2026-06-01 10:00:00", "2026-06-01 10:01:00"]),
+            "bet_id": [1.0, 2.0],
         }
     )
     scores = np.array([0.5, 0.8], dtype=np.float64)

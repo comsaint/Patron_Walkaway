@@ -1701,6 +1701,8 @@ def _maybe_run_pre_train_feature_gate(args: HighTierTrainArgs, metrics: dict[str
     cleaned_bet = repo / "trainer_hightier" / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet"
     mapping = default_canonical_mapping_parquet_path().resolve()
     out_json = step06_mod.default_pre_train_gate_json_path()
+    from trainer_hightier.utils.partition_inventory import default_partition_snapshot_dir
+
     report = step06_mod.run_pre_train_feature_gate(
         test_parquet,
         columns=gate_cols,
@@ -1709,6 +1711,7 @@ def _maybe_run_pre_train_feature_gate(args: HighTierTrainArgs, metrics: dict[str
         gate_cfg=args.pre_train_gate,
         duckdb_runtime=args.duckdb_runtime,
         output_json=out_json,
+        raw_partition_dir=default_partition_snapshot_dir(),
     )
     metrics["pre_train_feature_gate_json"] = str(out_json.resolve())
     metrics["pre_train_feature_gate_verdict"] = report.get("verdict")

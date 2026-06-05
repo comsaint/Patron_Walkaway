@@ -56,6 +56,37 @@ _NUMERIC_TRY_DOUBLE_COLS: Final[frozenset[str]] = frozenset(
     },
 )
 
+# Preferred ORDER BY keys when present (LightGBM is order-sensitive at fixed seed).
+_SPLIT_COPY_ORDER_BY_PREFERENCE: Final[tuple[tuple[str, str], ...]] = (
+    ("payout_complete_dtm", "TRY_CAST(payout_complete_dtm AS TIMESTAMPTZ) NULLS LAST"),
+    ("bet_id", "TRY_CAST(bet_id AS DOUBLE) NULLS LAST"),
+    ("gaming_day_event", "TRY_CAST(gaming_day_event AS DATE) NULLS LAST"),
+    ("canonical_id", "TRIM(CAST(canonical_id AS VARCHAR))"),
+)
+
+
+def _split_copy_order_by_sql(con: duckdb.DuckDBPyConnection) -> str:
+    """Build a deterministic ``ORDER BY`` clause from columns present on ``_step4_tagged``."""
+
+    available = {str(row[0]) for row in con.execute("DESCRIBE _step4_tagged").fetchall()}
+    parts = [expr for col, expr in _SPLIT_COPY_ORDER_BY_PREFERENCE if col in available]
+    if not parts:
+        raise RuntimeError(
+            "Step 4 split COPY requires at least one ORDER BY column on _step4_tagged; "
+            f"got columns={sorted(available)}",
+        )
+    return ", ".join(parts)
+
+
+def _split_copy_select_sql(split_tag: str, *, order_by: str) -> str:
+    """Return deterministic ``COPY`` subquery for one split tag."""
+
+    return (
+        f"SELECT * EXCLUDE (split_tag) FROM _step4_tagged "
+        f"WHERE split_tag = '{split_tag}' "
+        f"ORDER BY {order_by}"
+    )
+
 
 def _path_posix(path: Path) -> str:
     return str(Path(path).resolve()).replace("\\", "/")
@@ -283,16 +314,17 @@ def _copy_split_parquets(con: duckdb.DuckDBPyConnection, out_dir: Path) -> tuple
     train_esc = _path_posix(train_p).replace("'", "''")
     val_esc = _path_posix(val_p).replace("'", "''")
     test_esc = _path_posix(test_p).replace("'", "''")
+    order_by = _split_copy_order_by_sql(con)
     con.execute(
-        f"COPY (SELECT * EXCLUDE (split_tag) FROM _step4_tagged WHERE split_tag = 'train') "
+        f"COPY ({_split_copy_select_sql('train', order_by=order_by)}) "
         f"TO '{train_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
     )
     con.execute(
-        f"COPY (SELECT * EXCLUDE (split_tag) FROM _step4_tagged WHERE split_tag = 'val') "
+        f"COPY ({_split_copy_select_sql('val', order_by=order_by)}) "
         f"TO '{val_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
     )
     con.execute(
-        f"COPY (SELECT * EXCLUDE (split_tag) FROM _step4_tagged WHERE split_tag = 'test') "
+        f"COPY ({_split_copy_select_sql('test', order_by=order_by)}) "
         f"TO '{test_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
     )
     return train_p, val_p, test_p

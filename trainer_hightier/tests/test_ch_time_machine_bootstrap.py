@@ -12,10 +12,12 @@ from trainer_hightier.config import (
 )
 from trainer_hightier.serving.ch_time_machine import (
     _bootstrap_bundle_clickhouse,
+    run_window_capture,
     summarize_capture_readiness,
 )
 from trainer_hightier.serving.flight_recorder.config import FlightRecorderConfig
 from trainer_hightier.serving.flight_recorder.window_registry import register_window
+from trainer_hightier.serving.flight_recorder.window_registry import list_windows
 
 
 @pytest.fixture(autouse=True)
@@ -72,3 +74,35 @@ def test_readiness_reports_pending_not_due_yet(tmp_path: Path) -> None:
     assert summary["windows"] == 1
     assert summary["pending_labels"] == 1
     assert summary["due_labels"] == 0
+
+
+def test_time_machine_capture_error_does_not_mark_done(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed requery writes evidence and remains pending for retry."""
+    root = tmp_path / "recording"
+    window_id = register_window(
+        root,
+        source="cycles/scorer/cycle_000001/clickhouse",
+        fetch="fetch_bets_incremental",
+        query_meta={
+            "fetch": "fetch_bets_incremental",
+            "sql": "SELECT bet_id FROM db.t_bet FINAL",
+            "parameters": {},
+        },
+        t0_final_parquet="cycles/scorer/cycle_000001/clickhouse/incremental_t_bet.final.parquet",
+    )
+
+    def _raise_requery(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("trainer_hightier.serving.ch_time_machine.execute_query", _raise_requery)
+    window = list_windows(root)[0]
+    with pytest.raises(RuntimeError, match="boom"):
+        run_window_capture(root, window, "t_plus_15m", include_non_final=False)
+
+    error_path = root / "ch_time_machine" / window_id / "capture_t_plus_15m" / "capture_error.json"
+    assert error_path.is_file()
+    refreshed = list_windows(root)[0]
+    assert not refreshed.get("captures", {}).get("t_plus_15m")

@@ -97,6 +97,10 @@ from trainer_hightier.serving.snapshot_freshness import (
     validate_slow_artifact,
 )
 from trainer_hightier.serving.feature_state_store import ActiveSnapshotManifest, read_active_manifest
+from trainer_hightier.evaluation.player_alert_policy import (
+    apply_serving_player_alert_suppression,
+    warn_player_alert_policy_mismatch,
+)
 from trainer_hightier.serving.model_bundle import HightierModelBundle, load_hightier_model_bundle
 from trainer_hightier.serving.prediction_log import (
     append_hightier_prediction_log,
@@ -1447,6 +1451,21 @@ def score_once(
         composite_cols=supplier_plan.mid_composite_cols,
         runtime_inputs_by_feature=runtime_inputs_map,
     )
+    alerts, excluded_pg = _build_player_game_alert_frame(
+        staged,
+        prob,
+        threshold=thr,
+        scored_at_iso=scored_at_iso,
+        model_version=str(bundle.model_version),
+    )
+    policy = cfg.player_alert_policy
+    raised_alerts, _suppressed_alerts, alert_policy_decisions = apply_serving_player_alert_suppression(
+        alerts,
+        conn=conn,
+        suppression_enabled=bool(policy.suppression_enabled),
+        cooldown_min=int(policy.cooldown_min),
+    )
+    n = int(len(raised_alerts))
     if pl_path is not None and str(pl_path).strip():
         try:
             from trainer_hightier.serving.feast_readiness import compute_batch_mid_null_top_features
@@ -1479,18 +1498,10 @@ def score_once(
                 ),
                 mid_term_snapshot_age_days=mid_fresh.staleness_days,
                 mid_null_top_features_json=mid_top_json,
+                alert_policy_decisions=alert_policy_decisions,
             )
         except Exception as exc:
             logger.warning("[hightier_scorer] prediction_log write failed: %s", exc)
-
-    alerts, excluded_pg = _build_player_game_alert_frame(
-        staged,
-        prob,
-        threshold=thr,
-        scored_at_iso=scored_at_iso,
-        model_version=str(bundle.model_version),
-    )
-    n = int(len(alerts))
     scored_indices = staged.index
     if excluded_pg > 0:
         cycle_log = dict(cycle_log)
@@ -1517,7 +1528,7 @@ def score_once(
             queue_drained=queue_drained,
         )
         return 0
-    append_alerts(conn, alerts)
+    append_alerts(conn, raised_alerts)
     _commit_scoring_cursor(conn, batch.cursor, scored_indices)
     conn.commit()
     _flight_rec.on_score_once_end(
@@ -1586,6 +1597,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     init_state_db(Path(cfg.state_db_path))
     init_prediction_log_db(cfg.prediction_log_db_path)
     bundle = load_hightier_model_bundle(bundle_dir=args.bundle_dir)
+    warn_player_alert_policy_mismatch(
+        logger,
+        training_metrics=bundle.training_metrics,
+        serving_policy=cfg.player_alert_policy,
+    )
     map_path = Path(args.canonical_mapping).resolve() if args.canonical_mapping else None
     cli_al = Path(args.adt_allowlist).resolve() if args.adt_allowlist else None
     high_adt_only = bool(cfg.high_adt_only) and (not bool(args.no_high_adt_only))

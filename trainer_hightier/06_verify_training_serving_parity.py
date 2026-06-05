@@ -241,6 +241,210 @@ def short_term_parity_column_names(
     return tuple(dict.fromkeys(c for c in cols if c in present))
 
 
+RAW_W1H_SANITY_COLUMN = "bet__bets_cnt__w1h"
+
+
+def _raw_t_bet_partition_glob(raw_partition_dir: Path) -> str:
+    """POSIX glob for monthly raw ``t_bet`` partition parquets."""
+    root = Path(raw_partition_dir).resolve()
+    return str((root / "t_bet__part_*.parquet").as_posix()).replace("'", "''")
+
+
+def build_pool_from_raw_partitions(
+    bets: pd.DataFrame,
+    *,
+    raw_partition_dir: Path,
+    cfg: HightierServingConfig,
+    mapping_parquet: Path,
+) -> pd.DataFrame:
+    """Bounded hot pool from raw monthly ``t_bet`` partitions (reference semantics)."""
+    import duckdb
+
+    from trainer_hightier.serving.offline_serving_backtest import resolve_hot_pool_player_ids
+    from trainer_hightier.serving.scorer import compute_scoring_bounds_for_bets
+
+    if bets.empty:
+        return bets
+    bounds = compute_scoring_bounds_for_bets(bets, cfg=cfg)
+    if bounds.empty:
+        raise ValueError("[raw_source_sanity] scoring bounds empty for non-empty bets batch")
+    pool_start = bounds["pool_start"].min()
+    pool_end = bounds["scoring_pcd"].max()
+    if pd.isna(pool_start) or pd.isna(pool_end):
+        raise ValueError("[raw_source_sanity] scoring bounds produced null pool window")
+    pool_start = pd.Timestamp(pool_start).to_pydatetime()
+    pool_end = pd.Timestamp(pool_end).to_pydatetime()
+    pids = resolve_hot_pool_player_ids(bets, mapping_parquet, expand_canonical_aliases=False)
+    fan_cap = int(cfg.hightier_scorer_pool_player_fanout_cap)
+    if len(pids) > fan_cap:
+        pids = pids[:fan_cap]
+    glob_path = _raw_t_bet_partition_glob(raw_partition_dir)
+    conn = duckdb.connect()
+    try:
+        conn.execute(
+            "CREATE TEMP TABLE allow_pids AS SELECT * FROM (SELECT UNNEST(?) AS player_id)",
+            [pids],
+        )
+        q = f"""
+            SELECT
+                TRY_CAST(CAST(b.bet_id AS VARCHAR) AS BIGINT) AS bet_id,
+                TRY_CAST(CAST(b.is_back_bet AS VARCHAR) AS INTEGER) AS is_back_bet,
+                CAST(b.bet_type AS VARCHAR) AS bet_type,
+                CAST(b.type_of_bet AS VARCHAR) AS type_of_bet,
+                CAST(b.payout_complete_dtm AS TIMESTAMPTZ) AS payout_complete_dtm,
+                CAST(b.gaming_day AS DATE) AS gaming_day_event,
+                TRY_CAST(CAST(b.session_id AS VARCHAR) AS DOUBLE) AS session_id,
+                TRY_CAST(CAST(b.player_id AS VARCHAR) AS BIGINT) AS player_id,
+                TRY_CAST(CAST(b.table_id AS VARCHAR) AS BIGINT) AS table_id,
+                TRY_CAST(CAST(b.wager AS VARCHAR) AS DOUBLE) AS wager,
+                TRY_CAST(CAST(b.casino_win AS VARCHAR) AS DOUBLE) AS casino_win,
+                TRY_CAST(CAST(b.payout_odds AS VARCHAR) AS DOUBLE) AS payout_odds,
+                TRY_CAST(CAST(b.theo_win AS VARCHAR) AS DOUBLE) AS theo_win,
+                TRY_CAST(CAST(b.base_ha AS VARCHAR) AS DOUBLE) AS base_ha
+            FROM read_parquet('{glob_path}') AS b
+            INNER JOIN allow_pids AS p
+              ON TRY_CAST(CAST(b.player_id AS VARCHAR) AS BIGINT) = p.player_id
+            WHERE CAST(b.payout_complete_dtm AS TIMESTAMPTZ) >= ?
+              AND CAST(b.payout_complete_dtm AS TIMESTAMPTZ) <= ?
+              AND TRY_CAST(CAST(b.wager AS VARCHAR) AS DOUBLE) > 0
+        """
+        pool = conn.execute(q, [pool_start, pool_end]).fetchdf()
+    finally:
+        conn.close()
+    if pool.empty:
+        raise ValueError(
+            "[raw_source_sanity] raw partition pool empty; check raw_partition_dir and dates",
+        )
+    pool = pool.drop_duplicates(subset=["bet_id"], keep="last")
+    pool["__etl_insert_Dtm"] = pool["payout_complete_dtm"]
+    from trainer_hightier.serving.feature_builder import attach_synthetic_etl_and_prediction_visible
+
+    return attach_synthetic_etl_and_prediction_visible(pool)
+
+
+def run_raw_source_w1h_sanity_check(
+    test: pd.DataFrame,
+    *,
+    raw_partition_dir: Path,
+    mapping_parquet: Path,
+    max_rows: int = 200,
+    undercount_ratio_threshold: float = 2.0,
+    undercount_fail_fraction: float = 0.02,
+    duckdb_runtime: DuckDbRuntimeConfig | None = None,
+) -> dict[str, Any]:
+    """Compare training ``bet__bets_cnt__w1h`` against raw ``t_bet`` partition recompute."""
+    from trainer_hightier.serving.feature_builder import (
+        attach_canonical_id,
+        attach_synthetic_etl_and_prediction_visible,
+        attach_trial_bet_behavior_1h,
+    )
+    from trainer_hightier.serving.short_term_scoring_context import sort_bets_for_scoring_batch
+
+    issues: list[str] = []
+    col = RAW_W1H_SANITY_COLUMN
+    raw_dir = Path(raw_partition_dir).resolve()
+    if not raw_dir.is_dir():
+        return {
+            "schema_version": "raw_source_w1h_sanity_v1",
+            "verdict": "skipped",
+            "issues": [f"raw partition dir missing: {raw_dir}"],
+            "n_rows_compared": 0,
+        }
+    if col not in test.columns:
+        return {
+            "schema_version": "raw_source_w1h_sanity_v1",
+            "verdict": "skipped",
+            "issues": [f"training split missing column {col!r}"],
+            "n_rows_compared": 0,
+        }
+    work = test.loc[test[col].notna(), ["bet_id", "player_id", "payout_complete_dtm", col]].copy()
+    if work.empty:
+        return {
+            "schema_version": "raw_source_w1h_sanity_v1",
+            "verdict": "skipped",
+            "issues": [],
+            "n_rows_compared": 0,
+        }
+    if max_rows and len(work) > int(max_rows):
+        work = sort_bets_for_scoring_batch(work).head(int(max_rows)).reset_index(drop=True)
+    need_cols = ("bet_id", "player_id", "payout_complete_dtm")
+    missing = [c for c in need_cols if c not in work.columns]
+    if missing:
+        issues.append(f"sample missing required columns for raw recompute: {missing}")
+        return {
+            "schema_version": "raw_source_w1h_sanity_v1",
+            "verdict": "fail",
+            "issues": issues,
+            "n_rows_compared": 0,
+        }
+    cfg = default_hightier_serving_config()
+    runtime = duckdb_runtime or DuckDbRuntimeConfig()
+    cmap = Path(mapping_parquet).resolve()
+    if not cmap.is_file():
+        issues.append(f"canonical mapping parquet missing: {cmap}")
+        return {
+            "schema_version": "raw_source_w1h_sanity_v1",
+            "verdict": "fail",
+            "issues": issues,
+            "n_rows_compared": 0,
+        }
+    staged = sort_bets_for_scoring_batch(work)
+    staged["__etl_insert_Dtm"] = pd.to_datetime(staged["payout_complete_dtm"], errors="coerce", utc=True)
+    pool = build_pool_from_raw_partitions(
+        staged,
+        raw_partition_dir=raw_dir,
+        cfg=cfg,
+        mapping_parquet=cmap,
+    )
+    pool = attach_canonical_id(pool, mapping_parquet=cmap)
+    staged = attach_synthetic_etl_and_prediction_visible(staged)
+    staged = attach_canonical_id(staged, mapping_parquet=cmap)
+    staged = attach_trial_bet_behavior_1h(staged, pool, duckdb_runtime=runtime)
+    merged = work.merge(
+        staged[["bet_id", col]].rename(columns={col: f"{col}_raw"}),
+        on="bet_id",
+        how="inner",
+    )
+    train_vals = pd.to_numeric(merged[col], errors="coerce")
+    raw_vals = pd.to_numeric(merged[f"{col}_raw"], errors="coerce")
+    eligible = train_vals.notna() & raw_vals.notna()
+    n_eligible = int(eligible.sum())
+    severe = (
+        eligible
+        & (raw_vals >= train_vals * float(undercount_ratio_threshold))
+        & ((raw_vals - train_vals) >= 3)
+    )
+    n_severe = int(severe.sum())
+    severe_fraction = float(n_severe / max(n_eligible, 1))
+    examples = (
+        merged.loc[severe, ["bet_id", col, f"{col}_raw"]]
+        .head(5)
+        .to_dict(orient="records")
+        if n_severe
+        else []
+    )
+    if n_eligible > 0 and severe_fraction > float(undercount_fail_fraction):
+        issues.append(
+            f"{n_severe}/{n_eligible} rows ({severe_fraction:.2%}) show severe training under-count "
+            f"vs raw recompute (ratio>={undercount_ratio_threshold}, delta>=3); examples={examples}",
+        )
+    return {
+        "schema_version": "raw_source_w1h_sanity_v1",
+        "verdict": "fail" if issues else "pass",
+        "issues": issues,
+        "raw_partition_dir": str(raw_dir),
+        "mapping_parquet": str(cmap),
+        "column": col,
+        "n_rows_input": int(len(work)),
+        "n_rows_compared": n_eligible,
+        "n_severe_undercount": n_severe,
+        "severe_undercount_fraction": severe_fraction,
+        "undercount_ratio_threshold": float(undercount_ratio_threshold),
+        "undercount_fail_fraction": float(undercount_fail_fraction),
+        "examples": examples,
+    }
+
+
 def pre_train_gate_exit_code(report: dict[str, Any]) -> int:
     """Non-zero when Step 4.5 short-term gate failed."""
     if report.get("verdict") == "fail":
@@ -447,6 +651,7 @@ def run_pre_train_feature_gate(
     gate_cfg: PreTrainFeatureGateConfig,
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
     output_json: Path | None = None,
+    raw_partition_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Step 4.5: compare training short-layer columns to live bounded PIT replay."""
     if not gate_cfg.run_pre_train_gate:
@@ -529,6 +734,17 @@ def run_pre_train_feature_gate(
             f"{len(fail_features)} short column(s) exceed diff fraction "
             f"{gate_cfg.diff_fraction_fail_threshold}",
         )
+    raw_sanity: dict[str, Any] = {"verdict": "skipped", "issues": []}
+    if raw_partition_dir is not None and RAW_W1H_SANITY_COLUMN in columns:
+        raw_sanity = run_raw_source_w1h_sanity_check(
+            test,
+            raw_partition_dir=Path(raw_partition_dir),
+            mapping_parquet=mapping_parquet,
+            max_rows=min(int(gate_cfg.max_rows), 200),
+            duckdb_runtime=runtime,
+        )
+        if raw_sanity.get("verdict") == "fail":
+            issues.extend(raw_sanity.get("issues", []))
     report = {
         "schema_version": "pre_train_feature_gate_v1",
         "verdict": "fail" if issues else "pass",
@@ -542,6 +758,7 @@ def run_pre_train_feature_gate(
         "batch_size": int(gate_cfg.batch_size),
         "features_all": per_feature,
         "features_with_diff": [r for r in per_feature if r["n_diff"] > 0],
+        "raw_source_w1h_sanity": raw_sanity,
     }
     if output_json is not None:
         out = Path(output_json).resolve()
@@ -841,6 +1058,8 @@ def validate_one_model(
     batch_size: int,
     diff_fraction_fail_threshold: float = 0.02,
     parity_cfg: Step6ParityConfig | None = None,
+    raw_partition_dir: Path | None = None,
+    mapping_parquet: Path | None = None,
 ) -> dict[str, Any]:
     """Run all-feature parity checks for one trained model directory."""
     report: dict[str, Any] = {
@@ -887,6 +1106,40 @@ def validate_one_model(
             "mode": "all_model_features",
             "issues": [f"production feature replay failed: {exc}"],
         }
+    cfg6 = parity_cfg or Step6ParityConfig()
+    raw_sanity: dict[str, Any] = {"verdict": "skipped", "issues": []}
+    if cfg6.run_raw_source_sanity and raw_partition_dir is not None:
+        from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_parquet_path
+
+        cmap = (
+            Path(mapping_parquet).resolve()
+            if mapping_parquet is not None
+            else default_canonical_mapping_parquet_path().resolve()
+        )
+        try:
+            test_frame = pd.read_parquet(test_parquet)
+            if max_rows and len(test_frame) > max_rows:
+                from trainer_hightier.serving.short_term_scoring_context import sort_bets_for_scoring_batch
+
+                test_frame = sort_bets_for_scoring_batch(test_frame).head(int(max_rows)).reset_index(drop=True)
+            raw_sanity = run_raw_source_w1h_sanity_check(
+                test_frame,
+                raw_partition_dir=Path(raw_partition_dir),
+                mapping_parquet=cmap,
+                max_rows=int(cfg6.raw_source_sanity_max_rows),
+                undercount_ratio_threshold=float(cfg6.raw_source_undercount_ratio_threshold),
+                undercount_fail_fraction=float(cfg6.raw_source_undercount_fail_fraction),
+            )
+        except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:
+            raw_sanity = {
+                "schema_version": "raw_source_w1h_sanity_v1",
+                "verdict": "fail",
+                "issues": [f"raw source w1h sanity failed: {exc}"],
+                "n_rows_compared": 0,
+            }
+    report["raw_source_w1h_sanity"] = raw_sanity
+    if raw_sanity.get("verdict") == "fail":
+        report["issues"].extend(raw_sanity.get("issues", []))
     report["issues"].extend(report["slow_artifact"].get("issues", []))
     report["issues"].extend(report["training_split_static_slow"].get("issues", []))
     report["issues"].extend(report["all_feature_replay"].get("issues", []))
@@ -913,7 +1166,12 @@ def validate_one_model(
         "verdict": "fail" if all_feature_issues else "pass",
         "issues": all_feature_issues,
     }
-    report["verdict"] = "fail" if (slow_issues or all_feature_issues) else "pass"
+    raw_issues = list(raw_sanity.get("issues", [])) if raw_sanity.get("verdict") == "fail" else []
+    report["raw_source_gate"] = {
+        "verdict": "fail" if raw_issues else "pass",
+        "issues": raw_issues,
+    }
+    report["verdict"] = "fail" if (slow_issues or all_feature_issues or raw_issues) else "pass"
     return report
 
 
@@ -928,6 +1186,9 @@ def model_exit_code(
     if parity_cfg.hard_fail_slow_gate and slow_fail:
         return 1
     if parity_cfg.hard_fail_all_feature_gate and all_fail:
+        return 1
+    raw_fail = report.get("raw_source_gate", {}).get("verdict") == "fail"
+    if parity_cfg.hard_fail_raw_source_sanity and raw_fail:
         return 1
     return 0
 
@@ -947,6 +1208,16 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     model_dirs = resolve_model_dirs(args)
     cleaned_bet_root = Path(args.cleaned_bet).resolve()
     feast_repo = Path(args.feast_repo).resolve()
+    raw_partition_dir = (
+        Path(args.raw_partition_dir).resolve()
+        if getattr(args, "raw_partition_dir", None) is not None
+        else None
+    )
+    mapping_parquet = (
+        Path(args.canonical_mapping).resolve()
+        if getattr(args, "canonical_mapping", None) is not None
+        else None
+    )
     models = [
         validate_one_model(
             model_dir,
@@ -962,6 +1233,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
                 getattr(args, "all_feature_diff_fraction_fail_threshold", 0.02),
             ),
             parity_cfg=getattr(args, "parity_cfg", None),
+            raw_partition_dir=raw_partition_dir,
+            mapping_parquet=mapping_parquet,
         )
         for model_dir in model_dirs
     ]
@@ -974,6 +1247,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "slow_anchor_effective": slow_anchor_effective.isoformat(),
         "test_parquet": str(test_parquet),
         "cleaned_bet_root": str(cleaned_bet_root),
+        "raw_partition_dir": str(raw_partition_dir) if raw_partition_dir is not None else None,
         "feast_repo": str(feast_repo),
         "n_models": len(models),
         "n_failed": sum(1 for m in models if m.get("verdict") != "pass"),
@@ -1022,6 +1296,10 @@ def build_report_from_config(
         parity_cfg.all_feature_diff_fraction_fail_threshold
     )
     args.parity_cfg = parity_cfg
+    from trainer_hightier.utils.partition_inventory import default_partition_snapshot_dir
+
+    args.raw_partition_dir = default_partition_snapshot_dir()
+    args.canonical_mapping = None
     return build_report(args)
 
 
@@ -1052,6 +1330,18 @@ def run_cli(argv: list[str] | None = None) -> int:
     parser.add_argument("--models-root", type=Path, default=Path("out/models_high_tier_mvp"))
     parser.add_argument("--test-parquet", type=Path, default=Path("trainer_hightier/artifacts/training_data/splits/test.parquet"))
     parser.add_argument("--cleaned-bet", type=Path, default=Path("trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet"))
+    parser.add_argument(
+        "--raw-partition-dir",
+        type=Path,
+        default=Path("data/partitions"),
+        help="raw monthly t_bet partition dir for raw-source w1h sanity check",
+    )
+    parser.add_argument(
+        "--canonical-mapping",
+        type=Path,
+        default=None,
+        help="canonical mapping parquet for raw-source sanity (default bundled artifact)",
+    )
     parser.add_argument("--feast-repo", type=Path, default=Path("trainer_hightier/feast_repo"))
     parser.add_argument("--as-of-date", type=str, default=date.today().isoformat())
     parser.add_argument(

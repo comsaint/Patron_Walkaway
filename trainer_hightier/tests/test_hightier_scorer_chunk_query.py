@@ -354,6 +354,55 @@ def test_fetch_bet_pool_window_chunks_merge(monkeypatch: pytest.MonkeyPatch) -> 
         assert "CAST(payout_odds AS Nullable(Float64)) AS payout_odds" in q
 
 
+def test_append_hightier_prediction_log_writes_alert_policy_fields(tmp_path) -> None:
+    import sqlite3
+
+    from trainer_hightier.evaluation.player_alert_policy import PlayerAlertPolicyDecision
+    from trainer_hightier.serving.prediction_log import append_hightier_prediction_log
+
+    db = tmp_path / "prediction_log.db"
+    staged = pd.DataFrame(
+        {
+            "bet_id": [1],
+            "session_id": ["a"],
+            "player_id": [10],
+            "canonical_id": ["c1"],
+            "casino_player_id": ["x"],
+            "table_id": [1],
+            "payout_complete_dtm": ["2025-01-01T10:00:00+08:00"],
+        }
+    )
+    decisions = {
+        "1": PlayerAlertPolicyDecision(
+            candidate=True,
+            raised=False,
+            suppressed=True,
+            suppression_reason="player_cooldown_15m",
+            cooldown_min=15,
+            last_raised_ts="2025-01-01T09:50:00+08:00",
+            decision_ts="2025-01-01T10:00:00+08:00",
+        ),
+    }
+    append_hightier_prediction_log(
+        db,
+        scored_at="2025-01-01T10:00:00+08:00",
+        model_version="mv1",
+        staged=staged,
+        prob=np.array([0.9], dtype=np.float64),
+        threshold=0.5,
+        alert_policy_decisions=decisions,
+    )
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            """
+            SELECT alert_policy_candidate, alert_policy_raised, alert_policy_suppressed,
+                   alert_policy_suppression_reason, alert_policy_cooldown_min
+            FROM prediction_log
+            """
+        ).fetchone()
+    assert row == (1, 0, 1, "player_cooldown_15m", 15)
+
+
 def test_append_hightier_prediction_log_writes_rows(tmp_path) -> None:
     import json
     import sqlite3
@@ -449,6 +498,9 @@ def test_init_prediction_log_db_idempotent(tmp_path) -> None:
     assert "bet_ts" in cols
     assert "features_json" in cols
     assert "fe_features_missing" in cols
+    assert "alert_policy_candidate" in cols
+    assert "alert_policy_raised" in cols
+    assert "alert_policy_suppressed" in cols
     tables = {
         r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     }

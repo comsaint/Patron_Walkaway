@@ -27,6 +27,7 @@ from trainer_hightier.serving.flight_recorder.redact import redact_sql, redact_v
 # downstream replay schema stable without assuming the raw ClickHouse column exists.
 _TBET_CASINO_PLAYER_ID_SELECT = "CAST(NULL AS Nullable(String)) AS casino_player_id"
 BUSINESS_KEY_BET_ID: Final[str] = "bet_id"
+VALIDATOR_CANONICAL_KEY: Final[str] = "flight_recorder_canonical_key"
 
 
 def _incremental_select_cols() -> str:
@@ -78,6 +79,21 @@ def _pool_select_cols() -> str:
 def _strip_final(sql: str) -> str:
     """Remove ``FINAL`` modifier for diagnostic non-final replay."""
     return re.sub(r"\bFINAL\b", "", sql, flags=re.IGNORECASE)
+
+
+def add_validator_canonical_key(frame: pd.DataFrame) -> pd.DataFrame:
+    """Add a stable key for validator canonical captures without ``bet_id``."""
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=[VALIDATOR_CANONICAL_KEY])
+    out = frame.copy()
+    if VALIDATOR_CANONICAL_KEY in out.columns:
+        return out
+    if "player_id" not in out.columns or "payout_complete_dtm" not in out.columns:
+        return out
+    ts = pd.to_datetime(out["payout_complete_dtm"], errors="coerce", utc=True)
+    pid = pd.to_numeric(out["player_id"], errors="coerce").astype("Int64").astype("string")
+    out[VALIDATOR_CANONICAL_KEY] = pid.fillna("<NA>") + "|" + ts.astype("string").fillna("<NA>")
+    return out
 
 
 def default_business_key(fetch: str) -> str:

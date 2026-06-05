@@ -29,9 +29,17 @@ import optuna
 from optuna.trial import TrialState
 import pandas as pd
 import pyarrow.parquet as pq
-from trainer_hightier.evaluation.metrics_blocks import split_metrics_block
+from trainer_hightier.evaluation.metrics_blocks import (
+    metrics_at_threshold,
+    split_metrics_block,
+)
+from trainer_hightier.evaluation.player_alert_policy import (
+    build_player_alert_policy_metadata,
+    operational_simulated_metrics_block,
+)
 
 from trainer_hightier.config import (
+    ALERT_HORIZON_MIN,
     DuckDbRuntimeConfig,
     OptunaFloatParamRange,
     OptunaIntParamRange,
@@ -48,6 +56,8 @@ PAYOUT_TS_COLUMN: Final[str] = "payout_complete_dtm"
 LABEL_COLUMN: Final[str] = "walkaway_label"
 PLAYER_ID_COLUMN: Final[str] = "player_id"
 GAME_ID_COLUMN: Final[str] = "game_id"
+BET_ID_COLUMN: Final[str] = "bet_id"
+ALERT_TS_COLUMN: Final[str] = "alert_ts"
 CAT_COLUMNS: Final[frozenset[str]] = frozenset({"bet_type", "type_of_bet"})
 STEP5_GROUP_COLUMNS: Final[frozenset[str]] = frozenset({PLAYER_ID_COLUMN, GAME_ID_COLUMN})
 EVALUATION_GRAIN_PLAYER_GAME: Final[str] = "player_game"
@@ -87,6 +97,12 @@ class PlayerGameAggregationResult:
     excluded_bets: int
     player_game_count: int
     bet_count: int
+    candidates: pd.DataFrame
+
+
+# Backward-compatible aliases for unit tests.
+_metrics_at_threshold = metrics_at_threshold
+_split_metrics_block = split_metrics_block
 
 
 def split_window_hours_from_parquet(
@@ -140,9 +156,30 @@ def _validate_parquet_schema(parquet_path: Path, required: frozenset[str]) -> No
 
 
 def _load_split_frame(parquet_path: Path, *, feature_columns: tuple[str, ...]) -> pd.DataFrame:
-    cols = list(feature_columns) + [LABEL_COLUMN, PAYOUT_TS_COLUMN, PLAYER_ID_COLUMN, GAME_ID_COLUMN]
+    cols = list(feature_columns) + [
+        LABEL_COLUMN,
+        PAYOUT_TS_COLUMN,
+        PLAYER_ID_COLUMN,
+        GAME_ID_COLUMN,
+        BET_ID_COLUMN,
+    ]
     _validate_parquet_schema(parquet_path, frozenset(cols))
     return pd.read_parquet(Path(parquet_path).resolve(), columns=cols)
+
+
+def _empty_player_game_candidates() -> pd.DataFrame:
+    """Return an empty player-game candidate frame with the expected schema."""
+
+    return pd.DataFrame(
+        columns=[
+            PLAYER_ID_COLUMN,
+            GAME_ID_COLUMN,
+            "player_game_score",
+            "player_game_label",
+            ALERT_TS_COLUMN,
+            BET_ID_COLUMN,
+        ],
+    )
 
 
 def aggregate_bets_to_player_game(
@@ -162,31 +199,41 @@ def aggregate_bets_to_player_game(
             f"aggregate_bets_to_player_game: df length {len(df)} != scores length {len(scores)} "
             f"(split={split_name!r})",
         )
-    for col in STEP5_GROUP_COLUMNS:
+    need_cols = STEP5_GROUP_COLUMNS | {
+        LABEL_COLUMN,
+        PAYOUT_TS_COLUMN,
+        BET_ID_COLUMN,
+    }
+    for col in need_cols:
         if col not in df.columns:
             raise ValueError(
                 f"aggregate_bets_to_player_game missing column {col!r}; "
                 f"split={split_name!r}, got {list(df.columns)!r}",
             )
-    work = df[[PLAYER_ID_COLUMN, GAME_ID_COLUMN, LABEL_COLUMN]].copy()
+    work = df[
+        [PLAYER_ID_COLUMN, GAME_ID_COLUMN, LABEL_COLUMN, PAYOUT_TS_COLUMN, BET_ID_COLUMN]
+    ].copy()
     work["_score"] = np.asarray(scores, dtype=np.float64).reshape(-1)
     pid = pd.to_numeric(work[PLAYER_ID_COLUMN], errors="coerce")
     gid = pd.to_numeric(work[GAME_ID_COLUMN], errors="coerce")
     lbl = pd.to_numeric(work[LABEL_COLUMN], errors="coerce")
+    alert_ts = pd.to_datetime(work[PAYOUT_TS_COLUMN], errors="coerce")
     valid = (
         pid.notna()
         & gid.notna()
         & lbl.notna()
+        & alert_ts.notna()
         & np.isfinite(work["_score"].to_numpy())
     )
     excluded = int((~valid).sum())
     if excluded > 0:
         logger.warning(
-            "Step 5 %s: excluded %d bet rows with null player_id/game_id/label or non-finite score",
+            "Step 5 %s: excluded %d bet rows with null player_id/game_id/label/"
+            "payout_complete_dtm or non-finite score",
             split_name,
             excluded,
         )
-    work = work.loc[valid]
+    work = work.loc[valid].copy()
     if work.empty:
         return PlayerGameAggregationResult(
             y_true=np.array([], dtype=np.int8),
@@ -194,7 +241,14 @@ def aggregate_bets_to_player_game(
             excluded_bets=excluded,
             player_game_count=0,
             bet_count=0,
+            candidates=_empty_player_game_candidates(),
         )
+    work["_bet_id_sort"] = pd.to_numeric(work[BET_ID_COLUMN], errors="coerce").fillna(-1)
+    work = work.sort_values(
+        by=["_score", PAYOUT_TS_COLUMN, "_bet_id_sort"],
+        ascending=[False, True, True],
+        kind="mergesort",
+    )
     grouped = (
         work.groupby([PLAYER_ID_COLUMN, GAME_ID_COLUMN], as_index=False, dropna=True)
         .agg(
@@ -203,6 +257,13 @@ def aggregate_bets_to_player_game(
             bet_count=(LABEL_COLUMN, "count"),
         )
     )
+    rep = work.groupby([PLAYER_ID_COLUMN, GAME_ID_COLUMN], as_index=False, dropna=True).first()
+    candidates = grouped.merge(
+        rep[[PLAYER_ID_COLUMN, GAME_ID_COLUMN, PAYOUT_TS_COLUMN, BET_ID_COLUMN]],
+        on=[PLAYER_ID_COLUMN, GAME_ID_COLUMN],
+        how="left",
+    )
+    candidates = candidates.rename(columns={PAYOUT_TS_COLUMN: ALERT_TS_COLUMN})
     y_pg = np.asarray(grouped["player_game_label"], dtype=np.int8)
     s_pg = np.asarray(grouped["player_game_score"], dtype=np.float64)
     return PlayerGameAggregationResult(
@@ -211,6 +272,7 @@ def aggregate_bets_to_player_game(
         excluded_bets=excluded,
         player_game_count=int(len(grouped)),
         bet_count=int(len(work)),
+        candidates=candidates,
     )
 
 
@@ -698,10 +760,32 @@ def train_lgbm_from_splits(
     block_tr_main = split_metrics_block("train", pg_tr.y_true, pg_tr.scores, thr, window_hours=wh_train)
     block_va_main = split_metrics_block("val", pg_va.y_true, pg_va.scores, thr, window_hours=wh_val)
     block_te_main = split_metrics_block("test", pg_te.y_true, pg_te.scores, thr, window_hours=wh_test)
+    block_tr_op = operational_simulated_metrics_block(
+        "train",
+        pg_tr.candidates,
+        thr,
+        window_hours=wh_train,
+    )
+    block_va_op = operational_simulated_metrics_block(
+        "val",
+        pg_va.candidates,
+        thr,
+        window_hours=wh_val,
+    )
+    block_te_op = operational_simulated_metrics_block(
+        "test",
+        pg_te.candidates,
+        thr,
+        window_hours=wh_test,
+    )
 
     elapsed = round(time.perf_counter() - t0, 3)
+    policy_meta = build_player_alert_policy_metadata(cfg.player_alert_policy)
     report: dict[str, Any] = {
         "evaluation_grain": EVALUATION_GRAIN_PLAYER_GAME,
+        "player_cooldown_simulated": True,
+        "player_cooldown_simulated_min": int(ALERT_HORIZON_MIN),
+        "player_cooldown_alert_ts_source": PAYOUT_TS_COLUMN,
         "player_game_group_key": [PLAYER_ID_COLUMN, GAME_ID_COLUMN],
         "score_aggregation": "max",
         "label_aggregation": "max",
@@ -732,6 +816,10 @@ def train_lgbm_from_splits(
         **block_tr_bl,
         **block_va_bl,
         **block_te_bl,
+        **block_tr_op,
+        **block_va_op,
+        **block_te_op,
+        **policy_meta,
     }
     report.update(study_summary)
 
@@ -750,6 +838,7 @@ def train_lgbm_from_splits(
                 "val_pick_feasible": val_pick.feasible,
                 "refit_train_plus_val": bool(cfg.refit_train_plus_val),
                 "refit_best_iteration": refit_best_iteration,
+                **policy_meta,
             },
             f,
             protocol=pickle.HIGHEST_PROTOCOL,

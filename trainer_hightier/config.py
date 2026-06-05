@@ -100,6 +100,26 @@ TXN_LITE_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     "txn__buyin_cash_sum__w1h",
     "txn__buyin_prize_redemption_flag__w1h",
 )
+# Window ablation probes (experiment-only; not in feature_candidate_registry until Gate 1 passes).
+TXN_LITE_WINDOW_ABLATION_EXTRA_HOURS: Final[tuple[int, ...]] = (4, 24)
+
+
+def txn_lite_feature_columns(*, extra_window_hours: tuple[int, ...] = ()) -> tuple[str, ...]:
+    """Return ``txn__*`` output columns for materialize (base v0 + optional longer-window sums)."""
+
+    extra_cols: list[str] = []
+    for hours in extra_window_hours:
+        if hours <= 1:
+            continue
+        suffix = f"w{hours}h"
+        extra_cols.extend(
+            (
+                f"txn__cash_out_sum__{suffix}",
+                f"txn__buyin_cash_sum__{suffix}",
+                f"txn__net_cash_flow__{suffix}",
+            ),
+        )
+    return tuple(dict.fromkeys(TXN_LITE_FEATURE_COLUMNS + tuple(extra_cols)))
 # Month-sharded short-term PIT cache under ``artifacts/training_data/cache/``.
 SHORT_TERM_PIT_CACHE_DIRNAME: Final[str] = "short_term_pit_v1"
 SHORT_TERM_PIT_CACHE_SCHEMA_VERSION: Final[int] = 1
@@ -390,7 +410,7 @@ class HighTierObjectiveConfig:
     # Quantile in (0, 1) on patron **ADT** (from ``canonical_patron_profile.csv``): bet preprocess keeps
     # only bets tied (via canonical mapping) to patrons at or above this ADT quantile (~top ``1 - q``).
     # Align naming with ``trainer.training.high_roller_segmentation`` when wiring segment thresholds.
-    theo_train_quantile: float = 0.95
+    theo_train_quantile: float = 0.99
     # Require precision >= this value on the **segment** when choosing a score threshold.
     min_precision: float = 0.60
     # Placeholder paths for later steps (Parquet / DuckDB exports).
@@ -584,6 +604,16 @@ class Step5OptunaSearchConfig:
 
 
 @dataclass(frozen=True)
+class PlayerAlertPolicyConfig:
+    """Shared train/serve player-level alert suppression policy."""
+
+    suppression_enabled: bool = True
+    cooldown_min: int = ALERT_HORIZON_MIN
+    threshold_selection_enabled: bool = False
+    sample_weight_enabled: bool = False
+
+
+@dataclass(frozen=True)
 class Step5TrainConfig:
     """Step 5: one LightGBM on Step 4 Parquet splits; optional Optuna with time budget."""
 
@@ -610,6 +640,7 @@ class Step5TrainConfig:
     baseline_reg_lambda: float = 1.0
     #: When ``True``, final artifact model refits on train+val (test remains holdout-only).
     refit_train_plus_val: bool = True
+    player_alert_policy: PlayerAlertPolicyConfig = field(default_factory=PlayerAlertPolicyConfig)
 
 
 @dataclass(frozen=True)
@@ -646,6 +677,12 @@ class Step6ParityConfig:
     step6_deploy_e2e_enabled: bool = True
     #: Scorability sample size for deploy E2E gate (keep small for 10-minute budget).
     step6_deploy_e2e_max_bets: int = 500
+    #: Compare training short-term features against raw ``t_bet`` partition recompute.
+    run_raw_source_sanity: bool = True
+    hard_fail_raw_source_sanity: bool = True
+    raw_source_sanity_max_rows: int = 200
+    raw_source_undercount_ratio_threshold: float = 2.0
+    raw_source_undercount_fail_fraction: float = 0.02
 
 
 PRE_TRAIN_FEATURE_GATE_JSON_BASENAME: Final[str] = "pre_train_feature_gate.json"
@@ -795,6 +832,7 @@ class HightierServingConfig:
     scorer_feast_mid_smoke_columns: tuple[str, ...] = SCORER_FEAST_MID_SMOKE_COLUMNS
     #: Optional training mid snapshot parquet for bootstrap seed; ``None`` uses package default when present.
     training_mid_snapshot_parquet: Path | None = None
+    player_alert_policy: PlayerAlertPolicyConfig = field(default_factory=PlayerAlertPolicyConfig)
 
 
 _DEFAULT_HIGHTIER_SERVING: HightierServingConfig = HightierServingConfig()

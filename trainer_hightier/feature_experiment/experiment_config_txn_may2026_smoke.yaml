@@ -17,3 +17,9 @@ external_sources:
   t_casino_txn:
     enabled: true
     raw_parquet: data/new tables/partition_202605
+
+# Window ablation: probe w4h/w24h sums before registry promotion (enable via --txn-window-ablation).
+txn_window_ablation:
+  enabled: false
+  extra_windows: [4, 24]
+  # arms_profile: confirmatory | additive | window (default when flag set)

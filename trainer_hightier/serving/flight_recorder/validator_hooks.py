@@ -17,6 +17,8 @@ from zoneinfo import ZoneInfo
 
 from trainer_hightier.config import HK_TZ
 from trainer_hightier.serving.flight_recorder.ch_capture import (
+    VALIDATOR_CANONICAL_KEY,
+    add_validator_canonical_key,
     build_validator_bet_id_query_record,
     build_validator_canonical_query_record,
     save_clickhouse_capture,
@@ -157,6 +159,10 @@ class ValidatorCycleRecorder:
                 start=fetch_start,
                 end=fetch_end,
             )
+            if "bet_id" not in merged.columns:
+                merged = add_validator_canonical_key(merged)
+                if VALIDATOR_CANONICAL_KEY in merged.columns:
+                    meta["business_key"] = VALIDATOR_CANONICAL_KEY
             save_clickhouse_capture(
                 self.ch_dir,
                 "fetch_bets_by_canonical_id",

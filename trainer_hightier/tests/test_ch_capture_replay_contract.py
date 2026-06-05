@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pandas as pd
+
 from trainer_hightier.serving.flight_recorder.ch_capture import (
+    VALIDATOR_CANONICAL_KEY,
+    add_validator_canonical_key,
     build_incremental_query_record,
     build_pool_query_record,
     build_validator_bet_id_query_record,
@@ -102,3 +106,18 @@ def test_validator_bet_id_lookup_stores_ids() -> None:
     meta = build_validator_bet_id_query_record(bet_ids=[101, 202])
     assert meta["requeryable"] is True
     assert meta["external_inputs"]["bet_ids"] == [101, 202]
+
+
+def test_validator_canonical_key_normalizes_timezone() -> None:
+    """Synthetic canonical key is stable across UTC/HK timestamp rendering."""
+    left = pd.DataFrame(
+        {"player_id": [42], "payout_complete_dtm": ["2026-06-04T00:52:11+00:00"]}
+    )
+    right = pd.DataFrame(
+        {"player_id": [42], "payout_complete_dtm": ["2026-06-04T08:52:11+08:00"]}
+    )
+    left_keyed = add_validator_canonical_key(left)
+    right_keyed = add_validator_canonical_key(right)
+    assert left_keyed[VALIDATOR_CANONICAL_KEY].iloc[0] == right_keyed[
+        VALIDATOR_CANONICAL_KEY
+    ].iloc[0]

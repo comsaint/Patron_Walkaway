@@ -22,6 +22,7 @@ from trainer_hightier.config import (
     TXN_LITE_MATERIALIZER_VERSION,
     TXN_LITE_SOURCE_CONTRACT_REF,
     DuckDbRuntimeConfig,
+    txn_lite_feature_columns,
 )
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
 
@@ -96,6 +97,135 @@ def resolve_raw_casino_txn_read_sql(path: Path) -> str:
     raise FileNotFoundError(f"raw_casino_txn path not found: {p}")
 
 
+def _join_lookback_hours(extra_window_hours: tuple[int, ...]) -> int:
+    """Max PIT lookback for txn join (1h default; 24h when ablation windows include 24)."""
+
+    if not extra_window_hours:
+        return 1
+    return max((1, *extra_window_hours))
+
+
+def _cash_out_sum_sql(hours: int) -> str:
+    """Aggregate CASHOUT sum for one lookback window."""
+
+    suffix = f"w{hours}h"
+    return (
+        f"CAST(SUM(CASE WHEN type = 'CASHOUT'"
+        f" AND start_dtm >= pcd - INTERVAL {hours} HOUR AND start_dtm < pcd"
+        f" THEN txn_value ELSE 0 END) AS DOUBLE) AS txn__cash_out_sum__{suffix}"
+    )
+
+
+def _buyin_cash_sum_sql(hours: int) -> str:
+    """Aggregate BUYIN/CASH sum for one lookback window."""
+
+    suffix = f"w{hours}h"
+    return (
+        f"CAST(SUM(CASE WHEN type = 'BUYIN' AND sub_type = 'CASH'"
+        f" AND start_dtm >= pcd - INTERVAL {hours} HOUR AND start_dtm < pcd"
+        f" THEN txn_value ELSE 0 END) AS DOUBLE) AS txn__buyin_cash_sum__{suffix}"
+    )
+
+
+def _build_materialize_copy_sql(
+    *,
+    train_esc: str,
+    raw_read: str,
+    extra_window_hours: tuple[int, ...],
+) -> str:
+    """Build DuckDB COPY SQL for bet-grain txn_lite features."""
+
+    lookback_h = _join_lookback_hours(extra_window_hours)
+    extra_hours = tuple(h for h in extra_window_hours if h > 1)
+    extra_agg = []
+    for hours in extra_hours:
+        extra_agg.append(_cash_out_sum_sql(hours))
+        extra_agg.append(_buyin_cash_sum_sql(hours))
+    extra_agg_sql = ""
+    if extra_agg:
+        extra_agg_sql = ",\n  " + ",\n  ".join(extra_agg)
+
+    inner = f"""
+WITH {_CLEAN_BASE_CTE.format(raw=raw_read)},
+train_rows AS (
+  SELECT
+    TRY_CAST(bet_id AS DOUBLE) AS bet_id,
+    TRY_CAST(player_id AS BIGINT) AS player_id,
+    CAST(payout_complete_dtm AS TIMESTAMPTZ) AS pcd
+  FROM read_parquet('{train_esc}') AS b
+  WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
+    AND TRY_CAST(player_id AS BIGINT) IS NOT NULL
+    AND b.payout_complete_dtm IS NOT NULL
+),
+joined AS (
+  SELECT
+    tr.bet_id,
+    tr.pcd,
+    txn.type,
+    txn.sub_type,
+    txn.txn_value,
+    txn.start_dtm
+  FROM train_rows AS tr
+  LEFT JOIN txn_valid AS txn
+    ON tr.player_id = txn.player_id
+   AND txn.start_dtm < tr.pcd
+   AND txn.start_dtm >= tr.pcd - INTERVAL {lookback_h} HOUR
+)
+SELECT
+  bet_id,
+  MAX(CASE
+    WHEN type = 'CASHOUT'
+     AND start_dtm >= pcd - INTERVAL 15 MINUTE
+     AND start_dtm < pcd
+    THEN 1 ELSE 0 END) AS txn__has_cash_out__w15m,
+  CAST(SUM(CASE
+    WHEN type = 'CASHOUT'
+     AND start_dtm >= pcd - INTERVAL 1 HOUR AND start_dtm < pcd
+    THEN 1 ELSE 0 END) AS DOUBLE) AS txn__cash_out_cnt__w1h,
+  CAST(SUM(CASE
+    WHEN type = 'CASHOUT'
+     AND start_dtm >= pcd - INTERVAL 1 HOUR AND start_dtm < pcd
+    THEN txn_value ELSE 0 END) AS DOUBLE) AS txn__cash_out_sum__w1h,
+  CAST(SUM(CASE
+    WHEN type = 'BUYIN' AND sub_type = 'CASH'
+     AND start_dtm >= pcd - INTERVAL 1 HOUR AND start_dtm < pcd
+    THEN txn_value ELSE 0 END) AS DOUBLE) AS txn__buyin_cash_sum__w1h,
+  MAX(CASE
+    WHEN type = 'BUYIN' AND sub_type = 'PRIZE REDEMPTION'
+     AND start_dtm >= pcd - INTERVAL 1 HOUR AND start_dtm < pcd
+    THEN 1 ELSE 0 END) AS txn__buyin_prize_redemption_flag__w1h{extra_agg_sql}
+FROM joined
+GROUP BY bet_id, pcd
+""".strip()
+
+    outer_extra = []
+    for hours in extra_hours:
+        suffix = f"w{hours}h"
+        outer_extra.append(f"txn__cash_out_sum__{suffix}")
+        outer_extra.append(f"txn__buyin_cash_sum__{suffix}")
+        outer_extra.append(
+            f"txn__cash_out_sum__{suffix} - txn__buyin_cash_sum__{suffix}"
+            f" AS txn__net_cash_flow__{suffix}",
+        )
+    outer_extra_sql = ""
+    if outer_extra:
+        outer_extra_sql = ",\n  " + ",\n  ".join(outer_extra)
+
+    return f"""
+SELECT
+  bet_id,
+  txn__has_cash_out__w15m,
+  txn__cash_out_cnt__w1h,
+  txn__cash_out_sum__w1h,
+  CASE WHEN txn__cash_out_sum__w1h > txn__buyin_cash_sum__w1h THEN 1 ELSE 0 END
+    AS txn__net_cash_out_flag__w1h,
+  txn__cash_out_sum__w1h - txn__buyin_cash_sum__w1h AS txn__net_cash_flow__w1h,
+  txn__buyin_cash_sum__w1h,
+  txn__buyin_prize_redemption_flag__w1h{outer_extra_sql}
+FROM ({inner}) AS agg
+""".strip()
+
+
 def parquet_fingerprint(path: Path) -> str:
     """Return a short SHA-256 hex digest of raw input bytes (file or part directory)."""
 
@@ -123,6 +253,7 @@ def materialize_txn_lite_parquet(
     training_parquet_for_bet_ids: Path,
     out_parquet: Path,
     duckdb_runtime: DuckDbRuntimeConfig,
+    extra_window_hours: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     """Build bet-grain ``txn__*`` columns for training rows (player_id × PIT).
 
@@ -132,6 +263,8 @@ def materialize_txn_lite_parquet(
             ``player_id``, ``payout_complete_dtm``).
         out_parquet: Output Parquet path (``bet_id`` + ``txn__*`` columns).
         duckdb_runtime: DuckDB PRAGMA settings.
+        extra_window_hours: Optional longer lookbacks (e.g. ``(4, 24)``) for window
+            ablation; adds sum/net columns only (not in registry until promoted).
 
     Returns:
         Materialization audit dict (row counts, fingerprints, policy id).
@@ -146,67 +279,12 @@ def materialize_txn_lite_parquet(
     out.parent.mkdir(parents=True, exist_ok=True)
 
     tq, oq = _path_esc(train), _path_esc(out)
-    inner = f"""
-WITH {_CLEAN_BASE_CTE.format(raw=raw_read)},
-train_rows AS (
-  SELECT
-    TRY_CAST(bet_id AS DOUBLE) AS bet_id,
-    TRY_CAST(player_id AS BIGINT) AS player_id,
-    CAST(payout_complete_dtm AS TIMESTAMPTZ) AS pcd
-  FROM read_parquet('{tq}') AS b
-  WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
-    AND TRY_CAST(player_id AS BIGINT) IS NOT NULL
-    AND b.payout_complete_dtm IS NOT NULL
-),
-joined AS (
-  SELECT
-    tr.bet_id,
-    tr.pcd,
-    txn.type,
-    txn.sub_type,
-    txn.txn_value,
-    txn.start_dtm
-  FROM train_rows AS tr
-  LEFT JOIN txn_valid AS txn
-    ON tr.player_id = txn.player_id
-   AND txn.start_dtm < tr.pcd
-   AND txn.start_dtm >= tr.pcd - INTERVAL 1 HOUR
-)
-SELECT
-  bet_id,
-  MAX(CASE
-    WHEN type = 'CASHOUT'
-     AND start_dtm >= pcd - INTERVAL 15 MINUTE
-     AND start_dtm < pcd
-    THEN 1 ELSE 0 END) AS txn__has_cash_out__w15m,
-  CAST(SUM(CASE WHEN type = 'CASHOUT' AND start_dtm < pcd THEN 1 ELSE 0 END) AS DOUBLE)
-    AS txn__cash_out_cnt__w1h,
-  CAST(SUM(CASE WHEN type = 'CASHOUT' AND start_dtm < pcd THEN txn_value ELSE 0 END) AS DOUBLE)
-    AS txn__cash_out_sum__w1h,
-  CAST(SUM(CASE
-    WHEN type = 'BUYIN' AND sub_type = 'CASH' AND start_dtm < pcd THEN txn_value ELSE 0 END) AS DOUBLE)
-    AS txn__buyin_cash_sum__w1h,
-  MAX(CASE
-    WHEN type = 'BUYIN' AND sub_type = 'PRIZE REDEMPTION' AND start_dtm < pcd THEN 1 ELSE 0 END)
-    AS txn__buyin_prize_redemption_flag__w1h
-FROM joined
-GROUP BY bet_id, pcd
-""".strip()
-
-    # net features derived in outer SELECT
-    copy_sql = f"""
-SELECT
-  bet_id,
-  txn__has_cash_out__w15m,
-  txn__cash_out_cnt__w1h,
-  txn__cash_out_sum__w1h,
-  CASE WHEN txn__cash_out_sum__w1h > txn__buyin_cash_sum__w1h THEN 1 ELSE 0 END
-    AS txn__net_cash_out_flag__w1h,
-  txn__cash_out_sum__w1h - txn__buyin_cash_sum__w1h AS txn__net_cash_flow__w1h,
-  txn__buyin_cash_sum__w1h,
-  txn__buyin_prize_redemption_flag__w1h
-FROM ({inner}) AS agg
-""".strip()
+    copy_sql = _build_materialize_copy_sql(
+        train_esc=tq,
+        raw_read=raw_read,
+        extra_window_hours=extra_window_hours,
+    )
+    out_feature_cols = txn_lite_feature_columns(extra_window_hours=extra_window_hours)
 
     con = duckdb.connect(database=":memory:")
     try:
@@ -244,7 +322,8 @@ FROM ({inner}) AS agg
         "valid_txn_row_count": valid_n,
         "training_row_count": train_n,
         "materialized_bet_row_count": out_n,
-        "feature_columns": list(TXN_LITE_FEATURE_COLUMNS),
+        "extra_window_hours": list(extra_window_hours),
+        "feature_columns": list(out_feature_cols),
     }
     logger.info(
         "[txn_lite] materialized %d bet rows (valid_txn=%d raw=%d) → %s",

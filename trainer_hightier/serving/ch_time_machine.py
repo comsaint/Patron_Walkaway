@@ -111,6 +111,43 @@ def _capture_dir(recording_root: Path, window_id: str, label: str) -> Path:
     return recording_root / "ch_time_machine" / window_id / f"capture_{label}"
 
 
+def _write_capture_error(
+    cap_dir: Path,
+    *,
+    window_id: str,
+    label: str,
+    fetch: str,
+    exc: BaseException,
+) -> None:
+    """Persist a failed capture without marking the window complete."""
+    payload = {
+        "window_id": window_id,
+        "capture_label": label,
+        "fetch": fetch,
+        "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+    }
+    cap_dir.mkdir(parents=True, exist_ok=True)
+    (cap_dir / "capture_error.json").write_text(
+        json.dumps(payload, indent=2, default=str),
+        encoding="utf-8",
+    )
+    diffs_dir = cap_dir.parent / "diffs"
+    diffs_dir.mkdir(parents=True, exist_ok=True)
+    write_diff_report(diffs_dir / f"t0_vs_{label}.json", payload)
+
+
+def _validate_capture_frame(frame: pd.DataFrame, *, business_key: str, fetch: str) -> None:
+    """Reject requery frames that cannot participate in key-based diff."""
+    if business_key in frame.columns:
+        return
+    raise ValueError(
+        f"requery returned no {business_key!r} column for fetch={fetch}; "
+        f"rows={len(frame)} columns={list(frame.columns)}"
+    )
+
+
 def _base_readiness_summary(
     recording_root: Path,
     config: FlightRecorderConfig,
@@ -235,13 +272,19 @@ def run_window_capture(
         )
         return
     business_key = str(query_meta.get("business_key") or "bet_id")
-    final_df = execute_query(query_meta, use_final=True)
-    final_df.to_parquet(cap_dir / "t_bet.final.parquet", index=False)
-    if include_non_final:
-        non_final_df = execute_query(query_meta, use_final=False)
-        non_final_df.to_parquet(cap_dir / "t_bet.non_final.parquet", index=False)
-        diff_ff = diff_dataframes(final_df, non_final_df, business_key=business_key)
-        write_diff_report(cap_dir.parent / "diffs" / "final_vs_non_final.json", diff_ff)
+    try:
+        final_df = execute_query(query_meta, use_final=True)
+        _validate_capture_frame(final_df, business_key=business_key, fetch=fetch)
+        final_df.to_parquet(cap_dir / "t_bet.final.parquet", index=False)
+        if include_non_final:
+            non_final_df = execute_query(query_meta, use_final=False)
+            _validate_capture_frame(non_final_df, business_key=business_key, fetch=fetch)
+            non_final_df.to_parquet(cap_dir / "t_bet.non_final.parquet", index=False)
+            diff_ff = diff_dataframes(final_df, non_final_df, business_key=business_key)
+            write_diff_report(cap_dir.parent / "diffs" / "final_vs_non_final.json", diff_ff)
+    except Exception as exc:
+        _write_capture_error(cap_dir, window_id=window_id, label=label, fetch=fetch, exc=exc)
+        raise
     t0_path = window.get("t0_final_parquet")
     if t0_path:
         t0_file = recording_root / str(t0_path)

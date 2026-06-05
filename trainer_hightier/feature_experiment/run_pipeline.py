@@ -31,6 +31,7 @@ from trainer_hightier.config import (
     HighTierObjectiveConfig,
     Step4SplitConfig,
     Step5TrainConfig,
+    TXN_LITE_WINDOW_ABLATION_EXTRA_HOURS,
     configs_from_run_profile,
     get_run_profile,
 )
@@ -192,6 +193,30 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Train each experimental group add-one vs baseline and leave-one-out vs full candidate; "
             "writes gate1_ablation_report.json and embeds ablation_v0 in the main JSON."
+        ),
+    )
+    p.add_argument(
+        "--txn-window-ablation",
+        action="store_true",
+        help=(
+            "Materialize w4h/w24h txn sum probes (not in registry) and run add-one window arms "
+            "vs baseline; writes txn_window_ablation_report.json."
+        ),
+    )
+    p.add_argument(
+        "--txn-window-ablation-additive",
+        action="store_true",
+        help=(
+            "Like --txn-window-ablation but only v01_6col additive arms "
+            "(+net_w4h / +net_w24h / +both); still writes txn_window_ablation_report.json."
+        ),
+    )
+    p.add_argument(
+        "--txn-confirmatory-smoke",
+        action="store_true",
+        help=(
+            "Confirmatory smoke: train ref_v01_6col and promoted_v02_7col "
+            "(6-col + net_w4h) vs baseline; writes txn_window_ablation_report.json."
         ),
     )
     p.add_argument(
@@ -369,6 +394,7 @@ def _build_report(
     budget_sec: float,
     capacity_alerts_per_hour_cap: float,
     ablation_v0: dict[str, Any] | None = None,
+    txn_window_ablation_v0: dict[str, Any] | None = None,
     feature_quality: dict[str, Any] | None = None,
     candidate_registry: dict[str, Any] | None = None,
     feast_auto_apply: Mapping[str, Any] | None = None,
@@ -413,6 +439,8 @@ def _build_report(
         out["feature_quality"] = feature_quality
     if ablation_v0 is not None:
         out["ablation_v0"] = ablation_v0
+    if txn_window_ablation_v0 is not None:
+        out["txn_window_ablation_v0"] = txn_window_ablation_v0
     if external_sources is not None:
         out["external_sources"] = external_sources
     return out
@@ -422,6 +450,163 @@ def _safe_ablation_dir_name(group_id: str) -> str:
     """Filesystem-safe subdirectory name for ``group_id``."""
 
     return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in group_id)
+
+
+_TXN_V01_6COL: tuple[str, ...] = (
+    "txn__has_cash_out__w15m",
+    "txn__cash_out_cnt__w1h",
+    "txn__cash_out_sum__w1h",
+    "txn__net_cash_flow__w1h",
+    "txn__buyin_cash_sum__w1h",
+    "txn__buyin_prize_redemption_flag__w1h",
+)
+
+_TXN_WINDOW_ABLATION_ARMS: dict[str, tuple[str, ...]] = {
+    "ref_v01_6col": _TXN_V01_6COL,
+    "w1h_trio": (
+        "txn__net_cash_flow__w1h",
+        "txn__buyin_cash_sum__w1h",
+        "txn__cash_out_sum__w1h",
+    ),
+    "w4h_trio": (
+        "txn__net_cash_flow__w4h",
+        "txn__buyin_cash_sum__w4h",
+        "txn__cash_out_sum__w4h",
+    ),
+    "w24h_trio": (
+        "txn__net_cash_flow__w24h",
+        "txn__buyin_cash_sum__w24h",
+        "txn__cash_out_sum__w24h",
+    ),
+    "net_w1h_only": ("txn__net_cash_flow__w1h",),
+    "net_w4h_only": ("txn__net_cash_flow__w4h",),
+    "net_w24h_only": ("txn__net_cash_flow__w24h",),
+}
+
+_TXN_WINDOW_ADDITIVE_ARMS: dict[str, tuple[str, ...]] = {
+    "ref_v01_6col": _TXN_V01_6COL,
+    "v01_6col_plus_net_w4h": _TXN_V01_6COL + ("txn__net_cash_flow__w4h",),
+    "v01_6col_plus_net_w24h": _TXN_V01_6COL + ("txn__net_cash_flow__w24h",),
+    "v01_6col_plus_net_w4h_w24h": _TXN_V01_6COL
+    + ("txn__net_cash_flow__w4h", "txn__net_cash_flow__w24h",),
+}
+
+_TXN_CONFIRMATORY_ARMS: dict[str, tuple[str, ...]] = {
+    "ref_v01_6col": _TXN_V01_6COL,
+    "promoted_v02_7col": _TXN_V01_6COL + ("txn__net_cash_flow__w4h",),
+}
+
+
+def _txn_window_ablation_profile_and_arms(
+    ns: argparse.Namespace,
+    cfg_yaml: Mapping[str, Any],
+) -> tuple[str, dict[str, tuple[str, ...]]]:
+    """Return ``(arms_profile, arms)`` for the active txn ablation mode."""
+
+    blk = cfg_yaml.get("txn_window_ablation")
+    profile = ""
+    if isinstance(blk, dict) and blk.get("arms_profile"):
+        profile = str(blk["arms_profile"]).strip().lower()
+    if bool(getattr(ns, "txn_confirmatory_smoke", False)) or profile == "confirmatory":
+        return "confirmatory", _TXN_CONFIRMATORY_ARMS
+    if bool(getattr(ns, "txn_window_ablation_additive", False)) or profile == "additive":
+        return "additive", _TXN_WINDOW_ADDITIVE_ARMS
+    return "window", _TXN_WINDOW_ABLATION_ARMS
+
+
+def _txn_window_ablation_enabled(ns: argparse.Namespace, cfg_yaml: Mapping[str, Any]) -> bool:
+    """True when CLI flag or experiment config requests txn window ablation."""
+
+    if bool(getattr(ns, "txn_window_ablation", False)):
+        return True
+    if bool(getattr(ns, "txn_window_ablation_additive", False)):
+        return True
+    if bool(getattr(ns, "txn_confirmatory_smoke", False)):
+        return True
+    blk = cfg_yaml.get("txn_window_ablation")
+    return isinstance(blk, dict) and bool(blk.get("enabled"))
+
+
+def _txn_window_ablation_extra_hours(cfg_yaml: Mapping[str, Any]) -> tuple[int, ...]:
+    """Resolve extra lookback hours for window ablation materialize."""
+
+    blk = cfg_yaml.get("txn_window_ablation")
+    if isinstance(blk, dict) and blk.get("extra_windows"):
+        raw = blk["extra_windows"]
+        if not isinstance(raw, (list, tuple)):
+            raise ValueError(f"txn_window_ablation.extra_windows must be a list; got {type(raw)!r}")
+        return tuple(int(h) for h in raw)
+    return TXN_LITE_WINDOW_ABLATION_EXTRA_HOURS
+
+
+def _run_txn_window_ablation_phase(
+    *,
+    splits_dir: Path,
+    duckdb_runtime: DuckDbRuntimeConfig,
+    objective_min_precision: float,
+    random_seed: int,
+    step5: Step5TrainConfig,
+    run_dir: Path,
+    baseline_report: Mapping[str, Any],
+    baseline_cols: tuple[str, ...],
+    capacity_alerts_per_hour_cap: float,
+    budget_deadline_perf: float,
+    extra_window_hours: tuple[int, ...],
+    arms: Mapping[str, tuple[str, ...]],
+    arms_profile: str,
+) -> dict[str, Any]:
+    """Train baseline+txn window arms; compare Gate 1 vs baseline (registry unchanged)."""
+
+    arms_block: dict[str, Any] = {}
+    timing: dict[str, float] = {}
+    t0_all = time.perf_counter()
+    for arm_id, txn_cols in arms.items():
+        if time.perf_counter() > budget_deadline_perf:
+            raise RuntimeError("Exceeded single_round_budget_sec during txn window ablation arms")
+        present_txn = _feature_columns_present_in_splits(splits_dir, txn_cols)
+        cols = tuple(dict.fromkeys(baseline_cols + present_txn))
+        sub = _safe_ablation_dir_name(arm_id)
+        out_a = run_dir / f"txn_window_ablation_{sub}_lgbm"
+        logger.info("[FE] txn window ablation %s (%d txn cols) → %s", arm_id, len(present_txn), out_a)
+        t0 = time.perf_counter()
+        res_a = _b5.train_lgbm_from_splits(
+            splits_dir=splits_dir,
+            duckdb_runtime=duckdb_runtime,
+            objective_min_precision=float(objective_min_precision),
+            random_seed=random_seed,
+            step5=step5,
+            output_dir=out_a,
+            feature_columns=cols,
+        )
+        timing[f"train_txn_window_ablation_{sub}_sec"] = round(time.perf_counter() - t0, 3)
+        g1 = compute_gate1_vs_baseline(
+            dict(baseline_report),
+            res_a.report,
+            capacity_alerts_per_hour_cap=capacity_alerts_per_hour_cap,
+            arm_side_key_prefix="arm",
+        )
+        experiment_kind = "add_one_txn_window"
+        if arms_profile == "additive":
+            experiment_kind = "add_one_txn_window_additive"
+        elif arms_profile == "confirmatory":
+            experiment_kind = "add_one_txn_confirmatory"
+        arms_block[arm_id] = {
+            "experiment_kind": experiment_kind,
+            "txn_feature_columns": list(present_txn),
+            "feature_columns": list(cols),
+            "model_dir": str(out_a.resolve()),
+            "metrics": res_a.report,
+            "gate1_vs_baseline": g1,
+        }
+    timing["train_txn_window_ablation_total_sec"] = round(time.perf_counter() - t0_all, 3)
+    return {
+        "experiment_kind": "txn_window_ablation_v0",
+        "arms_profile": arms_profile,
+        "extra_window_hours": list(extra_window_hours),
+        "arms": arms_block,
+        "timing_sec": timing,
+        "note": "Probe columns not in feature_candidate_registry until an arm passes Gate 1.",
+    }
 
 
 def _ablation_train_add_one_arms(
@@ -743,6 +928,11 @@ def main() -> None:
 
     external_sources_echo: list[dict[str, Any]] = []
     txn_lite_path: Path | None = None
+    txn_extra_windows: tuple[int, ...] = ()
+    txn_feature_cols: tuple[str, ...] | None = None
+    if _txn_window_ablation_enabled(ns, cfg_yaml):
+        txn_extra_windows = _txn_window_ablation_extra_hours(cfg_yaml)
+        logger.info("[FE] txn window ablation enabled; extra_window_hours=%s", txn_extra_windows)
     ext_root = cfg_yaml.get("external_sources")
     txn_cfg = ext_root.get("t_casino_txn") if isinstance(ext_root, dict) else None
     if isinstance(txn_cfg, dict) and bool(txn_cfg.get("enabled")):
@@ -755,7 +945,9 @@ def main() -> None:
             training_parquet_for_bet_ids=step3_in,
             out_parquet=txn_lite_path,
             duckdb_runtime=duck,
+            extra_window_hours=txn_extra_windows,
         )
+        txn_feature_cols = tuple(str(c) for c in txn_meta["feature_columns"])
         mat_report_path, _src_meta_path = write_txn_lite_sidecars(
             run_dir=paths.run_dir,
             materialization_meta=txn_meta,
@@ -780,6 +972,7 @@ def main() -> None:
         out_parquet=paths.enriched_training_parquet,
         duckdb_runtime=duck,
         txn_lite_parquet=txn_lite_path,
+        txn_feature_columns=txn_feature_cols,
     )
     timing["enrich_sec"] = round(time.perf_counter() - t0, 3)
 
@@ -917,6 +1110,30 @@ def main() -> None:
 
     budget_deadline = t_wall0 + budget
     ablation_v0: dict[str, Any] | None = None
+    txn_window_ablation_v0: dict[str, Any] | None = None
+    if _txn_window_ablation_enabled(ns, cfg_yaml):
+        if txn_lite_path is None:
+            raise RuntimeError(
+                "txn window ablation requires external_sources.t_casino_txn.enabled=true",
+            )
+        arms_profile, ablation_arms = _txn_window_ablation_profile_and_arms(ns, cfg_yaml)
+        txn_window_ablation_v0 = _run_txn_window_ablation_phase(
+            splits_dir=paths.splits_dir,
+            duckdb_runtime=duck,
+            objective_min_precision=float(ns.min_precision),
+            random_seed=rnd,
+            step5=step5,
+            run_dir=paths.run_dir,
+            baseline_report=res_base.report,
+            baseline_cols=baseline_cols,
+            capacity_alerts_per_hour_cap=cap_alerts_hr,
+            budget_deadline_perf=budget_deadline,
+            extra_window_hours=txn_extra_windows,
+            arms=ablation_arms,
+            arms_profile=arms_profile,
+        )
+        for ak, av in txn_window_ablation_v0["timing_sec"].items():
+            timing[ak] = av
     if ns.ablation:
         ablation_v0 = _run_ablation_training_phase(
             splits_dir=paths.splits_dir,
@@ -1001,6 +1218,7 @@ def main() -> None:
         budget_sec=budget,
         capacity_alerts_per_hour_cap=cap_alerts_hr,
         ablation_v0=ablation_v0,
+        txn_window_ablation_v0=txn_window_ablation_v0,
         feature_quality=fq_quality_echo,
         candidate_registry=registry_echo,
         feast_auto_apply=feast_apply_echo,
@@ -1018,6 +1236,10 @@ def main() -> None:
         ga_path = paths.run_dir / "gate1_ablation_report.json"
         ga_path.write_text(json.dumps(ablation_v0, indent=2, default=str), encoding="utf-8")
         logger.info("[FE] wrote %s", ga_path)
+    if txn_window_ablation_v0 is not None:
+        tw_path = paths.run_dir / "txn_window_ablation_report.json"
+        tw_path.write_text(json.dumps(txn_window_ablation_v0, indent=2, default=str), encoding="utf-8")
+        logger.info("[FE] wrote %s", tw_path)
 
 
 if __name__ == "__main__":

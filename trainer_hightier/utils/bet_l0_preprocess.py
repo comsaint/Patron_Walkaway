@@ -552,22 +552,53 @@ def _wrapped_bet_select_for_partitioned_copy(pipeline_sql: str) -> str:
     )
 
 
-def _consolidate_staged_bucket_partition_dirs(*, staged_root: Path, final_dataset_root: Path, n_buckets: int) -> None:
-    """Move per-bucket partition leaves into ``final_dataset_root`` with deterministic ``bucket_*.parquet`` names."""
+def _partitioned_parquet_footer_row_count(dataset_root: Path) -> int:
+    """Sum parquet footer ``num_rows`` under a partitioned dataset root (no full scan)."""
 
+    root = Path(dataset_root).resolve()
+    if not root.is_dir():
+        return 0
+    total = 0
+    for shard in sorted(root.rglob("*.parquet")):
+        meta = pq.ParquetFile(shard).metadata
+        if meta is not None:
+            total += int(meta.num_rows)
+    return total
+
+
+def _consolidate_staged_bucket_partition_dirs(*, staged_root: Path, final_dataset_root: Path, n_buckets: int) -> None:
+    """Move per-bucket partition leaves into ``final_dataset_root`` with unique shard filenames.
+
+    DuckDB ``PARTITION_BY`` may emit multiple parquet files per bucket/day. Each staged shard
+    must land under a unique deterministic name so rows are not overwritten.
+    """
+
+    staged_rows_before = _partitioned_parquet_footer_row_count(staged_root)
     for b in range(int(n_buckets)):
         st = staged_root / f"b{b:04d}"
         if not st.is_dir():
             raise FileNotFoundError(f"missing staged bucket partition root: {st}")
-        bucket_label = f"bucket_{b:04d}.parquet"
+        shard_idx_by_parent: dict[Path, int] = {}
         for pq_src in sorted(st.rglob("*.parquet")):
-            rel_parent = pq_src.relative_to(st).parent  # hive dirs only
+            rel_parent = pq_src.relative_to(st).parent
+            shard_idx = shard_idx_by_parent.get(rel_parent, 0)
+            bucket_label = f"bucket_{b:04d}_part_{shard_idx:04d}.parquet"
+            shard_idx_by_parent[rel_parent] = shard_idx + 1
             dest_dir = final_dataset_root / rel_parent
             dest_dir.mkdir(parents=True, exist_ok=True)
             dest = dest_dir / bucket_label
             if dest.is_file():
-                dest.unlink()
+                raise ValueError(
+                    "[Step 2b] consolidation destination already exists "
+                    f"(invariant violation): {dest}",
+                )
             shutil.move(str(pq_src), str(dest))
+    staged_rows_after = _partitioned_parquet_footer_row_count(final_dataset_root)
+    if staged_rows_before != staged_rows_after:
+        raise ValueError(
+            "[Step 2b] bucket consolidation row-count invariant failed: "
+            f"staged_rows={staged_rows_before} final_rows={staged_rows_after}",
+        )
 
 
 def _partitioned_parquet_manifest_block(dataset_root: Path) -> dict[str, Any]:

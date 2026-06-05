@@ -7,6 +7,7 @@ PIT values for training ``bet_id`` only, not a reusable global feature table.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 import duckdb
@@ -116,6 +117,7 @@ def enrich_training_parquet(
     out_parquet: Path,
     duckdb_runtime: DuckDbRuntimeConfig,
     txn_lite_parquet: Path | None = None,
+    txn_feature_columns: Sequence[str] | None = None,
 ) -> Path:
     """Legacy left-join ``fe__*`` aggregates onto Step-3 training parquet (by ``bet_id``)."""
 
@@ -133,7 +135,12 @@ def enrich_training_parquet(
         tq = _esc(txn_lite_parquet)
         from trainer_hightier.config import TXN_LITE_FEATURE_COLUMNS
 
-        txn_cols = ",\n  " + ",\n  ".join(f't."{c}" AS "{c}"' for c in TXN_LITE_FEATURE_COLUMNS)
+        txn_col_list = (
+            list(txn_feature_columns)
+            if txn_feature_columns is not None
+            else list(TXN_LITE_FEATURE_COLUMNS)
+        )
+        txn_cols = ",\n  " + ",\n  ".join(f't."{c}" AS "{c}"' for c in txn_col_list)
         txn_join = f"""
 LEFT JOIN read_parquet('{tq}') AS t
   ON TRY_CAST(b.bet_id AS DOUBLE) = t.bet_id"""
