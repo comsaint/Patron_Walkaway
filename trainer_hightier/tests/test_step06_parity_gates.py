@@ -129,6 +129,94 @@ def test_run_production_feature_replay_uses_training_mid_snapshot_for_parity(
     assert captured.get("use_training_mid_snapshot_for_parity") is True
 
 
+def test_raw_source_w1h_sanity_passes_gaming_day_event_to_pool_builder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Raw w1h sanity must carry gaming_day_event for compute_scoring_bounds_for_bets."""
+    import pandas as pd
+
+    mod = _load_step06_module()
+    col = mod.RAW_W1H_SANITY_COLUMN
+    test_df = pd.DataFrame(
+        {
+            "bet_id": [1.0],
+            "player_id": [100],
+            "payout_complete_dtm": pd.to_datetime(["2026-05-01 12:00:00"]).tz_localize(
+                "Asia/Hong_Kong",
+            ),
+            "gaming_day_event": pd.to_datetime(["2026-05-01"]),
+            col: [5.0],
+        },
+    )
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    map_p = tmp_path / "map.parquet"
+    pd.DataFrame({"player_id": [100], "canonical_id": ["c100"]}).to_parquet(map_p, index=False)
+    captured: dict[str, list[str]] = {}
+
+    def _fake_build_pool(bets: pd.DataFrame, **_kwargs: object) -> pd.DataFrame:
+        captured["columns"] = list(bets.columns)
+        raise ValueError(
+            "[raw_source_sanity] raw partition pool empty; check raw_partition_dir and dates",
+        )
+
+    monkeypatch.setattr(mod, "build_pool_from_raw_partitions", _fake_build_pool)
+    with pytest.raises(ValueError, match="raw partition pool empty"):
+        mod.run_raw_source_w1h_sanity_check(
+            test_df,
+            raw_partition_dir=raw_dir,
+            mapping_parquet=map_p,
+        )
+    assert "gaming_day_event" in captured["columns"]
+
+
+def test_raw_source_w1h_sanity_fails_when_no_rows_compared(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enabled raw-source sanity must not pass with zero eligible comparisons."""
+    import pandas as pd
+
+    mod = _load_step06_module()
+    col = mod.RAW_W1H_SANITY_COLUMN
+    test_df = pd.DataFrame(
+        {
+            "bet_id": [1.0],
+            "player_id": [100],
+            "payout_complete_dtm": pd.to_datetime(["2026-05-01 12:00:00"]).tz_localize(
+                "Asia/Hong_Kong",
+            ),
+            "gaming_day_event": pd.to_datetime(["2026-05-01"]),
+            col: [5.0],
+        },
+    )
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    map_p = tmp_path / "map.parquet"
+    pd.DataFrame({"player_id": [100], "canonical_id": ["c100"]}).to_parquet(map_p, index=False)
+    from trainer_hightier.serving import feature_builder
+
+    monkeypatch.setattr(mod, "build_pool_from_raw_partitions", lambda *_a, **_k: pd.DataFrame())
+    monkeypatch.setattr(feature_builder, "attach_canonical_id", lambda df, **_k: df)
+    monkeypatch.setattr(feature_builder, "attach_synthetic_etl_and_prediction_visible", lambda df: df)
+    monkeypatch.setattr(
+        feature_builder,
+        "attach_trial_bet_behavior_1h",
+        lambda staged, *_a, **_k: staged.assign(**{col: [pd.NA]}),
+    )
+
+    report = mod.run_raw_source_w1h_sanity_check(
+        test_df,
+        raw_partition_dir=raw_dir,
+        mapping_parquet=map_p,
+    )
+
+    assert report["verdict"] == "fail"
+    assert report["n_rows_compared"] == 0
+    assert "0 eligible rows" in report["issues"][0]
+
+
 def test_trainer_step6_fails_after_retry_exhausted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from trainer_hightier import trainer as tr_mod
     from dataclasses import replace

@@ -31,6 +31,9 @@ DEFAULT_RANDOM_SEED: Final[int] = 42
 DEFAULT_TRAINING_FEATURE_SERVICE: Final[str] = "walkaway_bet_trial_v1"
 # Inclusive lower bound on ``gaming_day_event`` for L0 session/bet preprocess (2024 shards excluded).
 DEFAULT_L0_PREPROCESS_GAMING_DAY_EVENT_MIN: Final[date] = date(2025, 1, 1)
+# Inclusive lower bound on ``gaming_day_event`` for training rows (Step 3 output → Step 5).
+# ``None`` keeps the full L0-preprocessed scope; set a later date only for explicit fast experiments.
+DEFAULT_TRAINING_GAMING_DAY_EVENT_MIN: Final[date | None] = None
 
 # --- Shared domain constants (keep aligned with defaults in ``HightierServingConfig``) ---
 HK_TZ: Final[str] = "Asia/Hong_Kong"
@@ -336,6 +339,32 @@ L0_PREPROCESS_DATA_SCOPE_TEST_UNBOUNDED: Final[L0PreprocessDataScopeConfig] = L0
 
 
 @dataclass(frozen=True)
+class TrainingDataScopeConfig:
+    """Inclusive ``gaming_day_event`` bounds applied to training rows after Step 3."""
+
+    gaming_day_event_min: date | None = DEFAULT_TRAINING_GAMING_DAY_EVENT_MIN
+    gaming_day_event_max: date | None = None
+
+    def manifest_block(self) -> dict[str, str | None]:
+        """JSON-serializable fragment for run reports."""
+        return {
+            "gaming_day_event_min": (
+                self.gaming_day_event_min.isoformat() if self.gaming_day_event_min is not None else None
+            ),
+            "gaming_day_event_max": (
+                self.gaming_day_event_max.isoformat() if self.gaming_day_event_max is not None else None
+            ),
+        }
+
+
+# Unbounded training scope for unit tests.
+TRAINING_DATA_SCOPE_TEST_UNBOUNDED: Final[TrainingDataScopeConfig] = TrainingDataScopeConfig(
+    gaming_day_event_min=None,
+    gaming_day_event_max=None,
+)
+
+
+@dataclass(frozen=True)
 class SessionPreprocessConfig:
     """L0 ``t_session`` → cleaned Parquet: engine choice and pandas-shard batching only.
 
@@ -366,7 +395,7 @@ class BetPreprocessConfig:
     ``dedup_hash_buckets``: split ``ROW_NUMBER`` dedup by ``mod(abs(hash(bet_id)), N)`` so each
     bucket processes ~1/N of keys at a time (lower peak RAM on huge tables). ``1`` disables bucketing.
 
-    **ADT patron segment:** when ``adt_filter_quantile`` is set (e.g. ``0.99``), keep only bets whose
+    **ADT patron segment:** when ``adt_filter_quantile`` is set (e.g. ``0.95``), keep only bets whose
     ``player_id`` appears in ``adt_allowed_players_parquet`` (one row per allowed ``player_id``, written
     upstream from ``patron_profile_csv`` + ``canonical_mapping_parquet`` via ADT quantile threshold).
     ``patron_profile_csv`` / ``canonical_mapping_parquet`` remain on the config for DuckDB joins and
@@ -376,7 +405,7 @@ class BetPreprocessConfig:
 
     engine: str = "duckdb"
     preprocess_registry_yaml: Path | None = None
-    dedup_hash_buckets: int = 8
+    dedup_hash_buckets: int = 16
     adt_filter_quantile: float | None = None
     patron_profile_csv: Path | None = None
     canonical_mapping_parquet: Path | None = None
@@ -410,7 +439,7 @@ class HighTierObjectiveConfig:
     # Quantile in (0, 1) on patron **ADT** (from ``canonical_patron_profile.csv``): bet preprocess keeps
     # only bets tied (via canonical mapping) to patrons at or above this ADT quantile (~top ``1 - q``).
     # Align naming with ``trainer.training.high_roller_segmentation`` when wiring segment thresholds.
-    theo_train_quantile: float = 0.99
+    theo_train_quantile: float = 0.95
     # Require precision >= this value on the **segment** when choosing a score threshold.
     min_precision: float = 0.60
     # Placeholder paths for later steps (Parquet / DuckDB exports).

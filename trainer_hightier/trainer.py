@@ -62,6 +62,7 @@ from trainer_hightier.config import (
     Step6ParityConfig,
     SessionPreprocessConfig,
     Step4SplitConfig,
+    TrainingDataScopeConfig,
     configs_from_run_profile,
     get_run_profile,
     list_run_profile_names,
@@ -247,6 +248,8 @@ class HighTierTrainArgs:
     #: Explicit patron sampling ratio for logs (e.g. ``0.01`` vs ``0.10``). When ``None`` and ADT bet filter is on,
     #: :func:`build_run_summary` derives approximate segment fraction as ``1 - objective.theo_train_quantile``.
     patron_sampling_ratio: float | None = None
+    #: Drop training rows outside inclusive ``gaming_day_event`` bounds before Step 3.5 / split.
+    training_data_scope: TrainingDataScopeConfig = field(default_factory=TrainingDataScopeConfig)
 
 
 def _repo_root() -> Path:
@@ -463,6 +466,7 @@ def _step5_splits_have_feature_columns(
 def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None) -> None:
     """Ingest partition shards (schema QC) then build cleaned session/bet artifacts."""
     from trainer_hightier.utils.partition_inventory import (
+        collapsed_preprocess_read_sources,
         expect_default_partition_snapshot_dir,
         expect_existing_partition_snapshot_dir,
         resolve_partition_inventory_previous_for_run,
@@ -507,18 +511,31 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
     )
 
     ordered_sess = tuple(sorted((Path(p).resolve() for p in session_partition_paths), key=str))
-    session_primary = ordered_sess[0]
-    session_extras = ordered_sess[1:]
+    session_cache_primary = ordered_sess[0] if ordered_sess else None
+    session_cache_extras = ordered_sess[1:] if ordered_sess else ()
+    session_read = collapsed_preprocess_read_sources(
+        snapshot_dir=snap_dir,
+        table_name="t_session",
+        legacy_paths=ordered_sess,
+    )
+    if not session_read:
+        raise FileNotFoundError(f"no session preprocess sources under snapshot {snap_dir}")
+    session_preprocess_primary = session_read[0]
+    session_preprocess_extras = session_read[1:]
 
     cleaned_path = _hpre.default_cleaned_session_parquet_path()
     use_preprocess_caches = not args.ignore_caches
-    ses_cache_ok = use_preprocess_caches and _hpre.session_clean_cache_is_hit(
-        session_primary,
-        cleaned_path,
-        dedup_hash_buckets=args.session_preprocess.dedup_hash_buckets,
-        extra_source_session_parquets=session_extras or None,
-        partition_inventory_fingerprint_sha256_hex=inv_fp,
-        data_scope=args.session_preprocess.data_scope,
+    ses_cache_ok = (
+        session_cache_primary is not None
+        and use_preprocess_caches
+        and _hpre.session_clean_cache_is_hit(
+            session_cache_primary,
+            cleaned_path,
+            dedup_hash_buckets=args.session_preprocess.dedup_hash_buckets,
+            extra_source_session_parquets=session_cache_extras or None,
+            partition_inventory_fingerprint_sha256_hex=inv_fp,
+            data_scope=args.session_preprocess.data_scope,
+        )
     )
     if metrics is not None:
         metrics["session_clean_cache_hit"] = bool(ses_cache_ok)
@@ -536,19 +553,19 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
         )
     else:
         out_parquet, session_dedup_effective = _hpre.preprocess_sessions_from_parquet_streaming(
-            session_primary,
+            session_preprocess_primary,
             cleaned_path,
             cfg=args.session_preprocess,
             duckdb_runtime=args.duckdb_runtime,
-            extra_partition_sources=session_extras or None,
+            extra_partition_sources=session_preprocess_extras or None,
         )
         if metrics is not None:
             metrics["session_dedup_hash_buckets_effective"] = int(session_dedup_effective)
         _hpre.write_session_clean_cache_manifest(
-            session_primary,
+            session_cache_primary,
             out_parquet,
             dedup_hash_buckets=int(session_dedup_effective),
-            extra_source_session_parquets=session_extras or None,
+            extra_source_session_parquets=session_cache_extras or None,
             partition_inventory_fingerprint_sha256_hex=inv_fp,
             data_scope=args.session_preprocess.data_scope,
         )
@@ -627,14 +644,21 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
             bet_report.num_rows,
         )
         ordered_bets = tuple(sorted((Path(p).resolve() for p in bet_partition_paths), key=str))
-        bet_primary = ordered_bets[0]
-        bet_extras = ordered_bets[1:]
+        bet_cache_primary = ordered_bets[0]
+        bet_cache_extras = ordered_bets[1:]
+        bet_read = collapsed_preprocess_read_sources(
+            snapshot_dir=snap_dir,
+            table_name="t_bet",
+            legacy_paths=ordered_bets,
+        )
+        bet_preprocess_primary = bet_read[0]
+        bet_preprocess_extras = bet_read[1:]
         reg_yaml = (
             Path(args.bet_preprocess.preprocess_registry_yaml)
             if args.bet_preprocess.preprocess_registry_yaml is not None
             else _hpre.default_preprocess_registry_yaml_path()
         )
-        merged_bet_sources = _hbet.merge_bet_source_paths(bet_primary, bet_extras or None)
+        merged_bet_sources = _hbet.merge_bet_source_paths(bet_cache_primary, bet_cache_extras or None)
         base_bet_cfg = replace(
             effective_bet_cfg,
             adt_filter_quantile=None,
@@ -642,7 +666,8 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
             canonical_mapping_parquet=None,
             adt_allowed_players_parquet=None,
         )
-        bet_extras_arg = bet_extras or None
+        bet_cache_extras_arg = bet_cache_extras or None
+        bet_preprocess_extras_arg = bet_preprocess_extras or None
 
         if want_adt_bets and args.canonical_mapping.enabled and allowed_players_pq is not None:
             from datetime import date as _date_cls
@@ -672,7 +697,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 data_scope=base_bet_cfg.data_scope,
             )
             seg_hit = use_preprocess_caches and _hbet.bet_clean_cache_is_hit(
-                bet_primary,
+                bet_cache_primary,
                 cleaned_bet_path,
                 preprocess_registry_yaml=reg_yaml,
                 dedup_hash_buckets=effective_bet_cfg.dedup_hash_buckets,
@@ -681,7 +706,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 patron_profile_csv=effective_bet_cfg.patron_profile_csv,
                 canonical_mapping_parquet=effective_bet_cfg.canonical_mapping_parquet,
                 adt_allowed_players_parquet=effective_bet_cfg.adt_allowed_players_parquet,
-                extra_source_bet_parquets=bet_extras_arg,
+                extra_source_bet_parquets=bet_cache_extras_arg,
                 bet_base_cleaned_parquet=base_bet_path,
                 partition_inventory_fingerprint_sha256_hex=inv_fp,
                 data_scope=effective_bet_cfg.data_scope,
@@ -702,11 +727,11 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     bet_dedup_eff = int(mf_bkt)
                 if not base_hit:
                     _, bet_dedup_eff = _hpre.preprocess_bets_from_parquet_streaming(
-                        bet_primary,
+                        bet_preprocess_primary,
                         base_bet_path,
                         cfg=base_bet_cfg,
                         duckdb_runtime=args.duckdb_runtime,
-                        extra_partition_sources=bet_extras_arg,
+                        extra_partition_sources=bet_preprocess_extras_arg,
                     )
                     _hbet.write_bet_base_clean_cache_manifest(
                         merged_bet_sources,
@@ -730,7 +755,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     duckdb_runtime=args.duckdb_runtime,
                 )
                 _hbet.write_bet_clean_cache_manifest(
-                    bet_primary,
+                    bet_cache_primary,
                     cleaned_bet_path,
                     preprocess_registry_yaml=reg_yaml,
                     dedup_hash_buckets=int(bet_dedup_eff),
@@ -739,7 +764,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     patron_profile_csv=effective_bet_cfg.patron_profile_csv,
                     canonical_mapping_parquet=effective_bet_cfg.canonical_mapping_parquet,
                     adt_allowed_players_parquet=effective_bet_cfg.adt_allowed_players_parquet,
-                    extra_source_bet_parquets=bet_extras_arg,
+                    extra_source_bet_parquets=bet_cache_extras_arg,
                     bet_base_cleaned_parquet=base_bet_path,
                     partition_inventory_fingerprint_sha256_hex=inv_fp,
                     data_scope=effective_bet_cfg.data_scope,
@@ -754,7 +779,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     metrics["bet_dedup_hash_buckets_effective"] = int(bet_dedup_eff)
         else:
             bet_cache_ok = use_preprocess_caches and _hbet.bet_clean_cache_is_hit(
-                bet_primary,
+                bet_cache_primary,
                 cleaned_bet_path,
                 preprocess_registry_yaml=reg_yaml,
                 dedup_hash_buckets=effective_bet_cfg.dedup_hash_buckets,
@@ -763,7 +788,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 patron_profile_csv=effective_bet_cfg.patron_profile_csv,
                 canonical_mapping_parquet=effective_bet_cfg.canonical_mapping_parquet,
                 adt_allowed_players_parquet=effective_bet_cfg.adt_allowed_players_parquet,
-                extra_source_bet_parquets=bet_extras_arg,
+                extra_source_bet_parquets=bet_cache_extras_arg,
                 partition_inventory_fingerprint_sha256_hex=inv_fp,
                 data_scope=effective_bet_cfg.data_scope,
             )
@@ -776,14 +801,14 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 )
             else:
                 out_b, bet_dedup_eff = _hpre.preprocess_bets_from_parquet_streaming(
-                    bet_primary,
+                    bet_preprocess_primary,
                     cleaned_bet_path,
                     cfg=effective_bet_cfg,
                     duckdb_runtime=args.duckdb_runtime,
-                    extra_partition_sources=bet_extras_arg,
+                    extra_partition_sources=bet_preprocess_extras_arg,
                 )
                 _hbet.write_bet_clean_cache_manifest(
-                    bet_primary,
+                    bet_cache_primary,
                     out_b,
                     preprocess_registry_yaml=reg_yaml,
                     dedup_hash_buckets=int(bet_dedup_eff),
@@ -792,7 +817,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     patron_profile_csv=effective_bet_cfg.patron_profile_csv,
                     canonical_mapping_parquet=effective_bet_cfg.canonical_mapping_parquet,
                     adt_allowed_players_parquet=effective_bet_cfg.adt_allowed_players_parquet,
-                    extra_source_bet_parquets=bet_extras_arg,
+                    extra_source_bet_parquets=bet_cache_extras_arg,
                     partition_inventory_fingerprint_sha256_hex=inv_fp,
                     data_scope=effective_bet_cfg.data_scope,
                 )
@@ -928,6 +953,82 @@ COPY (
         "gaming_day" in names,
     )
     return p
+
+
+def _apply_training_data_scope_to_parquet(
+    parquet_path: Path,
+    *,
+    scope: TrainingDataScopeConfig,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> Path:
+    """Drop training rows outside inclusive ``gaming_day_event`` bounds."""
+
+    if scope.gaming_day_event_min is None and scope.gaming_day_event_max is None:
+        return parquet_path
+
+    import duckdb
+
+    from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
+    from trainer_hightier.utils.hk_time_semantics import duckdb_gaming_day_event_scope_and_sql
+
+    p = Path(parquet_path).resolve()
+    if "gaming_day_event" not in pq.read_schema(p).names:
+        raise ValueError(
+            f"training parquet missing gaming_day_event before data-scope filter; path={p}",
+        )
+    scope_sql = duckdb_gaming_day_event_scope_and_sql(
+        min_day=scope.gaming_day_event_min,
+        max_day=scope.gaming_day_event_max,
+    )
+    p_esc = str(p).replace("\\", "/").replace("'", "''")
+    tmp = p.parent / f"{p.stem}.__scope_filter__.parquet"
+    tmp_esc = str(tmp).replace("\\", "/").replace("'", "''")
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        n_before = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{p_esc}')").fetchone()[0])
+        con.execute(
+            f"COPY (SELECT * FROM read_parquet('{p_esc}') WHERE TRUE{scope_sql}) "
+            f"TO '{tmp_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
+        )
+        n_after = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{tmp_esc}')").fetchone()[0])
+    finally:
+        con.close()
+    if n_after == 0:
+        raise ValueError(
+            f"training data scope removed all rows (before={n_before}, scope={scope.manifest_block()})",
+        )
+    tmp.replace(p)
+    logger.info(
+        "[Step 4] training data scope %s: rows %d -> %d (%s)",
+        scope.manifest_block(),
+        n_before,
+        n_after,
+        p.name,
+    )
+    return p
+
+
+def _prepare_training_features_parquet(
+    parquet_path: Path,
+    *,
+    args: HighTierTrainArgs,
+    metrics: dict[str, Any] | None = None,
+) -> Path:
+    """Sync ``gaming_day_event`` and apply optional training-row date scope."""
+
+    fp = _ensure_training_parquet_gaming_day_event_column(
+        parquet_path,
+        duckdb_runtime=args.duckdb_runtime,
+    )
+    fp = _apply_training_data_scope_to_parquet(
+        fp,
+        scope=args.training_data_scope,
+        duckdb_runtime=args.duckdb_runtime,
+    )
+    if metrics is not None:
+        metrics["training_data_scope"] = args.training_data_scope.manifest_block()
+    return fp
 
 
 def _assert_training_parquet_has_short_term_pit_columns(
@@ -1150,7 +1251,7 @@ def _maybe_run_step4(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None)
         logger.warning("[Step 4] skip: no features parquet at %s", fp.resolve())
         return
     logger.info("[Step 4] starting from features parquet %s", fp.resolve())
-    fp = _ensure_training_parquet_gaming_day_event_column(fp, duckdb_runtime=args.duckdb_runtime)
+    fp = _prepare_training_features_parquet(fp, args=args, metrics=metrics)
     fp_eff = _ensure_fe_enriched_training_parquet_for_step4(args, fp, metrics=metrics)
     reg_p = Path(args.feature_candidate_registry).resolve() if args.feature_candidate_registry else None
     snap = load_candidate_registry(reg_p)
@@ -1232,6 +1333,7 @@ def _maybe_build_training_dataset(args: HighTierTrainArgs, *, metrics: dict[str,
         auto_feast_apply=bool(args.auto_feast_apply),
     )
     out = _b3.build_training_data(cfg)
+    _prepare_training_features_parquet(out, args=args, metrics=metrics)
     logger.info("[Step 3] training dataset written %s", out)
     logger.info(
         "[Pipeline] After Step 3: Step 4 will split by gaming_day (if run_step4), then Step 5 LightGBM (if run_step5). "

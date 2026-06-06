@@ -245,8 +245,23 @@ RAW_W1H_SANITY_COLUMN = "bet__bets_cnt__w1h"
 
 
 def _raw_t_bet_partition_glob(raw_partition_dir: Path) -> str:
-    """POSIX glob for monthly raw ``t_bet`` partition parquets."""
+    """POSIX path/glob for raw ``t_bet`` shards (legacy monthly or table-dir layout)."""
+    from trainer_hightier.utils.partition_inventory import (
+        LAYOUT_TABLE_PARTITION_SHARDS,
+        detect_partition_layout,
+        has_table_dir_partition_layout,
+    )
+
     root = Path(raw_partition_dir).resolve()
+    if has_table_dir_partition_layout(root):
+        return str((root / "t_bet").as_posix()).replace("'", "''")
+    try:
+        if detect_partition_layout(root) == LAYOUT_TABLE_PARTITION_SHARDS:
+            if root.name == "t_bet":
+                return str(root.as_posix()).replace("'", "''")
+            return str((root / "t_bet").as_posix()).replace("'", "''")
+    except (FileNotFoundError, NotADirectoryError, ValueError):
+        pass
     return str((root / "t_bet__part_*.parquet").as_posix()).replace("'", "''")
 
 
@@ -357,12 +372,15 @@ def run_raw_source_w1h_sanity_check(
             "issues": [f"training split missing column {col!r}"],
             "n_rows_compared": 0,
         }
-    work = test.loc[test[col].notna(), ["bet_id", "player_id", "payout_complete_dtm", col]].copy()
+    sample_cols = ["bet_id", "player_id", "payout_complete_dtm", col]
+    if "gaming_day_event" in test.columns:
+        sample_cols.insert(3, "gaming_day_event")
+    work = test.loc[test[col].notna(), sample_cols].copy()
     if work.empty:
         return {
             "schema_version": "raw_source_w1h_sanity_v1",
-            "verdict": "skipped",
-            "issues": [],
+            "verdict": "fail",
+            "issues": [f"no non-null {col!r} rows available for raw source sanity"],
             "n_rows_compared": 0,
         }
     if max_rows and len(work) > int(max_rows):
@@ -377,6 +395,11 @@ def run_raw_source_w1h_sanity_check(
             "issues": issues,
             "n_rows_compared": 0,
         }
+    if "gaming_day_event" not in work.columns:
+        from trainer_hightier.utils.hk_time_semantics import pandas_ts_series_to_hk_l0_contract
+
+        pcd_hk = pandas_ts_series_to_hk_l0_contract(work["payout_complete_dtm"])
+        work["gaming_day_event"] = pd.to_datetime(pcd_hk.dt.date)
     cfg = default_hightier_serving_config()
     runtime = duckdb_runtime or DuckDbRuntimeConfig()
     cmap = Path(mapping_parquet).resolve()
@@ -399,6 +422,7 @@ def run_raw_source_w1h_sanity_check(
     pool = attach_canonical_id(pool, mapping_parquet=cmap)
     staged = attach_synthetic_etl_and_prediction_visible(staged)
     staged = attach_canonical_id(staged, mapping_parquet=cmap)
+    staged = staged.drop(columns=[col], errors="ignore")
     staged = attach_trial_bet_behavior_1h(staged, pool, duckdb_runtime=runtime)
     merged = work.merge(
         staged[["bet_id", col]].rename(columns={col: f"{col}_raw"}),
@@ -409,6 +433,11 @@ def run_raw_source_w1h_sanity_check(
     raw_vals = pd.to_numeric(merged[f"{col}_raw"], errors="coerce")
     eligible = train_vals.notna() & raw_vals.notna()
     n_eligible = int(eligible.sum())
+    if n_eligible == 0:
+        issues.append(
+            f"raw source sanity compared 0 eligible rows for {col!r}; "
+            "check raw_partition_dir, mapping coverage, and sample timestamp overlap"
+        )
     severe = (
         eligible
         & (raw_vals >= train_vals * float(undercount_ratio_threshold))

@@ -345,16 +345,45 @@ def cleaned_bet_dataset_has_any_parquet(path: Path) -> bool:
     return False
 
 
+def _l0_parquet_schema_names(path: Path) -> frozenset[str]:
+    """Read schema from a parquet file or the first shard under a table-dir root."""
+    p = Path(path).resolve()
+    if p.is_file():
+        return frozenset(pq.read_schema(p).names)
+    if p.is_dir():
+        for candidate in sorted(p.rglob("*.parquet")):
+            if candidate.is_file() and not candidate.name.endswith(".gstmp"):
+                return frozenset(pq.read_schema(candidate).names)
+        raise FileNotFoundError(f"no parquet shards under {p}")
+    raise FileNotFoundError(p)
+
+
+def _is_l0_parquet_source(path: Path) -> bool:
+    """True when *path* is a parquet file or a directory containing parquet shards."""
+    p = Path(path).resolve()
+    if p.is_file():
+        return True
+    if p.is_dir():
+        return any(
+            child.is_file() and not child.name.endswith(".gstmp")
+            for child in p.rglob("*.parquet")
+        )
+    return False
+
+
 def _duckdb_read_parquet_sources_sql(paths: list[Path]) -> str:
     """Build DuckDB ``read_parquet([...])`` or single-file variant."""
     if not paths:
         raise ValueError("bet paths empty")
     if len(paths) == 1:
-        esc = _path_posix(paths[0].resolve()).replace("'", "''")
+        p = Path(paths[0]).resolve()
+        esc = _path_posix(p).replace("'", "''")
+        if p.is_dir():
+            return f"read_parquet('{esc}', union_by_name=true)"
         return f"read_parquet('{esc}')"
     parts = [_path_posix(p.resolve()).replace("'", "''") for p in paths]
     inner = ", ".join(f"'{p}'" for p in parts)
-    return "read_parquet([" + inner + "])"
+    return f"read_parquet([{inner}], union_by_name=true)"
 
 
 def _bet_hk_norm_select_list(read_cols_ordered: tuple[str, ...]) -> str:
@@ -703,7 +732,7 @@ def _preprocess_bets_duckdb_single_copy(
     n = int(cfg.dedup_hash_buckets)
     if n < 1:
         raise ValueError(f"dedup_hash_buckets must be >= 1, got {n}")
-    schema_names = frozenset(pq.read_schema(Path(source_parquets[0])).names)
+    schema_names = _l0_parquet_schema_names(Path(source_parquets[0]))
     read_ordered = _bet_preprocess_read_columns_ordered(schema_names)
     cap_sec, _applied = _bet_cap_applied_rules(registry_yaml)
     tags = bulk_bet_episode_calendar_tags(registry_yaml)
@@ -805,14 +834,14 @@ def preprocess_bets_from_parquet_streaming(
         ``(resolved output path, effective dedup_hash_buckets used)``.
     """
     src = Path(bet_parquet).resolve()
-    if not src.is_file():
+    if not _is_l0_parquet_source(src):
         raise FileNotFoundError(src)
     sources_list: list[Path] = [src]
     if extra_partition_sources:
         uniq = {str(src): src}
         for pp in extra_partition_sources:
             p = Path(pp).resolve()
-            if not p.is_file():
+            if not _is_l0_parquet_source(p):
                 raise FileNotFoundError(p)
             uniq[str(p)] = p
         sources_list = sorted(uniq.values(), key=lambda x: str(x))
@@ -1445,12 +1474,17 @@ def refresh_bet_preprocess_cache_manifests(
     """
 
     from trainer_hightier.utils.partition_inventory import (
+        default_partition_snapshot_dir,
+        expect_default_partition_snapshot_dir,
         infer_snapshot_id,
         inventory_to_manifest_dict,
         scan_partition_snapshot_dir,
     )
 
-    snap = Path(partition_snapshot_dir or Path(__file__).resolve().parents[2] / "data" / "partitions").resolve()
+    if partition_snapshot_dir is not None:
+        snap = Path(partition_snapshot_dir).resolve()
+    else:
+        snap = default_partition_snapshot_dir() or expect_default_partition_snapshot_dir()
     reg = _resolve_preprocess_registry(
         preprocess_registry_yaml or default_preprocess_registry_yaml_path(),
     )

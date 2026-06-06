@@ -14,6 +14,10 @@ import pyarrow.parquet as pq
 
 _PART_MONTH_RE_BET = re.compile(r"t_bet__part_(\d{6})\.parquet$")
 _PART_MONTH_RE_SESSION = re.compile(r"t_session__part_(\d{6})\.parquet$")
+_TABLE_PARTITION_MONTH_RE = re.compile(r"partition_(\d{6})$")
+
+LAYOUT_LEGACY_MONTHLY_PARQUET: str = "legacy_monthly_parquet"
+LAYOUT_TABLE_PARTITION_SHARDS: str = "table_partition_shards"
 
 
 @dataclass(frozen=True)
@@ -26,6 +30,27 @@ class PartitionParquetStat:
     mtime_ns: int
     size_bytes: int
     num_rows: int
+
+
+def _stat_one_parquet_with_yyyymm(path: Path, role: str, yyyymm: str) -> PartitionParquetStat:
+    """Build stats for one parquet shard with an explicit ``YYYYMM`` month key."""
+    p = Path(path).resolve()
+    if not p.is_file():
+        raise FileNotFoundError(p)
+    name = p.name
+    if name.endswith(".gstmp"):
+        raise ValueError(f"Refusing incomplete parquet filename: {p}")
+    st = p.stat()
+    meta = pq.ParquetFile(p).metadata
+    nrows = int(meta.num_rows) if meta is not None else -1
+    return PartitionParquetStat(
+        path=p,
+        yyyymm=str(yyyymm),
+        role=role,
+        mtime_ns=int(st.st_mtime_ns),
+        size_bytes=int(st.st_size),
+        num_rows=nrows,
+    )
 
 
 def _stat_one_parquet(path: Path, role: str, month_extractor: re.Pattern[str]) -> PartitionParquetStat:
@@ -41,27 +66,120 @@ def _stat_one_parquet(path: Path, role: str, month_extractor: re.Pattern[str]) -
     if not m:
         raise ValueError(f"Filename does not match expected pattern {month_extractor.pattern!r}: {name}")
     ym = str(m.group(1))
-    st = p.stat()
-    meta = pq.ParquetFile(p).metadata
-    nrows = int(meta.num_rows) if meta is not None else -1
-    return PartitionParquetStat(
-        path=p,
-        yyyymm=ym,
-        role=role,
-        mtime_ns=int(st.st_mtime_ns),
-        size_bytes=int(st.st_size),
-        num_rows=nrows,
-    )
+    return _stat_one_parquet_with_yyyymm(p, role, ym)
 
 
-def scan_partition_snapshot_dir(snapshot_dir: Path) -> tuple[list[PartitionParquetStat], list[PartitionParquetStat]]:
-    """List bet/session partition Parquets under a snapshot folder recursively.
+def _table_partition_roots(data_root: Path) -> tuple[Path, Path]:
+    """Return ``(t_bet, t_session)`` table roots under a repo ``data`` directory."""
+    root = Path(data_root).resolve()
+    return root / "t_bet", root / "t_session"
 
-    Supports both flat exports and dated subfolders such as ``partitions/20260512/...``.
+
+def _has_table_partition_shards(table_root: Path) -> bool:
+    """True when *table_root* contains ``partition_YYYYMM/`` monthly folders."""
+    tr = Path(table_root).resolve()
+    if not tr.is_dir():
+        return False
+    return any(p.is_dir() and _TABLE_PARTITION_MONTH_RE.match(p.name) for p in tr.iterdir())
+
+
+def has_table_dir_partition_layout(data_root: Path) -> bool:
+    """True when ``data/t_bet`` and ``data/t_session`` both expose monthly partition folders."""
+    root = Path(data_root).resolve()
+    bet_root, sess_root = _table_partition_roots(root)
+    return _has_table_partition_shards(bet_root) and _has_table_partition_shards(sess_root)
+
+
+def table_dir_preprocess_read_root(snapshot_dir: Path, table_name: str) -> Path:
+    """Return the DuckDB-readable table root for table-dir layout preprocess."""
+    root = Path(snapshot_dir).resolve()
+    if root.name == table_name:
+        return root
+    return root / table_name
+
+
+def collapsed_preprocess_read_sources(
+    *,
+    snapshot_dir: Path,
+    table_name: str,
+    legacy_paths: tuple[Path, ...] = (),
+) -> tuple[Path, ...]:
+    """Collapse table-dir monthly shards to one directory path for DuckDB reads.
+
+    Per-shard inventory stats remain in partition inventory manifests; this helper
+    is only for preprocess IO so ``read_parquet('<table_root>')`` scans all shards.
+    """
+    root = Path(snapshot_dir).resolve()
+    if detect_partition_layout(root) == LAYOUT_TABLE_PARTITION_SHARDS:
+        table_root = table_dir_preprocess_read_root(root, table_name)
+        if not table_root.is_dir():
+            raise FileNotFoundError(table_root)
+        return (table_root,)
+    if not legacy_paths:
+        return ()
+    return tuple(sorted({Path(p).resolve() for p in legacy_paths}, key=str))
+
+
+def _has_legacy_partition_files(snapshot_dir: Path) -> bool:
+    """True when *snapshot_dir* contains legacy ``t_*__part_YYYYMM.parquet`` shards."""
+    root = Path(snapshot_dir).resolve()
+    if not root.is_dir():
+        return False
+    for child in root.rglob("*.parquet"):
+        if child.is_file() and (
+            child.name.startswith("t_bet__part_") or child.name.startswith("t_session__part_")
+        ):
+            return True
+    return False
+
+
+def detect_partition_layout(snapshot_dir: Path) -> str:
+    """Detect inventory layout for *snapshot_dir*.
+
+    When both table-dir (``data/t_bet``, ``data/t_session``) and legacy monthly
+    parquet shards coexist under the same repo ``data`` root, table-dir wins so
+    the newer source layout is used without silently mixing both.
     """
     root = Path(snapshot_dir).resolve()
     if not root.is_dir():
         raise NotADirectoryError(root)
+
+    if has_table_dir_partition_layout(root):
+        return LAYOUT_TABLE_PARTITION_SHARDS
+    if root.name in {"t_bet", "t_session"} and _has_table_partition_shards(root):
+        return LAYOUT_TABLE_PARTITION_SHARDS
+    if _has_legacy_partition_files(root):
+        return LAYOUT_LEGACY_MONTHLY_PARQUET
+    raise FileNotFoundError(
+        f"No partition shards found under {root}. "
+        "Expected legacy t_bet__part_YYYYMM.parquet / t_session__part_YYYYMM.parquet, "
+        "or table-dir data/t_bet/partition_YYYYMM/part_*.parquet layout."
+    )
+
+
+def _scan_table_partition_shards(table_root: Path, role: str) -> list[PartitionParquetStat]:
+    """Scan ``partition_YYYYMM/part_*.parquet`` shards under one table root."""
+    root = Path(table_root).resolve()
+    if not root.is_dir():
+        return []
+    stats: list[PartitionParquetStat] = []
+    for part_dir in sorted(root.iterdir()):
+        if not part_dir.is_dir():
+            continue
+        m = _TABLE_PARTITION_MONTH_RE.match(part_dir.name)
+        if not m:
+            continue
+        ym = str(m.group(1))
+        for shard in sorted(part_dir.glob("*.parquet")):
+            if not shard.is_file() or shard.name.endswith(".gstmp"):
+                continue
+            stats.append(_stat_one_parquet_with_yyyymm(shard, role, ym))
+    return stats
+
+
+def _scan_legacy_partition_shards(snapshot_dir: Path) -> tuple[list[PartitionParquetStat], list[PartitionParquetStat]]:
+    """Scan legacy ``t_*__part_YYYYMM.parquet`` shards recursively under *snapshot_dir*."""
+    root = Path(snapshot_dir).resolve()
     bet_stats: list[PartitionParquetStat] = []
     sess_stats: list[PartitionParquetStat] = []
     for child in sorted(root.rglob("*.parquet")):
@@ -76,17 +194,50 @@ def scan_partition_snapshot_dir(snapshot_dir: Path) -> tuple[list[PartitionParqu
     return bet_stats, sess_stats
 
 
+def scan_partition_snapshot_dir(snapshot_dir: Path) -> tuple[list[PartitionParquetStat], list[PartitionParquetStat]]:
+    """List bet/session partition Parquets under a snapshot folder.
+
+    Supports:
+
+    - legacy monthly parquet: ``partitions/t_bet__part_YYYYMM.parquet``
+    - table-dir monthly shards: ``data/t_bet/partition_YYYYMM/part_*.parquet``
+    - nested dated export subfolders for the legacy layout
+    """
+    root = Path(snapshot_dir).resolve()
+    layout = detect_partition_layout(root)
+    if layout == LAYOUT_TABLE_PARTITION_SHARDS:
+        if root.name in {"t_bet", "t_session"}:
+            role = "t_bet" if root.name == "t_bet" else "t_session"
+            stats = _scan_table_partition_shards(root, role)
+            if role == "t_bet":
+                return stats, []
+            return [], stats
+        bet_root, sess_root = _table_partition_roots(root)
+        bet_stats = _scan_table_partition_shards(bet_root, "t_bet")
+        sess_stats = _scan_table_partition_shards(sess_root, "t_session")
+        if not bet_stats and not sess_stats:
+            raise FileNotFoundError(
+                f"table-dir layout detected under {root} but no partition shards were found "
+                f"under {bet_root} / {sess_root}"
+            )
+        return bet_stats, sess_stats
+    return _scan_legacy_partition_shards(root)
+
+
 def fingerprint_partition_inventory(
     snapshot_id: str,
     *,
     snapshot_dir: Path,
     bet_stats: list[PartitionParquetStat],
     session_stats: list[PartitionParquetStat],
+    layout_kind: str | None = None,
 ) -> str:
     """Deterministic fingerprint over snapshot id + sorted file stats."""
     lines: list[str] = []
     lines.append(str(snapshot_id).strip())
     lines.append(str(Path(snapshot_dir).resolve()))
+    lk = layout_kind or detect_partition_layout(Path(snapshot_dir))
+    lines.append(str(lk))
     all_rows = list(bet_stats) + list(session_stats)
     all_rows.sort(key=lambda s: (s.role, s.yyyymm, str(s.path)))
     for r in all_rows:
@@ -111,18 +262,22 @@ def inventory_to_manifest_dict(
     snapshot_dir: Path,
     bet_stats: list[PartitionParquetStat],
     session_stats: list[PartitionParquetStat],
+    layout_kind: str | None = None,
 ) -> dict[str, Any]:
     """Serializable manifest payload for artifact write."""
+    lk = layout_kind or detect_partition_layout(Path(snapshot_dir))
     fp = fingerprint_partition_inventory(
         snapshot_id,
         snapshot_dir=snapshot_dir,
         bet_stats=bet_stats,
         session_stats=session_stats,
+        layout_kind=lk,
     )
     return {
         "manifest_kind": "trainer_hightier_partition_inventory_v1",
         "snapshot_id": str(snapshot_id).strip(),
         "snapshot_dir": str(Path(snapshot_dir).resolve()),
+        "layout_kind": lk,
         "fingerprint_sha256_hex": fp,
         "tables": {
             "t_bet": [
@@ -206,6 +361,10 @@ def months_added_or_changed(
         return ix
 
     if prev is None:
+        return partition_month_union_from_manifest(cur)
+    prev_layout = str(prev.get("layout_kind", LAYOUT_LEGACY_MONTHLY_PARQUET)).strip()
+    cur_layout = str(cur.get("layout_kind", LAYOUT_LEGACY_MONTHLY_PARQUET)).strip()
+    if prev_layout != cur_layout:
         return partition_month_union_from_manifest(cur)
     ix_cur = _index(cur)
     ix_prev = _index(prev)
@@ -301,33 +460,42 @@ def repo_root_for_trainer_hightier() -> Path:
 
 
 def default_partition_snapshot_dir(*, repo_root: Path | None = None) -> Path | None:
-    """Return ``<repo>/data/partitions`` when that directory exists; else ``None``.
+    """Return default partition snapshot root when a supported layout exists.
+
+    Prefers table-dir ``<repo>/data`` when ``data/t_bet`` and ``data/t_session`` both
+    contain ``partition_YYYYMM/`` folders; otherwise falls back to legacy
+    ``<repo>/data/partitions``.
 
     For **optional** checks (e.g. tests). Trainer default path uses
     :func:`expect_default_partition_snapshot_dir` which raises when missing.
     """
     root = Path(repo_root).resolve() if repo_root is not None else repo_root_for_trainer_hightier()
-    candidate = root / "data" / "partitions"
-    return candidate if candidate.is_dir() else None
+    data_root = root / "data"
+    if has_table_dir_partition_layout(data_root):
+        return data_root.resolve()
+    legacy = root / "data" / "partitions"
+    return legacy.resolve() if legacy.is_dir() else None
 
 
 def expect_default_partition_snapshot_dir(*, repo_root: Path | None = None) -> Path:
-    """Return resolved ``<repo>/data/partitions`` or raise ``FileNotFoundError`` if absent.
+    """Return resolved default partition snapshot root or raise when absent.
 
     Used when the run relies on the conventional default layout (no ``--partition-snapshot-dir``,
     no ``--no-partition-snapshot``).
     """
     root = Path(repo_root).resolve() if repo_root is not None else repo_root_for_trainer_hightier()
-    candidate = (root / "data" / "partitions").resolve()
-    if not candidate.is_dir():
+    got = default_partition_snapshot_dir(repo_root=root)
+    if got is None:
+        data_root = (root / "data").resolve()
+        legacy = (root / "data" / "partitions").resolve()
         raise FileNotFoundError(
-            "Expected default partition snapshot directory is missing: "
-            f"{candidate}. "
-            "Create it and add t_bet__part_YYYYMM.parquet / t_session__part_YYYYMM.parquet shards, "
-            "or pass --partition-snapshot-dir <dir> for a different folder, "
+            "Expected default partition snapshot layout is missing. "
+            f"Need either table-dir shards under {data_root / 't_bet'} and {data_root / 't_session'}, "
+            f"or legacy monthly parquet shards under {legacy}. "
+            "Alternatively pass --partition-snapshot-dir <dir>, "
             "or --no-partition-snapshot to run without merging monthly shard Parquets."
         )
-    return candidate
+    return got
 
 
 def expect_existing_partition_snapshot_dir(snapshot_dir: Path) -> Path:

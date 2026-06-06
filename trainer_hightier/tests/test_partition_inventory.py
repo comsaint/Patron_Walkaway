@@ -10,9 +10,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from trainer_hightier.utils.partition_inventory import (
+    LAYOUT_LEGACY_MONTHLY_PARQUET,
+    LAYOUT_TABLE_PARTITION_SHARDS,
     compute_recompute_months,
     default_partition_inventory_path,
     default_partition_snapshot_dir,
+    detect_partition_layout,
     expect_default_partition_snapshot_dir,
     expect_existing_partition_snapshot_dir,
     inventory_to_manifest_dict,
@@ -104,10 +107,75 @@ def test_write_manifest_roundtrip_loads(tmp_path: Path) -> None:
     assert got["fingerprint_sha256_hex"] == m["fingerprint_sha256_hex"]
 
 
+def _write_table_dir_shard(table_root: Path, yyyymm: str, shard_name: str) -> None:
+    part = table_root / f"partition_{yyyymm}"
+    part.mkdir(parents=True, exist_ok=True)
+    (part / shard_name).write_bytes(_tiny_parquet_bytes())
+
+
+def test_scan_table_dir_partition_shards(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    _write_table_dir_shard(data / "t_bet", "202406", "part_000001.parquet")
+    _write_table_dir_shard(data / "t_bet", "202406", "part_000002.parquet")
+    _write_table_dir_shard(data / "t_session", "202406", "part_000001.parquet")
+    bets, sess = scan_partition_snapshot_dir(data)
+    assert detect_partition_layout(data) == LAYOUT_TABLE_PARTITION_SHARDS
+    assert [x.yyyymm for x in bets] == ["202406", "202406"]
+    assert [x.yyyymm for x in sess] == ["202406"]
+
+
+def test_scan_prefers_table_dir_when_legacy_also_present(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    legacy = data / "partitions"
+    legacy.mkdir(parents=True)
+    (legacy / "t_bet__part_202405.parquet").write_bytes(_tiny_parquet_bytes())
+    (legacy / "t_session__part_202405.parquet").write_bytes(_tiny_parquet_bytes())
+    _write_table_dir_shard(data / "t_bet", "202406", "part_000001.parquet")
+    _write_table_dir_shard(data / "t_session", "202406", "part_000001.parquet")
+    bets, sess = scan_partition_snapshot_dir(data)
+    assert detect_partition_layout(data) == LAYOUT_TABLE_PARTITION_SHARDS
+    assert [x.yyyymm for x in bets] == ["202406"]
+    assert [x.yyyymm for x in sess] == ["202406"]
+
+
+def test_default_partition_snapshot_dir_prefers_table_dir(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    legacy = data / "partitions"
+    legacy.mkdir(parents=True)
+    (legacy / "t_bet__part_202406.parquet").write_bytes(_tiny_parquet_bytes())
+    _write_table_dir_shard(data / "t_bet", "202406", "part_000001.parquet")
+    _write_table_dir_shard(data / "t_session", "202406", "part_000001.parquet")
+    assert default_partition_snapshot_dir(repo_root=tmp_path) == data.resolve()
+
+
+def test_layout_kind_change_marks_all_months_changed(tmp_path: Path) -> None:
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    (legacy_dir / "t_bet__part_202401.parquet").write_bytes(_tiny_parquet_bytes())
+    (legacy_dir / "t_session__part_202401.parquet").write_bytes(_tiny_parquet_bytes())
+    b1, s1 = scan_partition_snapshot_dir(legacy_dir)
+    m_legacy = inventory_to_manifest_dict(
+        "legacy",
+        snapshot_dir=legacy_dir,
+        bet_stats=b1,
+        session_stats=s1,
+        layout_kind=LAYOUT_LEGACY_MONTHLY_PARQUET,
+    )
+
+    data = tmp_path / "data"
+    _write_table_dir_shard(data / "t_bet", "202401", "part_000001.parquet")
+    _write_table_dir_shard(data / "t_session", "202401", "part_000001.parquet")
+    b2, s2 = scan_partition_snapshot_dir(data)
+    m_table = inventory_to_manifest_dict("data", snapshot_dir=data, bet_stats=b2, session_stats=s2)
+    assert months_added_or_changed(m_table, m_legacy) == {"202401"}
+
+
 def test_default_partition_snapshot_dir_only_when_dir_exists(tmp_path: Path) -> None:
     assert default_partition_snapshot_dir(repo_root=tmp_path) is None
     target = tmp_path / "data" / "partitions"
     target.mkdir(parents=True)
+    (target / "t_bet__part_202406.parquet").write_bytes(_tiny_parquet_bytes())
+    (target / "t_session__part_202406.parquet").write_bytes(_tiny_parquet_bytes())
     assert default_partition_snapshot_dir(repo_root=tmp_path) == target.resolve()
 
 
@@ -144,13 +212,15 @@ def test_resolve_partition_inventory_previous_explicit_wins(tmp_path: Path) -> N
 
 
 def test_expect_default_partition_snapshot_dir_raises_when_missing(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError, match="Expected default partition snapshot directory"):
+    with pytest.raises(FileNotFoundError, match="Expected default partition snapshot layout"):
         expect_default_partition_snapshot_dir(repo_root=tmp_path)
 
 
 def test_expect_default_partition_snapshot_dir_returns_resolved(tmp_path: Path) -> None:
     target = tmp_path / "data" / "partitions"
     target.mkdir(parents=True)
+    (target / "t_bet__part_202406.parquet").write_bytes(_tiny_parquet_bytes())
+    (target / "t_session__part_202406.parquet").write_bytes(_tiny_parquet_bytes())
     got = expect_default_partition_snapshot_dir(repo_root=tmp_path)
     assert got == target.resolve()
 

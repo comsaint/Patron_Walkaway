@@ -197,15 +197,47 @@ def _build_s2_cte_sql(names: frozenset[str], *, source_alias: str = "hk") -> str
 )"""
 
 
+def _l0_parquet_schema_names(path: Path) -> frozenset[str]:
+    """Read schema from a parquet file or the first shard under a table-dir root."""
+    p = Path(path).resolve()
+    if p.is_file():
+        return frozenset(pq.read_schema(p).names)
+    if p.is_dir():
+        for candidate in sorted(p.rglob("*.parquet")):
+            if candidate.is_file() and not candidate.name.endswith(".gstmp"):
+                return frozenset(pq.read_schema(candidate).names)
+        raise FileNotFoundError(f"no parquet shards under {p}")
+    raise FileNotFoundError(p)
+
+
+def _is_l0_parquet_source(path: Path) -> bool:
+    """True when *path* is a parquet file or a directory containing parquet shards."""
+    p = Path(path).resolve()
+    if p.is_file():
+        return True
+    if p.is_dir():
+        return any(
+            child.is_file() and not child.name.endswith(".gstmp")
+            for child in p.rglob("*.parquet")
+        )
+    return False
+
+
 def _duckdb_read_parquet_array_sql(paths: list[Path]) -> str:
     """Build DuckDB ``read_parquet([...])`` source from explicit Parquet paths."""
     if not paths:
         raise ValueError("paths must be non-empty for read_parquet list")
+    if len(paths) == 1:
+        p = Path(paths[0]).resolve()
+        esc = _path_posix(p).replace("'", "''")
+        if p.is_dir():
+            return f"read_parquet('{esc}', union_by_name=true)"
+        return f"read_parquet('{esc}')"
     parts: list[str] = []
     for p in paths:
         esc = _path_posix(Path(p).resolve()).replace("'", "''")
         parts.append(f"'{esc}'")
-    return "read_parquet([" + ", ".join(parts) + "])"
+    return "read_parquet([" + ", ".join(parts) + "], union_by_name=true)"
 
 
 def _duckdb_session_clean_pipeline_select_sql(
@@ -298,8 +330,7 @@ def _preprocess_sessions_duckdb_single_copy(
     if not session_sources:
         raise ValueError("session_sources must not be empty")
     if len(session_sources) == 1:
-        sp = _path_posix(Path(session_sources[0]).resolve()).replace("'", "''")
-        src_clause = f"read_parquet('{sp}')"
+        src_clause = _duckdb_read_parquet_array_sql([Path(session_sources[0])])
     else:
         src_clause = _duckdb_read_parquet_array_sql([Path(x) for x in session_sources])
     con = duckdb.connect(database=":memory:")
@@ -318,7 +349,7 @@ def _preprocess_sessions_duckdb_single_copy(
     n = int(dedup_hash_buckets)
     if n < 1:
         raise ValueError(f"dedup_hash_buckets must be >= 1, got {n}")
-    schema_names = frozenset(pq.read_schema(Path(session_sources[0])).names)
+    schema_names = _l0_parquet_schema_names(Path(session_sources[0]))
     read_ordered = _session_preprocess_read_columns_ordered(schema_names)
     out_p = _path_posix(out).replace("'", "''")
     scope = data_scope if data_scope is not None else L0PreprocessDataScopeConfig()
@@ -711,14 +742,14 @@ def preprocess_sessions_from_parquet_streaming(
         ``(resolved output_path, effective dedup_hash_buckets used)``.
     """
     src = Path(session_parquet).resolve()
-    if not src.is_file():
+    if not _is_l0_parquet_source(src):
         raise FileNotFoundError(src)
     sources_list: list[Path] = [src]
     if extra_partition_sources:
         uniq: dict[str, Path] = {str(src): src}
         for pp in extra_partition_sources:
             p = Path(pp).resolve()
-            if not p.is_file():
+            if not _is_l0_parquet_source(p):
                 raise FileNotFoundError(p)
             uniq[str(p)] = p
         sources_list = sorted(uniq.values(), key=lambda x: str(x))
