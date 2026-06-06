@@ -182,6 +182,14 @@ def _empty_player_game_candidates() -> pd.DataFrame:
     )
 
 
+def _coerce_group_id_series(series: pd.Series) -> pd.Series:
+    """Coerce identifier columns to nullable ``Int64`` for stable player-game grouping."""
+
+    if pd.api.types.is_integer_dtype(series.dtype):
+        return series.astype("Int64")
+    return pd.to_numeric(series, errors="coerce").astype("Int64")
+
+
 def aggregate_bets_to_player_game(
     df: pd.DataFrame,
     scores: np.ndarray,
@@ -214,13 +222,13 @@ def aggregate_bets_to_player_game(
         [PLAYER_ID_COLUMN, GAME_ID_COLUMN, LABEL_COLUMN, PAYOUT_TS_COLUMN, BET_ID_COLUMN]
     ].copy()
     work["_score"] = np.asarray(scores, dtype=np.float64).reshape(-1)
-    pid = pd.to_numeric(work[PLAYER_ID_COLUMN], errors="coerce")
-    gid = pd.to_numeric(work[GAME_ID_COLUMN], errors="coerce")
+    work[PLAYER_ID_COLUMN] = _coerce_group_id_series(work[PLAYER_ID_COLUMN])
+    work[GAME_ID_COLUMN] = _coerce_group_id_series(work[GAME_ID_COLUMN])
     lbl = pd.to_numeric(work[LABEL_COLUMN], errors="coerce")
     alert_ts = pd.to_datetime(work[PAYOUT_TS_COLUMN], errors="coerce")
     valid = (
-        pid.notna()
-        & gid.notna()
+        work[PLAYER_ID_COLUMN].notna()
+        & work[GAME_ID_COLUMN].notna()
         & lbl.notna()
         & alert_ts.notna()
         & np.isfinite(work["_score"].to_numpy())

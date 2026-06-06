@@ -110,6 +110,30 @@ def test_aggregate_bets_to_player_game_max_score_and_label() -> None:
     assert float(game100["bet_id"]) == pytest.approx(2.0)
 
 
+def test_aggregate_bets_to_player_game_preserves_large_integer_game_ids() -> None:
+    """Adjacent game_ids beyond float53 precision must not collapse into one group."""
+
+    gid_a = 9_007_199_254_740_992
+    gid_b = 9_007_199_254_740_993
+    assert float(gid_a) == float(gid_b)
+
+    df = pd.DataFrame(
+        {
+            "player_id": [1, 1],
+            "game_id": [gid_a, gid_b],
+            "walkaway_label": [0, 1],
+            "payout_complete_dtm": pd.to_datetime(
+                ["2026-06-01 10:00:00", "2026-06-01 10:01:00"],
+            ),
+            "bet_id": [1, 2],
+        },
+    )
+    scores = np.array([0.4, 0.9], dtype=np.float64)
+    out = aggregate_bets_to_player_game(df, scores, split_name="val")
+    assert out.player_game_count == 2
+    assert set(out.candidates["game_id"].astype("int64").tolist()) == {gid_a, gid_b}
+
+
 def test_aggregate_bets_to_player_game_excludes_invalid_keys() -> None:
     """Null player_id/game_id rows are excluded from player-game metrics."""
 

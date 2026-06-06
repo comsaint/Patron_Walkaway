@@ -264,6 +264,14 @@ def build_pipeline_debug(metrics: dict[str, Any]) -> dict[str, Any]:
             "selected_universe_canonical_count": metrics.get("selected_universe_canonical_count"),
             "selected_universe_player_count": metrics.get("selected_universe_player_count"),
         },
+        "entity_set_v1": {
+            "cache_hit": metrics.get("entity_set_cache_hit"),
+            "elapsed_seconds": metrics.get("entity_set_elapsed_seconds"),
+            "row_count": metrics.get("entity_set_row_count"),
+            "manifest_path": metrics.get("entity_set_manifest_path"),
+            "output_path": metrics.get("entity_set_output_path"),
+            "legacy_fallback_used": metrics.get("bet_segment_legacy_fallback_used"),
+        },
         "timings_sec": {
             "prepare_training_frame": metrics.get("prepare_training_frame_seconds"),
             "build_training_dataset": metrics.get("build_training_dataset_seconds"),

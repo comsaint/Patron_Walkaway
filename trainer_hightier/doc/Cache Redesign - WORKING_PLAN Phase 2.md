@@ -214,4 +214,10 @@ Phase 2 完成當且僅當：
 | P2-WP-2 | ✅ 完成 | L1 session/bet **base** cache 改用 `source_manifest_v2_fingerprint_sha256_hex` |
 | P2-WP-3 | ✅ 完成 | `universe_cache_v1.py` ADT rank table + selected universe manifest |
 | P2-WP-4 | ✅ 完成 | `write_selected_universe_manifest`（含於 universe 模組） |
-| P2-WP-5～P2-WP-11 | 待辦 | entity set、Step 3 cutover、segment 退役 |
+| P2-WP-5 | ✅ 完成 | `entity_set_v1.py`；按月 partition 歸檔 |
+| P2-WP-6 | ✅ 完成 | Trainer 預設 entity set；`--use-legacy-bet-segment` fallback |
+| P2-WP-7 | ✅ 完成 | Step 3 仍讀 `cleaned__gmwds_t_bet`（entity set 寫入同一路徑） |
+| P2-WP-8 | ✅ 完成 | `retire_bet_segment_cache_sidecar` 於 entity set materialize 後執行 |
+| P2-WP-9 | ✅ 完成 | （見 P2-WP-1） |
+| P2-WP-10 | ✅ 部分 | `test_entity_set_v1.py`（含 P2-T-5 golden compare） |
+| P2-WP-11 | ✅ 部分 | RUNBOOK §5.6 |

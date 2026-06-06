@@ -669,6 +669,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
     if want_adt_bets and args.canonical_mapping.enabled:
         allowed_players_pq = default_adt_allowed_players_parquet_path(q_thr)
 
+    rank_meta: dict[str, Any] | None = None
     if args.canonical_mapping.enabled and profile_csv_path.is_file() and mapping_parquet_path.is_file():
         from datetime import date as _date_cls
 
@@ -682,8 +683,8 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
         _rank_slow_ctx = resolve_slow_month_turn_context(_date_cls.today())
         _rank_svc_cfg = default_hightier_serving_config()
         rank_meta = materialize_adt_rank_table_v1_cached(
-            profile_csv_path,
-            mapping_parquet_path,
+            patron_profile_csv=profile_csv_path,
+            canonical_mapping_parquet=mapping_parquet_path,
             duckdb_runtime=args.duckdb_runtime,
             cleaned_session_parquet=cleaned_path if cleaned_path.is_file() else None,
             slow_active_anchor=_rank_slow_ctx.slow_anchor_required,
@@ -744,23 +745,6 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
         bet_preprocess_extras_arg = bet_preprocess_extras or None
 
         if want_adt_bets and args.canonical_mapping.enabled and allowed_players_pq is not None:
-            from datetime import date as _date_cls
-
-            from trainer_hightier.config import default_hightier_serving_config
-            from trainer_hightier.utils.slow_month_turn import resolve_slow_month_turn_context
-
-            _slow_ctx = resolve_slow_month_turn_context(_date_cls.today())
-            _svc_cfg = default_hightier_serving_config()
-            materialize_adt_allowed_players_parquet(
-                profile_csv_path,
-                mapping_parquet_path,
-                quantile=q_thr,
-                duckdb_runtime=args.duckdb_runtime,
-                output_parquet=allowed_players_pq,
-                cleaned_session_parquet=cleaned_path,
-                slow_active_anchor=_slow_ctx.slow_anchor_required,
-                slow_lookback_days=int(_svc_cfg.production_slow_lookback_days),
-            )
             base_hit = use_preprocess_caches and _hbet.bet_base_clean_cache_is_hit(
                 merged_bet_sources,
                 base_bet_path,
@@ -770,69 +754,81 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 source_manifest_v2_fingerprint_sha256_hex=source_fp,
                 data_scope=base_bet_cfg.data_scope,
             )
-            seg_hit = use_preprocess_caches and _hbet.bet_clean_cache_is_hit(
-                bet_cache_primary,
-                cleaned_bet_path,
-                preprocess_registry_yaml=reg_yaml,
-                dedup_hash_buckets=effective_bet_cfg.dedup_hash_buckets,
-                cleaned_session_parquet=cleaned_path,
-                adt_filter_quantile=effective_bet_cfg.adt_filter_quantile,
-                patron_profile_csv=effective_bet_cfg.patron_profile_csv,
-                canonical_mapping_parquet=effective_bet_cfg.canonical_mapping_parquet,
-                adt_allowed_players_parquet=effective_bet_cfg.adt_allowed_players_parquet,
-                extra_source_bet_parquets=bet_cache_extras_arg,
-                bet_base_cleaned_parquet=base_bet_path,
-                partition_inventory_fingerprint_sha256_hex=inv_fp,
-                data_scope=effective_bet_cfg.data_scope,
-            )
+            bet_dedup_eff = int(base_bet_cfg.dedup_hash_buckets)
+            mf_bkt = _hbet.bet_base_manifest_dedup_hash_buckets(base_bet_path)
+            if base_hit and mf_bkt is not None:
+                bet_dedup_eff = int(mf_bkt)
+            if not base_hit:
+                _, bet_dedup_eff = _hpre.preprocess_bets_from_parquet_streaming(
+                    bet_preprocess_primary,
+                    base_bet_path,
+                    cfg=base_bet_cfg,
+                    duckdb_runtime=args.duckdb_runtime,
+                    extra_partition_sources=bet_preprocess_extras_arg,
+                )
+                _hbet.write_bet_base_clean_cache_manifest(
+                    merged_bet_sources,
+                    base_bet_path,
+                    preprocess_registry_yaml=reg_yaml,
+                    dedup_hash_buckets=int(bet_dedup_eff),
+                    cleaned_session_parquet=cleaned_path,
+                    source_manifest_v2_fingerprint_sha256_hex=source_fp,
+                    data_scope=base_bet_cfg.data_scope,
+                )
             if metrics is not None:
                 metrics["bet_base_clean_cache_hit"] = bool(base_hit)
-                metrics["bet_segment_clean_cache_hit"] = bool(seg_hit)
+                metrics["bet_dedup_hash_buckets_effective"] = int(bet_dedup_eff)
 
-            if base_hit and seg_hit:
+            if args.use_entity_set_v1:
+                if rank_meta is None or source_fp is None:
+                    raise ValueError(
+                        "entity set v1 requires ADT rank table and source_manifest_v2 fingerprint",
+                    )
+                from trainer_hightier.utils.entity_set_v1 import materialize_entity_set_v1_cached
+
+                es_meta = materialize_entity_set_v1_cached(
+                    base_cleaned_parquet=base_bet_path,
+                    rank_table_path=Path(str(rank_meta["universe_adt_rank_table_path"])),
+                    rank_fingerprint_sha256_hex=str(rank_meta["universe_adt_rank_fingerprint_sha256_hex"]),
+                    selected_quantile=q_thr,
+                    training_scope=base_bet_cfg.data_scope,
+                    source_manifest_v2_fingerprint_sha256_hex=source_fp,
+                    duckdb_runtime=args.duckdb_runtime,
+                    output_parquet=cleaned_bet_path,
+                    use_cache=use_preprocess_caches,
+                )
+                if metrics is not None:
+                    metrics.update(es_meta)
+                    metrics["bet_segment_legacy_fallback_used"] = False
                 logger.info(
-                    "[Step 2b] bet base+segment cache hit; skip (use --ignore-caches to force): %s",
+                    "[Step 2b] entity set v1 OK: rows=%d cache_hit=%s -> %s",
+                    int(es_meta["entity_set_row_count"]),
+                    bool(es_meta["entity_set_cache_hit"]),
                     cleaned_bet_path.resolve(),
                 )
             else:
-                bet_dedup_eff = int(base_bet_cfg.dedup_hash_buckets)
-                mf_bkt = _hbet.bet_base_manifest_dedup_hash_buckets(base_bet_path)
-                if base_hit and mf_bkt is not None:
-                    bet_dedup_eff = int(mf_bkt)
-                if not base_hit:
-                    _, bet_dedup_eff = _hpre.preprocess_bets_from_parquet_streaming(
-                        bet_preprocess_primary,
-                        base_bet_path,
-                        cfg=base_bet_cfg,
-                        duckdb_runtime=args.duckdb_runtime,
-                        extra_partition_sources=bet_preprocess_extras_arg,
-                    )
-                    _hbet.write_bet_base_clean_cache_manifest(
-                        merged_bet_sources,
-                        base_bet_path,
-                        preprocess_registry_yaml=reg_yaml,
-                        dedup_hash_buckets=int(bet_dedup_eff),
-                        cleaned_session_parquet=cleaned_path,
-                        source_manifest_v2_fingerprint_sha256_hex=source_fp,
-                        data_scope=base_bet_cfg.data_scope,
-                    )
-                elif not seg_hit and mf_bkt is None:
-                    logger.warning(
-                        "[Step 2b] bet base cache hit without readable manifest buckets; "
-                        "using nominal dedup_hash_buckets=%s for segment manifest fingerprint",
-                        bet_dedup_eff,
-                    )
-                _hbet.segment_cleaned_bet_from_base_parquet(
-                    base_bet_path,
-                    allowed_players_pq,
-                    cleaned_bet_path,
+                from datetime import date as _date_cls
+
+                from trainer_hightier.config import default_hightier_serving_config
+                from trainer_hightier.utils.slow_month_turn import resolve_slow_month_turn_context
+
+                _slow_ctx = resolve_slow_month_turn_context(_date_cls.today())
+                _svc_cfg = default_hightier_serving_config()
+                materialize_adt_allowed_players_parquet(
+                    profile_csv_path,
+                    mapping_parquet_path,
+                    quantile=q_thr,
                     duckdb_runtime=args.duckdb_runtime,
+                    output_parquet=allowed_players_pq,
+                    cleaned_session_parquet=cleaned_path,
+                    slow_active_anchor=_slow_ctx.slow_anchor_required,
+                    slow_lookback_days=int(_svc_cfg.production_slow_lookback_days),
                 )
-                _hbet.write_bet_clean_cache_manifest(
+                seg_hit = use_preprocess_caches and _hbet.bet_clean_cache_is_hit(
                     bet_cache_primary,
                     cleaned_bet_path,
                     preprocess_registry_yaml=reg_yaml,
-                    dedup_hash_buckets=int(bet_dedup_eff),
+                    dedup_hash_buckets=effective_bet_cfg.dedup_hash_buckets,
                     cleaned_session_parquet=cleaned_path,
                     adt_filter_quantile=effective_bet_cfg.adt_filter_quantile,
                     patron_profile_csv=effective_bet_cfg.patron_profile_csv,
@@ -843,14 +839,43 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     partition_inventory_fingerprint_sha256_hex=inv_fp,
                     data_scope=effective_bet_cfg.data_scope,
                 )
-                n_b = _hbet.partitioned_cleaned_bet_total_rows(cleaned_bet_path)
-                logger.info(
-                    "[Step 2b] bet preprocess OK (base+ADT segment): cleaned rows=%d; written %s",
-                    n_b,
-                    cleaned_bet_path,
-                )
                 if metrics is not None:
-                    metrics["bet_dedup_hash_buckets_effective"] = int(bet_dedup_eff)
+                    metrics["bet_segment_clean_cache_hit"] = bool(seg_hit)
+                    metrics["bet_segment_legacy_fallback_used"] = True
+                if base_hit and seg_hit:
+                    logger.info(
+                        "[Step 2b] bet base+legacy segment cache hit; skip: %s",
+                        cleaned_bet_path.resolve(),
+                    )
+                else:
+                    if not seg_hit:
+                        _hbet.segment_cleaned_bet_from_base_parquet(
+                            base_bet_path,
+                            allowed_players_pq,
+                            cleaned_bet_path,
+                            duckdb_runtime=args.duckdb_runtime,
+                        )
+                        _hbet.write_bet_clean_cache_manifest(
+                            bet_cache_primary,
+                            cleaned_bet_path,
+                            preprocess_registry_yaml=reg_yaml,
+                            dedup_hash_buckets=int(bet_dedup_eff),
+                            cleaned_session_parquet=cleaned_path,
+                            adt_filter_quantile=effective_bet_cfg.adt_filter_quantile,
+                            patron_profile_csv=effective_bet_cfg.patron_profile_csv,
+                            canonical_mapping_parquet=effective_bet_cfg.canonical_mapping_parquet,
+                            adt_allowed_players_parquet=effective_bet_cfg.adt_allowed_players_parquet,
+                            extra_source_bet_parquets=bet_cache_extras_arg,
+                            bet_base_cleaned_parquet=base_bet_path,
+                            partition_inventory_fingerprint_sha256_hex=inv_fp,
+                            data_scope=effective_bet_cfg.data_scope,
+                        )
+                    n_b = _hbet.partitioned_cleaned_bet_total_rows(cleaned_bet_path)
+                    logger.info(
+                        "[Step 2b] bet preprocess OK (legacy base+segment): rows=%d -> %s",
+                        n_b,
+                        cleaned_bet_path,
+                    )
         else:
             bet_cache_ok = use_preprocess_caches and _hbet.bet_clean_cache_is_hit(
                 bet_cache_primary,

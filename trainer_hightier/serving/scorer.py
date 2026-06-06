@@ -1084,9 +1084,9 @@ def _build_player_game_alert_frame(
             )
     work = staged.copy()
     work["_score"] = np.asarray(prob, dtype=np.float64).reshape(-1)
-    pid = pd.to_numeric(work["player_id"], errors="coerce")
-    gid = pd.to_numeric(work["game_id"], errors="coerce")
-    valid = pid.notna() & gid.notna() & np.isfinite(work["_score"].to_numpy())
+    work["player_id"] = pd.to_numeric(work["player_id"], errors="coerce").astype("Int64")
+    work["game_id"] = pd.to_numeric(work["game_id"], errors="coerce").astype("Int64")
+    valid = work["player_id"].notna() & work["game_id"].notna() & np.isfinite(work["_score"].to_numpy())
     excluded = int((~valid).sum())
     if excluded > 0:
         logger.warning(

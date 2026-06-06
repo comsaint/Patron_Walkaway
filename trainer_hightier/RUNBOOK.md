@@ -318,6 +318,19 @@ Phase 1 在 `prepare_training_frame` 的 partition inventory 之後，對 L0 sna
 
 **Run report keys：**`source_manifest_v2_elapsed_seconds`、`source_manifest_v2_hashed_bytes`、`source_manifest_v2_diff_summary`、`source_manifest_v2_changed_partitions`、`source_manifest_v2_change_set_path`。
 
+## 5.6 Entity set v1（Phase 2 cutover）
+
+預設 **`use_entity_set_v1=True`**：ADT 篩選改由 rank table → entity set 投影，輸出仍寫入 `cleaned__gmwds_t_bet`（Step 3 相容）。Legacy 路徑：`--use-legacy-bet-segment`。
+
+| 項目 | 路徑 / 說明 |
+|------|-------------|
+| Entity set cache | `trainer_hightier/artifacts/cache/entity_set_v1/quantile=…/scope=…/universe=…/` |
+| 按月 partition | `…/partitions/yyyymm=YYYYMM/`（自 `gaming_month` 歸檔） |
+| 訓練讀取路徑 | `trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet`（不變） |
+| Segment sidecar | **已退役**；entity set 成功後會刪除 `cleaned__gmwds_t_bet.cache.json` |
+
+**Quantile 變更：**bet **base** L1 cache 可 hit；entity set manifest miss → 只重跑投影，不重跑 base clean。
+
 ## 6. Preprocess disk cache（session / bet）
 
 - **命中條件：**清洗目標 Parquet 已存在，且 sidecar JSON 與 `build_session_clean_cache_record()` 計出的指紋一致（含來源 `mtime`/`size`、列數 metadata、`session_l0_preprocess` 模組 hash、**合併後的 session shard 路徑清單** 與 **partition inventory fingerprint**）。Bet 清洗對應 `bet_l0_preprocess` 之 `build_bet_clean_cache_record()` / `build_bet_base_clean_cache_record()` 與側車（含 base vs segment、inventory fingerprint、**ADT allowlist 之 distinct `player_id` 集合 hash**，**不依** allowlist 檔案 mtime）。
