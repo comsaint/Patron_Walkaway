@@ -235,6 +235,11 @@ def build_pipeline_debug(metrics: dict[str, Any]) -> dict[str, Any]:
         "partition": {
             "inventory_fingerprint_sha256_hex": metrics.get("partition_inventory_fingerprint_sha256_hex"),
             "recompute_months": metrics.get("partition_recompute_months"),
+            "l1_recompute_months": metrics.get("l1_recompute_months"),
+            "l1_recompute_months_source": metrics.get("l1_recompute_months_source"),
+            "recompute_months_inventory_legacy": metrics.get(
+                "partition_recompute_months_inventory_legacy",
+            ),
             "snapshot_dir_effective": metrics.get("partition_snapshot_dir_effective"),
             "inventory_baseline_path": metrics.get("partition_inventory_baseline_path"),
         },
@@ -242,11 +247,22 @@ def build_pipeline_debug(metrics: dict[str, Any]) -> dict[str, Any]:
             "elapsed_seconds": metrics.get("source_manifest_v2_elapsed_seconds"),
             "hashed_bytes": metrics.get("source_manifest_v2_hashed_bytes"),
             "hash_elapsed_seconds": metrics.get("source_manifest_v2_hash_elapsed_seconds"),
+            "aggregate_fingerprint_sha256_hex": metrics.get(
+                "source_manifest_v2_aggregate_fingerprint_sha256_hex",
+            ),
             "diff_summary": metrics.get("source_manifest_v2_diff_summary"),
             "changed_partitions": metrics.get("source_manifest_v2_changed_partitions"),
             "change_set_path": metrics.get("source_manifest_v2_change_set_path"),
             "cache_report_path": metrics.get("source_manifest_v2_cache_report_path"),
             "current_path": metrics.get("source_manifest_v2_current_path"),
+        },
+        "universe_v1": {
+            "adt_rank_cache_hit": metrics.get("universe_adt_rank_cache_hit"),
+            "adt_rank_elapsed_seconds": metrics.get("universe_adt_rank_elapsed_seconds"),
+            "adt_rank_table_path": metrics.get("universe_adt_rank_table_path"),
+            "adt_rank_canonical_count": metrics.get("universe_adt_rank_canonical_count"),
+            "selected_universe_canonical_count": metrics.get("selected_universe_canonical_count"),
+            "selected_universe_player_count": metrics.get("selected_universe_player_count"),
         },
         "timings_sec": {
             "prepare_training_frame": metrics.get("prepare_training_frame_seconds"),

@@ -126,19 +126,15 @@ _PARTITION_INGRESS_DEFAULTS = PartitionIngressConfig()
 def _materialize_partition_inventory(
     *,
     manifests_dir: Path,
-    correction_months: tuple[str, ...],
-    backfill_month_count: int,
     previous_manifest_path: Path | None,
     snapshot_dir: Path,
-) -> tuple[str | None, tuple[Path, ...], tuple[Path, ...], list[str], list[Any], list[Any]]:
-    """Scan snapshot parquet shards → inventory JSON with fingerprint + recompute-month list."""
+) -> tuple[str | None, tuple[Path, ...], tuple[Path, ...], list[Any], list[Any], dict[str, Any]]:
+    """Scan snapshot parquet shards → inventory JSON with fingerprint (diagnostic)."""
 
     from trainer_hightier.utils.partition_inventory import (
-        compute_recompute_months,
         default_partition_inventory_path,
         infer_snapshot_id,
         inventory_to_manifest_dict,
-        load_partition_inventory_manifest,
         scan_partition_snapshot_dir,
         write_partition_inventory_manifest,
     )
@@ -150,28 +146,15 @@ def _materialize_partition_inventory(
     fp = manifest.get("fingerprint_sha256_hex")
     fp_s = str(fp).strip() if fp is not None else None
 
-    prev_obj: dict | None = None
-    if previous_manifest_path is not None:
-        pth = Path(previous_manifest_path).resolve()
-        if pth.is_file():
-            prev_obj = load_partition_inventory_manifest(pth)
-
-    recompute_list = compute_recompute_months(
-        current_manifest=manifest,
-        previous_manifest=prev_obj,
-        correction_months=correction_months,
-        backfill_month_count=int(backfill_month_count),
-    )
     manifests_dir.mkdir(parents=True, exist_ok=True)
     out_manifest = write_partition_inventory_manifest(
         default_partition_inventory_path(manifests_dir=manifests_dir, snapshot_id=snap_id),
         manifest,
     )
     logger.info(
-        "[Step 1b] partition inventory wrote %s fingerprint=%s recompute_months=%s",
+        "[Step 1b] partition inventory wrote %s fingerprint=%s",
         out_manifest.resolve(),
         fp_s,
-        recompute_list,
     )
     if bet_rows or sess_rows:
         logger.warning(
@@ -182,7 +165,7 @@ def _materialize_partition_inventory(
 
     bet_paths = tuple(sorted({r.path.resolve() for r in bet_rows}, key=str))
     sess_paths = tuple(sorted({r.path.resolve() for r in sess_rows}, key=str))
-    return fp_s, bet_paths, sess_paths, recompute_list, bet_rows, sess_rows
+    return fp_s, bet_paths, sess_paths, bet_rows, sess_rows, manifest
 
 
 @dataclass
@@ -225,6 +208,8 @@ class HighTierTrainArgs:
     partition_inventory_previous_manifest: Path | None = None
     partition_correction_months: tuple[str, ...] = ()
     partition_backfill_month_count: int = _PARTITION_INGRESS_DEFAULTS.backfill_month_count
+    #: When True (default): Step 3 / 3.5 read entity set v1 instead of ADT-segmented cleaned bet.
+    use_entity_set_v1: bool = True
     # Step 4: deterministic arrange + time split on ``gaming_day`` (after Step 3 or --start-from-features).
     run_step4: bool = True
     step4_split: Step4SplitConfig = field(default_factory=Step4SplitConfig)
@@ -498,17 +483,24 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
         inv_fp,
         bet_partition_paths,
         session_partition_paths,
-        recompute_months,
         bet_inventory_rows,
         session_inventory_rows,
+        partition_manifest,
     ) = _materialize_partition_inventory(
         manifests_dir=manifests_dir,
-        correction_months=args.partition_correction_months,
-        backfill_month_count=args.partition_backfill_month_count,
         previous_manifest_path=baseline_used,
         snapshot_dir=snap_dir,
     )
 
+    from trainer_hightier.utils.cache_invalidation_v1 import (
+        RECOMPUTE_SOURCE_V2,
+        compute_l1_recompute_months,
+    )
+    from trainer_hightier.utils.partition_inventory import (
+        compute_recompute_months,
+        load_partition_inventory_manifest,
+        partition_month_union_from_manifest,
+    )
     from trainer_hightier.utils.source_manifest_v2 import materialize_source_manifest_v2_phase1
 
     sm_v2_meta = materialize_source_manifest_v2_phase1(
@@ -516,8 +508,43 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
         bet_stats=bet_inventory_rows,
         session_stats=session_inventory_rows,
     )
+    available_months = partition_month_union_from_manifest(partition_manifest)
+    recompute_months = compute_l1_recompute_months(
+        changed_partitions=sm_v2_meta["source_manifest_v2_changed_partitions"],
+        correction_months=args.partition_correction_months,
+        backfill_month_count=args.partition_backfill_month_count,
+        available_months=available_months,
+    )
+    prev_inv: dict[str, Any] | None = None
+    if baseline_used is not None and Path(baseline_used).is_file():
+        prev_inv = load_partition_inventory_manifest(Path(baseline_used))
+    legacy_recompute = compute_recompute_months(
+        current_manifest=partition_manifest,
+        previous_manifest=prev_inv,
+        correction_months=args.partition_correction_months,
+        backfill_month_count=args.partition_backfill_month_count,
+    )
+    if legacy_recompute != recompute_months:
+        logger.info(
+            "[Step 1b] l1_recompute_months source=%s months=%s "
+            "(inventory_mtime_legacy=%s; scheduling uses source_manifest_v2 only)",
+            RECOMPUTE_SOURCE_V2,
+            recompute_months,
+            legacy_recompute,
+        )
+    else:
+        logger.info(
+            "[Step 1b] l1_recompute_months source=%s months=%s",
+            RECOMPUTE_SOURCE_V2,
+            recompute_months,
+        )
+    source_fp = str(sm_v2_meta.get("source_manifest_v2_aggregate_fingerprint_sha256_hex") or "").strip() or None
     if metrics is not None:
         metrics.update(sm_v2_meta)
+        metrics["l1_recompute_months"] = list(recompute_months)
+        metrics["l1_recompute_months_source"] = RECOMPUTE_SOURCE_V2
+        metrics["partition_recompute_months_inventory_legacy"] = list(legacy_recompute)
+        metrics["partition_recompute_months"] = list(recompute_months)
 
     sess_report = _ingest.validate_partition_session_ingress_or_raise(session_partition_paths)
     logger.info(
@@ -550,7 +577,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
             cleaned_path,
             dedup_hash_buckets=args.session_preprocess.dedup_hash_buckets,
             extra_source_session_parquets=session_cache_extras or None,
-            partition_inventory_fingerprint_sha256_hex=inv_fp,
+            source_manifest_v2_fingerprint_sha256_hex=source_fp,
             data_scope=args.session_preprocess.data_scope,
         )
     )
@@ -558,7 +585,6 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
         metrics["session_clean_cache_hit"] = bool(ses_cache_ok)
         metrics["l0_preprocess_data_scope"] = args.session_preprocess.data_scope.manifest_block()
         metrics["partition_inventory_fingerprint_sha256_hex"] = inv_fp
-        metrics["partition_recompute_months"] = list(recompute_months)
         metrics["partition_snapshot_dir_effective"] = str(snap_dir.resolve())
         metrics["partition_inventory_baseline_path"] = (
             str(baseline_used.resolve()) if baseline_used is not None else None
@@ -583,7 +609,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
             out_parquet,
             dedup_hash_buckets=int(session_dedup_effective),
             extra_source_session_parquets=session_cache_extras or None,
-            partition_inventory_fingerprint_sha256_hex=inv_fp,
+            source_manifest_v2_fingerprint_sha256_hex=source_fp,
             data_scope=args.session_preprocess.data_scope,
         )
         n_clean = int(pq.ParquetFile(out_parquet).metadata.num_rows) if pq.ParquetFile(out_parquet).metadata else 0
@@ -642,6 +668,37 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
     allowed_players_pq: Path | None = None
     if want_adt_bets and args.canonical_mapping.enabled:
         allowed_players_pq = default_adt_allowed_players_parquet_path(q_thr)
+
+    if args.canonical_mapping.enabled and profile_csv_path.is_file() and mapping_parquet_path.is_file():
+        from datetime import date as _date_cls
+
+        from trainer_hightier.config import default_hightier_serving_config
+        from trainer_hightier.utils.slow_month_turn import resolve_slow_month_turn_context
+        from trainer_hightier.utils.universe_cache_v1 import (
+            materialize_adt_rank_table_v1_cached,
+            write_selected_universe_manifest,
+        )
+
+        _rank_slow_ctx = resolve_slow_month_turn_context(_date_cls.today())
+        _rank_svc_cfg = default_hightier_serving_config()
+        rank_meta = materialize_adt_rank_table_v1_cached(
+            profile_csv_path,
+            mapping_parquet_path,
+            duckdb_runtime=args.duckdb_runtime,
+            cleaned_session_parquet=cleaned_path if cleaned_path.is_file() else None,
+            slow_active_anchor=_rank_slow_ctx.slow_anchor_required,
+            slow_lookback_days=int(_rank_svc_cfg.production_slow_lookback_days),
+        )
+        if metrics is not None:
+            metrics.update(rank_meta)
+        if want_adt_bets and 0.0 < q_thr < 1.0:
+            sel_meta = write_selected_universe_manifest(
+                rank_table_path=Path(str(rank_meta["universe_adt_rank_table_path"])),
+                quantile=q_thr,
+                rank_fingerprint_sha256_hex=str(rank_meta["universe_adt_rank_fingerprint_sha256_hex"]),
+            )
+            if metrics is not None:
+                metrics.update(sel_meta)
 
     effective_bet_cfg = args.bet_preprocess
     if want_adt_bets and args.canonical_mapping.enabled:
@@ -710,7 +767,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 preprocess_registry_yaml=reg_yaml,
                 dedup_hash_buckets=base_bet_cfg.dedup_hash_buckets,
                 cleaned_session_parquet=cleaned_path,
-                partition_inventory_fingerprint_sha256_hex=inv_fp,
+                source_manifest_v2_fingerprint_sha256_hex=source_fp,
                 data_scope=base_bet_cfg.data_scope,
             )
             seg_hit = use_preprocess_caches and _hbet.bet_clean_cache_is_hit(
@@ -756,7 +813,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                         preprocess_registry_yaml=reg_yaml,
                         dedup_hash_buckets=int(bet_dedup_eff),
                         cleaned_session_parquet=cleaned_path,
-                        partition_inventory_fingerprint_sha256_hex=inv_fp,
+                        source_manifest_v2_fingerprint_sha256_hex=source_fp,
                         data_scope=base_bet_cfg.data_scope,
                     )
                 elif not seg_hit and mf_bkt is None:
@@ -2230,6 +2287,15 @@ def _build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--use-legacy-bet-segment",
+        action="store_true",
+        dest="use_legacy_bet_segment",
+        help=(
+            "Use ADT-segmented cleaned__gmwds_t_bet preprocess path instead of entity set v1 "
+            "(default is entity set v1 when materialized)."
+        ),
+    )
+    p.add_argument(
         "--skip-training-dataset",
         action="store_true",
         dest="skip_training_dataset",
@@ -2411,6 +2477,7 @@ def _train_args_from_cli_namespace(ns: argparse.Namespace) -> HighTierTrainArgs:
         ignore_caches=bool(ns.ignore_caches),
         force_refresh_short_term_pit=bool(ns.force_refresh_short_term_pit),
         skip_bet_preprocess=bool(ns.skip_bet_preprocess),
+        use_entity_set_v1=not bool(ns.use_legacy_bet_segment),
         materialize_walkaway_labels=not bool(ns.skip_walkaway_labels),
         build_training_dataset=not bool(ns.skip_training_dataset),
         training_materialize_derived=not bool(ns.skip_training_materialize_derived),

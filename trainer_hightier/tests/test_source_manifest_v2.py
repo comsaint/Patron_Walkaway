@@ -21,6 +21,7 @@ from trainer_hightier.utils.source_manifest_v2 import (
     CHANGE_MODIFIED,
     CHANGE_REMOVED,
     CHANGE_UNCHANGED,
+    aggregate_source_files_fingerprint_sha256_hex,
     build_source_file_record,
     build_source_manifest_v2,
     diff_source_manifests,
@@ -161,6 +162,19 @@ def test_diff_classifies_unchanged_modified_added_removed() -> None:
     assert len(diff.added) == 1
     assert len(diff.removed) == 1
     assert len(diff.modified) == 1
+
+
+def test_aggregate_fingerprint_stable_for_same_files() -> None:
+    manifest = {
+        "files": [
+            {"table": "t_bet", "relative_path": "a.parquet", "file_sha256": "1"},
+            {"table": "t_session", "relative_path": "b.parquet", "file_sha256": "2"},
+        ],
+    }
+    fp1 = aggregate_source_files_fingerprint_sha256_hex(manifest)
+    fp2 = aggregate_source_files_fingerprint_sha256_hex(manifest)
+    assert fp1 == fp2
+    assert len(fp1) == 64
 
 
 def test_build_manifest_records_sorted_and_atomic_paths_exist(tmp_path: Path) -> None:

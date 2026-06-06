@@ -1059,6 +1059,7 @@ def build_bet_base_clean_cache_record(
     dedup_hash_buckets: int | None = None,
     cleaned_session_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    source_manifest_v2_fingerprint_sha256_hex: str | None = None,
     data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> dict[str, Any]:
     """Fingerprint intermediate base bet (raw sources + registry; no ADT).
@@ -1105,10 +1106,13 @@ def build_bet_base_clean_cache_record(
         "source_bets": stats,
         "l0_data_scope": (data_scope or BetPreprocessConfig().data_scope).manifest_block(),
     }
-    if partition_inventory_fingerprint_sha256_hex is not None:
-        rec["partition_inventory_fingerprint_sha256_hex"] = str(
-            partition_inventory_fingerprint_sha256_hex,
-        ).strip()
+    from trainer_hightier.utils.cache_invalidation_v1 import attach_l1_source_identity
+
+    attach_l1_source_identity(
+        rec,
+        source_manifest_v2_fingerprint_sha256_hex=source_manifest_v2_fingerprint_sha256_hex,
+        partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+    )
     return rec
 
 
@@ -1120,6 +1124,7 @@ def bet_base_clean_cache_is_hit(
     dedup_hash_buckets: int | None = None,
     cleaned_session_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    source_manifest_v2_fingerprint_sha256_hex: str | None = None,
     data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> bool:
     """Return True if base cleaned bet exists and manifest matches."""
@@ -1149,6 +1154,7 @@ def bet_base_clean_cache_is_hit(
                 dedup_hash_buckets=nb,
                 cleaned_session_parquet=None,
                 partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+                source_manifest_v2_fingerprint_sha256_hex=source_manifest_v2_fingerprint_sha256_hex,
                 data_scope=data_scope,
             )
 
@@ -1169,6 +1175,7 @@ def write_bet_base_clean_cache_manifest(
     dedup_hash_buckets: int | None = None,
     cleaned_session_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    source_manifest_v2_fingerprint_sha256_hex: str | None = None,
     data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> Path:
     """Write manifest next to intermediate base cleaned parquet."""
@@ -1180,6 +1187,7 @@ def write_bet_base_clean_cache_manifest(
         dedup_hash_buckets=dedup_hash_buckets,
         cleaned_session_parquet=cleaned_session_parquet,
         partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+        source_manifest_v2_fingerprint_sha256_hex=source_manifest_v2_fingerprint_sha256_hex,
         data_scope=data_scope,
     )
     mp = bet_base_clean_cache_manifest_path(Path(base_cleaned_parquet))

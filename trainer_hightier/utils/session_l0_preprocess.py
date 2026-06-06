@@ -881,6 +881,7 @@ def build_session_clean_cache_record(
     dedup_hash_buckets: int | None = None,
     extra_source_session_parquets: tuple[Path, ...] | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    source_manifest_v2_fingerprint_sha256_hex: str | None = None,
     data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> dict[str, Any]:
     """Fingerprint: source L0 stats + row count + this module's source hash + dedup buckets."""
@@ -920,10 +921,13 @@ def build_session_clean_cache_record(
     else:
         body["manifest_kind"] = "session_clean_merge_v1"
         body["source_sessions"] = stats
-    if partition_inventory_fingerprint_sha256_hex is not None:
-        body["partition_inventory_fingerprint_sha256_hex"] = str(
-            partition_inventory_fingerprint_sha256_hex,
-        ).strip()
+    from trainer_hightier.utils.cache_invalidation_v1 import attach_l1_source_identity
+
+    attach_l1_source_identity(
+        body,
+        source_manifest_v2_fingerprint_sha256_hex=source_manifest_v2_fingerprint_sha256_hex,
+        partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+    )
     return body
 
 
@@ -961,6 +965,7 @@ def session_clean_cache_is_hit(
     dedup_hash_buckets: int | None = None,
     extra_source_session_parquets: tuple[Path, ...] | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    source_manifest_v2_fingerprint_sha256_hex: str | None = None,
     data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> bool:
     """Return True if cleaned parquet exists and manifest matches current fingerprint."""
@@ -986,6 +991,7 @@ def session_clean_cache_is_hit(
                 dedup_hash_buckets=nb,
                 extra_source_session_parquets=extra_source_session_parquets,
                 partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+                source_manifest_v2_fingerprint_sha256_hex=source_manifest_v2_fingerprint_sha256_hex,
                 data_scope=data_scope,
             )
 
@@ -1005,6 +1011,7 @@ def write_session_clean_cache_manifest(
     dedup_hash_buckets: int | None = None,
     extra_source_session_parquets: tuple[Path, ...] | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    source_manifest_v2_fingerprint_sha256_hex: str | None = None,
     data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> Path:
     """Write cache sidecar after a successful cleaned parquet write."""
@@ -1014,6 +1021,7 @@ def write_session_clean_cache_manifest(
         dedup_hash_buckets=dedup_hash_buckets,
         extra_source_session_parquets=extra_source_session_parquets,
         partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+        source_manifest_v2_fingerprint_sha256_hex=source_manifest_v2_fingerprint_sha256_hex,
         data_scope=data_scope,
     )
     mp = session_clean_cache_manifest_path(Path(cleaned_parquet))

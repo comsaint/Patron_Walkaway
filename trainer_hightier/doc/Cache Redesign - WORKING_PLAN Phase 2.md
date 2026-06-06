@@ -29,7 +29,7 @@
 | P2-D-004 | Selected universe manifest 只記 quantile + rank table fingerprint + counts。 | 不進 L1 cache key。 |
 | P2-D-005 | Entity set grain：`bet_id` × training scope × selected quantile policy hash。 | 含 `source_partition_yyyymm`；供 downstream month invalidation。 |
 | P2-D-006 | `partition_recompute_months` 收斂為 `source_change_set.changed_partitions` ∪ correction/backfill。 | 單一「哪些月份要重算」語意；inventory mtime diff 退役。 |
-| P2-D-007 | Phase 2 採 **parallel build + cutover flag**；預設先寫新 artifact、讀路徑可切換。 | 避免一次 big-bang 破壞現有訓練。 |
+| P2-D-007 | **`use_entity_set_v1=True` 為預設**；legacy 僅 `--use-legacy-bet-segment`。 | Entity set 按月 partition；sidecar 退役不保留過渡。 |
 | P2-D-008 | Entity set / universe cache 寫入採 staging → validate → atomic rename（D-013）。 | 對齊 Phase 1 atomic JSON 模式。 |
 
 ## 2) Work Breakdown
@@ -198,8 +198,20 @@ Phase 2 完成當且僅當：
 | Phase 4 | Assembly cache + full cache_report | Phase 3 primitives |
 | Phase 5 | Retention、compact、移除舊 cache path | Phase 4 production stable |
 
-## 11) Open Questions (Phase 2 啟動前確認)
+## 11) Decisions Locked (Product / 2026-06-06)
 
-1. Entity set 按月 shard vs 單檔：資料量 28GB base bet 下，建議 **按月 partition**；是否同意？
-2. Cutover flag 命名與預設：`use_entity_set_v1=True` 何時 flip 為 default？
-3. `cleaned__gmwds_t_bet` 舊路徑：硬刪 sidecar 還是保留只讀一輪？
+| 項目 | 決策 |
+|------|------|
+| Entity set 儲存粒度 | **按月 partition**（`entity_set_v1/.../partitions/yyyymm=YYYYMM/`） |
+| Cutover flag | **`use_entity_set_v1=True` 為預設**；legacy 用 CLI `--use-legacy-bet-segment` |
+| `cleaned__gmwds_t_bet` sidecar | **P2-WP-8 完成時立即退役**（不保留只讀過渡） |
+
+## 12) Implementation Status
+
+| ID | 狀態 | 備註 |
+|----|------|------|
+| P2-WP-1 | ✅ 完成 | `cache_invalidation_v1.py`；`partition_recompute_months` 由 source manifest v2 驅動 |
+| P2-WP-2 | ✅ 完成 | L1 session/bet **base** cache 改用 `source_manifest_v2_fingerprint_sha256_hex` |
+| P2-WP-3 | ✅ 完成 | `universe_cache_v1.py` ADT rank table + selected universe manifest |
+| P2-WP-4 | ✅ 完成 | `write_selected_universe_manifest`（含於 universe 模組） |
+| P2-WP-5～P2-WP-11 | 待辦 | entity set、Step 3 cutover、segment 退役 |

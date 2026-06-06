@@ -162,6 +162,25 @@ def build_source_manifest_v2(
     return manifest, hashed_bytes, hash_elapsed
 
 
+def aggregate_source_files_fingerprint_sha256_hex(manifest: dict[str, Any]) -> str:
+    """SHA-256 hex over sorted ``(table, relative_path, file_sha256)`` tuples."""
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        raise ValueError("manifest.files must be a list for aggregate fingerprint")
+    tuples = [
+        (
+            str(row["table"]),
+            str(row["relative_path"]),
+            str(row["file_sha256"]),
+        )
+        for row in files
+        if isinstance(row, dict)
+    ]
+    tuples.sort()
+    blob = json.dumps(tuples, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
 def load_source_manifest_v2(path: Path) -> dict[str, Any] | None:
     """Load manifest JSON; return ``None`` when missing or corrupt."""
     p = Path(path).resolve()
@@ -413,9 +432,11 @@ def materialize_source_manifest_v2_phase1(
         hashed_bytes=hashed_bytes,
     )
     current_path, _ = publish_source_manifest_v2(cache_root=root, current_manifest=current)
+    aggregate_fp = aggregate_source_files_fingerprint_sha256_hex(current)
 
     return {
         "source_manifest_v2_elapsed_seconds": round(time.perf_counter() - t0, 6),
+        "source_manifest_v2_aggregate_fingerprint_sha256_hex": aggregate_fp,
         "source_manifest_v2_hashed_bytes": int(hashed_bytes),
         "source_manifest_v2_hash_elapsed_seconds": round(hash_elapsed, 6),
         "source_manifest_v2_diff_summary": diff.summary(),
