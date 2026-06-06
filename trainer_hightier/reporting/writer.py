@@ -238,6 +238,16 @@ def build_pipeline_debug(metrics: dict[str, Any]) -> dict[str, Any]:
             "snapshot_dir_effective": metrics.get("partition_snapshot_dir_effective"),
             "inventory_baseline_path": metrics.get("partition_inventory_baseline_path"),
         },
+        "source_manifest_v2": {
+            "elapsed_seconds": metrics.get("source_manifest_v2_elapsed_seconds"),
+            "hashed_bytes": metrics.get("source_manifest_v2_hashed_bytes"),
+            "hash_elapsed_seconds": metrics.get("source_manifest_v2_hash_elapsed_seconds"),
+            "diff_summary": metrics.get("source_manifest_v2_diff_summary"),
+            "changed_partitions": metrics.get("source_manifest_v2_changed_partitions"),
+            "change_set_path": metrics.get("source_manifest_v2_change_set_path"),
+            "cache_report_path": metrics.get("source_manifest_v2_cache_report_path"),
+            "current_path": metrics.get("source_manifest_v2_current_path"),
+        },
         "timings_sec": {
             "prepare_training_frame": metrics.get("prepare_training_frame_seconds"),
             "build_training_dataset": metrics.get("build_training_dataset_seconds"),

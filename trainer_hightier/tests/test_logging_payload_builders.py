@@ -217,3 +217,18 @@ def test_build_metrics_detailed_and_pipeline_debug_smoke() -> None:
     assert dbg["cache"]["session_clean_cache_hit"] is True
     assert dbg["split_periods"]["basis"] == "gaming_day_event"
     assert dbg["timings_sec"]["prepare_training_frame"] == 1.0
+
+    metrics_with_sm_v2 = {
+        **metrics,
+        "source_manifest_v2_elapsed_seconds": 22.0,
+        "source_manifest_v2_hashed_bytes": 28_000_000_000,
+        "source_manifest_v2_hash_elapsed_seconds": 21.9,
+        "source_manifest_v2_diff_summary": {"added": 0, "removed": 0, "modified": 0, "unchanged": 1192},
+        "source_manifest_v2_changed_partitions": {"t_bet": [], "t_session": []},
+        "source_manifest_v2_change_set_path": "trainer_hightier/artifacts/cache/source_change_sets/x.json",
+    }
+    dbg_v2 = build_pipeline_debug(metrics_with_sm_v2)
+    sm = dbg_v2["source_manifest_v2"]
+    assert sm["elapsed_seconds"] == 22.0
+    assert sm["diff_summary"]["unchanged"] == 1192
+    assert sm["changed_partitions"]["t_bet"] == []

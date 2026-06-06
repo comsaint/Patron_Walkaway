@@ -297,6 +297,27 @@ run_training(args)
 
 變更台帳後建議跑：`python -m pytest trainer_hightier/tests/test_candidate_registry_loader.py trainer_hightier/tests/test_feature_experiment_ablation.py -q`。
 
+## 5.5 Source manifest v2（Phase 1：觀測 only）
+
+Phase 1 在 `prepare_training_frame` 的 partition inventory 之後，對 L0 snapshot parquet 做 **full-file SHA-256** 指紋與 diff；**不**改變 Step 2/3/3.5 cache 命中語意。
+
+| 項目 | 路徑 / 說明 |
+|------|-------------|
+| Current manifest | `trainer_hightier/artifacts/cache/source_manifest_v2/current.json` |
+| Diff baseline | `trainer_hightier/artifacts/cache/source_manifest_v2/previous.json`（上一輪 published） |
+| Change set | `trainer_hightier/artifacts/cache/source_change_sets/source_change_set_<snapshot_id>_<utc>.json` |
+| Cache report | `trainer_hightier/artifacts/cache/reports/cache_report_<run_id>.json` |
+
+**解讀 `source_change_set.json`：**
+
+- `diff_summary`：`added` / `removed` / `modified` / `unchanged`（以 `file_sha256` 比對；`mtime_ns_diagnostic` 不參與）。
+- `changed_partitions`：依 `table` + `partition_yyyymm` 彙總；單檔修改只會標記該月。
+- `hash_elapsed_seconds` / `hashed_bytes`：full SHA 成本（Phase 2 前評估用）。
+
+**與 `partition_recompute_months` 的關係：**兩者並存。Inventory 仍用 path/size/mtime fingerprint 驅動 recompute；source manifest v2 的 `changed_partitions` 僅寫入 metrics / `run_report.json` 的 `pipeline_debug.source_manifest_v2`，**尚未**覆寫 preprocess / Feast / short PIT miss 邏輯。
+
+**Run report keys：**`source_manifest_v2_elapsed_seconds`、`source_manifest_v2_hashed_bytes`、`source_manifest_v2_diff_summary`、`source_manifest_v2_changed_partitions`、`source_manifest_v2_change_set_path`。
+
 ## 6. Preprocess disk cache（session / bet）
 
 - **命中條件：**清洗目標 Parquet 已存在，且 sidecar JSON 與 `build_session_clean_cache_record()` 計出的指紋一致（含來源 `mtime`/`size`、列數 metadata、`session_l0_preprocess` 模組 hash、**合併後的 session shard 路徑清單** 與 **partition inventory fingerprint**）。Bet 清洗對應 `bet_l0_preprocess` 之 `build_bet_clean_cache_record()` / `build_bet_base_clean_cache_record()` 與側車（含 base vs segment、inventory fingerprint、**ADT allowlist 之 distinct `player_id` 集合 hash**，**不依** allowlist 檔案 mtime）。

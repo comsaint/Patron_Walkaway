@@ -130,7 +130,7 @@ def _materialize_partition_inventory(
     backfill_month_count: int,
     previous_manifest_path: Path | None,
     snapshot_dir: Path,
-) -> tuple[str | None, tuple[Path, ...], tuple[Path, ...], list[str]]:
+) -> tuple[str | None, tuple[Path, ...], tuple[Path, ...], list[str], list[Any], list[Any]]:
     """Scan snapshot parquet shards → inventory JSON with fingerprint + recompute-month list."""
 
     from trainer_hightier.utils.partition_inventory import (
@@ -182,7 +182,7 @@ def _materialize_partition_inventory(
 
     bet_paths = tuple(sorted({r.path.resolve() for r in bet_rows}, key=str))
     sess_paths = tuple(sorted({r.path.resolve() for r in sess_rows}, key=str))
-    return fp_s, bet_paths, sess_paths, recompute_list
+    return fp_s, bet_paths, sess_paths, recompute_list, bet_rows, sess_rows
 
 
 @dataclass
@@ -494,13 +494,30 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
         snap_dir.resolve(),
         baseline_used.resolve() if baseline_used is not None else None,
     )
-    inv_fp, bet_partition_paths, session_partition_paths, recompute_months = _materialize_partition_inventory(
+    (
+        inv_fp,
+        bet_partition_paths,
+        session_partition_paths,
+        recompute_months,
+        bet_inventory_rows,
+        session_inventory_rows,
+    ) = _materialize_partition_inventory(
         manifests_dir=manifests_dir,
         correction_months=args.partition_correction_months,
         backfill_month_count=args.partition_backfill_month_count,
         previous_manifest_path=baseline_used,
         snapshot_dir=snap_dir,
     )
+
+    from trainer_hightier.utils.source_manifest_v2 import materialize_source_manifest_v2_phase1
+
+    sm_v2_meta = materialize_source_manifest_v2_phase1(
+        snapshot_dir=snap_dir,
+        bet_stats=bet_inventory_rows,
+        session_stats=session_inventory_rows,
+    )
+    if metrics is not None:
+        metrics.update(sm_v2_meta)
 
     sess_report = _ingest.validate_partition_session_ingress_or_raise(session_partition_paths)
     logger.info(
