@@ -268,6 +268,39 @@ def materialize_adt_rank_table_v1_cached(
     }
 
 
+def diff_selected_universe_added_player_ids(
+    rank_table_path: Path,
+    *,
+    previous_quantile: float,
+    current_quantile: float,
+) -> tuple[int, ...]:
+    """Return ``player_id`` values newly included when quantile **decreases**."""
+    prev_q = float(previous_quantile)
+    cur_q = float(current_quantile)
+    if not (0.0 < prev_q < 1.0):
+        raise ValueError(f"previous_quantile must be in (0,1), got {prev_q!r}")
+    if not (0.0 < cur_q < 1.0):
+        raise ValueError(f"current_quantile must be in (0,1), got {cur_q!r}")
+    if cur_q >= prev_q:
+        return ()
+    p = _path_esc(rank_table_path)
+    con = duckdb.connect()
+    try:
+        rows = con.execute(
+            f"""
+            SELECT DISTINCT TRY_CAST(player_id AS BIGINT) AS pid
+            FROM read_parquet('{p}')
+            WHERE has_slow_window_coverage
+              AND CAST(adt_percentile AS DOUBLE) >= {cur_q}
+              AND CAST(adt_percentile AS DOUBLE) < {prev_q}
+            ORDER BY 1
+            """,
+        ).fetchall()
+    finally:
+        con.close()
+    return tuple(int(r[0]) for r in rows if r and r[0] is not None)
+
+
 def write_selected_universe_manifest(
     *,
     rank_table_path: Path,

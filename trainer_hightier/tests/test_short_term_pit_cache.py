@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pandas as pd
@@ -14,6 +15,8 @@ from trainer_hightier.config import DuckDbRuntimeConfig, SHORT_TERM_TRIAL_BET_CO
 from trainer_hightier.feature_experiment.short_term_pit_cache import (
     REASON_FORCE_REFRESH,
     REASON_UNIVERSE_CHANGED,
+    _merge_delta_rows_into_shard,
+    _shard_delta_fill_eligible,
     compute_shard_universe_fingerprint,
     list_training_payout_months,
     materialize_fe_derived_short_term_parquet_with_cache,
@@ -248,6 +251,47 @@ def test_short_term_pit_cache_universe_change_misses_shard(short_cache_fixture: 
     assert plan3.reason_counts.get(REASON_UNIVERSE_CHANGED, 0) >= 1
 
 
+def test_merge_delta_rows_into_shard_prefers_delta_bet_id(tmp_path: Path) -> None:
+    cols = ("bet_id", "fe__bets_cnt__w15m")
+    base_p = tmp_path / "base.parquet"
+    delta_p = tmp_path / "delta.parquet"
+    out_p = tmp_path / "shard" / "data.parquet"
+    out_p.parent.mkdir(parents=True)
+    pq.write_table(pa.table({"bet_id": [1.0, 2.0], "fe__bets_cnt__w15m": [1, 2]}), base_p)
+    pq.write_table(pa.table({"bet_id": [2.0], "fe__bets_cnt__w15m": [99]}), delta_p)
+    shutil.copy(base_p, out_p)
+    _merge_delta_rows_into_shard(
+        shard_parquet=out_p,
+        delta_parquet=delta_p,
+        out_columns=cols,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+    )
+    got = pq.read_table(out_p).to_pandas().sort_values("bet_id")
+    assert int(got.loc[got["bet_id"] == 2.0, "fe__bets_cnt__w15m"].iloc[0]) == 99
+
+
+def test_short_term_pit_cache_entity_set_fingerprint_misses(short_cache_fixture: dict[str, Path]) -> None:
+    runtime = DuckDbRuntimeConfig()
+    trial_cols = tuple(SHORT_TERM_TRIAL_BET_COLUMNS[:1])
+    kwargs = {
+        "cleaned_bet_parquet": short_cache_fixture["cleaned"],
+        "training_parquet_for_bet_ids": short_cache_fixture["training"],
+        "out_parquet": short_cache_fixture["out"],
+        "duckdb_runtime": runtime,
+        "canonical_mapping_parquet": short_cache_fixture["mapping"],
+        "short_term_columns": ("fe__bets_cnt__w15m",),
+        "trial_columns": trial_cols,
+        "batch_size": 2000,
+        "entity_set_fingerprint_sha256_hex": "entity_fp_a" * 4,
+    }
+    materialize_fe_derived_short_term_parquet_with_cache(**kwargs)
+    _, meta2 = materialize_fe_derived_short_term_parquet_with_cache(
+        **{**kwargs, "entity_set_fingerprint_sha256_hex": "entity_fp_b" * 4},
+    )
+    assert meta2["cache_hit"] is False
+    assert meta2["cache_miss_shards"] == ["202406"]
+
+
 def test_global_manifest_written(short_cache_fixture: dict[str, Path]) -> None:
     runtime = DuckDbRuntimeConfig()
     materialize_fe_derived_short_term_parquet_with_cache(
@@ -264,3 +308,5 @@ def test_global_manifest_written(short_cache_fixture: dict[str, Path]) -> None:
     assert manifest.is_file()
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     assert payload.get("shard_months") == ["202406"]
+    assert payload.get("schema_version") == 2
+    assert payload.get("supplier_family") == "short_term:w1h"

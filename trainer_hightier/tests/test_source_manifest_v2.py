@@ -29,6 +29,7 @@ from trainer_hightier.utils.source_manifest_v2 import (
     materialize_source_manifest_v2_phase1,
     sha256_file_bytes,
     validate_partition_yyyymm,
+    write_cache_report_skeleton,
 )
 
 
@@ -175,6 +176,45 @@ def test_aggregate_fingerprint_stable_for_same_files() -> None:
     fp2 = aggregate_source_files_fingerprint_sha256_hex(manifest)
     assert fp1 == fp2
     assert len(fp1) == 64
+
+
+def test_finalize_cache_report_merges_pipeline_layers(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    report_path = write_cache_report_skeleton(
+        cache_root=cache,
+        run_id="run_finalize",
+        change_set_path=tmp_path / "change_set.json",
+        diff_summary={"added": 0, "removed": 0, "modified": 0, "unchanged": 1},
+        changed_partitions={"t_bet": [], "t_session": []},
+        elapsed_seconds=1.0,
+        hashed_bytes=100,
+    )
+    metrics = {
+        "source_manifest_v2_cache_report_path": str(report_path),
+        "session_clean_cache_hit": True,
+        "labels_cache_hit": False,
+        "labels_cache_elapsed_seconds": 0.5,
+        "labels_invalid_months": ["202503"],
+        "main_trainer_fe_short_term_cache": {
+            "cache_hit": True,
+            "cache_hit_ratio": 1.0,
+            "cache_hit_shards": ["202503"],
+            "cache_miss_shards": [],
+            "cache_reason_counts": {},
+        },
+        "l1_recompute_months": [],
+    }
+    from trainer_hightier.utils.source_manifest_v2 import finalize_cache_report_from_metrics
+
+    out = finalize_cache_report_from_metrics(metrics)
+    assert out is not None and out.is_file()
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    layer_names = [row["layer"] for row in payload["layers"]]
+    assert "source_manifest_v2" in layer_names
+    assert "l1_session_clean" in layer_names
+    assert "l4_walkaway_labels_v1" in layer_names
+    assert "l5_short_term_pit_primitive" in layer_names
+    assert payload["schema_version"] == 2
 
 
 def test_build_manifest_records_sorted_and_atomic_paths_exist(tmp_path: Path) -> None:

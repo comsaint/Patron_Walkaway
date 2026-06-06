@@ -254,6 +254,7 @@ def build_pipeline_debug(metrics: dict[str, Any]) -> dict[str, Any]:
             "changed_partitions": metrics.get("source_manifest_v2_changed_partitions"),
             "change_set_path": metrics.get("source_manifest_v2_change_set_path"),
             "cache_report_path": metrics.get("source_manifest_v2_cache_report_path"),
+            "cache_report_finalized_path": metrics.get("cache_report_finalized_path"),
             "current_path": metrics.get("source_manifest_v2_current_path"),
         },
         "universe_v1": {
@@ -271,6 +272,30 @@ def build_pipeline_debug(metrics: dict[str, Any]) -> dict[str, Any]:
             "manifest_path": metrics.get("entity_set_manifest_path"),
             "output_path": metrics.get("entity_set_output_path"),
             "legacy_fallback_used": metrics.get("bet_segment_legacy_fallback_used"),
+            "policy_fingerprint_sha256_hex": metrics.get("entity_set_policy_fingerprint_sha256_hex"),
+        },
+        "labels_v1": {
+            "cache_hit": metrics.get("labels_cache_hit"),
+            "elapsed_seconds": metrics.get("labels_cache_elapsed_seconds"),
+            "row_count": metrics.get("labels_row_count"),
+            "manifest_path": metrics.get("labels_manifest_path"),
+            "invalid_months": metrics.get("labels_invalid_months"),
+            "semantic_fingerprint": metrics.get("labels_semantic_fingerprint"),
+        },
+        "short_term_pit_v2": {
+            "primitive_hit_ratio": metrics.get("short_term_pit_primitive_hit_ratio"),
+            "recompute_months": metrics.get("short_term_pit_recompute_months"),
+            "source_invalid_months": metrics.get("short_term_pit_source_invalid_months"),
+            "entity_set_fingerprint_sha256_hex": metrics.get("entity_set_policy_fingerprint_sha256_hex"),
+            "delta_fill_shards": metrics.get("short_term_pit_delta_fill_shards"),
+            "entity_delta_fill_elapsed_seconds": metrics.get("entity_delta_fill_elapsed_seconds"),
+        },
+        "entity_set_delta": {
+            "row_count": metrics.get("entity_delta_row_count"),
+            "previous_quantile": metrics.get("entity_delta_previous_quantile"),
+            "current_quantile": metrics.get("entity_delta_current_quantile"),
+            "manifest_path": metrics.get("entity_delta_manifest_path"),
+            "added_player_ids_path": metrics.get("entity_delta_added_player_ids_path"),
         },
         "timings_sec": {
             "prepare_training_frame": metrics.get("prepare_training_frame_seconds"),

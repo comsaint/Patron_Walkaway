@@ -6,6 +6,10 @@ import pytest
 
 from trainer_hightier.utils.cache_invalidation_v1 import (
     compute_l1_recompute_months,
+    label_invalid_months,
+    mid_term_invalid_months,
+    shift_calendar_month,
+    short_pit_invalid_months,
     union_changed_partition_months,
 )
 
@@ -50,6 +54,31 @@ def test_compute_l1_recompute_intersects_available_only() -> None:
         available_months={"202601"},
     )
     assert got == ["202601"]
+
+
+def test_p3_t1_label_invalid_months_prev_dirty_next() -> None:
+    got = label_invalid_months({"202503"})
+    assert got == {"202502", "202503", "202504"}
+
+
+def test_p3_t2_label_invalid_months_year_boundary() -> None:
+    got = label_invalid_months({"202501"})
+    assert got == {"202412", "202501", "202502"}
+
+
+def test_p3_t3_short_pit_neighbor_backfill() -> None:
+    got = short_pit_invalid_months({"202503"}, neighbor_backfill=1)
+    assert got == {"202502", "202503"}
+
+
+def test_shift_calendar_month_handles_rollover() -> None:
+    assert shift_calendar_month("202501", delta_months=-1) == "202412"
+    assert shift_calendar_month("202512", delta_months=1) == "202601"
+
+
+def test_mid_term_invalid_months_lookback() -> None:
+    got = mid_term_invalid_months({"202503"}, lookback_months=2)
+    assert got == {"202501", "202502", "202503"}
 
 
 def test_compute_l1_recompute_empty_diff_only_correction() -> None:

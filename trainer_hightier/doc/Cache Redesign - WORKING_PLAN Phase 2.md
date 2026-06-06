@@ -221,3 +221,5 @@ Phase 2 完成當且僅當：
 | P2-WP-9 | ✅ 完成 | （見 P2-WP-1） |
 | P2-WP-10 | ✅ 部分 | `test_entity_set_v1.py`（含 P2-T-5 golden compare） |
 | P2-WP-11 | ✅ 部分 | RUNBOOK §5.6 |
+
+**下一步：** [Cache Redesign - WORKING_PLAN Phase 3.md](./Cache%20Redesign%20-%20WORKING_PLAN%20Phase%203.md)

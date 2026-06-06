@@ -125,7 +125,8 @@ def txn_lite_feature_columns(*, extra_window_hours: tuple[int, ...] = ()) -> tup
     return tuple(dict.fromkeys(TXN_LITE_FEATURE_COLUMNS + tuple(extra_cols)))
 # Month-sharded short-term PIT cache under ``artifacts/training_data/cache/``.
 SHORT_TERM_PIT_CACHE_DIRNAME: Final[str] = "short_term_pit_v1"
-SHORT_TERM_PIT_CACHE_SCHEMA_VERSION: Final[int] = 1
+SHORT_TERM_PIT_CACHE_SCHEMA_VERSION: Final[int] = 2
+SHORT_TERM_PIT_SUPPLIER_FAMILY: Final[str] = "short_term:w1h"
 # Training materialize batch size (decoupled from scorer cycle size for offline throughput).
 DEFAULT_TRAINING_SHORT_TERM_MATERIALIZE_BATCH_SIZE: Final[int] = 20_000
 # Neighbor months included when invalidating shards after partition inventory deltas.
@@ -152,6 +153,7 @@ CASINO_PLAYER_ID_CLEAN_SQL: Final[str] = (
 )
 WALKAWAY_GAP_MIN: Final[int] = 30
 ALERT_HORIZON_MIN: Final[int] = 15
+LABELS_CANONICAL_SHARD_COUNT: Final[int] = 32
 LABEL_LOOKAHEAD_MIN: Final[int] = 45
 BET_AVAIL_DELAY_MIN: Final[int] = 1
 SCORER_POLL_INTERVAL_SECONDS: Final[int] = 45

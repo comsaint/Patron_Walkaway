@@ -49,6 +49,76 @@ def _write_rank_table(path: Path) -> None:
     )
 
 
+def test_entity_set_quantile_delta_records_added_players(tmp_path: Path) -> None:
+    """Quantile decrease writes delta manifest with added player ids (P3-T-8 prep)."""
+    rank_pq = tmp_path / "rank.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "canonical_id": ["c1", "c2", "c3", "c4"],
+                "player_id": [10, 20, 30, 40],
+                "adt": [10.0, 40.0, 60.0, 90.0],
+                "adt_rank": [1, 2, 3, 4],
+                "adt_percentile": [0.0, 0.33, 0.66, 1.0],
+                "has_slow_window_coverage": [True, True, True, True],
+            }
+        ),
+        rank_pq,
+    )
+    rank_fp = sha256_file_bytes(rank_pq)
+    t_pay = pd.Timestamp("2025-05-27 09:00:00")
+    df = pd.DataFrame(
+        [
+            _bet_row(bet_id=1, player_id=10, payout_complete_dtm=t_pay),
+            _bet_row(bet_id=2, player_id=30, payout_complete_dtm=t_pay),
+            _bet_row(bet_id=3, player_id=40, payout_complete_dtm=t_pay),
+        ]
+    )
+    raw = tmp_path / "gmwds_t_bet.parquet"
+    pq.write_table(pa.Table.from_pandas(df), raw)
+    base = tmp_path / "base_ds"
+    _hpre.preprocess_bets_from_parquet_streaming(
+        raw,
+        base,
+        cfg=BetPreprocessConfig(
+            data_scope=L0PreprocessDataScopeConfig(),
+            preprocess_registry_yaml=default_preprocess_registry_yaml_path(),
+            dedup_hash_buckets=1,
+        ),
+    )
+    scope = TRAINING_DATA_SCOPE_TEST_UNBOUNDED
+    source_fp = "abc123" * 10 + "abcd"
+    cache = tmp_path / "cache"
+    duck = DuckDbRuntimeConfig()
+    materialize_entity_set_v1_cached(
+        base_cleaned_parquet=base,
+        rank_table_path=rank_pq,
+        rank_fingerprint_sha256_hex=rank_fp,
+        selected_quantile=0.99,
+        training_scope=scope,
+        source_manifest_v2_fingerprint_sha256_hex=source_fp,
+        duckdb_runtime=duck,
+        cache_root=cache,
+        output_parquet=tmp_path / "out_99",
+        use_cache=False,
+    )
+    lo = materialize_entity_set_v1_cached(
+        base_cleaned_parquet=base,
+        rank_table_path=rank_pq,
+        rank_fingerprint_sha256_hex=rank_fp,
+        selected_quantile=0.5,
+        training_scope=scope,
+        source_manifest_v2_fingerprint_sha256_hex=source_fp,
+        duckdb_runtime=duck,
+        cache_root=cache,
+        output_parquet=tmp_path / "out_50",
+        use_cache=False,
+    )
+    assert int(lo.get("entity_delta_row_count") or 0) == 1
+    assert lo.get("entity_delta_previous_quantile") == 0.99
+    assert Path(str(lo.get("entity_delta_added_player_ids_path") or "")).is_file()
+
+
 def test_entity_set_matches_legacy_segment_row_set(tmp_path: Path) -> None:
     """Entity set v1 projection row set aligns with legacy allowlist segment (P2-T-5)."""
     profile_csv = tmp_path / "canonical_patron_profile.csv"

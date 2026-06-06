@@ -12,6 +12,7 @@ import pytest
 from trainer_hightier.config import DuckDbRuntimeConfig
 from trainer_hightier.utils.universe_cache_v1 import (
     adt_rank_cache_is_hit,
+    diff_selected_universe_added_player_ids,
     materialize_adt_rank_table_v1_cached,
     write_selected_universe_manifest,
 )
@@ -100,6 +101,28 @@ def test_write_selected_universe_manifest_counts(tmp_path: Path) -> None:
     assert sel["selected_universe_player_count"] == 0
     assert sel["selected_universe_canonical_count"] == 0
     assert Path(str(sel["selected_universe_manifest_path"])).is_file()
+
+
+def test_diff_selected_universe_added_player_ids_on_quantile_decrease(tmp_path: Path) -> None:
+    rank_p = tmp_path / "rank.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "canonical_id": ["c1", "c2", "c3", "c4"],
+                "player_id": [10, 20, 30, 40],
+                "adt": [10.0, 40.0, 60.0, 90.0],
+                "adt_rank": [1, 2, 3, 4],
+                "adt_percentile": [0.0, 0.33, 0.66, 1.0],
+                "has_slow_window_coverage": [True, True, True, True],
+            }
+        ),
+        rank_p,
+    )
+    added = diff_selected_universe_added_player_ids(rank_p, previous_quantile=0.99, current_quantile=0.5)
+    assert added == (30,)
+    added_wide = diff_selected_universe_added_player_ids(rank_p, previous_quantile=0.99, current_quantile=0.25)
+    assert added_wide == (20, 30)
+    assert diff_selected_universe_added_player_ids(rank_p, previous_quantile=0.5, current_quantile=0.99) == ()
 
 
 def test_write_selected_universe_manifest_rejects_bad_quantile(tmp_path: Path) -> None:

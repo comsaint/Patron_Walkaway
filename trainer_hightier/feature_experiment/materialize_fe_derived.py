@@ -521,6 +521,7 @@ def _iter_training_bet_batches(
     batch_size: int,
     duckdb_runtime: DuckDbRuntimeConfig,
     payout_yyyymm: str | None = None,
+    restrict_player_ids: tuple[int, ...] | None = None,
 ) -> Iterator[pd.DataFrame]:
     """Yield chronological training bet slices without loading the full table into memory."""
 
@@ -533,10 +534,14 @@ def _iter_training_bet_batches(
         if len(ym) != 6 or not ym.isdigit():
             raise ValueError(f"payout_yyyymm must be six digits, got {payout_yyyymm!r}")
         month_filter = f" AND strftime(CAST(payout_complete_dtm AS TIMESTAMPTZ), '%Y%m') = '{ym}'"
+    player_filter = ""
+    if restrict_player_ids:
+        ids_sql = ",".join(str(int(pid)) for pid in restrict_player_ids)
+        player_filter = f" AND TRY_CAST(player_id AS BIGINT) IN ({ids_sql})"
     base_where = f"""
             WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
               AND payout_complete_dtm IS NOT NULL
-              AND TRY_CAST(player_id AS BIGINT) IS NOT NULL{month_filter}
+              AND TRY_CAST(player_id AS BIGINT) IS NOT NULL{month_filter}{player_filter}
     """.strip()
     con = duckdb.connect(database=":memory:")
     try:
@@ -634,6 +639,7 @@ def materialize_fe_derived_short_term_parquet(
     trial_columns: tuple[str, ...] | None = None,
     batch_size: int | None = None,
     payout_yyyymm: str | None = None,
+    restrict_player_ids: tuple[int, ...] | None = None,
 ) -> Path:
     """Write **offline short-term PIT cache** (``bet__*`` + short ``fe__*``) for training rows.
 
@@ -677,6 +683,7 @@ def materialize_fe_derived_short_term_parquet(
         batch_size=effective_batch_size,
         duckdb_runtime=duckdb_runtime,
         payout_yyyymm=payout_yyyymm,
+        restrict_player_ids=restrict_player_ids,
     ):
         features = _short_term_features_for_batch(
             bets_batch,

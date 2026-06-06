@@ -26,7 +26,7 @@ logger = logging.getLogger("trainer_hightier")
 SOURCE_FILE_RECORD_SCHEMA_VERSION: Final[int] = 2
 SOURCE_MANIFEST_SCHEMA_VERSION: Final[int] = 1
 SOURCE_CHANGE_SET_SCHEMA_VERSION: Final[int] = 1
-CACHE_REPORT_SCHEMA_VERSION: Final[int] = 1
+CACHE_REPORT_SCHEMA_VERSION: Final[int] = 2
 HASH_ALGORITHM: Final[str] = "sha256_file_bytes_v1"
 MANIFEST_KIND: Final[str] = "trainer_hightier_source_manifest_v2"
 
@@ -352,6 +352,125 @@ def write_source_change_set(
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
     }
     return write_json_atomic(source_change_sets_dir(cache_root) / out_name, payload)
+
+
+def _cache_layer_entry(
+    layer: str,
+    *,
+    hit: bool | None,
+    elapsed_seconds: float | None = None,
+    reason: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Build one cache-report layer dict when *hit* is known."""
+    if hit is None:
+        return None
+    entry: dict[str, Any] = {
+        "layer": layer,
+        "hit": bool(hit),
+        "miss": not bool(hit),
+        "reason": reason,
+        "elapsed_seconds": elapsed_seconds,
+    }
+    if extra:
+        entry.update(extra)
+    return entry
+
+
+def build_pipeline_cache_layers(metrics: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build L1–L5 layer entries from trainer *metrics* (Phase 2/3 observability)."""
+    layers: list[dict[str, Any]] = []
+    specs: list[tuple[str, str, str | None]] = [
+        ("l1_session_clean", "session_clean_cache_hit", "session_clean_cache_miss"),
+        ("l1_bet_base_clean", "bet_base_clean_cache_hit", "bet_base_clean_cache_miss"),
+        ("l1_bet_segment_legacy", "bet_segment_clean_cache_hit", "bet_segment_clean_cache_miss"),
+        ("l1_bet_clean", "bet_clean_cache_hit", "bet_clean_cache_miss"),
+        ("l2_universe_adt_rank", "universe_adt_rank_cache_hit", "universe_adt_rank_cache_miss"),
+        ("l3_entity_set_v1", "entity_set_cache_hit", "entity_set_cache_miss"),
+        ("l4_walkaway_labels_v1", "labels_cache_hit", "labels_cache_miss"),
+    ]
+    for layer_name, hit_key, miss_reason in specs:
+        if hit_key not in metrics:
+            continue
+        hit = bool(metrics.get(hit_key))
+        elapsed_key = {
+            "l2_universe_adt_rank": "universe_adt_rank_elapsed_seconds",
+            "l3_entity_set_v1": "entity_set_elapsed_seconds",
+            "l4_walkaway_labels_v1": "labels_cache_elapsed_seconds",
+        }.get(layer_name)
+        elapsed_raw = metrics.get(elapsed_key) if elapsed_key else None
+        elapsed = float(elapsed_raw) if elapsed_raw is not None else None
+        extra: dict[str, Any] | None = None
+        if layer_name == "l4_walkaway_labels_v1":
+            extra = {
+                "invalid_months": metrics.get("labels_invalid_months"),
+                "semantic_fingerprint": metrics.get("labels_semantic_fingerprint"),
+            }
+        if layer_name == "l3_entity_set_v1":
+            extra = {
+                "policy_fingerprint_sha256_hex": metrics.get(
+                    "entity_set_policy_fingerprint_sha256_hex",
+                ),
+                "legacy_fallback_used": metrics.get("bet_segment_legacy_fallback_used"),
+            }
+        entry = _cache_layer_entry(
+            layer_name,
+            hit=hit,
+            elapsed_seconds=elapsed,
+            reason=None if hit else miss_reason,
+            extra=extra,
+        )
+        if entry is not None:
+            layers.append(entry)
+    short_cache = metrics.get("main_trainer_fe_short_term_cache")
+    if isinstance(short_cache, dict):
+        hit = bool(short_cache.get("cache_hit"))
+        layers.append(
+            {
+                "layer": "l5_short_term_pit_primitive",
+                "hit": hit,
+                "miss": not hit,
+                "reason": None if hit else "short_term_pit_shard_miss",
+                "elapsed_seconds": None,
+                "hit_ratio": short_cache.get("short_term_pit_primitive_hit_ratio")
+                or short_cache.get("cache_hit_ratio"),
+                "hit_shards": short_cache.get("cache_hit_shards"),
+                "miss_shards": short_cache.get("cache_miss_shards"),
+                "reason_counts": short_cache.get("cache_reason_counts"),
+                "recompute_months": metrics.get("short_term_pit_recompute_months"),
+                "source_invalid_months": metrics.get("short_term_pit_source_invalid_months"),
+                "entity_set_fingerprint_sha256_hex": metrics.get(
+                    "entity_set_policy_fingerprint_sha256_hex",
+                ),
+            },
+        )
+    return layers
+
+
+def finalize_cache_report_from_metrics(metrics: dict[str, Any]) -> Path | None:
+    """Merge pipeline L1–L5 layers into the run ``cache_report_*.json``."""
+    report_raw = metrics.get("source_manifest_v2_cache_report_path")
+    if report_raw is None or not str(report_raw).strip():
+        return None
+    path = Path(str(report_raw)).resolve()
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        logger.warning("[cache_report] skip finalize; corrupt JSON at %s", path)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    existing = payload.get("layers")
+    keep: list[dict[str, Any]] = []
+    if isinstance(existing, list):
+        keep = [row for row in existing if isinstance(row, dict) and row.get("layer") == "source_manifest_v2"]
+    payload["schema_version"] = CACHE_REPORT_SCHEMA_VERSION
+    payload["layers"] = keep + build_pipeline_cache_layers(metrics)
+    payload["pipeline_layers_finalized_at_utc"] = datetime.now(timezone.utc).isoformat()
+    payload["l1_recompute_months"] = metrics.get("l1_recompute_months")
+    return write_json_atomic(path, payload)
 
 
 def write_cache_report_skeleton(

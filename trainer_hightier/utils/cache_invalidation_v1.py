@@ -71,3 +71,65 @@ def compute_l1_recompute_months(
     )
     pool &= set(available_months)
     return sorted(pool)
+
+
+def _validate_yyyymm(yyyymm: str) -> str:
+    """Validate six-digit ``YYYYMM`` or raise."""
+    ym = str(yyyymm).strip()
+    if len(ym) != 6 or not ym.isdigit():
+        raise ValueError(f"month must be six YYYYMM digits, got {yyyymm!r}")
+    return ym
+
+
+def shift_calendar_month(yyyymm: str, *, delta_months: int) -> str:
+    """Shift ``YYYYMM`` by *delta_months* on the calendar axis."""
+    ym = _validate_yyyymm(yyyymm)
+    y = int(ym[:4])
+    m = int(ym[4:6])
+    m += int(delta_months)
+    while m < 1:
+        m += 12
+        y -= 1
+    while m > 12:
+        m -= 12
+        y += 1
+    return f"{y:04d}{m:02d}"
+
+
+def label_invalid_months(dirty_months: set[str]) -> set[str]:
+    """Expand dirty source months to label safety window (prev + dirty + next)."""
+    out: set[str] = set()
+    for raw in dirty_months:
+        ym = _validate_yyyymm(raw)
+        out.add(shift_calendar_month(ym, delta_months=-1))
+        out.add(ym)
+        out.add(shift_calendar_month(ym, delta_months=1))
+    return out
+
+
+def short_pit_invalid_months(
+    dirty_months: set[str],
+    *,
+    neighbor_backfill: int = 1,
+) -> set[str]:
+    """Expand dirty months for short-term PIT (dirty + prior neighbor months)."""
+    seeds = {_validate_yyyymm(m) for m in dirty_months}
+    return backfill_neighbor_months(seeds, backfill_count=int(neighbor_backfill))
+
+
+def mid_term_invalid_months(
+    dirty_months: set[str],
+    *,
+    lookback_months: int = 32,
+) -> set[str]:
+    """Expand dirty months for mid-term lookback overlap (MVP month grain)."""
+    lb = max(0, int(lookback_months))
+    out: set[str] = set()
+    for raw in dirty_months:
+        ym = _validate_yyyymm(raw)
+        cur = ym
+        out.add(cur)
+        for _ in range(lb):
+            cur = shift_calendar_month(cur, delta_months=-1)
+            out.add(cur)
+    return out

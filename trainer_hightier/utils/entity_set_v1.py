@@ -11,7 +11,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Final
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 from trainer_hightier.config import DuckDbRuntimeConfig, L0PreprocessDataScopeConfig
+from trainer_hightier.utils.universe_cache_v1 import diff_selected_universe_added_player_ids
 from trainer_hightier.utils.bet_l0_preprocess import (
     _bet_artifact_manifest_block,
     _clear_partitioned_dataset_dir,
@@ -49,6 +53,73 @@ def training_scope_fingerprint(scope: L0PreprocessDataScopeConfig) -> str:
     """SHA-256 hex of L0 training scope manifest block."""
     blob = json.dumps(scope.manifest_block(), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _policy_blob_sha256(payload: dict[str, Any]) -> str:
+    """Hash a sorted JSON policy blob."""
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def entity_set_policy_fingerprint_sha256_hex(
+    *,
+    selected_quantile: float,
+    universe_fingerprint_sha256_hex: str,
+    source_manifest_v2_fingerprint_sha256_hex: str,
+    bet_base_fingerprint_sha256_hex: str,
+    training_scope_fingerprint_sha256_hex: str,
+) -> str:
+    """Stable fingerprint for entity-set v1 universe used by labels / short PIT caches."""
+    return _policy_blob_sha256(
+        {
+            "kind": ENTITY_SET_KIND,
+            "selected_quantile": float(selected_quantile),
+            "universe_fingerprint": str(universe_fingerprint_sha256_hex).strip(),
+            "source_manifest_v2_fingerprint": str(source_manifest_v2_fingerprint_sha256_hex).strip(),
+            "bet_base_cleaned_fingerprint": str(bet_base_fingerprint_sha256_hex).strip(),
+            "training_scope_fingerprint": str(training_scope_fingerprint_sha256_hex).strip(),
+        },
+    )
+
+
+def legacy_bet_segment_policy_fingerprint_sha256_hex(
+    *,
+    selected_quantile: float,
+    bet_base_fingerprint_sha256_hex: str,
+    training_scope_fingerprint_sha256_hex: str,
+    partition_inventory_fingerprint_sha256_hex: str,
+    source_manifest_v2_fingerprint_sha256_hex: str | None,
+) -> str:
+    """Fingerprint for legacy ADT segment path (pre entity-set v1)."""
+    return _policy_blob_sha256(
+        {
+            "kind": "legacy_bet_segment_v1",
+            "selected_quantile": float(selected_quantile),
+            "bet_base_cleaned_fingerprint": str(bet_base_fingerprint_sha256_hex).strip(),
+            "training_scope_fingerprint": str(training_scope_fingerprint_sha256_hex).strip(),
+            "partition_inventory_fingerprint": str(partition_inventory_fingerprint_sha256_hex).strip(),
+            "source_manifest_v2_fingerprint": str(source_manifest_v2_fingerprint_sha256_hex or "").strip(),
+        },
+    )
+
+
+def bet_clean_policy_fingerprint_sha256_hex(
+    *,
+    cleaned_bet_fingerprint_sha256_hex: str,
+    training_scope_fingerprint_sha256_hex: str,
+    source_manifest_v2_fingerprint_sha256_hex: str | None,
+    partition_inventory_fingerprint_sha256_hex: str | None,
+) -> str:
+    """Fingerprint for full cleaned bet without ADT entity projection."""
+    return _policy_blob_sha256(
+        {
+            "kind": "bet_clean_v1",
+            "cleaned_bet_fingerprint": str(cleaned_bet_fingerprint_sha256_hex).strip(),
+            "training_scope_fingerprint": str(training_scope_fingerprint_sha256_hex).strip(),
+            "source_manifest_v2_fingerprint": str(source_manifest_v2_fingerprint_sha256_hex or "").strip(),
+            "partition_inventory_fingerprint": str(partition_inventory_fingerprint_sha256_hex or "").strip(),
+        },
+    )
 
 
 def entity_set_policy_dir(
@@ -138,6 +209,97 @@ def _archive_monthly_partitions(*, output_root: Path, partitions_dir: Path) -> l
         shutil.copytree(month_dir, target)
         months.append(ym)
     return sorted(months)
+
+
+def find_stricter_cached_entity_set_quantile(
+    *,
+    cache_root: Path,
+    scope_fingerprint: str,
+    universe_fingerprint: str,
+    current_quantile: float,
+    bet_base_fingerprint_sha256_hex: str,
+    source_manifest_v2_fingerprint_sha256_hex: str,
+) -> tuple[float, dict[str, Any]] | None:
+    """Return strictest cached quantile above *current_quantile* with matching base/source."""
+    root = Path(cache_root).resolve()
+    scope_s = str(scope_fingerprint)[:16]
+    uni_s = str(universe_fingerprint)[:16]
+    cur_q = float(current_quantile)
+    best: tuple[float, dict[str, Any]] | None = None
+    for qdir in sorted(root.glob("quantile=*")):
+        manifest_path = qdir / f"scope={scope_s}" / f"universe={uni_s}" / "manifest.json"
+        prev = load_entity_set_manifest(manifest_path)
+        if prev is None:
+            continue
+        qf = float(prev.get("selected_quantile", -1))
+        if qf <= cur_q:
+            continue
+        if str(prev.get("bet_base_cleaned_fingerprint")) != str(bet_base_fingerprint_sha256_hex):
+            continue
+        if str(prev.get("source_manifest_v2_fingerprint")) != str(
+            source_manifest_v2_fingerprint_sha256_hex,
+        ):
+            continue
+        if best is None or qf > best[0]:
+            best = (qf, prev)
+    return best
+
+
+def write_entity_set_quantile_delta(
+    *,
+    policy_dir: Path,
+    rank_table_path: Path,
+    previous_quantile: float,
+    current_quantile: float,
+    universe_fingerprint_sha256_hex: str,
+    source_manifest_v2_fingerprint_sha256_hex: str,
+    bet_base_fingerprint_sha256_hex: str,
+    training_scope_fingerprint_sha256_hex: str,
+) -> dict[str, Any]:
+    """Persist added ``player_id`` rows when quantile decreases (delta fill input)."""
+    added = diff_selected_universe_added_player_ids(
+        rank_table_path,
+        previous_quantile=float(previous_quantile),
+        current_quantile=float(current_quantile),
+    )
+    if not added:
+        return {
+            "entity_delta_row_count": 0,
+            "entity_delta_previous_quantile": float(previous_quantile),
+            "entity_delta_current_quantile": float(current_quantile),
+        }
+    delta_dir = Path(policy_dir).resolve() / "delta" / "latest"
+    delta_dir.mkdir(parents=True, exist_ok=True)
+    ids_path = delta_dir / "added_player_ids.parquet"
+    pq.write_table(pa.table({"player_id": list(added)}), ids_path)
+    prev_fp = entity_set_policy_fingerprint_sha256_hex(
+        selected_quantile=float(previous_quantile),
+        universe_fingerprint_sha256_hex=str(universe_fingerprint_sha256_hex),
+        source_manifest_v2_fingerprint_sha256_hex=str(source_manifest_v2_fingerprint_sha256_hex),
+        bet_base_fingerprint_sha256_hex=str(bet_base_fingerprint_sha256_hex),
+        training_scope_fingerprint_sha256_hex=str(training_scope_fingerprint_sha256_hex),
+    )
+    manifest = {
+        "schema_version": ENTITY_SET_SCHEMA_VERSION,
+        "kind": "entity_set_quantile_delta_v1",
+        "previous_quantile": float(previous_quantile),
+        "current_quantile": float(current_quantile),
+        "added_player_count": int(len(added)),
+        "previous_entity_set_fingerprint": prev_fp,
+        "added_player_ids_path": str(ids_path.resolve()),
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    manifest_path = delta_dir / "manifest.json"
+    write_json_atomic(manifest_path, manifest)
+    return {
+        "entity_delta_row_count": int(len(added)),
+        "entity_delta_previous_quantile": float(previous_quantile),
+        "entity_delta_current_quantile": float(current_quantile),
+        "entity_delta_manifest_path": str(manifest_path.resolve()),
+        "entity_delta_added_player_ids_path": str(ids_path.resolve()),
+        "entity_delta_added_player_ids": list(added),
+        "entity_delta_previous_entity_set_fingerprint_sha256_hex": prev_fp,
+    }
 
 
 def load_entity_set_manifest(path: Path) -> dict[str, Any] | None:
@@ -269,6 +431,34 @@ def materialize_entity_set_v1_cached(
         row_n = int(prev.get("row_count") or partitioned_cleaned_bet_total_rows(out))
         entity_months = list(prev.get("entity_months") or [])
     retire_bet_segment_cache_sidecar(out)
+    policy_fp = entity_set_policy_fingerprint_sha256_hex(
+        selected_quantile=float(selected_quantile),
+        universe_fingerprint_sha256_hex=str(rank_fingerprint_sha256_hex),
+        source_manifest_v2_fingerprint_sha256_hex=str(source_manifest_v2_fingerprint_sha256_hex),
+        bet_base_fingerprint_sha256_hex=base_fp,
+        training_scope_fingerprint_sha256_hex=scope_fp,
+    )
+    delta_meta: dict[str, Any] = {}
+    stricter = find_stricter_cached_entity_set_quantile(
+        cache_root=uroot,
+        scope_fingerprint=scope_fp,
+        universe_fingerprint=str(rank_fingerprint_sha256_hex),
+        current_quantile=float(selected_quantile),
+        bet_base_fingerprint_sha256_hex=base_fp,
+        source_manifest_v2_fingerprint_sha256_hex=str(source_manifest_v2_fingerprint_sha256_hex),
+    )
+    if stricter is not None:
+        prev_q, _ = stricter
+        delta_meta = write_entity_set_quantile_delta(
+            policy_dir=policy_dir,
+            rank_table_path=rank_p,
+            previous_quantile=float(prev_q),
+            current_quantile=float(selected_quantile),
+            universe_fingerprint_sha256_hex=str(rank_fingerprint_sha256_hex),
+            source_manifest_v2_fingerprint_sha256_hex=str(source_manifest_v2_fingerprint_sha256_hex),
+            bet_base_fingerprint_sha256_hex=base_fp,
+            training_scope_fingerprint_sha256_hex=scope_fp,
+        )
     return {
         "entity_set_cache_hit": bool(cache_hit),
         "entity_set_elapsed_seconds": round(time.perf_counter() - t0, 6),
@@ -278,4 +468,6 @@ def materialize_entity_set_v1_cached(
         "entity_set_output_path": str(out.resolve()),
         "entity_set_months": entity_months,
         "entity_set_training_scope_fingerprint": scope_fp,
+        "entity_set_policy_fingerprint_sha256_hex": policy_fp,
+        **delta_meta,
     }
