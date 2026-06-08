@@ -177,7 +177,7 @@ python -m trainer_hightier.trainer --partition-snapshot-dir "D:/exports/my_snaps
 
 - **訓練集**：`trainer_hightier/artifacts/training_data/training_set.parquet`  
 - **版本保留**：`trainer_hightier/artifacts/training_data/versions/training_set_*.parquet`（預設保留最近 10 個；`03_build_training_data.py` 的 `--training-retention`）  
-- **Run 報表**：**`run_report.json`**（巢狀 schema；見 [`doc/Training logs - TEMPLATE.md`](doc/Training%20logs%20-%20TEMPLATE.md)）。工程 lineage 在 **`pipeline_debug`**；核心 val/test 指標在 **`summary.metrics`** 與 **`training_metrics.json`**。
+- **Run 報表**：**`run_report.json`**（巢狀 schema；見 [`doc/templates/Training logs - TEMPLATE.md`](doc/templates/Training%20logs%20-%20TEMPLATE.md)）。工程 lineage 在 **`pipeline_debug`**；核心 val/test 指標在 **`summary.metrics`** 與 **`training_metrics.json`**。
 
 ### 2.3 僅重跑 Step 3（preprocess 已完成時）
 

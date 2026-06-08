@@ -2,8 +2,8 @@
 
 本文件是 **Working / execution plan 層**，承接：
 
-- Implementation plan：[Production Flight Recorder - IMPLEMENTATION_PLAN.md](Production%20Flight%20Recorder%20-%20IMPLEMENTATION_PLAN.md)
-- Serving contract（背景）：[Scorer Runtime Contract - SSOT.md](Scorer%20Runtime%20Contract%20-%20SSOT.md)
+- Implementation plan：[Production Flight Recorder - IMPLEMENTATION_PLAN.md](../../implementation/active/Production%20Flight%20Recorder%20-%20IMPLEMENTATION_PLAN.md)
+- Serving contract（背景）：[Scorer Runtime Contract - SSOT.md](../../ssot/Scorer%20Runtime%20Contract%20-%20SSOT.md)
 - Schema 參考：[GDP_GMWDS_Raw_Schema_Dictionary.md](../../schema/GDP_GMWDS_Raw_Schema_Dictionary.md)
 
 本文件只拆解可執行工作、依賴、Definition of Done、建議順序與驗收證據；不重新定義產品範圍或架構。若與 implementation plan 衝突，先更新 implementation plan 再執行。
@@ -242,7 +242,7 @@ flowchart TD
 |----|------|-------|--------------|-------------------|
 | FR-P5-1 | `deploy/main.py` 增加 `--record-production-flight` | [`deploy/main.py`](../deploy/main.py) | FR-P1-7, FR-P2-6 | 與 `mode=all` 相容；預設關閉 |
 | FR-P5-2 | Deploy fail-fast default wiring | [`deploy/main.py`](../deploy/main.py), `serving/flight_recorder/attach.py` | FR-P0-8, FR-P5-1 | `--record-production-flight` 預設 `fail_fast=true`；recording root 不可寫時 deploy 立即退出 |
-| FR-P5-3 | Runbook：新模型 deploy + recording | `doc/Production Flight Recorder - RUNBOOK.md`（新建） | FR-P5-1, FR-P5-2 | 含雙 process、建議錄製時長、pack 指令、fail-fast 故障處理 |
+| FR-P5-3 | Runbook：新模型 deploy + recording | `doc/runbooks/active/Production Flight Recorder - RUNBOOK.md` | FR-P5-1, FR-P5-2 | 含雙 process、建議錄製時長、pack 指令、fail-fast 故障處理 |
 | FR-P5-4 | `collect_debug_bundle.py` 可選納入 recording manifest | [`collect_debug_bundle.py`](../serving/collect_debug_bundle.py) | FR-P0-6 | zip 內有 `flight_recording/MANIFEST.json` 指標 |
 | FR-P5-5 | Production dry-run checklist | RUNBOOK + 本文件 §驗收 | FR-P1–P4, FR-P5-2 | 至少 1 scorer + 1 validator cycle；本機 replay 成功；fail-fast 故障演練完成 |
 

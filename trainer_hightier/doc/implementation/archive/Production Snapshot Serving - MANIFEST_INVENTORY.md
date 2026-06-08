@@ -1,7 +1,7 @@
 # Production Snapshot Serving — Manifest Inventory
 
 > Historical reference. The current scorer packaging/runtime source of truth is
-> [`Scorer Runtime Contract - SSOT.md`](Scorer%20Runtime%20Contract%20-%20SSOT.md).
+> [`Scorer Runtime Contract - SSOT.md`](../../ssot/Scorer%20Runtime%20Contract%20-%20SSOT.md).
 > If this document conflicts with that SSOT, follow the SSOT.
 > This document describes the pre-scorer-v2 Parquet snapshot rollout. Scorer v2 production runtime must not use
 > `fe_short_term_parquet`, `fe_derived_parquet`, or slow/mid Parquet layers as feature fallback suppliers.

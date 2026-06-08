@@ -62,7 +62,7 @@ MANIFEST_KEY_MID_TERM_COVERAGE_END: Final[str] = "mid_term_coverage_end_exclusiv
 MANIFEST_KEY_MID_TERM_GENERATED_AT: Final[str] = "mid_term_generated_at"
 MANIFEST_KEY_MID_TERM_STALE_HARD_CAP_DAYS: Final[str] = "mid_term_stale_hard_cap_days"
 # Manifest JSON key (legacy string). Semantics: short-term **offline PIT cache** path — see
-# ``MANIFEST_KEY_SHORT_TERM_PIT_CACHE`` and ``doc/Scorer Runtime Contract - SSOT.md`` §Short-term.
+# ``MANIFEST_KEY_SHORT_TERM_PIT_CACHE`` and ``doc/ssot/Scorer Runtime Contract - SSOT.md`` §Short-term.
 MANIFEST_KEY_FE_SHORT_TERM: Final[str] = "fe_short_term_parquet"
 MANIFEST_KEY_SHORT_TERM_PIT_CACHE: Final[str] = MANIFEST_KEY_FE_SHORT_TERM
 MANIFEST_KEY_SLOW_ANCHOR_MAX: Final[str] = "slow_anchor_gaming_day_event_max"

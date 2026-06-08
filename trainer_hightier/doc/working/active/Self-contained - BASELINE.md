@@ -1,6 +1,6 @@
 # trainer_hightier Self-contained Baseline（Working-layer）
 
-對應 [Self-contained - IMPLEMENTATION_PLAN.md](./Self-contained%20-%20IMPLEMENTATION_PLAN.md)。本檔定義 **training/preprocess + runtime** 去耦後的回歸基線（非產品 SSOT）。
+對應 [Self-contained - IMPLEMENTATION_PLAN.md](../../implementation/archive/Self-contained%20-%20IMPLEMENTATION_PLAN.md)。本檔定義 **training/preprocess + runtime** 去耦後的回歸基線（非產品 SSOT）。
 
 ## Import gate（每一輪 PR）
 

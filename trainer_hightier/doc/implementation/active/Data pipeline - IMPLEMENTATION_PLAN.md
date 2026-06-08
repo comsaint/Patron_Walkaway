@@ -5,8 +5,8 @@
 
 ## 對齊基準
 
-- SSOT: `trainer_hightier/doc/Data pipeline - SSOT.md`
-- Scorer runtime SSOT: `trainer_hightier/doc/Scorer Runtime Contract - SSOT.md`
+- SSOT: `trainer_hightier/doc/ssot/Data pipeline - SSOT.md`
+- Scorer runtime SSOT: `trainer_hightier/doc/ssot/Scorer Runtime Contract - SSOT.md`
 - 時間語意 registry: `schema/time_semantics_registry.yaml`（升版為 v2 後作為機讀真相）
 
 ## 實作目標

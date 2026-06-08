@@ -5,7 +5,7 @@
 
 ## 0) Alignment
 
-- SSOT：`trainer_hightier/doc/Cache Redesign - SSOT.md`
+- SSOT：`trainer_hightier/doc/ssot/Cache Redesign - SSOT.md`
 - 目標：讓 source 更新、ADT quantile 變化與 feature registry 頻繁調整時，訓練管線只重算必要部分。
 - 非目標：不重定義 walkaway label、模型策略、serving runtime 或 row-level historical ADT。
 
@@ -17,8 +17,8 @@
 |-------|----------|-------|--------------------|----------------------|
 | L0 Source Manifest | source file manifest | table + file + partition | shared | file SHA / schema / hash algorithm |
 | L1 Cleaned Source | normalized session / bet | table + partition | shared | source partition changed / cleaning semantic version |
-| L2 ADT Rank Universe | latest/global ADT rank | canonical + player projection | shared | profile / mapping / slow coverage anchor |
-| L3 Selected Entity Set | training entity set | quantile + scope + month | run-scoped or shared by policy hash | quantile / training scope / source partition |
+| L2 Universe Selection | selected top-x membership | quantile + canonical/player projection | shared | selected patron/player set / mapping / slow coverage policy |
+| L3 Selected Entity Set | training entity set | quantile + scope + month | run-scoped or shared by policy hash | selected universe membership / training scope / source partition |
 | L4 Labels | walkaway label shard | canonical shard + month | shared by entity/source policy | bet sequence change / mapping / label semantic version |
 | L5 Feature Primitive | supplier family + window | supplier + window + month | shared | entity delta / source dependency window / supplier semantic version |
 | L6 Assembly | model training parquet | registry + entity set | run-local | registry selection / assembly semantic version |
@@ -117,14 +117,14 @@ Target behavior:
 
 Migration should remove long-term dependency on `adt_filter_quantile` in bet preprocess cache semantics.
 
-## 4) ADT Universe Layer
+## 4) Universe Selection Layer
 
 ### 4.1 ADT Rank Table
 
-Build latest/global rank table at canonical level:
+Build latest/global rank table at canonical level as an intermediate artifact:
 
 ```text
-universe_v1/adt_rank_latest/profile=<sha>/mapping=<sha>/slow_anchor=<date>/data.parquet
+universe_v1/adt_rank_latest/profile=<provenance_or_content_sha>/mapping=<mapping_fp>/slow_anchor=<date>/data.parquet
 ```
 
 Required fields:
@@ -139,7 +139,7 @@ Required fields:
 - `mapping_sha256`
 - `slow_anchor_required`
 
-The table may contain multiple `player_id` rows per `canonical_id`, but ranking is canonical-level.
+The table may contain multiple `player_id` rows per `canonical_id`, but ranking is canonical-level. Exact `adt` values are **not** downstream cache identity; they are only used to derive selected top-x membership.
 
 ### 4.2 Quantile Selection
 
@@ -150,12 +150,17 @@ adt_percentile >= :quantile
 AND has_slow_window_coverage
 ```
 
+The selected universe is the cache boundary that downstream layers consume. Its identity is the deterministic canonical/player membership projection after quantile and slow-coverage filtering.
+
 Quantile selection writes a small manifest with:
 
 - quantile
-- rank table fingerprint
+- selected universe membership fingerprint（canonical/player projection set）
+- rank table fingerprint（diagnostic / provenance, not the downstream identity）
 - selected canonical count
 - selected player count
+
+Downstream L3+ cache keys depend on selected membership. If patrons' exact ADT values change but the selected top-x canonical/player set and mapping are unchanged, entity set / labels / primitive caches should remain reusable.
 
 Quantile changes do not invalidate L0 source or cleaned source caches.
 
@@ -184,7 +189,7 @@ At minimum:
 - `source_partition_yyyymm`
 - `entity_month_yyyymm`
 - `selected_quantile`
-- `universe_fingerprint`
+- `selected_universe_fingerprint`
 - `training_scope_fingerprint`
 
 ### 5.3 Delta Fill For Quantile Decrease
@@ -283,6 +288,17 @@ MVP dependency windows:
 | assembly | entity set + registry only |
 
 Exact expansion helpers should live in one cache dependency module, not be scattered across supplier implementations.
+
+### 7.4 Short-Term PIT Cold-Build Strategy
+
+Short-term PIT is the highest-risk primitive for full cold builds because training materialization is per target bet, while the hot pool dependency is a rolling window over cleaned bet history. MVP cache design must therefore separate two concerns:
+
+- **I/O reuse within a miss month:** when materializing `short_term:w1h` for a month, build the candidate hot-pool source once at month grain (target month + required neighbor / lookback partitions), then let batches query that month-local pool. Batch-level code must not repeatedly scan the same cleaned parquet month partitions.
+- **Primitive reuse across runs:** persist month-sharded primitive output under the short PIT cache root with manifest identity based on supplier family, entity set fingerprint, source dependency window, schema, and policy. Registry add/remove should not miss this layer when requested features are already derivable from the cached primitive.
+
+The near-term implementation should keep exact per-bet PIT semantics. Approximate `canonical_id × time_bucket` ASOF primitives may be considered later, but they are a semantic change and require separate validation.
+
+Full cold builds of all short PIT months are not an interactive smoke target. Integration smoke should use a bounded month/sample slice unless the goal is explicitly to warm the production-scale primitive cache.
 
 ## 8) Assembly Layer
 
@@ -399,8 +415,8 @@ Milestone:
 Deliverables:
 
 - cleaned source cache without ADT quantile
-- ADT rank table cache
-- selected universe cache
+- ADT rank table as intermediate cache/provenance
+- selected universe membership cache
 - entity set cache
 - direct replacement of cleaned bet segment path for downstream Step 3 / Step 3.5
 
@@ -414,12 +430,13 @@ Deliverables:
 
 - label cache with canonical shard + month grain
 - supplier family + window primitive cache
+- month-level hot-pool reuse for short PIT cold builds
 - dependency window invalidation helpers
 - delta fill path for quantile decrease
 
 Milestone:
 
-- Feature add/remove mostly misses only assembly.
+- Feature add/remove mostly misses only assembly; warm short PIT reruns hit month-sharded primitives, and cold-build smoke is bounded to month/sample scale unless explicitly warming cache.
 
 ### Phase 4 - Assembly And Observability
 
@@ -463,6 +480,7 @@ Milestone:
 - Identical content with overwritten source folder yields source hit.
 - One historical file modification yields partial invalidation, not full source miss.
 - ADT quantile change does not invalidate cleaned source.
+- ADT value changes do not invalidate downstream caches when selected top-x membership is unchanged.
 - Quantile decrease fills only added entity rows for feature primitives.
 - Feature registry add/remove of existing primitives does not rerun suppliers.
 - Label invalidation includes canonical sequence boundary risk.

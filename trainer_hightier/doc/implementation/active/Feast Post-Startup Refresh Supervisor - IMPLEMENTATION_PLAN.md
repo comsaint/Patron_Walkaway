@@ -4,7 +4,7 @@
 
 上層契約：
 
-- [`Scorer Runtime Contract - SSOT.md`](Scorer%20Runtime%20Contract%20-%20SSOT.md) — deploy / scoring contract
+- [`Scorer Runtime Contract - SSOT.md`](../../ssot/Scorer%20Runtime%20Contract%20-%20SSOT.md) — deploy / scoring contract
 - [`Feast Online Refresh - IMPLEMENTATION_PLAN.md`](Feast%20Online%20Refresh%20-%20IMPLEMENTATION_PLAN.md) — refresh orchestration CLI 與 publish 順序
 - [`Scorer v2 Feast Runtime - IMPLEMENTATION_PLAN.md`](Scorer%20v2%20Feast%20Runtime%20-%20IMPLEMENTATION_PLAN.md) — scorer v2 refresh plane 與 Phase 3b 背景
 

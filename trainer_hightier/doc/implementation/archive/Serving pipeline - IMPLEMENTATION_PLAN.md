@@ -1,5 +1,10 @@
 # trainer_hightier - Serving Pipeline Implementation Plan
 
+> **Historical reference.** The current scorer packaging/runtime source of truth is
+> [`Scorer Runtime Contract - SSOT.md`](../../ssot/Scorer%20Runtime%20Contract%20-%20SSOT.md).
+> This plan predates scorer v2 Feast integration and the deprecation of the Parquet snapshot
+> supervisor as the primary mid/long supplier path. Retained for module-boundary context only.
+
 本文件是 **Implementation plan 層**，定義 high-tier 上線 serving 的 realization strategy、模組邊界、階段里程碑、風險與驗證策略；不展開 ticket 級 task checklist。
 
 ## 範圍與非範圍

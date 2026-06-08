@@ -1,6 +1,6 @@
 # trainer_hightier — Packaging（Working / execution plan）
 
-本文件為 **Working / execution plan**，承接 [`doc/Packaging - IMPLEMENTATION_PLAN.md`](Packaging%20-%20IMPLEMENTATION_PLAN.md)，記錄可執行任務、依賴、DoD 與驗收證據；**不**重寫產品 SSOT。
+本文件為 **Working / execution plan**，承接 [`doc/implementation/archive/Packaging - IMPLEMENTATION_PLAN.md`](../../implementation/archive/Packaging%20-%20IMPLEMENTATION_PLAN.md)，記錄可執行任務、依賴、DoD 與驗收證據；**不**重寫產品 SSOT。
 
 ## 執行護欄
 

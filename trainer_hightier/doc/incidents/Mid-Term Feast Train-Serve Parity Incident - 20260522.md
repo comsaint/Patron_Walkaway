@@ -237,8 +237,8 @@ Registry `runtime_inputs`：
 | `trainer_hightier/serving/feature_builder.py` | Training ASOF mid join |
 | `trainer_hightier/serving/audit_supplier_root_cause.py` | 逐列 supplier 根因 |
 | `trainer_hightier/trainer.py` | Step 3.5 mid snapshot（training scope） |
-| `trainer_hightier/doc/Feature Serving Incident - 20260519.md` | 前一版 serving 事故（不同根因） |
-| `trainer_hightier/doc/Feast Online Refresh - IMPLEMENTATION_PLAN.md` | Feast refresh 設計背景 |
+| `trainer_hightier/doc/incidents/Feature Serving Incident - 20260519.md` | 前一版 serving 事故（不同根因） |
+| `trainer_hightier/doc/implementation/active/Feast Online Refresh - IMPLEMENTATION_PLAN.md` | Feast refresh 設計背景 |
 
 ## Operator Steps（Option A — scorer v2 Feast mid）
 

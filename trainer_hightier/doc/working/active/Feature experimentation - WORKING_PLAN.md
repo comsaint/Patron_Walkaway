@@ -2,12 +2,12 @@
 
 本文件屬於 **Working / execution plan 層**，承接：
 
-- SSOT：`doc/Data pipeline - SSOT.md`
-- Implementation Plan：`doc/Feature experimentation - IMPLEMENTATION_PLAN.md`
+- SSOT：`doc/ssot/Data pipeline - SSOT.md`
+- Implementation Plan：`doc/implementation/active/Feature experimentation - IMPLEMENTATION_PLAN.md`
 
 內容僅包含 **feature experimentation** 的可執行任務拆解、wave 順序、DoD、gates 清單、營運限制與每輪報表模板。
 
-> **不重疊／不修改**：本計畫 **不取代、不編輯** 既有端到端計畫 `doc/trainer-hightier-working-plan_c12558b9.plan.md`；該檔維持原用途，本檔為特徵實驗之獨立執行面。
+> **不重疊／不修改**：本計畫 **不取代、不編輯** 既有端到端計畫 `doc/_meta/trainer-hightier-working-plan_c12558b9.plan.md`（**superseded**）；本檔為特徵實驗之獨立執行面。
 
 ---
 

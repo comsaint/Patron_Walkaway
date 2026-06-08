@@ -1,7 +1,7 @@
 # Production Snapshot Serving — Runbook
 
 > Historical runbook for the pre-scorer-v2 Parquet snapshot serving route. The current scorer v2 runtime source of
-> truth is [`Scorer Runtime Contract - SSOT.md`](Scorer%20Runtime%20Contract%20-%20SSOT.md). Scorer v2 production
+> truth is [`Scorer Runtime Contract - SSOT.md`](../../ssot/Scorer%20Runtime%20Contract%20-%20SSOT.md). Scorer v2 production
 > runtime must not use `fe_short_term_parquet`, `fe_derived_parquet`, or snapshot Parquet layers as feature fallback
 > suppliers.
 >
@@ -113,7 +113,7 @@ Use only when an external job owns all refresh cadence.
 
 ## Scorer v2 — Feast online mid bootstrap / daily refresh
 
-For model `20260520-032615-df799bd` and later scorer v2 bundles using Feast mid lookup (not snapshot manifest mid parquet). See also [Mid-Term Feast Train-Serve Parity Incident - 20260522.md](Mid-Term%20Feast%20Train-Serve%20Parity%20Incident%20-%2020260522.md).
+For model `20260520-032615-df799bd` and later scorer v2 bundles using Feast mid lookup (not snapshot manifest mid parquet). See also [Mid-Term Feast Train-Serve Parity Incident - 20260522.md](../../incidents/Mid-Term%20Feast%20Train-Serve%20Parity%20Incident%20-%2020260522.md).
 
 **Bootstrap** (first deploy, `--force-feast-refresh`, or mid coverage < 95% of allowlist):
 

@@ -6,7 +6,7 @@
 
 上層契約：
 
-- [`Scorer Runtime Contract - SSOT.md`](Scorer%20Runtime%20Contract%20-%20SSOT.md) — deploy/scoring runtime contract
+- [`Scorer Runtime Contract - SSOT.md`](../../ssot/Scorer%20Runtime%20Contract%20-%20SSOT.md) — deploy/scoring runtime contract
 - [`Feast Post-Startup Refresh Supervisor - IMPLEMENTATION_PLAN.md`](Feast%20Post-Startup%20Refresh%20Supervisor%20-%20IMPLEMENTATION_PLAN.md) — 既有 deploy 長駐背景流程與觀測語意
 
 ## Objective

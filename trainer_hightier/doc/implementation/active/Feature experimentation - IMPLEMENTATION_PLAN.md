@@ -5,7 +5,7 @@
 
 ## 0) 對齊範圍與非目標
 
-- 對齊來源：`trainer_hightier/doc/Data pipeline - SSOT.md`
+- 對齊來源：`trainer_hightier/doc/ssot/Data pipeline - SSOT.md`
 - 實作邊界：
   - 包含：候選生成、群組化實驗、篩選 gate、長窗快取治理、訓練視窗策略比較、外部事件來源之實驗接入框架
   - 不包含：模型家族替換、線上 serving 架構改造、產品策略決策、單一來源表的欄位級清洗細節

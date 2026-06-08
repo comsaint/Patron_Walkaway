@@ -2,9 +2,9 @@
 
 本文件是 **Working / execution plan 層**，承接：
 
-- SSOT：[`Scorer Runtime Contract - SSOT.md`](Scorer%20Runtime%20Contract%20-%20SSOT.md)（含特徵四層、short PIT、離線 PIT cache、hot pool）
-- Implementation plan：[`Scorer v2 Feast Runtime - IMPLEMENTATION_PLAN.md`](Scorer%20v2%20Feast%20Runtime%20-%20IMPLEMENTATION_PLAN.md)（含 **Follow-on P1+P2** 架構決策）
-- Data pipeline SSOT：[`Data pipeline - SSOT.md`](Data%20pipeline%20-%20SSOT.md) §5.1（訓練 Step 3.5 short cache）
+- SSOT：[`Scorer Runtime Contract - SSOT.md`](../../ssot/Scorer%20Runtime%20Contract%20-%20SSOT.md)（含特徵四層、short PIT、離線 PIT cache、hot pool）
+- Implementation plan：[`Scorer v2 Feast Runtime - IMPLEMENTATION_PLAN.md`](../../implementation/active/Scorer%20v2%20Feast%20Runtime%20-%20IMPLEMENTATION_PLAN.md)（含 **Follow-on P1+P2** 架構決策）
+- Data pipeline SSOT：[`Data pipeline - SSOT.md`](../../ssot/Data%20pipeline%20-%20SSOT.md) §5.1（訓練 Step 3.5 short cache）
 - Decision record：`Feast Production Feasibility Spike - DECISION_RECORD.md`
 
 本文件只拆解可執行工作、依賴、Definition of Done、建議順序與驗收證據；不重新定義 scorer v2 的產品範圍或架構。若本文件與 SSOT / implementation plan 衝突，先更新上層文件再執行。

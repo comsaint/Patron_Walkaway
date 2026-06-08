@@ -2,7 +2,7 @@
 
 本文件屬於 **Working / Execution Plan 層**，承接：
 
-- Implementation Plan：[`Player Cooldown Offline Evaluation - IMPLEMENTATION_PLAN.md`](Player%20Cooldown%20Offline%20Evaluation%20-%20IMPLEMENTATION_PLAN.md)
+- Implementation Plan：[`Player Cooldown Offline Evaluation - IMPLEMENTATION_PLAN.md`](../../implementation/active/Player%20Cooldown%20Offline%20Evaluation%20-%20IMPLEMENTATION_PLAN.md)
 
 內容僅包含 offline player-level 15 分鐘 cooldown simulation 的可執行任務拆解、順序、DoD 與驗證步驟。
 

@@ -67,7 +67,7 @@ Production deploy（`trainer_hightier.deploy.main`）在 scorer-capable 模式�
 
 `mode=api`、`mode=validator` 單獨啟動前，須 scorer-capable startup 已成功。
 
-**Post-startup refresh（已採用）**：`mode=all`／`mode=scorer` 預設啟動 Feast refresh supervisor（`--no-feast-refresh-supervisor` 可關）。見 [`Feast Post-Startup Refresh Supervisor - IMPLEMENTATION_PLAN.md`](Feast%20Post-Startup%20Refresh%20Supervisor%20-%20IMPLEMENTATION_PLAN.md)。
+**Post-startup refresh（已採用）**：`mode=all`／`mode=scorer` 預設啟動 Feast refresh supervisor（`--no-feast-refresh-supervisor` 可關）。見 [`Feast Post-Startup Refresh Supervisor - IMPLEMENTATION_PLAN.md`](../implementation/active/Feast%20Post-Startup%20Refresh%20Supervisor%20-%20IMPLEMENTATION_PLAN.md)。
 
 **Option B 首次 deploy／bootstrap**：
 
@@ -170,7 +170,7 @@ Scorer **不得**靜默補齊缺失的 model 特徵：
 | 與 Option B 差異 | 分佈較「新鮮」 | 若僅 finite-N refresh 無 carry-forward，會大量 null |
 
 **勿**將 Option B 權重部署在 Option A serving 語意上，或反之。  
-詳見 [`Mid-Term Feast Train-Serve Parity Incident - 20260522.md`](Mid-Term%20Feast%20Train-Serve%20Parity%20Incident%20-%2020260522.md)。
+詳見 [`Mid-Term Feast Train-Serve Parity Incident - 20260522.md`](../incidents/Mid-Term%20Feast%20Train-Serve%20Parity%20Incident%20-%2020260522.md)。
 
 ---
 
@@ -253,12 +253,12 @@ Production scorer v2 **不得** fallback 至 `fe_derived_parquet`、`fe_short_te
 | 層級 | 文件 |
 |------|------|
 | 離線訓練管線四層與 Step 3.5 cache | [`Data pipeline - SSOT.md`](Data%20pipeline%20-%20SSOT.md) §5.1 |
-| Mid-term 事故與 Option A/B 背景 | [`Mid-Term Feast Train-Serve Parity Incident - 20260522.md`](Mid-Term%20Feast%20Train-Serve%20Parity%20Incident%20-%2020260522.md) |
-| Serving 事故（2026-05-19） | [`Feature Serving Incident - 20260519.md`](Feature%20Serving%20Incident%20-%2020260519.md) |
-| Feast spike | [`Feast Production Feasibility Spike - DECISION_RECORD.md`](Feast%20Production%20Feasibility%20Spike%20-%20DECISION_RECORD.md) |
-| Scorer v2 實作計畫 | [`Scorer v2 Feast Runtime - IMPLEMENTATION_PLAN.md`](Scorer%20v2%20Feast%20Runtime%20-%20IMPLEMENTATION_PLAN.md) |
-| Feast refresh | [`Feast Online Refresh - IMPLEMENTATION_PLAN.md`](Feast%20Online%20Refresh%20-%20IMPLEMENTATION_PLAN.md) |
-| 執行計畫 | [`Scorer v2 Feast Runtime - WORKING_PLAN.md`](Scorer%20v2%20Feast%20Runtime%20-%20WORKING_PLAN.md) |
+| Mid-term 事故與 Option A/B 背景 | [`Mid-Term Feast Train-Serve Parity Incident - 20260522.md`](../incidents/Mid-Term%20Feast%20Train-Serve%20Parity%20Incident%20-%2020260522.md) |
+| Serving 事故（2026-05-19） | [`Feature Serving Incident - 20260519.md`](../incidents/Feature%20Serving%20Incident%20-%2020260519.md) |
+| Feast spike | [`Feast Production Feasibility Spike - DECISION_RECORD.md`](../decisions/Feast%20Production%20Feasibility%20Spike%20-%20DECISION_RECORD.md) |
+| Scorer v2 實作計畫 | [`Scorer v2 Feast Runtime - IMPLEMENTATION_PLAN.md`](../implementation/active/Scorer%20v2%20Feast%20Runtime%20-%20IMPLEMENTATION_PLAN.md) |
+| Feast refresh | [`Feast Online Refresh - IMPLEMENTATION_PLAN.md`](../implementation/active/Feast%20Online%20Refresh%20-%20IMPLEMENTATION_PLAN.md) |
+| 執行計畫 | [`Scorer v2 Feast Runtime - WORKING_PLAN.md`](../working/active/Scorer%20v2%20Feast%20Runtime%20-%20WORKING_PLAN.md) |
 
 ---
 

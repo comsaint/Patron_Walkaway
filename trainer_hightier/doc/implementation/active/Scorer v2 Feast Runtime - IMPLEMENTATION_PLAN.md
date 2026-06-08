@@ -2,7 +2,7 @@
 
 本文件是 **Implementation plan 層**，定義 `trainer_hightier` scorer v2 的 realization strategy、模組邊界、階段里程碑、風險與驗證策略。本文不展開 ticket 級工作清單；具體 task 拆解應放到後續 working / execution plan。
 
-**治理對齊**：特徵四層（raw / short / mid / long）、short-term PIT 語意、離線 PIT cache、hot pool 邊界以 [`Scorer Runtime Contract - SSOT.md`](Scorer%20Runtime%20Contract%20-%20SSOT.md) 為準；與本文衝突時先改 SSOT。
+**治理對齊**：特徵四層（raw / short / mid / long）、short-term PIT 語意、離線 PIT cache、hot pool 邊界以 [`Scorer Runtime Contract - SSOT.md`](../../ssot/Scorer%20Runtime%20Contract%20-%20SSOT.md) 為準；與本文衝突時先改 SSOT。
 
 ## Context
 
@@ -428,7 +428,7 @@ Implemented as deploy-managed **Feast refresh supervisor daemon** in `trainer_hi
 
 | 層級 | 文件 |
 |------|------|
-| SSOT | [`Scorer Runtime Contract - SSOT.md`](Scorer%20Runtime%20Contract%20-%20SSOT.md) |
-| 訓練管線四層 | [`Data pipeline - SSOT.md`](Data%20pipeline%20-%20SSOT.md) §5.1 |
+| SSOT | [`Scorer Runtime Contract - SSOT.md`](../../ssot/Scorer%20Runtime%20Contract%20-%20SSOT.md) |
+| 訓練管線四層 | [`Data pipeline - SSOT.md`](../../ssot/Data%20pipeline%20-%20SSOT.md) §5.1 |
 | Working plan | 待撰：`Scorer v2 Feast Runtime - WORKING_PLAN.md`（ticket 級拆解） |
 | Feast refresh | [`Feast Online Refresh - IMPLEMENTATION_PLAN.md`](Feast%20Online%20Refresh%20-%20IMPLEMENTATION_PLAN.md) |

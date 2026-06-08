@@ -1,7 +1,7 @@
 # trainer_hightier - Self-contained Implementation Plan
 
 > Historical reference. The current scorer packaging/runtime source of truth is
-> [`Scorer Runtime Contract - SSOT.md`](Scorer%20Runtime%20Contract%20-%20SSOT.md).
+> [`Scorer Runtime Contract - SSOT.md`](../../ssot/Scorer%20Runtime%20Contract%20-%20SSOT.md).
 > If this document conflicts with that SSOT, follow the SSOT.
 > This plan predates scorer v2 Feast runtime adoption. Its `fe_short_term_parquet`, `mid_term_snapshot_parquet`, and
 > `slow_patron_parquet` supplier rules are historical and must not be used to justify scorer v2 production fallback.

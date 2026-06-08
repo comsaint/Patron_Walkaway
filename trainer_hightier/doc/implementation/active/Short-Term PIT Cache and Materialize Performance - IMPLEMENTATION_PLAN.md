@@ -3,8 +3,8 @@
 本文件是 **Implementation Plan 層**，聚焦 `trainer_hightier` Step 3.5 short-term PIT 物化的可重用快取與效能改善策略。  
 治理規格（語意、邊界、供應契約）以上位 SSOT 為準：
 
-- `trainer_hightier/doc/Scorer Runtime Contract - SSOT.md`
-- `trainer_hightier/doc/Data pipeline - SSOT.md`
+- `trainer_hightier/doc/ssot/Scorer Runtime Contract - SSOT.md`
+- `trainer_hightier/doc/ssot/Data pipeline - SSOT.md`
 
 本文件定義 realization strategy、模組邊界、分階段交付、風險與驗證；不展開 ticket 級 task list。
 
@@ -107,6 +107,164 @@
 - 新 batch iterator 實作（一次排序/分塊產生，非 repeated global sort）。
 - 訓練專用 batch size 配置（落在 `config.py`，不使用環境變數控制）。
 - 效能回歸報告（wall time、CPU time、peak RAM、scan bytes）。
+
+### WS-B2: Event replay / streaming-state prototype
+
+**Goal**：研究是否能以「單次時間序 replay + per-entity rolling state」取代目前 per-batch bounded pool window SQL，在維持 exact per-bet PIT 語意的前提下，降低 full miss short PIT cold-build 成本。
+
+**Positioning**
+
+- 這是 prototype，不是 Phase 3 預設替換路徑。
+- 不改 production scorer contract；production 仍使用 live bounded PIT。
+- 不採 time-bucket / ASOF approximation；prototype 目標是輸出與現有 bounded DuckDB materializer 對齊。
+- 若 prototype 無法通過 parity 或無明顯效能收益，保留現有 month-sharded cache + month-pool reuse 策略。
+- 初版 prototype 已驗證 correctness，但未達效能 gate；不得接入 production/cache path。
+
+**Approach**
+
+目前 bounded materializer 對每個 target batch 建立 scoring bounds，從 hot pool 切出每筆 target bet 的歷史視窗，再用 DuckDB window function 計算 short features。Event replay prototype 改成：
+
+1. 對單一 miss month 載入 target month training bets 與必要 lookback cleaned bet rows。
+2. 依 `payout_complete_dtm, bet_id` 排序事件流。
+3. 以 `player_id` / `canonical_id` policy 維護 rolling state（15m、1h、7d、today、last-event）。
+4. 當事件是 target training bet 時，先從 state emit PIT features，再把該事件寫入 state。
+5. 輸出仍寫入現有 month shard path，並以現有 short PIT cache manifest 管理命中與失效。
+
+**Prototype scope**
+
+- 先只做 bounded 1-month / fixed sample，避免 full cold build 驗證成本。
+- 先覆蓋一小組高價值欄位：
+  - `fe__bets_cnt__w15m`
+  - `fe__wager_sum__w15m`
+  - `fe__time_since_last_bet_sec`
+  - `fe__odds__payout_odds_step_ratio`
+  - `bet__bets_cnt__w1h`
+- 使用既有 bounded DuckDB path 作 oracle；比較同一批 target `bet_id` 的欄位值。
+- 初版可用 Python / pandas / NumPy 實作以驗證語意；只有在 parity 成立後才考慮 Numba / Polars / Rust extension 等效能化。
+
+**State model**
+
+- Rolling sum/count：使用 timestamp queue + running sum/count。
+- Rolling stddev：使用 timestamp queue + running sum / sumsq / count。
+- Rolling max：使用 monotonic deque，避免 max 值過期後需重掃。
+- Interarrival：先由 last `pcd` 產生 gap，再將 gap 寫入對應 rolling stats。
+- Today counters：按 `canonical_id` / `gaming_day_event` 維護 bets so far、wager so far、first bet time。
+
+**Validation**
+
+- Correctness gate：prototype output vs bounded DuckDB output，核心欄位 mismatch 需可解釋；浮點欄位使用明確 tolerance。
+- Tie-break audit：同 timestamp / same canonical / same player rows 必須單獨抽樣檢查，確認是否對齊現有 `ORDER BY pcd, bet_id` 與 `1 MICROSECOND PRECEDING` 語意。
+- Performance gate：1-month sample 至少比 month-pool DuckDB bounded path 快 3x，且 peak RAM 不高於現有 path。
+- Resource gate：記錄 rows/sec、state key count、peak queue length、peak memory。
+
+**Expected impact**
+
+- 若成功，full miss short PIT cold build 目標從目前 overnight 等級降至數小時級。
+- 初版 Python deque replay 未達預期；後續預估不應沿用 2-8x 假設，需由 indexed replay v2 實測重新校準。
+- Warm rerun 仍優先依賴現有 month-sharded primitive cache；event replay 主要改善 miss / partial miss 場景。
+
+**Prototype result (202605 real-data sample)**
+
+已建立 `short_term_pit_replay_prototype.py`，在真實 202605 cleaned pool 上對 5 個核心欄位完成 bounded DuckDB oracle parity：
+
+- `fe__bets_cnt__w15m`
+- `fe__wager_sum__w15m`
+- `fe__time_since_last_bet_sec`
+- `fe__odds__payout_odds_step_ratio`
+- `bet__bets_cnt__w1h`
+
+Benchmark 結果：
+
+| Target rows | Replay | Month-pool bounded DuckDB | Speedup | Parity |
+|-------------|--------|---------------------------|---------|--------|
+| 1,000 | 5.15s | 3.04s | 0.59x | pass |
+| 10,000 | 12.14s | 9.26s | 0.76x | pass |
+| 50,000 | 46.70s | 42.09s | 0.90x | pass |
+
+Result artifacts:
+
+- `out/replay_benchmark_202605/benchmark_report.json`
+- `out/replay_benchmark_202605_scaling_summary.json`
+
+**Interpretation**
+
+- Correctness is validated for the first slice, so the idea failed on performance rather than PIT semantics.
+- The current bounded baseline is stronger than the original comparison target because month hot pool reuse avoids repeated parquet reads and DuckDB still executes joins/window functions in vectorized C++.
+- The Python prototype does not implement true O(1) / O(log n) streaming-state emit. It scans `state.events` at target emission time for 15m, 1h, and row-lag semantics, so high-frequency patrons with queues around 20k rows create substantial Python overhead.
+- Exact PIT semantics require per-target `pool_start`, `scoring_pcd - 1 microsecond`, RANGE lower-bound behavior, same-timestamp tie handling, and row-based lag alignment. These constraints make a simple rolling queue insufficient.
+
+**Decision**
+
+WS-B2 initial prototype is a correctness proof only. It should remain out of production and out of the main short PIT cache path unless a second implementation demonstrates clear speedup against the month-pool DuckDB baseline.
+
+**Indexed v2 result (202605 real-data sample, regrouped gate)**
+
+Follow-up prototype `short_term_pit_replay_indexed_prototype.py` replaces deque scans with per-entity NumPy arrays, prefix sums, and `searchsorted`. The latest regroup benchmark no longer treats full 17-column production scorer coverage as the prototype gate. Instead, it uses the 16-column production short PIT gate with `fe__odds__payout_odds_z__w1h` temporarily marked as prototype out-of-gate because that column still has edge mismatches and is low importance in recent models.
+
+| Target rows | Indexed replay | Month-pool bounded DuckDB | Speedup | 16-column gate parity |
+|-------------|----------------|---------------------------|---------|-----------------------|
+| 10,000 | 7.91s | 11.62s | 1.47x | pass |
+| 50,000 | 29.98s | 58.97s | 1.97x | pass |
+| 100,000 | 47.22s | 130.28s | 2.76x | pass |
+
+Artifacts:
+
+- `out/replay_benchmark_202605_indexed_gate16_scaling_summary.json`
+- `out/replay_benchmark_202605_indexed_limit10000_gate16_ignore_odds_z_w1h/benchmark_report.json`
+- `out/replay_benchmark_202605_indexed_limit50000_gate16_ignore_odds_z_w1h/benchmark_report.json`
+- `out/replay_benchmark_202605_indexed_limit100000_gate16_ignore_odds_z_w1h/benchmark_report.json`
+
+Interpretation:
+
+- Correctness is now strong for the current prototype decision gate: all 16 in-gate columns match the bounded DuckDB oracle across 10k / 50k / 100k samples.
+- This is not yet full production scorer parity. The production short PIT gate remains 17 columns; `fe__odds__payout_odds_z__w1h` is only ignored for prototype go/no-go, not formally removed from the scorer contract.
+- Speedup improves with target count and clears the feasibility gates (50k >= 1.5x, 100k >= 2.0x), but it does not clear the 3x integration gate.
+- Phase timing shows the main residual bottleneck is now the Python emit path rather than pool loading or oracle comparison.
+
+**Decision update:** indexed v2 should continue as a prototype optimization track, not as an integration candidate yet. The next decision gate is emit-path optimization plus either refreshed 100k benchmark evidence or full-month cold-build profiling before any Step 3.5 wiring is considered.
+
+### WS-B3: Indexed replay / vectorized state prototype
+
+**Goal**：保留 WS-B2 exact PIT 語意，但用 entity-level indexed arrays / prefix sums 取代 Python row-loop + emit-time deque scan，重新驗證 event replay 是否有實際效能空間。
+
+**Approach**
+
+1. 以 DuckDB 載入同一 month-pruned cleaned pool 與 target sample，但只抽 prototype 所需欄位。
+2. 將 pool 與 targets 對齊到 `(canonical_id, player_id)`，依 `canonical_id, player_id, payout_complete_dtm, bet_id` 排序。
+3. 每個 entity 轉為 NumPy arrays：
+   - `pcd_ns`：int64 timestamp。
+   - `bet_id`：排序 tie-break key。
+   - `wager` / `wager_prefix_sum`。
+   - `payout_odds`。
+4. 對 entity targets 批次使用 `np.searchsorted` 計算：
+   - 15m count/sum。
+   - 1h count。
+   - row-based lag / odds step。
+5. 避免在 target emit 時掃整段 entity history；所有窗口查詢必須是 O(log n) 或 prefix-sum O(1)。
+6. 加入 phase timing：load targets、load pool、canonical attach、sort/group、build arrays、emit、write、oracle、parity。
+
+**Prototype scope**
+
+- 不新增 production integration。
+- 目前 prototype gate 以 production scorer short PIT 17 欄中的 16 欄為準，暫時排除 `fe__odds__payout_odds_z__w1h`。
+- 不使用 time-bucket / ASOF approximation。
+- 不引入多檔大型架構；若需要新檔，命名為 `short_term_pit_replay_indexed_prototype.py`。
+
+**Validation gate**
+
+- Parity：目前 202605 regroup benchmark 以 16-column gate 為準，10k / 50k / 100k sample 全欄位 0 mismatch。
+- Performance：50k target 至少 1.5x 快於 month-pool bounded DuckDB，100k target 至少 2x 才能保留 replay 方向。
+- Final integration gate：仍需達到 3x speedup 且 peak RAM 不高於現有 path。
+- 若 16-column gate parity 失敗，或 100k 仍低於 2x，停止 event replay 方向，後續集中在 DuckDB month-pool / query-level optimization。
+- 若 parity 穩定但 100k 仍低於 3x，下一輪優先優化 emit path，而不是直接擴更多 feature family。
+
+**Risks**
+
+- Tie-break 或 timestamp precision 導致 train-serve parity drift。
+- Rolling max / stddev / interarrival state 實作錯誤。
+- 純 Python row loop 可能抵消演算法收益。
+- 高頻 patron 的 7d rolling state 可能造成 RAM 壓力。
+- Indexed v2 若仍以 pandas object/Timestamp 執行核心 loop，可能重複 WS-B2 的瓶頸；核心計算必須落在 NumPy int64/float64 arrays。
 
 ## WS-C: Observability and operational controls
 

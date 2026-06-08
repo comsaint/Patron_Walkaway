@@ -2,8 +2,8 @@
 
 本文件屬於 **Working / execution plan** 層，承接：
 
-- [Cache Redesign - SSOT.md](./Cache%20Redesign%20-%20SSOT.md)
-- [Cache Redesign - IMPLEMENTATION_PLAN.md](./Cache%20Redesign%20-%20IMPLEMENTATION_PLAN.md)
+- [Cache Redesign - SSOT.md](../../ssot/Cache%20Redesign%20-%20SSOT.md)
+- [Cache Redesign - IMPLEMENTATION_PLAN.md](../../implementation/active/Cache%20Redesign%20-%20IMPLEMENTATION_PLAN.md)
 
 本文件只拆 **Phase 1：Source Identity Foundation**。Phase 2+ 僅保留摘要與 non-goals，不在本輪展開 ticket 級任務。
 
@@ -199,8 +199,8 @@ Phase 1 完成當且僅當：
 
 | Phase | Theme | Prerequisite |
 |-------|-------|--------------|
-| Phase 2 | Entity set + ADT rank；替換 cleaned bet segment | Phase 1 stable diff + report |
-| Phase 3 | Labels + feature primitive cache + quantile delta fill | Phase 2 entity set |
+| Phase 2 | Entity set + selected top-x membership cache；ADT rank 僅作推導/provenance；替換 cleaned bet segment | Phase 1 stable diff + report |
+| Phase 3 | Labels + feature primitive cache + quantile delta fill；short PIT cold-build 採 month-level hot-pool reuse，full cold build 不作互動式 smoke | Phase 2 entity set |
 | Phase 4 | Assembly cache + full cache_report + validation hooks | Phase 3 primitives |
 | Phase 5 | Retention、compact、移除舊 cache path | Phase 4 stable in production runs |
 
@@ -237,4 +237,4 @@ Production snapshot `data/`（table-dir layout）：
 
 **結論：** full SHA 成本可接受（約佔上次 `prepare_training_frame` 475 s 的 4.6%）。Phase 2 前不必降級 correctness；footer shortcut 留待實測成為瓶頸再決策。
 
-**下一步：** [Cache Redesign - WORKING_PLAN Phase 2.md](./Cache%20Redesign%20-%20WORKING_PLAN%20Phase%202.md)
+**下一步：** [Cache Redesign - WORKING_PLAN Phase 2.md](Cache%20Redesign%20-%20WORKING_PLAN%20Phase%202.md)

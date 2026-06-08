@@ -2,7 +2,7 @@
 
 Short-term: all ``bet__*`` and short-horizon ``fe__*`` share ``SUPPLIER_SHORT_TERM_PIT``
 (point-in-time per ``bet_id``). Training may persist an offline PIT cache parquet; serving
-uses live bounded PIT (see ``doc/Scorer Runtime Contract - SSOT.md``).
+uses live bounded PIT (see ``doc/ssot/Scorer Runtime Contract - SSOT.md``).
 """
 
 from __future__ import annotations

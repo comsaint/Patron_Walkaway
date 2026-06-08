@@ -1,10 +1,10 @@
 # Production Flight Recorder — Runbook
 
 > 操作手冊（Runbook 層）。架構與元件定義見
-> [Production Flight Recorder - IMPLEMENTATION_PLAN.md](Production%20Flight%20Recorder%20-%20IMPLEMENTATION_PLAN.md)；
-> 任務拆解見 [Production Flight Recorder - WORKING_PLAN.md](Production%20Flight%20Recorder%20-%20WORKING_PLAN.md)。
+> [Production Flight Recorder - IMPLEMENTATION_PLAN.md](../../implementation/active/Production%20Flight%20Recorder%20-%20IMPLEMENTATION_PLAN.md)；
+> 任務拆解見 [Production Flight Recorder - WORKING_PLAN.md](../../working/active/Production%20Flight%20Recorder%20-%20WORKING_PLAN.md)。
 > Scorer / validator 業務語意仍以
-> [Scorer Runtime Contract - SSOT.md](Scorer%20Runtime%20Contract%20-%20SSOT.md) 為準。
+> [Scorer Runtime Contract - SSOT.md](../../ssot/Scorer%20Runtime%20Contract%20-%20SSOT.md) 為準。
 
 本 Runbook 說明如何在 **deploy bundle 機器**上啟用 flight recorder、與既有 `collect_debug_bundle` 並行運作，以及事後打包與離線分析。
 
