@@ -113,6 +113,24 @@ def _columns_fingerprint(out_columns: tuple[str, ...]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _primitive_schema_fingerprint(trial_columns: tuple[str, ...]) -> str:
+    """Stable primitive cache key: registry ``fe__*`` columns are not part of the key."""
+    payload = "|".join(("bet_id", *trial_columns))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _shard_parquet_column_names(shard_parquet: Path) -> frozenset[str]:
+    """Return column names present in a month shard parquet."""
+    names = pq.ParquetFile(Path(shard_parquet).resolve()).schema_arrow.names
+    return frozenset(str(name) for name in names)
+
+
+def _shard_covers_requested_columns(shard_parquet: Path, out_columns: tuple[str, ...]) -> bool:
+    """Return True when cached shard parquet contains every requested output column."""
+    have = _shard_parquet_column_names(shard_parquet)
+    return all(str(col) in have for col in out_columns)
+
+
 def _parquet_quick_stat(path: Path) -> dict[str, Any]:
     resolved = Path(path).resolve()
     stat = resolved.stat()
@@ -260,6 +278,7 @@ def _shard_manifest_compatible(
     partition_inventory_fp: str | None,
     entity_set_fp: str | None,
     columns_fp: str,
+    primitive_fp: str,
     universe_fp: str,
     num_rows: int,
     out_stat: dict[str, Any],
@@ -283,11 +302,16 @@ def _shard_manifest_compatible(
         have_inv = manifest.get("partition_inventory_fingerprint_sha256")
         if str(have_inv or "").strip() != partition_inventory_fp:
             return REASON_SOURCE_CHANGED
-    schema_fp = str(
-        manifest.get("output_schema_fingerprint") or manifest.get("columns_fingerprint") or "",
-    ).strip()
-    if schema_fp != columns_fp:
-        return REASON_SCHEMA_CHANGED
+    have_primitive = str(manifest.get("primitive_schema_fingerprint", "")).strip()
+    if have_primitive:
+        if have_primitive != primitive_fp:
+            return REASON_SCHEMA_CHANGED
+    else:
+        schema_fp = str(
+            manifest.get("output_schema_fingerprint") or manifest.get("columns_fingerprint") or "",
+        ).strip()
+        if schema_fp != columns_fp:
+            return REASON_SCHEMA_CHANGED
     if str(manifest.get("training_universe_fingerprint", "")).strip() != universe_fp:
         return REASON_UNIVERSE_CHANGED
     if int(manifest.get("training_universe_num_rows", -1)) != int(num_rows):
@@ -311,6 +335,7 @@ def _write_shard_manifest(
     entity_set_fp: str | None,
     source_invalid_months: tuple[str, ...],
     columns_fp: str,
+    primitive_fp: str,
     universe_fp: str,
     num_rows: int,
     out_stat: dict[str, Any],
@@ -330,6 +355,7 @@ def _write_shard_manifest(
         "partition_inventory_fingerprint_sha256": partition_inventory_fp,
         "output_schema_fingerprint": columns_fp,
         "columns_fingerprint": columns_fp,
+        "primitive_schema_fingerprint": primitive_fp,
         "training_universe_fingerprint": universe_fp,
         "training_universe_num_rows": int(num_rows),
         "output_parquet_stat": out_stat,
@@ -342,6 +368,7 @@ def plan_short_term_pit_cache(
     training_parquet: Path,
     cache_root: Path,
     out_columns: tuple[str, ...],
+    trial_columns: tuple[str, ...] = (),
     canonical_mapping_parquet: Path,
     batch_size: int,
     duckdb_runtime: DuckDbRuntimeConfig,
@@ -355,6 +382,7 @@ def plan_short_term_pit_cache(
     code_fp = _code_fingerprint()
     policy_fp = _policy_fingerprint(batch_size=int(batch_size))
     columns_fp = _columns_fingerprint(out_columns)
+    primitive_fp = _primitive_schema_fingerprint(trial_columns)
     mapping_sha256 = _sha256_file(Path(canonical_mapping_parquet).resolve())
     shard_months = list_training_payout_months(training_parquet, duckdb_runtime=duckdb_runtime)
     source_invalid = _source_invalidated_shards(shard_months, recompute_months=recompute_months)
@@ -394,10 +422,13 @@ def plan_short_term_pit_cache(
             partition_inventory_fp=partition_inventory_fingerprint_sha256,
             entity_set_fp=entity_set_fingerprint_sha256_hex,
             columns_fp=columns_fp,
+            primitive_fp=primitive_fp,
             universe_fp=universe_fp,
             num_rows=num_rows,
             out_stat=_parquet_quick_stat(shard_p),
         )
+        if reason is None and not _shard_covers_requested_columns(shard_p, out_columns):
+            reason = REASON_SCHEMA_CHANGED
         if reason is None:
             hit.append(yyyymm)
         else:
@@ -572,6 +603,7 @@ def materialize_fe_derived_short_term_parquet_with_cache(
         training_parquet=tp,
         cache_root=root,
         out_columns=out_cols,
+        trial_columns=trial_columns,
         canonical_mapping_parquet=cmap,
         batch_size=int(batch_size),
         duckdb_runtime=duckdb_runtime,
@@ -583,6 +615,7 @@ def materialize_fe_derived_short_term_parquet_with_cache(
     code_fp = _code_fingerprint()
     policy_fp = _policy_fingerprint(batch_size=int(batch_size))
     columns_fp = _columns_fingerprint(out_cols)
+    primitive_fp = _primitive_schema_fingerprint(trial_columns)
     mapping_sha256 = _sha256_file(cmap)
     shard_months = list_training_payout_months(tp, duckdb_runtime=duckdb_runtime)
 
@@ -652,6 +685,7 @@ def materialize_fe_derived_short_term_parquet_with_cache(
             entity_set_fp=entity_set_fingerprint_sha256_hex,
             source_invalid_months=source_invalid_months,
             columns_fp=columns_fp,
+            primitive_fp=primitive_fp,
             universe_fp=universe_fp,
             num_rows=num_rows,
             out_stat=_parquet_quick_stat(shard_out),

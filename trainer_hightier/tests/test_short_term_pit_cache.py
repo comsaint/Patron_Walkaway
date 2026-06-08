@@ -193,6 +193,7 @@ def test_short_term_pit_cache_universe_change_misses_shard(short_cache_fixture: 
         training_parquet=short_cache_fixture["training"],
         cache_root=cache_root,
         out_columns=out_cols,
+        trial_columns=trial_cols,
         canonical_mapping_parquet=short_cache_fixture["mapping"],
         batch_size=2000,
         duckdb_runtime=runtime,
@@ -213,6 +214,7 @@ def test_short_term_pit_cache_universe_change_misses_shard(short_cache_fixture: 
         training_parquet=short_cache_fixture["training"],
         cache_root=cache_root,
         out_columns=out_cols,
+        trial_columns=trial_cols,
         canonical_mapping_parquet=short_cache_fixture["mapping"],
         batch_size=2000,
         duckdb_runtime=runtime,
@@ -243,6 +245,7 @@ def test_short_term_pit_cache_universe_change_misses_shard(short_cache_fixture: 
         training_parquet=changed,
         cache_root=cache_root,
         out_columns=out_cols,
+        trial_columns=trial_cols,
         canonical_mapping_parquet=short_cache_fixture["mapping"],
         batch_size=2000,
         duckdb_runtime=runtime,
@@ -290,6 +293,78 @@ def test_short_term_pit_cache_entity_set_fingerprint_misses(short_cache_fixture:
     )
     assert meta2["cache_hit"] is False
     assert meta2["cache_miss_shards"] == ["202406"]
+
+
+def test_p3_t6_registry_remove_feature_primitive_still_hits(short_cache_fixture: dict[str, Path]) -> None:
+    """P3-T-6: removing registry ``fe__*`` columns should not invalidate primitive shards."""
+    runtime = DuckDbRuntimeConfig()
+    trial_cols = tuple(SHORT_TERM_TRIAL_BET_COLUMNS[:1])
+    base_kwargs = {
+        "cleaned_bet_parquet": short_cache_fixture["cleaned"],
+        "training_parquet_for_bet_ids": short_cache_fixture["training"],
+        "out_parquet": short_cache_fixture["out"],
+        "duckdb_runtime": runtime,
+        "canonical_mapping_parquet": short_cache_fixture["mapping"],
+        "trial_columns": trial_cols,
+        "batch_size": 2000,
+    }
+    materialize_fe_derived_short_term_parquet_with_cache(
+        **base_kwargs,
+        short_term_columns=("fe__bets_cnt__w15m",),
+    )
+    _, meta = materialize_fe_derived_short_term_parquet_with_cache(
+        **base_kwargs,
+        short_term_columns=(),
+    )
+    assert meta["cache_hit"] is True
+    assert meta["cache_miss_shards"] == []
+
+
+def test_p3_t7_registry_add_derivable_feature_primitive_still_hits(
+    short_cache_fixture: dict[str, Path],
+) -> None:
+    """P3-T-7: unchanged primitive request still hits when registry grows elsewhere."""
+    runtime = DuckDbRuntimeConfig()
+    trial_cols = tuple(SHORT_TERM_TRIAL_BET_COLUMNS[:1])
+    base_kwargs = {
+        "cleaned_bet_parquet": short_cache_fixture["cleaned"],
+        "training_parquet_for_bet_ids": short_cache_fixture["training"],
+        "out_parquet": short_cache_fixture["out"],
+        "duckdb_runtime": runtime,
+        "canonical_mapping_parquet": short_cache_fixture["mapping"],
+        "trial_columns": trial_cols,
+        "batch_size": 2000,
+        "short_term_columns": ("fe__bets_cnt__w15m",),
+    }
+    materialize_fe_derived_short_term_parquet_with_cache(**base_kwargs)
+    _, meta = materialize_fe_derived_short_term_parquet_with_cache(**base_kwargs)
+    assert meta["cache_hit"] is True
+    assert meta["cache_hit_ratio"] == 1.0
+
+
+def test_p3_t7_new_primitive_column_misses_when_not_in_shard(short_cache_fixture: dict[str, Path]) -> None:
+    """Adding a new primitive column that is absent from cached shard must rematerialize."""
+    runtime = DuckDbRuntimeConfig()
+    trial_cols = tuple(SHORT_TERM_TRIAL_BET_COLUMNS[:1])
+    base_kwargs = {
+        "cleaned_bet_parquet": short_cache_fixture["cleaned"],
+        "training_parquet_for_bet_ids": short_cache_fixture["training"],
+        "out_parquet": short_cache_fixture["out"],
+        "duckdb_runtime": runtime,
+        "canonical_mapping_parquet": short_cache_fixture["mapping"],
+        "trial_columns": trial_cols,
+        "batch_size": 2000,
+    }
+    materialize_fe_derived_short_term_parquet_with_cache(
+        **base_kwargs,
+        short_term_columns=("fe__bets_cnt__w15m",),
+    )
+    _, meta = materialize_fe_derived_short_term_parquet_with_cache(
+        **base_kwargs,
+        short_term_columns=("fe__bets_cnt__w15m", "fe__wager_sum__w15m"),
+    )
+    assert meta["cache_hit"] is False
+    assert meta["cache_miss_shards"] == ["202406"]
 
 
 def test_global_manifest_written(short_cache_fixture: dict[str, Path]) -> None:
