@@ -38,3 +38,38 @@ def test_log_artifact_to_run_safe_success() -> None:
             )
     assert ok is True
     mock_client.log_artifact.assert_called_once()
+
+
+def test_safe_start_run_swallows_unicode_encode_error_on_exit() -> None:
+    """Teardown must not fail when MLflow prints emoji to cp932 stdout."""
+    inner_cm = MagicMock()
+    inner_cm.__enter__.return_value = MagicMock()
+    inner_cm.__exit__.side_effect = UnicodeEncodeError(
+        "cp932",
+        "\U0001f3c3",
+        0,
+        1,
+        "illegal multibyte sequence",
+    )
+    with patch.object(ma, "is_mlflow_available", return_value=True):
+        with patch.object(ma, "_configure_stdio_replace_on_encode_error"):
+            with patch("mlflow.set_experiment"):
+                with patch("mlflow.start_run", return_value=inner_cm):
+                    with ma.safe_start_run(run_name="20260609-test"):
+                        pass
+    inner_cm.__exit__.assert_called_once()
+
+
+def test_configure_stdio_replace_on_encode_error_is_idempotent() -> None:
+    """Stdio guard should only reconfigure streams once per process."""
+    ma._stdio_encode_guard_configured = False
+    mock_stdout = MagicMock()
+    mock_stderr = MagicMock()
+    with patch.object(ma, "sys") as mock_sys:
+        mock_sys.stdout = mock_stdout
+        mock_sys.stderr = mock_stderr
+        ma._configure_stdio_replace_on_encode_error()
+        ma._configure_stdio_replace_on_encode_error()
+    assert mock_stdout.reconfigure.call_count == 1
+    assert mock_stderr.reconfigure.call_count == 1
+    ma._stdio_encode_guard_configured = False
