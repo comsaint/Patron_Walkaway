@@ -11,12 +11,15 @@ Other packages may still *call* shared helpers; only **config** stays local here
 
 from __future__ import annotations
 
+import calendar
+import hashlib
+import json
 import os
 
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 # Installed / editable package directory ``…/trainer_hightier/`` (contracts, modules).
@@ -129,6 +132,22 @@ SHORT_TERM_PIT_CACHE_SCHEMA_VERSION: Final[int] = 2
 SHORT_TERM_PIT_SUPPLIER_FAMILY: Final[str] = "short_term:w1h"
 # Training materialize batch size (decoupled from scorer cycle size for offline throughput).
 DEFAULT_TRAINING_SHORT_TERM_MATERIALIZE_BATCH_SIZE: Final[int] = 100_000
+STEP35_MISS_PATH_INDEXED_REPLAY: Final[str] = "indexed_replay"
+STEP35_MISS_PATH_BOUNDED: Final[str] = "bounded_duckdb"
+DEFAULT_STEP35_MISS_PATH: Final[str] = STEP35_MISS_PATH_INDEXED_REPLAY
+INDEXED_REPLAY_GATE_MODE_HARD_FE: Final[str] = "hard_fe_soft_bet_pack"
+INDEXED_REPLAY_MATERIALIZER_VERSION: Final[str] = "indexed_replay_emit_opt_v1"
+LEGACY_BET_PACK_1H_COLUMNS: Final[tuple[str, ...]] = (
+    "bet__bets_cnt__w1h",
+    "bet__wager_sum__w1h",
+    "bet__back_bet_ratio__w1h",
+    "bet__payout_odds_avg__w1h",
+)
+LEGACY_BET_PACK_WAIVER_MAX_MISMATCH_RATIO: Final[float] = 1e-4
+LEGACY_BET_PACK_WAIVER_ROOT_CAUSE: Final[str] = (
+    "indexed full-month replay includes canonical alias player history that the "
+    "bounded 2000-row batch pool does not include"
+)
 # Neighbor months included when invalidating shards after partition inventory deltas.
 SHORT_TERM_PIT_SOURCE_NEIGHBOR_MONTHS: Final[int] = 1
 # Production snapshot lifecycle (HK wall-clock).
@@ -365,6 +384,233 @@ TRAINING_DATA_SCOPE_TEST_UNBOUNDED: Final[TrainingDataScopeConfig] = TrainingDat
     gaming_day_event_min=None,
     gaming_day_event_max=None,
 )
+
+DEFAULT_RECENT_FULL_MONTHS: Final[int] = 3
+DATA_COMPLETENESS_MODE_WARN: Final[str] = "warn"
+DATA_COMPLETENESS_MODE_STRICT: Final[str] = "strict"
+TRAINING_RUN_KIND_SPEED: Final[str] = "speed_iteration"
+TRAINING_RUN_KIND_RELEASE: Final[str] = "release_promoted"
+NEG_SAMPLE_SCOPE_TRAIN_ONLY: Final[str] = "train_only"
+DataCompletenessMode = Literal["warn", "strict"]
+TrainingRunKind = Literal["speed_iteration", "release_promoted"]
+
+
+def _policy_blob_sha256(payload: dict[str, object]) -> str:
+    """Return SHA-256 hex digest of a sorted JSON policy blob."""
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class TrainingScopePolicy:
+    """Target-row horizon policy (SSOT TA-001 / TA-005).
+
+    When ``recent_full_months`` is ``None``, horizon filtering is disabled (legacy all-history
+    rows within ``TrainingDataScopeConfig``).
+    """
+
+    recent_full_months: int | None = None
+    include_current_partial_month: bool = True
+    as_of_date: date | None = None
+    data_completeness_mode: DataCompletenessMode = DATA_COMPLETENESS_MODE_WARN
+
+    def manifest_block(self) -> dict[str, object]:
+        """JSON-serializable policy fragment for run artifacts."""
+        return {
+            "recent_full_months": self.recent_full_months,
+            "include_current_partial_month": bool(self.include_current_partial_month),
+            "as_of_date": self.as_of_date.isoformat() if self.as_of_date is not None else None,
+            "data_completeness_mode": str(self.data_completeness_mode),
+        }
+
+
+@dataclass(frozen=True)
+class ResolvedTrainingScope:
+    """Resolved target months and date bounds for a training run."""
+
+    policy: TrainingScopePolicy
+    as_of_date: date
+    horizon_enabled: bool
+    target_months: tuple[str, ...]
+    partial_target_months: frozenset[str]
+    target_start_date: date | None
+    target_end_date: date | None
+
+    def manifest_block(self) -> dict[str, object]:
+        """JSON-serializable resolved scope for run artifacts."""
+        return {
+            **self.policy.manifest_block(),
+            "horizon_enabled": bool(self.horizon_enabled),
+            "as_of_date_resolved": self.as_of_date.isoformat(),
+            "target_months": list(self.target_months),
+            "partial_target_months": sorted(self.partial_target_months),
+            "target_start_date": (
+                self.target_start_date.isoformat() if self.target_start_date is not None else None
+            ),
+            "target_end_date": (
+                self.target_end_date.isoformat() if self.target_end_date is not None else None
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class SamplePolicy:
+    """Train-only negative downsampling policy (SSOT TA-008)."""
+
+    neg_sample_frac: float = 1.0
+    neg_sample_seed: int = DEFAULT_RANDOM_SEED
+    neg_sample_scope: str = NEG_SAMPLE_SCOPE_TRAIN_ONLY
+
+    def __post_init__(self) -> None:
+        frac = float(self.neg_sample_frac)
+        if not (0.0 < frac <= 1.0):
+            raise ValueError(
+                f"neg_sample_frac must be in (0, 1], got {self.neg_sample_frac!r}",
+            )
+        if str(self.neg_sample_scope) != NEG_SAMPLE_SCOPE_TRAIN_ONLY:
+            raise ValueError(
+                f"neg_sample_scope must be {NEG_SAMPLE_SCOPE_TRAIN_ONLY!r}, "
+                f"got {self.neg_sample_scope!r}",
+            )
+
+    def manifest_block(self) -> dict[str, object]:
+        """JSON-serializable sampling policy fragment."""
+        return {
+            "neg_sample_frac": float(self.neg_sample_frac),
+            "neg_sample_seed": int(self.neg_sample_seed),
+            "neg_sample_scope": str(self.neg_sample_scope),
+            "enabled": float(self.neg_sample_frac) < 1.0,
+        }
+
+
+@dataclass(frozen=True)
+class FeatureScreeningPolicy:
+    """Optional pre-Step-5 feature screening hook (default off)."""
+
+    enabled: bool = False
+    manifest_path: Path | None = None
+
+    def manifest_block(self) -> dict[str, object]:
+        """JSON-serializable screening policy fragment."""
+        mp = self.manifest_path
+        return {
+            "enabled": bool(self.enabled),
+            "manifest_path": str(mp.resolve()) if mp is not None else None,
+        }
+
+
+def _shift_calendar_month(yyyymm: str, *, delta_months: int) -> str:
+    """Shift ``YYYYMM`` by *delta_months* on the calendar axis."""
+    ym = str(yyyymm).strip()
+    if len(ym) != 6 or not ym.isdigit():
+        raise ValueError(f"month must be six YYYYMM digits, got {yyyymm!r}")
+    y = int(ym[:4])
+    m = int(ym[4:6])
+    m += int(delta_months)
+    while m < 1:
+        m += 12
+        y -= 1
+    while m > 12:
+        m -= 12
+        y += 1
+    return f"{y:04d}{m:02d}"
+
+
+def _month_last_day(year: int, month: int) -> date:
+    """Return the last calendar day of ``year``/``month``."""
+    _, last = calendar.monthrange(year, month)
+    return date(year, month, last)
+
+
+def resolve_training_scope(
+    policy: TrainingScopePolicy,
+    *,
+    as_of: date | None = None,
+) -> ResolvedTrainingScope:
+    """Resolve target months and inclusive date bounds from horizon policy."""
+    as_of_date = policy.as_of_date or as_of or date.today()
+    if policy.recent_full_months is None:
+        return ResolvedTrainingScope(
+            policy=policy,
+            as_of_date=as_of_date,
+            horizon_enabled=False,
+            target_months=(),
+            partial_target_months=frozenset(),
+            target_start_date=None,
+            target_end_date=None,
+        )
+    recent = int(policy.recent_full_months)
+    if recent <= 0:
+        raise ValueError(f"recent_full_months must be positive when set, got {recent!r}")
+    anchor_y, anchor_m = as_of_date.year, as_of_date.month
+    anchor_ym = f"{anchor_y:04d}{anchor_m:02d}"
+    full_months = [_shift_calendar_month(anchor_ym, delta_months=-offset) for offset in range(recent, 0, -1)]
+    target_months = list(full_months)
+    partial: set[str] = set()
+    if policy.include_current_partial_month:
+        if anchor_ym not in target_months:
+            target_months.append(anchor_ym)
+        partial.add(anchor_ym)
+    earliest_ym = min(target_months)
+    start = date(int(earliest_ym[:4]), int(earliest_ym[4:6]), 1)
+    if partial:
+        end = as_of_date
+    else:
+        latest_ym = max(full_months)
+        end = _month_last_day(int(latest_ym[:4]), int(latest_ym[4:6]))
+    return ResolvedTrainingScope(
+        policy=policy,
+        as_of_date=as_of_date,
+        horizon_enabled=True,
+        target_months=tuple(sorted(target_months)),
+        partial_target_months=frozenset(partial),
+        target_start_date=start,
+        target_end_date=end,
+    )
+
+
+def training_scope_policy_fingerprint(resolved: ResolvedTrainingScope) -> str:
+    """Fingerprint for target horizon policy (distinct from L0 ``training_scope_fingerprint``)."""
+    return _policy_blob_sha256(
+        {
+            "kind": "training_scope_policy_v1",
+            **resolved.manifest_block(),
+        },
+    )
+
+
+def sample_policy_fingerprint(policy: SamplePolicy) -> str:
+    """Fingerprint for train-only negative downsampling policy."""
+    return _policy_blob_sha256({"kind": "sample_policy_v1", **policy.manifest_block()})
+
+
+def feature_selection_policy_fingerprint(policy: FeatureScreeningPolicy) -> str:
+    """Fingerprint for optional feature screening hook policy."""
+    return _policy_blob_sha256({"kind": "feature_screening_policy_v1", **policy.manifest_block()})
+
+
+def validate_sample_policy_for_run(
+    policy: SamplePolicy,
+    *,
+    run_kind: TrainingRunKind,
+) -> None:
+    """Fail-fast when release runs attempt downsampling."""
+    if run_kind == TRAINING_RUN_KIND_RELEASE and float(policy.neg_sample_frac) != 1.0:
+        raise ValueError(
+            "release_promoted runs require neg_sample_frac=1.0; "
+            f"got neg_sample_frac={policy.neg_sample_frac!r}",
+        )
+
+
+def validate_feature_screening_policy(policy: FeatureScreeningPolicy) -> None:
+    """Fail-fast when screening is enabled without a readable manifest path."""
+    if not policy.enabled:
+        return
+    if policy.manifest_path is None:
+        raise ValueError("feature_screening enabled=True requires manifest_path")
+    path = Path(policy.manifest_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"feature_screening manifest not found at {path}")
 
 
 @dataclass(frozen=True)
