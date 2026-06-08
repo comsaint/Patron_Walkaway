@@ -14,7 +14,170 @@ from trainer_hightier.feature_experiment.materialize_fe_derived import (
     materialize_fe_derived_short_term_parquet,
 )
 from trainer_hightier.serving.offline_serving_backtest import resolve_hot_pool_player_ids
+from trainer_hightier.utils.cleaned_bet_pool_read import (
+    cleaned_bet_pool_read_parquet_sql,
+    gaming_months_for_bounded_pool,
+    open_month_hot_pool_session,
+)
 from trainer_hightier.utils.trial_bet_behavior_1h import materialize_trial_bet_behavior_1h
+
+
+def test_gaming_months_for_bounded_pool_payout_month_prunes_neighbors() -> None:
+    """Month-sharded materialize should only need prior + target partition months."""
+    got = gaming_months_for_bounded_pool(
+        pool_start=pd.Timestamp("2025-01-15 12:00:00", tz="UTC").to_pydatetime(),
+        pool_end=pd.Timestamp("2025-01-31 23:00:00", tz="UTC").to_pydatetime(),
+        payout_yyyymm="202501",
+    )
+    assert got == ("202412", "202501")
+
+
+def test_cleaned_bet_pool_read_parquet_sql_scopes_partitions(tmp_path: Path) -> None:
+    """Pool reads should target ``gaming_month`` dirs, not the full cleaned hive."""
+    root = tmp_path / "cleaned"
+    for ym in ("202412", "202501", "202502"):
+        (root / f"gaming_month={ym}" / "gaming_day_key=2025-01-01").mkdir(parents=True)
+        pq.write_table(
+            pa.table({"bet_id": pa.array([1.0], type=pa.float64())}),
+            root / f"gaming_month={ym}" / "gaming_day_key=2025-01-01" / "part.parquet",
+        )
+    sql = cleaned_bet_pool_read_parquet_sql(
+        root,
+        pool_start=pd.Timestamp("2025-01-15", tz="UTC").to_pydatetime(),
+        pool_end=pd.Timestamp("2025-01-31", tz="UTC").to_pydatetime(),
+        payout_yyyymm="202501",
+    )
+    assert "gaming_month=202412" in sql
+    assert "gaming_month=202501" in sql
+    assert "gaming_month=202502" not in sql
+    assert "hive_partitioning=false" in sql
+
+
+def test_open_month_hot_pool_session_loads_once(tmp_path: Path) -> None:
+    """Month pool session should load partition-pruned rows into a reusable DuckDB table."""
+    root = tmp_path / "cleaned"
+    for ym in ("202412", "202501"):
+        part_dir = root / f"gaming_month={ym}" / "gaming_day_key=2025-01-01"
+        part_dir.mkdir(parents=True)
+        pq.write_table(
+            pa.Table.from_pandas(
+                pd.DataFrame(
+                    [
+                        {
+                            "bet_id": 1.0 if ym == "202412" else 2.0,
+                            "player_id": 10,
+                            "session_id": 1,
+                            "table_id": 1,
+                            "gaming_day_event": pd.Timestamp("2025-01-01"),
+                            "payout_complete_dtm": pd.Timestamp(
+                                "2024-12-15 12:00:00" if ym == "202412" else "2025-01-15 12:00:00",
+                                tz="UTC",
+                            ),
+                            "wager": 10.0,
+                            "is_back_bet": 0,
+                            "payout_odds": 2.0,
+                            "casino_win": 0.0,
+                            "theo_win": 1.0,
+                            "base_ha": 0.01,
+                            "bet_type": "PLAYER",
+                            "type_of_bet": "MAIN",
+                        },
+                    ],
+                ),
+            ),
+            part_dir / "part.parquet",
+        )
+    session = open_month_hot_pool_session(
+        root,
+        payout_yyyymm="202501",
+        duckdb_runtime=DuckDbRuntimeConfig(),
+    )
+    try:
+        assert session.row_count == 2
+        got = session.conn.execute(
+            f"SELECT bet_id FROM {session.table_name} ORDER BY bet_id",
+        ).fetchall()
+        assert [row[0] for row in got] == [1.0, 2.0]
+    finally:
+        session.close()
+
+
+def test_build_pool_uses_month_hot_pool_without_parquet_rescan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When month pool is attached, per-batch pool queries must not rescan parquet."""
+    from trainer_hightier.config import default_hightier_serving_config
+    from trainer_hightier.serving.offline_serving_backtest import build_pool_from_cleaned_parquet
+    import trainer_hightier.utils.cleaned_bet_pool_read as pool_read
+
+    root = tmp_path / "cleaned"
+    part_dir = root / "gaming_month=202501" / "gaming_day_key=2025-01-01"
+    part_dir.mkdir(parents=True)
+    t0 = pd.Timestamp("2025-01-15 12:00:00", tz="UTC")
+    pq.write_table(
+        pa.Table.from_pandas(
+            pd.DataFrame(
+                [
+                    {
+                        "bet_id": 1.0,
+                        "player_id": 10,
+                        "session_id": 1,
+                        "table_id": 1,
+                        "gaming_day_event": pd.Timestamp("2025-01-15"),
+                        "payout_complete_dtm": t0,
+                        "wager": 10.0,
+                        "is_back_bet": 0,
+                        "payout_odds": 2.0,
+                        "casino_win": 0.0,
+                        "theo_win": 1.0,
+                        "base_ha": 0.01,
+                        "bet_type": "PLAYER",
+                        "type_of_bet": "MAIN",
+                    },
+                ],
+            ),
+        ),
+        part_dir / "part.parquet",
+    )
+    cmap = tmp_path / "map.parquet"
+    pq.write_table(
+        pa.Table.from_pandas(pd.DataFrame([{"player_id": 10, "canonical_id": "c1"}])),
+        cmap,
+    )
+    session = open_month_hot_pool_session(
+        root,
+        payout_yyyymm="202501",
+        duckdb_runtime=DuckDbRuntimeConfig(),
+    )
+
+    def _forbidden_parquet_sql(*args: object, **kwargs: object) -> str:
+        raise AssertionError("cleaned_bet_pool_read_parquet_sql must not run with month pool attached")
+
+    monkeypatch.setattr(pool_read, "cleaned_bet_pool_read_parquet_sql", _forbidden_parquet_sql)
+    bets = pd.DataFrame(
+        [
+            {
+                "bet_id": 1.0,
+                "player_id": 10,
+                "payout_complete_dtm": t0,
+                "gaming_day_event": pd.Timestamp("2025-01-15"),
+            },
+        ],
+    )
+    try:
+        pool = build_pool_from_cleaned_parquet(
+            bets,
+            cleaned_root=root,
+            cfg=default_hightier_serving_config(),
+            mapping_parquet=cmap,
+            payout_yyyymm="202501",
+            month_pool_conn=session.conn,
+            month_pool_table=session.table_name,
+        )
+        assert len(pool) == 1
+    finally:
+        session.close()
 
 
 def test_resolve_hot_pool_player_ids_no_alias_expansion(tmp_path: Path) -> None:

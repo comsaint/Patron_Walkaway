@@ -609,6 +609,9 @@ def _short_term_features_for_batch(
     duckdb_runtime: DuckDbRuntimeConfig,
     fe_columns: tuple[str, ...],
     trial_columns: tuple[str, ...],
+    payout_yyyymm: str | None = None,
+    month_pool_conn: duckdb.DuckDBPyConnection | None = None,
+    month_pool_table: str | None = None,
 ) -> pd.DataFrame:
     """Compute short-layer PIT ``bet__*`` and ``fe__*`` for one training/scoring batch."""
     from trainer_hightier.serving.short_term_scoring_context import (
@@ -625,6 +628,9 @@ def _short_term_features_for_batch(
         fe_columns=fe_columns,
         trial_columns=trial_columns,
         context=default_short_term_scoring_context(serving_cfg),
+        payout_yyyymm=payout_yyyymm,
+        month_pool_conn=month_pool_conn,
+        month_pool_table=month_pool_table,
     )
 
 
@@ -678,33 +684,52 @@ def materialize_fe_derived_short_term_parquet(
 
     batch_paths: list[Path] = []
     batch_idx = 0
-    for bets_batch in _iter_training_bet_batches(
-        Path(training_parquet_for_bet_ids).resolve(),
-        batch_size=effective_batch_size,
-        duckdb_runtime=duckdb_runtime,
-        payout_yyyymm=payout_yyyymm,
-        restrict_player_ids=restrict_player_ids,
-    ):
-        features = _short_term_features_for_batch(
-            bets_batch,
-            cleaned_bet_parquet=Path(cleaned_bet_parquet).resolve(),
-            mapping_parquet=cmap,
-            serving_cfg=serving_cfg,
+    cleaned_root = Path(cleaned_bet_parquet).resolve()
+    month_pool = None
+    if payout_yyyymm is not None:
+        from trainer_hightier.utils.cleaned_bet_pool_read import open_month_hot_pool_session
+
+        month_pool = open_month_hot_pool_session(
+            cleaned_root,
+            payout_yyyymm=str(payout_yyyymm),
             duckdb_runtime=duckdb_runtime,
-            fe_columns=fe_cols,
-            trial_columns=trial_cols,
+            hk_tz=serving_cfg.hk_tz,
+            restrict_player_ids=restrict_player_ids,
         )
-        part = batch_dir / f"part_{batch_idx:06d}.parquet"
-        features[list(out_cols)].to_parquet(part, index=False)
-        batch_paths.append(part)
-        batch_idx += 1
-        if batch_idx % 10 == 0:
-            logger.info(
-                "[bounded_short_term] materialized %d batches (last_part=%s rows=%d)",
-                batch_idx,
-                part.name,
-                len(features),
+    try:
+        for bets_batch in _iter_training_bet_batches(
+            Path(training_parquet_for_bet_ids).resolve(),
+            batch_size=effective_batch_size,
+            duckdb_runtime=duckdb_runtime,
+            payout_yyyymm=payout_yyyymm,
+            restrict_player_ids=restrict_player_ids,
+        ):
+            features = _short_term_features_for_batch(
+                bets_batch,
+                cleaned_bet_parquet=cleaned_root,
+                mapping_parquet=cmap,
+                serving_cfg=serving_cfg,
+                duckdb_runtime=duckdb_runtime,
+                fe_columns=fe_cols,
+                trial_columns=trial_cols,
+                payout_yyyymm=payout_yyyymm,
+                month_pool_conn=month_pool.conn if month_pool is not None else None,
+                month_pool_table=month_pool.table_name if month_pool is not None else None,
             )
+            part = batch_dir / f"part_{batch_idx:06d}.parquet"
+            features[list(out_cols)].to_parquet(part, index=False)
+            batch_paths.append(part)
+            batch_idx += 1
+            if batch_idx % 10 == 0:
+                logger.info(
+                    "[bounded_short_term] materialized %d batches (last_part=%s rows=%d)",
+                    batch_idx,
+                    part.name,
+                    len(features),
+                )
+    finally:
+        if month_pool is not None:
+            month_pool.close()
 
     if not batch_paths:
         raise ValueError(
@@ -927,17 +952,40 @@ src_with_iv AS (
 ),
 ordered AS (
   SELECT s.*,
+    COUNT(*) OVER w5m AS cnt_w5m,
     COUNT(*) OVER w15 AS fe__bets_cnt__w15m_raw,
     COALESCE(SUM(wager) OVER w15, 0.0) AS fe__wager_sum__w15m_raw,
+    COUNT(*) OVER w1h AS cnt_w1h,
+    COUNT(*) OVER w1d AS fe__bets_cnt__w1d_raw,
+    COALESCE(SUM(wager) OVER w1d, 0.0) AS fe__wager_sum__w1d_raw,
+    COUNT(*) OVER w7d AS fe__bets_cnt__w7d_raw,
+    COALESCE(SUM(wager) OVER w7d, 0.0) AS fe__wager_sum__w7d_raw,
+    COUNT(*) OVER w30d AS fe__bets_cnt__w30d_raw,
+    COALESCE(SUM(wager) OVER w30d, 0.0) AS fe__wager_sum__w30d_raw,
+    AVG(wager) OVER w1h AS avg_wager_w1h,
+    STDDEV_POP(wager) OVER w1h AS std_wager_w1h,
+    COALESCE(STDDEV_POP(wager) OVER w7d, CAST(NULL AS DOUBLE)) AS std_wager_w7d,
+    COALESCE(AVG(ABS(wager)) OVER w7d, CAST(NULL AS DOUBLE)) AS avg_abs_wager_w7d,
+    COALESCE(AVG(wager) OVER w30d, CAST(NULL AS DOUBLE)) AS prior_wager_mean_w30d,
+    COALESCE(STDDEV_POP(wager) OVER w30d, CAST(NULL AS DOUBLE)) AS prior_wager_std_w30d,
+    COALESCE(AVG(payout_odds) OVER w30d, CAST(NULL AS DOUBLE)) AS prior_odds_mean_w30d,
+    COALESCE(STDDEV_POP(payout_odds) OVER w30d, CAST(NULL AS DOUBLE)) AS prior_odds_std_w30d,
     AVG(payout_odds) OVER w1h AS payout_odds_avg_w1h,
     STDDEV_POP(payout_odds) OVER w1h AS payout_odds_std_w1h,
     AVG(interarrival_sec) OVER w1h AS interarrival_avg_w1h,
     STDDEV_POP(interarrival_sec) OVER w1h AS interarrival_std_w1h,
+    AVG(interarrival_sec) OVER w7d AS interarrival_avg_w7d,
+    STDDEV_POP(interarrival_sec) OVER w7d AS interarrival_std_w7d,
     AVG(payout_odds) OVER w7d AS payout_odds_avg_w7d,
     STDDEV_POP(payout_odds) OVER w7d AS payout_odds_std_w7d,
+    MAX(wager) OVER w1h AS max_wager_w1h,
     MAX(payout_odds) OVER w1h AS max_payout_odds_w1h
   FROM src_with_iv AS s
   WINDOW
+    w5m AS (
+      PARTITION BY target_bet_id ORDER BY pcd
+      RANGE BETWEEN INTERVAL '5 MINUTE' PRECEDING AND INTERVAL '1 MICROSECOND' PRECEDING
+    ),
     w15 AS (
       PARTITION BY target_bet_id ORDER BY pcd
       RANGE BETWEEN INTERVAL '15 MINUTE' PRECEDING AND INTERVAL '1 MICROSECOND' PRECEDING
@@ -946,9 +994,17 @@ ordered AS (
       PARTITION BY target_bet_id ORDER BY pcd
       RANGE BETWEEN INTERVAL '1 HOUR' PRECEDING AND INTERVAL '1 MICROSECOND' PRECEDING
     ),
+    w1d AS (
+      PARTITION BY target_bet_id ORDER BY pcd
+      RANGE BETWEEN INTERVAL '1 DAY' PRECEDING AND INTERVAL '1 MICROSECOND' PRECEDING
+    ),
     w7d AS (
       PARTITION BY target_bet_id ORDER BY pcd
       RANGE BETWEEN INTERVAL '7 DAY' PRECEDING AND INTERVAL '1 MICROSECOND' PRECEDING
+    ),
+    w30d AS (
+      PARTITION BY target_bet_id ORDER BY pcd
+      RANGE BETWEEN INTERVAL '30 DAY' PRECEDING AND INTERVAL '1 MICROSECOND' PRECEDING
     )
 )
 SELECT
@@ -956,6 +1012,70 @@ SELECT
   CAST(interarrival_sec AS DOUBLE) AS fe__time_since_last_bet_sec,
   CAST(fe__bets_cnt__w15m_raw AS DOUBLE) AS fe__bets_cnt__w15m,
   CAST(fe__wager_sum__w15m_raw AS DOUBLE) AS fe__wager_sum__w15m,
+  CAST(cnt_w5m AS DOUBLE) AS fe__rate__bets_cnt__w5m,
+  CAST(fe__bets_cnt__w1d_raw AS DOUBLE) AS fe__bets_cnt__w1d,
+  CAST(fe__wager_sum__w1d_raw AS DOUBLE) AS fe__wager_sum__w1d,
+  CAST(fe__bets_cnt__w7d_raw AS DOUBLE) AS fe__bets_cnt__w7d,
+  CAST(fe__wager_sum__w7d_raw AS DOUBLE) AS fe__wager_sum__w7d,
+  CAST(fe__bets_cnt__w30d_raw AS DOUBLE) AS fe__bets_cnt__w30d,
+  CAST(fe__wager_sum__w30d_raw AS DOUBLE) AS fe__wager_sum__w30d,
+  CASE
+    WHEN fe__wager_sum__w1d_raw > 1e-9
+    THEN CAST(fe__wager_sum__w15m_raw / fe__wager_sum__w1d_raw AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__wager_sum__w15m_over_w1d,
+  CASE
+    WHEN fe__bets_cnt__w1d_raw > 1e-9
+    THEN CAST(fe__bets_cnt__w15m_raw / fe__bets_cnt__w1d_raw AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__bets_cnt__w15m_over_w1d,
+  CASE
+    WHEN fe__wager_sum__w30d_raw > 1e-9
+    THEN CAST(fe__wager_sum__w7d_raw / fe__wager_sum__w30d_raw AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__wager_sum__w7d_over_w30d,
+  CASE
+    WHEN fe__bets_cnt__w15m_raw > 0
+    THEN CAST(cnt_w5m * 3.0 / fe__bets_cnt__w15m_raw AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__rate__velocity__w5m_over_w15m,
+  CASE
+    WHEN cnt_w1h > 0
+    THEN CAST(fe__bets_cnt__w15m_raw * 4.0 / cnt_w1h AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__rate__velocity__w15m_over_w1h,
+  CASE
+    WHEN std_wager_w1h IS NOT NULL AND ABS(std_wager_w1h) > 1e-12
+       AND avg_wager_w1h IS NOT NULL AND wager IS NOT NULL
+    THEN CAST((wager - avg_wager_w1h) / std_wager_w1h AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__stake__wager_z__w1h,
+  CASE
+    WHEN avg_wager_w1h IS NOT NULL AND avg_wager_w1h > 1e-12 AND std_wager_w1h IS NOT NULL
+    THEN CAST(std_wager_w1h / avg_wager_w1h AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__stake__wager_cv__w1h,
+  CASE
+    WHEN avg_abs_wager_w7d IS NOT NULL AND avg_abs_wager_w7d > 1e-12 AND std_wager_w7d IS NOT NULL
+    THEN CAST(std_wager_w7d / avg_abs_wager_w7d AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__wager_cv_w7d,
+  CASE
+    WHEN prior_wager_std_w30d IS NOT NULL AND ABS(prior_wager_std_w30d) > 1e-12
+    THEN CAST((wager - prior_wager_mean_w30d) / prior_wager_std_w30d AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__wager_z_prior_w30d,
+  CASE
+    WHEN prior_odds_std_w30d IS NOT NULL AND ABS(prior_odds_std_w30d) > 1e-12
+       AND payout_odds IS NOT NULL
+    THEN CAST((payout_odds - prior_odds_mean_w30d) / prior_odds_std_w30d AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__payout_odds_z_prior_w30d,
+  CASE
+    WHEN max_wager_w1h IS NOT NULL AND max_wager_w1h > 1e-9 AND wager IS NOT NULL
+    THEN CAST(wager / max_wager_w1h AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__stake__wager_to_recent_max_ratio__w1h,
   CAST(COALESCE(bets_today_so_far, 0) AS DOUBLE) AS fe__canonical__bets_cnt__today,
   CAST(COALESCE(wager_today_so_far, 0.0) AS DOUBLE) AS fe__canonical__wager_sum__today,
   CASE
@@ -978,6 +1098,12 @@ SELECT
     THEN CAST(interarrival_std_w1h / interarrival_avg_w1h AS DOUBLE)
     ELSE CAST(NULL AS DOUBLE)
   END AS fe__interarrival__cv__w1h,
+  CASE
+    WHEN interarrival_std_w7d IS NOT NULL AND interarrival_std_w7d > 1e-9
+       AND interarrival_avg_w7d IS NOT NULL AND interarrival_sec IS NOT NULL
+    THEN CAST((interarrival_sec - interarrival_avg_w7d) / interarrival_std_w7d AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__interarrival__last_gap_z__w7d,
   CASE
     WHEN payout_odds_std_w1h IS NOT NULL AND payout_odds_std_w1h > 1e-12
        AND payout_odds_avg_w1h IS NOT NULL AND payout_odds IS NOT NULL

@@ -128,7 +128,7 @@ SHORT_TERM_PIT_CACHE_DIRNAME: Final[str] = "short_term_pit_v1"
 SHORT_TERM_PIT_CACHE_SCHEMA_VERSION: Final[int] = 2
 SHORT_TERM_PIT_SUPPLIER_FAMILY: Final[str] = "short_term:w1h"
 # Training materialize batch size (decoupled from scorer cycle size for offline throughput).
-DEFAULT_TRAINING_SHORT_TERM_MATERIALIZE_BATCH_SIZE: Final[int] = 20_000
+DEFAULT_TRAINING_SHORT_TERM_MATERIALIZE_BATCH_SIZE: Final[int] = 100_000
 # Neighbor months included when invalidating shards after partition inventory deltas.
 SHORT_TERM_PIT_SOURCE_NEIGHBOR_MONTHS: Final[int] = 1
 # Production snapshot lifecycle (HK wall-clock).

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+import duckdb
 import numpy as np
 import pandas as pd
 
@@ -87,6 +88,9 @@ def build_pool_from_cleaned_bets(
     mapping_parquet: Path,
     serving_cfg: HightierServingConfig,
     context: ShortTermScoringContext | None = None,
+    payout_yyyymm: str | None = None,
+    month_pool_conn: duckdb.DuckDBPyConnection | None = None,
+    month_pool_table: str | None = None,
 ) -> pd.DataFrame:
     """Bounded hot pool for offline replay / training materialize (``expand=False`` default)."""
     from trainer_hightier.serving.offline_serving_backtest import build_pool_from_cleaned_parquet
@@ -98,6 +102,9 @@ def build_pool_from_cleaned_bets(
         cfg=serving_cfg,
         mapping_parquet=mapping_parquet,
         expand_canonical_aliases=ctx.expand_canonical_aliases,
+        payout_yyyymm=payout_yyyymm,
+        month_pool_conn=month_pool_conn,
+        month_pool_table=month_pool_table,
     )
 
 
@@ -111,6 +118,9 @@ def build_short_term_features_for_batch(
     fe_columns: tuple[str, ...],
     trial_columns: tuple[str, ...] = SHORT_TERM_TRIAL_BET_COLUMNS,
     context: ShortTermScoringContext | None = None,
+    payout_yyyymm: str | None = None,
+    month_pool_conn: duckdb.DuckDBPyConnection | None = None,
+    month_pool_table: str | None = None,
 ) -> pd.DataFrame:
     """Compute short-layer ``bet__*`` and ``fe__*`` for one training / parity batch."""
     from trainer_hightier.serving.feature_builder import (
@@ -129,6 +139,9 @@ def build_short_term_features_for_batch(
         mapping_parquet=mapping_parquet,
         serving_cfg=serving_cfg,
         context=context,
+        payout_yyyymm=payout_yyyymm,
+        month_pool_conn=month_pool_conn,
+        month_pool_table=month_pool_table,
     )
     pool = attach_canonical_id(pool, mapping_parquet=mapping_parquet)
     staged = attach_synthetic_etl_and_prediction_visible(work)

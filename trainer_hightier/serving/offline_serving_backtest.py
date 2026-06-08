@@ -734,16 +734,19 @@ def build_pool_from_cleaned_parquet(
     cfg: HightierServingConfig,
     mapping_parquet: Path,
     expand_canonical_aliases: bool = False,
+    payout_yyyymm: str | None = None,
+    month_pool_conn: duckdb.DuckDBPyConnection | None = None,
+    month_pool_table: str | None = None,
 ) -> pd.DataFrame:
     """Bounded hot pool from local cleaned bet hive (no ClickHouse)."""
     import duckdb
 
     from trainer_hightier.serving.scorer import compute_scoring_bounds_for_bets
+    from trainer_hightier.utils.cleaned_bet_pool_read import cleaned_bet_pool_read_parquet_sql
 
     if bets.empty:
         return bets
     root = Path(cleaned_root).resolve()
-    glob_path = str((root / "**" / "*.parquet").as_posix())
     bounds = compute_scoring_bounds_for_bets(bets, cfg=cfg)
     if bounds.empty:
         raise ValueError("[offline_backtest] scoring bounds empty for non-empty bets batch")
@@ -764,8 +767,24 @@ def build_pool_from_cleaned_parquet(
     if len(pids) > fan_cap:
         logger.warning("[offline_backtest] pool fanout %d -> %d", len(pids), fan_cap)
         pids = pids[:fan_cap]
-    conn = duckdb.connect()
+    if month_pool_conn is not None:
+        if not month_pool_table:
+            raise ValueError("month_pool_table is required when month_pool_conn is set")
+        conn = month_pool_conn
+        own_conn = False
+        bet_from = month_pool_table
+    else:
+        conn = duckdb.connect()
+        own_conn = True
+        bet_from = cleaned_bet_pool_read_parquet_sql(
+            root,
+            pool_start=pool_start,
+            pool_end=pool_end,
+            payout_yyyymm=payout_yyyymm,
+            hk_tz=cfg.hk_tz,
+        )
     try:
+        conn.execute("DROP TABLE IF EXISTS allow_pids")
         conn.execute(
             "CREATE TEMP TABLE allow_pids AS SELECT * FROM (SELECT UNNEST(?) AS player_id)",
             [pids],
@@ -786,14 +805,15 @@ def build_pool_from_cleaned_parquet(
                 b.payout_odds,
                 b.theo_win,
                 b.base_ha
-            FROM read_parquet('{glob_path}', hive_partitioning=true) AS b
+            FROM {bet_from} AS b
             INNER JOIN allow_pids AS p ON b.player_id = p.player_id
             WHERE b.payout_complete_dtm >= ?
               AND b.payout_complete_dtm <= ?
         """
         pool = conn.execute(q, [pool_start, pool_end]).fetchdf()
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
     if pool.empty:
         raise ValueError(
             "[offline_backtest] cleaned bet pool empty; check --local-cleaned-bet path and dates"
