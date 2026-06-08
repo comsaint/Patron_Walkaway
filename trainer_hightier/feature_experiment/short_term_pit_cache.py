@@ -14,12 +14,17 @@ import duckdb
 import pyarrow.parquet as pq
 
 from trainer_hightier.config import (
+    DEFAULT_STEP35_MISS_PATH,
     DEFAULT_TRAINING_SHORT_TERM_MATERIALIZE_BATCH_SIZE,
     DuckDbRuntimeConfig,
+    INDEXED_REPLAY_GATE_MODE_HARD_FE,
+    INDEXED_REPLAY_MATERIALIZER_VERSION,
     SHORT_TERM_PIT_CACHE_DIRNAME,
     SHORT_TERM_PIT_CACHE_SCHEMA_VERSION,
     SHORT_TERM_PIT_SOURCE_NEIGHBOR_MONTHS,
     SHORT_TERM_PIT_SUPPLIER_FAMILY,
+    STEP35_MISS_PATH_BOUNDED,
+    STEP35_MISS_PATH_INDEXED_REPLAY,
     default_hightier_serving_config,
 )
 from trainer_hightier.utils.cache_invalidation_v1 import short_pit_invalid_months
@@ -34,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 _CODE_MODULE_PATHS: Final[tuple[Path, ...]] = (
     Path(__file__).resolve().parent / "materialize_fe_derived.py",
+    Path(__file__).resolve().parent / "short_term_pit_replay_indexed_prototype.py",
     Path(__file__).resolve().parents[1] / "serving" / "short_term_scoring_context.py",
 )
 
@@ -98,13 +104,21 @@ def _code_fingerprint() -> str:
     return digest.hexdigest()
 
 
-def _policy_fingerprint(*, batch_size: int) -> dict[str, Any]:
+def _policy_fingerprint(*, batch_size: int, step35_miss_path: str) -> dict[str, Any]:
     cfg = default_hightier_serving_config()
+    miss_path = str(step35_miss_path).strip()
+    if miss_path not in (STEP35_MISS_PATH_INDEXED_REPLAY, STEP35_MISS_PATH_BOUNDED):
+        raise ValueError(
+            f"step35_miss_path must be {STEP35_MISS_PATH_INDEXED_REPLAY!r} or "
+            f"{STEP35_MISS_PATH_BOUNDED!r}, got {step35_miss_path!r}",
+        )
     return {
         "hot_feature_pool_lookback_hours": int(cfg.hot_feature_pool_lookback_hours),
         "expand_canonical_aliases": False,
         "hightier_scorer_pool_player_fanout_cap": int(cfg.hightier_scorer_pool_player_fanout_cap),
         "training_materialize_batch_size": int(batch_size),
+        "step35_miss_path": miss_path,
+        "indexed_replay_gate_mode": INDEXED_REPLAY_GATE_MODE_HARD_FE,
     }
 
 
@@ -376,11 +390,12 @@ def plan_short_term_pit_cache(
     entity_set_fingerprint_sha256_hex: str | None = None,
     recompute_months: tuple[str, ...] = (),
     force_refresh: bool = False,
+    step35_miss_path: str = DEFAULT_STEP35_MISS_PATH,
 ) -> ShortTermPitCachePlan:
     """Decide month-shard cache hits and misses."""
     root = Path(cache_root).resolve()
     code_fp = _code_fingerprint()
-    policy_fp = _policy_fingerprint(batch_size=int(batch_size))
+    policy_fp = _policy_fingerprint(batch_size=int(batch_size), step35_miss_path=step35_miss_path)
     columns_fp = _columns_fingerprint(out_columns)
     primitive_fp = _primitive_schema_fingerprint(trial_columns)
     mapping_sha256 = _sha256_file(Path(canonical_mapping_parquet).resolve())
@@ -571,6 +586,97 @@ def _write_global_manifest(
     mpath.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def _project_parquet_columns(
+    src_parquet: Path,
+    dst_parquet: Path,
+    out_columns: tuple[str, ...],
+    *,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> None:
+    """Project an indexed replay parquet down to the requested output schema."""
+    src = Path(src_parquet).resolve()
+    dst = Path(dst_parquet).resolve()
+    available = set(pq.ParquetFile(src).schema_arrow.names)
+    missing = [col for col in out_columns if col not in available]
+    if missing:
+        raise ValueError(
+            f"indexed replay output missing required columns {missing}; "
+            f"available={sorted(available)}",
+        )
+    col_sql = ", ".join(f'"{c}"' for c in out_columns)
+    src_esc = _path_esc(src)
+    dst_esc = _path_esc(dst)
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        con.execute(
+            f"COPY (SELECT {col_sql} FROM read_parquet('{src_esc}')) "
+            f"TO '{dst_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
+        )
+    finally:
+        con.close()
+
+
+def _materialize_miss_shard(
+    *,
+    step35_miss_path: str,
+    cleaned_bet_parquet: Path,
+    training_parquet: Path,
+    shard_out: Path,
+    duckdb_runtime: DuckDbRuntimeConfig,
+    canonical_mapping_parquet: Path,
+    short_term_columns: tuple[str, ...],
+    trial_columns: tuple[str, ...],
+    batch_size: int,
+    yyyymm: str,
+    out_columns: tuple[str, ...],
+) -> tuple[str, float]:
+    """Materialize one month shard using the configured Step 3.5 miss-path engine."""
+    miss_path = str(step35_miss_path).strip()
+    if miss_path == STEP35_MISS_PATH_BOUNDED:
+        materialize_fe_derived_short_term_parquet(
+            cleaned_bet_parquet=cleaned_bet_parquet,
+            training_parquet_for_bet_ids=training_parquet,
+            out_parquet=shard_out,
+            duckdb_runtime=duckdb_runtime,
+            canonical_mapping_parquet=canonical_mapping_parquet,
+            short_term_columns=short_term_columns,
+            trial_columns=trial_columns,
+            batch_size=int(batch_size),
+            payout_yyyymm=yyyymm,
+        )
+        return STEP35_MISS_PATH_BOUNDED, 0.0
+    if miss_path != STEP35_MISS_PATH_INDEXED_REPLAY:
+        raise ValueError(
+            f"unsupported step35_miss_path={step35_miss_path!r}; "
+            f"expected {STEP35_MISS_PATH_INDEXED_REPLAY!r} or {STEP35_MISS_PATH_BOUNDED!r}",
+        )
+    from trainer_hightier.feature_experiment.short_term_pit_replay_indexed_prototype import (
+        materialize_short_term_replay_indexed_prototype,
+    )
+
+    raw_tmp = shard_out.parent / "data.__indexed_replay__.parquet"
+    t0 = time.perf_counter()
+    materialize_short_term_replay_indexed_prototype(
+        cleaned_bet_parquet=cleaned_bet_parquet,
+        training_parquet_for_bet_ids=training_parquet,
+        out_parquet=raw_tmp,
+        payout_yyyymm=yyyymm,
+        duckdb_runtime=duckdb_runtime,
+        canonical_mapping_parquet=canonical_mapping_parquet,
+        target_limit=None,
+    )
+    elapsed = round(time.perf_counter() - t0, 6)
+    _project_parquet_columns(
+        raw_tmp,
+        shard_out,
+        out_columns,
+        duckdb_runtime=duckdb_runtime,
+    )
+    raw_tmp.unlink(missing_ok=True)
+    return STEP35_MISS_PATH_INDEXED_REPLAY, elapsed
+
+
 def materialize_fe_derived_short_term_parquet_with_cache(
     *,
     cleaned_bet_parquet: Path,
@@ -588,10 +694,17 @@ def materialize_fe_derived_short_term_parquet_with_cache(
     previous_entity_set_fingerprint_sha256_hex: str | None = None,
     recompute_months: tuple[str, ...] = (),
     force_refresh: bool = False,
+    step35_miss_path: str = DEFAULT_STEP35_MISS_PATH,
 ) -> tuple[Path, dict[str, Any]]:
     """Materialize short-term PIT with month-sharded cache reuse."""
     if batch_size < 1:
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+    miss_path = str(step35_miss_path).strip()
+    if miss_path not in (STEP35_MISS_PATH_INDEXED_REPLAY, STEP35_MISS_PATH_BOUNDED):
+        raise ValueError(
+            f"step35_miss_path must be {STEP35_MISS_PATH_INDEXED_REPLAY!r} or "
+            f"{STEP35_MISS_PATH_BOUNDED!r}, got {step35_miss_path!r}",
+        )
     tp = Path(training_parquet_for_bet_ids).resolve()
     cmap = Path(canonical_mapping_parquet).resolve()
     dst = Path(out_parquet).resolve()
@@ -611,15 +724,18 @@ def materialize_fe_derived_short_term_parquet_with_cache(
         entity_set_fingerprint_sha256_hex=entity_set_fingerprint_sha256_hex,
         recompute_months=recompute_months,
         force_refresh=force_refresh,
+        step35_miss_path=miss_path,
     )
     code_fp = _code_fingerprint()
-    policy_fp = _policy_fingerprint(batch_size=int(batch_size))
+    policy_fp = _policy_fingerprint(batch_size=int(batch_size), step35_miss_path=miss_path)
     columns_fp = _columns_fingerprint(out_cols)
     primitive_fp = _primitive_schema_fingerprint(trial_columns)
     mapping_sha256 = _sha256_file(cmap)
     shard_months = list_training_payout_months(tp, duckdb_runtime=duckdb_runtime)
 
     delta_fill_shards: list[str] = []
+    replay_shard_seconds: dict[str, float] = {}
+    materializer_by_shard: dict[str, str] = {}
     t_delta = time.perf_counter()
     added_ids = tuple(int(pid) for pid in entity_delta_added_player_ids)
     prev_entity_fp = (
@@ -658,18 +774,24 @@ def materialize_fe_derived_short_term_parquet_with_cache(
             )
             delta_tmp.unlink(missing_ok=True)
             delta_fill_shards.append(yyyymm)
+            materializer_by_shard[yyyymm] = STEP35_MISS_PATH_BOUNDED
         else:
-            materialize_fe_derived_short_term_parquet(
+            engine, elapsed = _materialize_miss_shard(
+                step35_miss_path=miss_path,
                 cleaned_bet_parquet=cleaned_bet_parquet,
-                training_parquet_for_bet_ids=tp,
-                out_parquet=shard_out,
+                training_parquet=tp,
+                shard_out=shard_out,
                 duckdb_runtime=duckdb_runtime,
                 canonical_mapping_parquet=cmap,
                 short_term_columns=short_term_columns,
                 trial_columns=trial_columns,
                 batch_size=int(batch_size),
-                payout_yyyymm=yyyymm,
+                yyyymm=yyyymm,
+                out_columns=out_cols,
             )
+            materializer_by_shard[yyyymm] = engine
+            if elapsed > 0:
+                replay_shard_seconds[yyyymm] = elapsed
         universe_fp, num_rows = compute_shard_universe_fingerprint(
             tp,
             yyyymm=yyyymm,
@@ -731,12 +853,17 @@ def materialize_fe_derived_short_term_parquet_with_cache(
         "entity_set_fingerprint_sha256_hex": entity_set_fingerprint_sha256_hex,
         "short_term_pit_delta_fill_shards": list(delta_fill_shards),
         "entity_delta_fill_elapsed_seconds": round(time.perf_counter() - t_delta, 6),
+        "step35_miss_path": miss_path,
+        "step35_materializer_by_shard": materializer_by_shard,
+        "step35_indexed_replay_shard_seconds": replay_shard_seconds,
+        "indexed_replay_gate_mode": INDEXED_REPLAY_GATE_MODE_HARD_FE,
     }
     logger.info(
-        "[bounded_short_term] cache summary hit=%d miss=%d ratio=%.3f reasons=%s -> %s",
+        "[short_term_pit] cache summary hit=%d miss=%d ratio=%.3f miss_path=%s reasons=%s -> %s",
         len(plan.hit_shards),
         len(plan.miss_shards),
         hit_ratio,
+        miss_path,
         plan.reason_counts,
         dst.name,
     )

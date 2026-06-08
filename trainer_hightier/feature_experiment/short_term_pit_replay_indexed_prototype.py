@@ -24,6 +24,9 @@ import pyarrow.parquet as pq
 from trainer_hightier.config import (
     DuckDbRuntimeConfig,
     HightierServingConfig,
+    LEGACY_BET_PACK_1H_COLUMNS,
+    LEGACY_BET_PACK_WAIVER_MAX_MISMATCH_RATIO,
+    LEGACY_BET_PACK_WAIVER_ROOT_CAUSE,
     default_hightier_serving_config,
 )
 from trainer_hightier.feature_experiment.short_term_pit_replay_prototype import (
@@ -2290,7 +2293,15 @@ def compare_replay_to_oracle_parquet(
                 )
                 SELECT
                     (SELECT COUNT(*)::BIGINT FROM bad) AS mismatch_count,
-                    (SELECT list(bet_id ORDER BY bet_id LIMIT 5) FROM bad) AS sample_bet_ids
+                    (
+                        SELECT list(bet_id)
+                        FROM (
+                            SELECT bet_id
+                            FROM bad
+                            ORDER BY bet_id
+                            LIMIT 5
+                        )
+                    ) AS sample_bet_ids
                 """,
             ).fetchone()
             report["columns"][col] = {
@@ -2305,40 +2316,125 @@ def compare_replay_to_oracle_parquet(
     return report
 
 
+def apply_parity_waiver_governance(
+    parity: dict[str, Any],
+    *,
+    compared_rows: int,
+) -> dict[str, Any]:
+    """Enrich parity report with hard-parity and pinned legacy bet-pack waiver fields."""
+    if compared_rows < 1:
+        raise ValueError(f"compared_rows must be >= 1 for waiver governance, got {compared_rows}")
+    fe_cols, _bet_cols = split_scorer_short_pit_gate_columns()
+    columns = parity.get("columns")
+    if not isinstance(columns, dict):
+        raise TypeError(f"parity.columns must be dict, got {type(columns).__name__}")
+
+    hard_failed = [
+        col
+        for col in fe_cols
+        if int(columns.get(col, {}).get("mismatch_count", 0)) > 0
+    ]
+    hard_parity_passed = len(hard_failed) == 0
+
+    non_waived_mismatch_cols: list[str] = []
+    waived_mismatch_counts: list[int] = []
+    for col, info in columns.items():
+        mismatch_count = int(info.get("mismatch_count", 0))
+        if mismatch_count <= 0:
+            continue
+        if col in LEGACY_BET_PACK_1H_COLUMNS:
+            waived_mismatch_counts.append(mismatch_count)
+        else:
+            non_waived_mismatch_cols.append(str(col))
+
+    max_waived_mismatch = max(waived_mismatch_counts) if waived_mismatch_counts else 0
+    mismatch_row_ratio = (
+        float(max_waived_mismatch) / float(compared_rows) if compared_rows > 0 else 0.0
+    )
+    waiver_accepted = bool(
+        hard_parity_passed
+        and not non_waived_mismatch_cols
+        and max_waived_mismatch > 0
+        and mismatch_row_ratio <= float(LEGACY_BET_PACK_WAIVER_MAX_MISMATCH_RATIO)
+    )
+
+    enriched = dict(parity)
+    enriched["passed"] = all(
+        int(info.get("mismatch_count", 0)) == 0 for info in columns.values()
+    )
+    enriched["hard_parity_passed"] = hard_parity_passed
+    enriched["hard_parity_columns"] = list(fe_cols)
+    enriched["hard_parity_failed_columns"] = list(hard_failed)
+    enriched["waived_columns"] = list(LEGACY_BET_PACK_1H_COLUMNS)
+    enriched["waiver_accepted"] = waiver_accepted
+    if waiver_accepted:
+        enriched["waiver"] = {
+            "scope": "legacy_bet_pack_1h",
+            "waived_columns": list(LEGACY_BET_PACK_1H_COLUMNS),
+            "mismatch_row_upper_bound": int(max_waived_mismatch),
+            "mismatch_row_ratio": mismatch_row_ratio,
+            "root_cause": LEGACY_BET_PACK_WAIVER_ROOT_CAUSE,
+            "cluster_anchor_bet_id": int(
+                columns.get("bet__bets_cnt__w1h", {}).get("sample_bet_ids", [0])[0] or 0,
+            ),
+            "notes": [
+                "All hard-parity fe__* gate columns matched bounded oracle.",
+                "Observed bet__* mismatches are limited to the pinned legacy bet 1h pack waiver.",
+                "Waiver does not redefine production scorer semantics or claim full parity.",
+            ],
+        }
+    return enriched
+
+
 def evaluate_full_month_cold_build_gate(
     *,
-    parity_passed: bool,
+    parity: dict[str, Any],
     output_validation_passed: bool,
     replay_elapsed_seconds: float,
     bounded_elapsed_seconds: float,
 ) -> dict[str, Any]:
-    """Apply WP-10 full-month cold-build decision gates."""
+    """Apply WP-10 full-month cold-build decision gates with pinned waiver governance."""
+    hard_parity_passed = bool(parity.get("hard_parity_passed"))
+    waiver_accepted = bool(parity.get("waiver_accepted"))
+    parity_passed = bool(parity.get("passed"))
     speedup = (
         bounded_elapsed_seconds / replay_elapsed_seconds
         if replay_elapsed_seconds > 0
         else None
     )
-    integrate = bool(
-        parity_passed
-        and output_validation_passed
-        and speedup is not None
-        and speedup >= 3.0
-    )
-    if not parity_passed or not output_validation_passed:
+    speedup_passed = speedup is not None and speedup >= 3.0
+    decision_basis = {
+        "speedup_passed": bool(speedup_passed),
+        "output_validation_passed": bool(output_validation_passed),
+        "hard_parity_passed": hard_parity_passed,
+        "waiver_accepted": waiver_accepted,
+    }
+    if not hard_parity_passed or not output_validation_passed:
         decision = "stop_indexed_replay"
-    elif integrate:
+        final_integration_met = False
+    elif hard_parity_passed and waiver_accepted and speedup_passed:
+        decision = "integrate_candidate_with_bet_pack_waiver"
+        final_integration_met = True
+    elif parity_passed and speedup_passed:
         decision = "integrate_candidate"
+        final_integration_met = True
     elif speedup is not None and speedup >= 1.5:
         decision = "continue_prototype"
+        final_integration_met = False
     else:
         decision = "stop_or_optimize"
+        final_integration_met = False
     return {
         "decision": decision,
-        "parity_passed": bool(parity_passed),
+        "parity_passed": parity_passed,
+        "hard_parity_passed": hard_parity_passed,
+        "waiver_accepted": waiver_accepted,
         "output_validation_passed": bool(output_validation_passed),
         "speedup_ratio": speedup,
         "final_integration_ratio": 3.0,
-        "final_integration_met": integrate,
+        "final_integration_met": final_integration_met,
+        "decision_basis": decision_basis,
+        "waiver_reason": LEGACY_BET_PACK_WAIVER_ROOT_CAUSE if waiver_accepted else None,
         "gate_columns": list(resolve_scorer_short_pit_prototype_gate_columns()),
         "ignored_gate_columns": list(PROTOTYPE_GATE_IGNORE_COLUMNS),
         "production_gate_columns": list(resolve_production_scorer_short_pit_gate_columns()),
@@ -2523,9 +2619,11 @@ def benchmark_indexed_replay_full_month_gate(
     phase_timings["parity_s"] = round(time.perf_counter() - t_parity, 6)
     memory_peak_mb["parity_peak_rss_mb"] = parity_mem.peak_mb
 
+    compared_rows = int(parity.get("compared_rows") or output_validation.get("target_rows") or 0)
+    parity = apply_parity_waiver_governance(parity, compared_rows=compared_rows)
     speedup = round(bounded_elapsed / replay_elapsed, 3) if replay_elapsed > 0 else None
     go_no_go = evaluate_full_month_cold_build_gate(
-        parity_passed=bool(parity["passed"]),
+        parity=parity,
         output_validation_passed=bool(output_validation["passed"]),
         replay_elapsed_seconds=replay_elapsed,
         bounded_elapsed_seconds=bounded_elapsed,

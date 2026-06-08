@@ -11,7 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from trainer_hightier.config import DuckDbRuntimeConfig, SHORT_TERM_TRIAL_BET_COLUMNS
+from trainer_hightier.config import DuckDbRuntimeConfig, SHORT_TERM_TRIAL_BET_COLUMNS, STEP35_MISS_PATH_BOUNDED
 from trainer_hightier.feature_experiment.short_term_pit_cache import (
     REASON_FORCE_REFRESH,
     REASON_UNIVERSE_CHANGED,
@@ -23,6 +23,9 @@ from trainer_hightier.feature_experiment.short_term_pit_cache import (
     plan_short_term_pit_cache,
     short_term_pit_cache_root,
 )
+
+# Minimal fixtures use bounded DuckDB materializer (indexed replay needs full-month infra).
+_STEP35_MISS_KW = {"step35_miss_path": STEP35_MISS_PATH_BOUNDED}
 
 
 def _write_training_parquet(path: Path, rows: list[dict[str, object]]) -> None:
@@ -154,6 +157,7 @@ def test_short_term_pit_cache_hit_on_second_run(short_cache_fixture: dict[str, P
         "short_term_columns": ("fe__bets_cnt__w15m",),
         "trial_columns": trial_cols,
         "batch_size": 2000,
+        **_STEP35_MISS_KW,
     }
     _, meta1 = materialize_fe_derived_short_term_parquet_with_cache(**kwargs)
     assert meta1["cache_miss_shards"]
@@ -177,6 +181,7 @@ def test_short_term_pit_cache_force_refresh_invalidates(short_cache_fixture: dic
         "short_term_columns": ("fe__bets_cnt__w15m",),
         "trial_columns": trial_cols,
         "batch_size": 2000,
+        **_STEP35_MISS_KW,
     }
     materialize_fe_derived_short_term_parquet_with_cache(**kwargs)
     _, meta = materialize_fe_derived_short_term_parquet_with_cache(force_refresh=True, **kwargs)
@@ -197,6 +202,7 @@ def test_short_term_pit_cache_universe_change_misses_shard(short_cache_fixture: 
         canonical_mapping_parquet=short_cache_fixture["mapping"],
         batch_size=2000,
         duckdb_runtime=runtime,
+        step35_miss_path=STEP35_MISS_PATH_BOUNDED,
     )
     assert plan1.miss_shards == ("202406",)
 
@@ -209,6 +215,7 @@ def test_short_term_pit_cache_universe_change_misses_shard(short_cache_fixture: 
         short_term_columns=("fe__bets_cnt__w15m",),
         trial_columns=trial_cols,
         batch_size=2000,
+        step35_miss_path=STEP35_MISS_PATH_BOUNDED,
     )
     plan2 = plan_short_term_pit_cache(
         training_parquet=short_cache_fixture["training"],
@@ -218,6 +225,7 @@ def test_short_term_pit_cache_universe_change_misses_shard(short_cache_fixture: 
         canonical_mapping_parquet=short_cache_fixture["mapping"],
         batch_size=2000,
         duckdb_runtime=runtime,
+        step35_miss_path=STEP35_MISS_PATH_BOUNDED,
     )
     assert plan2.hit_shards == ("202406",)
     assert plan2.miss_shards == ()
@@ -249,6 +257,7 @@ def test_short_term_pit_cache_universe_change_misses_shard(short_cache_fixture: 
         canonical_mapping_parquet=short_cache_fixture["mapping"],
         batch_size=2000,
         duckdb_runtime=runtime,
+        step35_miss_path=STEP35_MISS_PATH_BOUNDED,
     )
     assert plan3.miss_shards == ("202406",)
     assert plan3.reason_counts.get(REASON_UNIVERSE_CHANGED, 0) >= 1
@@ -286,6 +295,7 @@ def test_short_term_pit_cache_entity_set_fingerprint_misses(short_cache_fixture:
         "trial_columns": trial_cols,
         "batch_size": 2000,
         "entity_set_fingerprint_sha256_hex": "entity_fp_a" * 4,
+        **_STEP35_MISS_KW,
     }
     materialize_fe_derived_short_term_parquet_with_cache(**kwargs)
     _, meta2 = materialize_fe_derived_short_term_parquet_with_cache(
@@ -307,6 +317,7 @@ def test_p3_t6_registry_remove_feature_primitive_still_hits(short_cache_fixture:
         "canonical_mapping_parquet": short_cache_fixture["mapping"],
         "trial_columns": trial_cols,
         "batch_size": 2000,
+        **_STEP35_MISS_KW,
     }
     materialize_fe_derived_short_term_parquet_with_cache(
         **base_kwargs,
@@ -354,6 +365,7 @@ def test_p3_t7_new_primitive_column_misses_when_not_in_shard(short_cache_fixture
         "canonical_mapping_parquet": short_cache_fixture["mapping"],
         "trial_columns": trial_cols,
         "batch_size": 2000,
+        **_STEP35_MISS_KW,
     }
     materialize_fe_derived_short_term_parquet_with_cache(
         **base_kwargs,
@@ -378,6 +390,7 @@ def test_global_manifest_written(short_cache_fixture: dict[str, Path]) -> None:
         short_term_columns=("fe__bets_cnt__w15m",),
         trial_columns=tuple(SHORT_TERM_TRIAL_BET_COLUMNS[:1]),
         batch_size=2000,
+        **_STEP35_MISS_KW,
     )
     manifest = short_term_pit_cache_root(short_cache_fixture["training"].parent) / "manifest.json"
     assert manifest.is_file()

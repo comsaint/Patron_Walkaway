@@ -923,6 +923,32 @@ def test_scorer_gate_columns_subset_of_indexed_output() -> None:
         assert ignored not in gate
 
 
+def _synthetic_parity_report(
+    *,
+    fe_mismatch_cols: tuple[str, ...] = (),
+    bet_waiver_mismatch_count: int = 0,
+    compared_rows: int = 500_000,
+) -> dict:
+    """Build a parity dict and run pinned waiver governance (WP-10 test helper)."""
+    from trainer_hightier.config import LEGACY_BET_PACK_1H_COLUMNS
+    from trainer_hightier.feature_experiment.short_term_pit_replay_indexed_prototype import (
+        apply_parity_waiver_governance,
+        resolve_scorer_short_pit_prototype_gate_columns,
+    )
+
+    columns: dict[str, dict[str, object]] = {}
+    for col in resolve_scorer_short_pit_prototype_gate_columns():
+        mismatch_count = 1 if col in fe_mismatch_cols else 0
+        if col in LEGACY_BET_PACK_1H_COLUMNS and bet_waiver_mismatch_count > 0:
+            mismatch_count = bet_waiver_mismatch_count
+        info: dict[str, object] = {"mismatch_count": mismatch_count}
+        if mismatch_count > 0 and col.startswith("bet__"):
+            info["sample_bet_ids"] = [12345]
+        columns[col] = info
+    raw = {"columns": columns, "compared_rows": compared_rows}
+    return apply_parity_waiver_governance(raw, compared_rows=compared_rows)
+
+
 def test_evaluate_full_month_cold_build_gate_decisions() -> None:
     """WP-10 decision thresholds: parity + output validation + 3x speedup."""
     from trainer_hightier.feature_experiment.short_term_pit_replay_indexed_prototype import (
@@ -930,7 +956,7 @@ def test_evaluate_full_month_cold_build_gate_decisions() -> None:
     )
 
     integrate = evaluate_full_month_cold_build_gate(
-        parity_passed=True,
+        parity=_synthetic_parity_report(),
         output_validation_passed=True,
         replay_elapsed_seconds=100.0,
         bounded_elapsed_seconds=350.0,
@@ -939,7 +965,7 @@ def test_evaluate_full_month_cold_build_gate_decisions() -> None:
     assert integrate["final_integration_met"] is True
 
     continue_proto = evaluate_full_month_cold_build_gate(
-        parity_passed=True,
+        parity=_synthetic_parity_report(),
         output_validation_passed=True,
         replay_elapsed_seconds=100.0,
         bounded_elapsed_seconds=200.0,
@@ -947,9 +973,37 @@ def test_evaluate_full_month_cold_build_gate_decisions() -> None:
     assert continue_proto["decision"] == "continue_prototype"
 
     stop = evaluate_full_month_cold_build_gate(
-        parity_passed=False,
+        parity=_synthetic_parity_report(fe_mismatch_cols=("fe__bets_cnt__w15m",)),
         output_validation_passed=True,
         replay_elapsed_seconds=100.0,
         bounded_elapsed_seconds=400.0,
     )
     assert stop["decision"] == "stop_indexed_replay"
+
+
+def test_apply_parity_waiver_governance_accepts_legacy_bet_pack() -> None:
+    """Pinned DL-001 waiver: fe__* hard parity + small bet__* mismatch ratio."""
+    parity = _synthetic_parity_report(bet_waiver_mismatch_count=54, compared_rows=600_000)
+    assert parity["hard_parity_passed"] is True
+    assert parity["waiver_accepted"] is True
+    assert parity["passed"] is False
+
+    from trainer_hightier.feature_experiment.short_term_pit_replay_indexed_prototype import (
+        evaluate_full_month_cold_build_gate,
+    )
+
+    gate = evaluate_full_month_cold_build_gate(
+        parity=parity,
+        output_validation_passed=True,
+        replay_elapsed_seconds=100.0,
+        bounded_elapsed_seconds=350.0,
+    )
+    assert gate["decision"] == "integrate_candidate_with_bet_pack_waiver"
+    assert gate["final_integration_met"] is True
+
+
+def test_apply_parity_waiver_governance_rejects_excessive_bet_mismatch() -> None:
+    """Bet-pack waiver must fail when mismatch ratio exceeds pinned bound."""
+    parity = _synthetic_parity_report(bet_waiver_mismatch_count=50_000, compared_rows=500_000)
+    assert parity["hard_parity_passed"] is True
+    assert parity["waiver_accepted"] is False
