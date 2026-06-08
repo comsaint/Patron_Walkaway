@@ -8,6 +8,8 @@ from trainer_hightier.utils.cache_invalidation_v1 import (
     compute_l1_recompute_months,
     label_invalid_months,
     mid_term_invalid_months,
+    feature_screening_change_invalidates_layers,
+    sample_policy_change_invalidates_layers,
     shift_calendar_month,
     short_pit_invalid_months,
     union_changed_partition_months,
@@ -119,3 +121,16 @@ def test_p3_t10_single_source_dirty_month_expands_labels_and_short_pit() -> None
     assert label_months == ["202502", "202503", "202504"]
     assert pit_months == ["202502", "202503"]
     assert "202504" not in pit_months
+
+
+def test_feature_screening_change_invalidates_manifest_and_model_only() -> None:
+    layers = feature_screening_change_invalidates_layers()
+    assert layers == ("selected_feature_manifest", "model_artifacts")
+    assert "assembled_training_dataset" not in layers
+
+
+def test_sample_policy_change_invalidates_only_sampled_train_and_model() -> None:
+    layers = sample_policy_change_invalidates_layers()
+    assert layers == ("sampled_train_cache", "model_artifacts")
+    assert "short_term_pit_cache" not in layers
+    assert "assembled_training_dataset" not in layers

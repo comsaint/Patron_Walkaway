@@ -133,3 +133,25 @@ def mid_term_invalid_months(
             cur = shift_calendar_month(cur, delta_months=-1)
             out.add(cur)
     return out
+
+
+SAMPLE_POLICY_DOWNSTREAM_LAYERS: Final[tuple[str, ...]] = (
+    "sampled_train_cache",
+    "model_artifacts",
+)
+
+
+def sample_policy_change_invalidates_layers() -> tuple[str, ...]:
+    """Return artifact layers invalidated by ``neg_sample_frac`` / seed change (SSOT §6.2)."""
+    return SAMPLE_POLICY_DOWNSTREAM_LAYERS
+
+
+FEATURE_SCREENING_DOWNSTREAM_LAYERS: Final[tuple[str, ...]] = (
+    "selected_feature_manifest",
+    "model_artifacts",
+)
+
+
+def feature_screening_change_invalidates_layers() -> tuple[str, ...]:
+    """Return artifact layers invalidated by screening policy/manifest change (SSOT §6.3)."""
+    return FEATURE_SCREENING_DOWNSTREAM_LAYERS

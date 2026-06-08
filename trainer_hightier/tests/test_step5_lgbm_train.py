@@ -163,3 +163,83 @@ def test_player_game_metrics_at_threshold_counts_groups() -> None:
     assert prec == pytest.approx(0.5)
     assert rec == pytest.approx(1.0)
 
+
+def _synthetic_train_frame(*, n_neg: int, n_pos: int) -> pd.DataFrame:
+    neg = pd.DataFrame({"walkaway_label": [0] * n_neg, "bet_id": np.arange(n_neg, dtype=float)})
+    pos = pd.DataFrame(
+        {
+            "walkaway_label": [1] * n_pos,
+            "bet_id": np.arange(n_neg, n_neg + n_pos, dtype=float),
+        },
+    )
+    return pd.concat([neg, pos], ignore_index=True)
+
+
+def test_downsample_train_negatives_preserves_all_positives() -> None:
+    from trainer_hightier.utils.train_negative_sampling import downsample_train_negatives
+
+    df = _synthetic_train_frame(n_neg=100, n_pos=5)
+    out, counts = downsample_train_negatives(df, neg_sample_frac=0.2, neg_sample_seed=11)
+    assert counts["train_positives_kept"] == 5
+    assert int(out["walkaway_label"].sum()) == 5
+    assert counts["train_negatives_after"] < counts["train_negatives_before"]
+
+
+def test_downsample_train_negatives_reproducible_with_seed() -> None:
+    from trainer_hightier.utils.train_negative_sampling import downsample_train_negatives
+
+    df = _synthetic_train_frame(n_neg=200, n_pos=3)
+    out_a, meta_a = downsample_train_negatives(df, neg_sample_frac=0.25, neg_sample_seed=99)
+    out_b, meta_b = downsample_train_negatives(df, neg_sample_frac=0.25, neg_sample_seed=99)
+    assert meta_a == meta_b
+    assert set(out_a["bet_id"].tolist()) == set(out_b["bet_id"].tolist())
+
+
+def test_materialize_sampled_train_disabled_uses_source_train(tmp_path: Path) -> None:
+    from trainer_hightier.config import SamplePolicy
+    from trainer_hightier.utils.train_negative_sampling import materialize_sampled_train_parquet
+
+    splits = tmp_path / "splits"
+    splits.mkdir()
+    train_p = splits / "train.parquet"
+    pd.DataFrame({"walkaway_label": [0, 1], "bet_id": [1.0, 2.0]}).to_parquet(train_p)
+    out, meta = materialize_sampled_train_parquet(
+        train_parquet=train_p,
+        splits_dir=splits,
+        policy=SamplePolicy(neg_sample_frac=1.0),
+    )
+    assert out.resolve() == train_p.resolve()
+    assert meta["enabled"] is False
+
+
+def test_materialize_sampled_train_cache_hit(tmp_path: Path) -> None:
+    from trainer_hightier.config import SamplePolicy
+    from trainer_hightier.utils.train_negative_sampling import materialize_sampled_train_parquet
+
+    splits = tmp_path / "splits"
+    splits.mkdir()
+    train_p = splits / "train.parquet"
+    pd.DataFrame(
+        {
+            "walkaway_label": [0] * 80 + [1] * 20,
+            "bet_id": np.arange(100, dtype=float),
+        },
+    ).to_parquet(train_p)
+    policy = SamplePolicy(neg_sample_frac=0.3, neg_sample_seed=7)
+    _, meta1 = materialize_sampled_train_parquet(
+        train_parquet=train_p,
+        splits_dir=splits,
+        policy=policy,
+    )
+    assert meta1["cache_hit"] is False
+    assert (splits / "train_sampled.parquet").is_file()
+
+    _, meta2 = materialize_sampled_train_parquet(
+        train_parquet=train_p,
+        splits_dir=splits,
+        policy=policy,
+    )
+    assert meta2["cache_hit"] is True
+    assert meta2["train_rows_after"] == meta1["train_rows_after"]
+    assert meta2["val_test_evaluation_unsampled"] is True
+
