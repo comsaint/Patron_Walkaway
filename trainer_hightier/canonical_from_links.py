@@ -45,7 +45,11 @@ def _apply_mn_resolution(
         )
 
     resolved = (
-        df.sort_values("lud_dtm", ascending=False, na_position="last")
+        df.sort_values(
+            ["lud_dtm", "casino_player_id"],
+            ascending=[False, True],
+            na_position="last",
+        )
         .drop_duplicates(subset=["player_id"], keep="first")
         [["player_id", "casino_player_id"]]
         .rename(columns={"casino_player_id": "canonical_id"})

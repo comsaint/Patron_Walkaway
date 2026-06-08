@@ -9,7 +9,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from trainer_hightier.config import CanonicalMappingConfig, DuckDbRuntimeConfig
-from trainer_hightier.utils.canonical_mapping import build_canonical_mapping_from_cleaned_session_parquet
+from trainer_hightier.utils.canonical_mapping import (
+    build_canonical_mapping_from_cleaned_session_parquet,
+    canonical_mapping_content_fingerprint,
+)
+from trainer_hightier.utils.source_manifest_v2 import sha256_file_bytes
 
 
 def _base_row(**kwargs):
@@ -69,3 +73,32 @@ def test_canonical_mapping_card_swap_latest_wins_and_dummy_excluded(tmp_path) ->
     assert "casino_player_id" in mp.columns
     assert str(mp["casino_player_id"].iloc[0]) == "card_new"
     assert out_js.is_file()
+    assert mp["player_id"].is_monotonic_increasing
+
+
+def test_canonical_mapping_content_fingerprint_invariant_to_row_order(tmp_path) -> None:
+    """Content fingerprint matches when only parquet row order differs."""
+    base = tmp_path / "base.parquet"
+    shuf = tmp_path / "shuf.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "player_id": [1, 2, 3],
+                "canonical_id": ["c1", "c2", "c3"],
+                "casino_player_id": ["c1", "c2", "c3"],
+            }
+        ),
+        base,
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "player_id": [3, 1, 2],
+                "canonical_id": ["c3", "c1", "c2"],
+                "casino_player_id": ["c3", "c1", "c2"],
+            }
+        ),
+        shuf,
+    )
+    assert canonical_mapping_content_fingerprint(base) == canonical_mapping_content_fingerprint(shuf)
+    assert sha256_file_bytes(base) != sha256_file_bytes(shuf)

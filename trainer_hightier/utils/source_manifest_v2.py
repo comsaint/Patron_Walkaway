@@ -405,6 +405,10 @@ def build_pipeline_cache_layers(metrics: dict[str, Any]) -> list[dict[str, Any]]
             extra = {
                 "invalid_months": metrics.get("labels_invalid_months"),
                 "semantic_fingerprint": metrics.get("labels_semantic_fingerprint"),
+                "grain": metrics.get("labels_grain"),
+                "hit_shards": metrics.get("labels_cache_hit_shards"),
+                "miss_shards": metrics.get("labels_cache_miss_shards"),
+                "sharded": metrics.get("labels_sharded"),
             }
         if layer_name == "l3_entity_set_v1":
             extra = {

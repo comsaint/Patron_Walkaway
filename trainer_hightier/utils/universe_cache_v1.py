@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -13,7 +14,11 @@ import duckdb
 
 from trainer_hightier.config import DuckDbRuntimeConfig
 from trainer_hightier.utils.duckdb_runtime import execute_sql_with_progress_oom_retry
-from trainer_hightier.utils.patron_session_metrics import _validate_adt_allowlist_inputs
+from trainer_hightier.utils.canonical_mapping import canonical_mapping_content_fingerprint
+from trainer_hightier.utils.patron_session_metrics import (
+    _validate_adt_allowlist_inputs,
+    patron_profile_content_fingerprint,
+)
 from trainer_hightier.utils.source_manifest_v2 import (
     default_cache_root,
     sha256_file_bytes,
@@ -24,6 +29,7 @@ logger = logging.getLogger("trainer_hightier")
 
 ADT_RANK_KIND: Final[str] = "adt_rank_latest_v1"
 ADT_RANK_SCHEMA_VERSION: Final[int] = 1
+SELECTED_UNIVERSE_KIND: Final[str] = "selected_universe_v1"
 SELECTED_UNIVERSE_SCHEMA_VERSION: Final[int] = 1
 
 
@@ -187,8 +193,8 @@ def materialize_adt_rank_table_v1_cached(
     src_p = Path(patron_profile_csv).resolve()
     src_m = Path(canonical_mapping_parquet).resolve()
     _validate_adt_allowlist_inputs(src_p, src_m)
-    profile_sha = sha256_file_bytes(src_p)
-    mapping_sha = sha256_file_bytes(src_m)
+    profile_sha = patron_profile_content_fingerprint(src_p)
+    mapping_sha = canonical_mapping_content_fingerprint(src_m)
     slow_anchor_s = str(slow_active_anchor) if slow_active_anchor is not None else "none"
     uroot = default_universe_cache_root() if cache_root is None else Path(cache_root).resolve()
     out_dir = rank_table_dir(
@@ -268,6 +274,38 @@ def materialize_adt_rank_table_v1_cached(
     }
 
 
+def selected_universe_membership_fingerprint(
+    rank_table_path: Path,
+    *,
+    quantile: float,
+) -> str:
+    """Hash sorted selected ``(canonical_id, player_id)`` pairs (ADT values excluded)."""
+    qf = float(quantile)
+    if not (0.0 < qf < 1.0):
+        raise ValueError(f"quantile must be strictly between 0 and 1, got {qf!r}")
+    p = _path_esc(rank_table_path)
+    con = duckdb.connect()
+    try:
+        rows = con.execute(
+            f"""
+            SELECT
+              TRIM(CAST(canonical_id AS VARCHAR)) AS cid,
+              TRY_CAST(player_id AS BIGINT) AS pid
+            FROM read_parquet('{p}')
+            WHERE CAST(adt_percentile AS DOUBLE) >= {qf}
+              AND has_slow_window_coverage
+              AND TRY_CAST(player_id AS BIGINT) IS NOT NULL
+            ORDER BY 1, 2
+            """,
+        ).fetchall()
+    finally:
+        con.close()
+    blob = "\n".join(
+        f"{cid}\t{pid}" for cid, pid in rows if cid is not None and pid is not None
+    ).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
 def diff_selected_universe_added_player_ids(
     rank_table_path: Path,
     *,
@@ -305,14 +343,23 @@ def write_selected_universe_manifest(
     *,
     rank_table_path: Path,
     quantile: float,
-    rank_fingerprint_sha256_hex: str,
+    rank_fingerprint_sha256_hex: str | None = None,
     cache_root: Path | None = None,
 ) -> dict[str, Any]:
     """Write selected-universe sidecar for one quantile filter over a rank table."""
     qf = float(quantile)
     if not (0.0 < qf < 1.0):
         raise ValueError(f"quantile must be strictly between 0 and 1, got {qf!r}")
-    p = str(Path(rank_table_path).resolve()).replace("\\", "/").replace("'", "''")
+    rank_p = Path(rank_table_path).resolve()
+    if not rank_p.is_file():
+        raise FileNotFoundError(f"ADT rank table missing: {rank_p}")
+    membership_fp = selected_universe_membership_fingerprint(rank_p, quantile=qf)
+    rank_fp = (
+        str(rank_fingerprint_sha256_hex).strip()
+        if rank_fingerprint_sha256_hex
+        else sha256_file_bytes(rank_p)
+    )
+    p = str(rank_p).replace("\\", "/").replace("'", "''")
     con = duckdb.connect()
     try:
         row = con.execute(
@@ -333,11 +380,13 @@ def write_selected_universe_manifest(
     uroot = default_universe_cache_root() if cache_root is None else Path(cache_root).resolve()
     out_dir = uroot / "selected_universe"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"selected_universe_q{qslug}_{rank_fingerprint_sha256_hex[:16]}.json"
+    out_path = out_dir / f"selected_universe_q{qslug}_{membership_fp[:16]}.json"
     payload = {
         "schema_version": SELECTED_UNIVERSE_SCHEMA_VERSION,
+        "kind": SELECTED_UNIVERSE_KIND,
         "selected_quantile": qf,
-        "rank_table_fingerprint_sha256_hex": str(rank_fingerprint_sha256_hex),
+        "selected_universe_fingerprint": membership_fp,
+        "rank_table_fingerprint_sha256_hex": rank_fp,
         "selected_canonical_count": canon_n,
         "selected_player_count": player_n,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -345,6 +394,7 @@ def write_selected_universe_manifest(
     write_json_atomic(out_path, payload)
     return {
         "selected_universe_manifest_path": str(out_path.resolve()),
+        "selected_universe_fingerprint_sha256_hex": membership_fp,
         "selected_universe_canonical_count": canon_n,
         "selected_universe_player_count": player_n,
         "selected_universe_quantile": qf,

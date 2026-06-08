@@ -207,6 +207,8 @@ class HighTierTrainArgs:
     partition_backfill_month_count: int = _PARTITION_INGRESS_DEFAULTS.backfill_month_count
     #: When True (default): Step 3 / 3.5 read entity set v1 instead of ADT-segmented cleaned bet.
     use_entity_set_v1: bool = True
+    #: When True: Step 2c labels use month×canonical_shard cache (default off until smoke sign-off).
+    use_sharded_labels_cache: bool = False
     # Step 4: deterministic arrange + time split on ``gaming_day`` (after Step 3 or --start-from-features).
     run_step4: bool = True
     step4_split: Step4SplitConfig = field(default_factory=Step4SplitConfig)
@@ -667,6 +669,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
         allowed_players_pq = default_adt_allowed_players_parquet_path(q_thr)
 
     rank_meta: dict[str, Any] | None = None
+    selected_universe_fp: str | None = None
     if args.canonical_mapping.enabled and profile_csv_path.is_file() and mapping_parquet_path.is_file():
         from datetime import date as _date_cls
 
@@ -695,6 +698,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 quantile=q_thr,
                 rank_fingerprint_sha256_hex=str(rank_meta["universe_adt_rank_fingerprint_sha256_hex"]),
             )
+            selected_universe_fp = str(sel_meta["selected_universe_fingerprint_sha256_hex"])
             if metrics is not None:
                 metrics.update(sel_meta)
 
@@ -784,11 +788,17 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                         "entity set v1 requires ADT rank table and source_manifest_v2 fingerprint",
                     )
                 from trainer_hightier.utils.entity_set_v1 import materialize_entity_set_v1_cached
+                from trainer_hightier.utils.universe_cache_v1 import selected_universe_membership_fingerprint
 
+                if selected_universe_fp is None:
+                    selected_universe_fp = selected_universe_membership_fingerprint(
+                        Path(str(rank_meta["universe_adt_rank_table_path"])),
+                        quantile=q_thr,
+                    )
                 es_meta = materialize_entity_set_v1_cached(
                     base_cleaned_parquet=base_bet_path,
                     rank_table_path=Path(str(rank_meta["universe_adt_rank_table_path"])),
-                    rank_fingerprint_sha256_hex=str(rank_meta["universe_adt_rank_fingerprint_sha256_hex"]),
+                    selected_universe_fingerprint_sha256_hex=selected_universe_fp,
                     selected_quantile=q_thr,
                     training_scope=base_bet_cfg.data_scope,
                     source_manifest_v2_fingerprint_sha256_hex=source_fp,
@@ -1008,6 +1018,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 out_parquet=labels_out,
                 invalid_months=labels_invalid,
                 use_cache=use_preprocess_caches,
+                use_sharded_cache=bool(args.use_sharded_labels_cache),
             )
             if metrics is not None:
                 metrics.update(lbl_meta)
@@ -1254,6 +1265,63 @@ def _ensure_fe_enriched_training_parquet_for_step4(
     mid_snap_out = out_dir / "_main_trainer_mid_term_daily_snapshot.parquet"
     enriched = out_dir / "training_set_fe_enriched.parquet"
 
+    from trainer_hightier.utils.assembly_cache_v1 import (
+        assembly_cache_is_hit,
+        assembly_manifest_path,
+        assembly_policy_fingerprint_sha256_hex,
+        enrich_module_fingerprint_sha256_hex,
+        parquet_content_fingerprint,
+        registry_baseline_fingerprint_sha256_hex,
+        write_assembly_manifest,
+    )
+    from trainer_hightier.utils.source_manifest_v2 import sha256_file_bytes
+
+    entity_fp_for_assembly: str | None = None
+    if metrics is not None:
+        entity_raw = metrics.get("entity_set_policy_fingerprint_sha256_hex")
+        if entity_raw is not None and str(entity_raw).strip():
+            entity_fp_for_assembly = str(entity_raw).strip()
+    registry_fp = registry_baseline_fingerprint_sha256_hex(baseline)
+    training_base_fp = sha256_file_bytes(base_training_parquet)
+    enrich_fp = enrich_module_fingerprint_sha256_hex()
+    assembly_manifest_p = assembly_manifest_path(enriched)
+
+    def _assembly_policy_fp(*, short_fp: str | None, mid_fp: str | None) -> str:
+        if not entity_fp_for_assembly:
+            raise ValueError("entity_set_policy_fingerprint_sha256_hex required for assembly policy")
+        return assembly_policy_fingerprint_sha256_hex(
+            registry_baseline_fingerprint_sha256_hex=registry_fp,
+            training_base_fingerprint_sha256_hex=training_base_fp,
+            entity_set_fingerprint_sha256_hex=entity_fp_for_assembly,
+            enrich_module_fingerprint_sha256_hex=enrich_fp,
+            short_term_parquet_fingerprint_sha256_hex=short_fp,
+            mid_term_snapshot_fingerprint_sha256_hex=mid_fp,
+        )
+
+    if (
+        entity_fp_for_assembly
+        and not args.ignore_caches
+        and not args.force_refresh_short_term_pit
+    ):
+        probe_fp = _assembly_policy_fp(
+            short_fp=parquet_content_fingerprint(fe_short_out if short_cols else None),
+            mid_fp=parquet_content_fingerprint(mid_snap_out if mid_cols else None),
+        )
+        if assembly_cache_is_hit(
+            manifest_path=assembly_manifest_p,
+            enriched_parquet=enriched,
+            assembly_policy_fingerprint_sha256_hex=probe_fp,
+        ):
+            if metrics is not None:
+                metrics["assembly_cache_hit"] = True
+                metrics["assembly_policy_fingerprint_sha256_hex"] = probe_fp
+                metrics["assembly_manifest_path"] = str(assembly_manifest_p.resolve())
+                metrics["main_trainer_training_parquet_for_step4"] = str(enriched.resolve())
+            logger.info("[Step 3.5] assembly cache hit -> %s", enriched.resolve())
+            return enriched
+        if metrics is not None:
+            metrics["assembly_policy_fingerprint_sha256_hex"] = probe_fp
+
     t_m0 = time.perf_counter()
     short_fe_only = tuple(c for c in short_cols if str(c).startswith("fe__"))
     short_cache_meta: dict[str, Any] = {}
@@ -1405,6 +1473,22 @@ def _ensure_fe_enriched_training_parquet_for_step4(
         metrics["feature_cadence_audit_path"] = str(audit_path.resolve())
         if mid_meta:
             metrics["main_trainer_mid_term_snapshot_meta"] = mid_meta
+        if entity_fp_for_assembly and not args.ignore_caches:
+            final_fp = _assembly_policy_fp(
+                short_fp=parquet_content_fingerprint(fe_short_out if short_cols else None),
+                mid_fp=parquet_content_fingerprint(mid_snap_out if mid_cols else None),
+            )
+            write_assembly_manifest(
+                manifest_path=assembly_manifest_p,
+                enriched_parquet=enriched,
+                assembly_policy_fingerprint_sha256_hex=final_fp,
+                registry_baseline_fingerprint_sha256_hex=registry_fp,
+                training_base_fingerprint_sha256_hex=training_base_fp,
+                entity_set_fingerprint_sha256_hex=entity_fp_for_assembly,
+            )
+            metrics["assembly_cache_hit"] = False
+            metrics["assembly_manifest_path"] = str(assembly_manifest_p.resolve())
+            metrics["assembly_policy_fingerprint_sha256_hex"] = final_fp
     logger.info(
         "[Step 3.5] cadence enrich: short_pit=%d (bet__=%d fe__=%d) mid=%d -> %s "
         "(short %.3fs, mid %.3fs, enrich %.3fs%s)",
@@ -2423,6 +2507,15 @@ def _build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--use-sharded-labels-cache",
+        action="store_true",
+        dest="use_sharded_labels_cache",
+        help=(
+            "Step 2c: materialize walkaway labels via month×canonical_shard cache "
+            "(default monolithic labels cache)."
+        ),
+    )
+    p.add_argument(
         "--skip-training-dataset",
         action="store_true",
         dest="skip_training_dataset",
@@ -2605,6 +2698,7 @@ def _train_args_from_cli_namespace(ns: argparse.Namespace) -> HighTierTrainArgs:
         force_refresh_short_term_pit=bool(ns.force_refresh_short_term_pit),
         skip_bet_preprocess=bool(ns.skip_bet_preprocess),
         use_entity_set_v1=not bool(ns.use_legacy_bet_segment),
+        use_sharded_labels_cache=bool(ns.use_sharded_labels_cache),
         materialize_walkaway_labels=not bool(ns.skip_walkaway_labels),
         build_training_dataset=not bool(ns.skip_training_dataset),
         training_materialize_derived=not bool(ns.skip_training_materialize_derived),

@@ -89,3 +89,33 @@ def test_compute_l1_recompute_empty_diff_only_correction() -> None:
         available_months={"202406", "202407"},
     )
     assert got == ["202406"]
+
+
+def test_p2_t7_l1_recompute_months_match_source_changed_partitions() -> None:
+    """P2-T-7: ``l1_recompute_months`` equals union of ``changed_partitions`` (when available)."""
+    changed = {"t_bet": ["202503", "202504"], "t_session": ["202503"]}
+    got = compute_l1_recompute_months(
+        changed_partitions=changed,
+        correction_months=(),
+        backfill_month_count=0,
+        available_months={"202503", "202504", "202505"},
+    )
+    assert got == ["202503", "202504"]
+    assert set(got) == union_changed_partition_months(changed)
+
+
+def test_p3_t10_single_source_dirty_month_expands_labels_and_short_pit() -> None:
+    """P3-T-10: one modified historical file month drives downstream invalidation windows."""
+    changed = {"t_bet": ["202503"], "t_session": []}
+    l1_months = compute_l1_recompute_months(
+        changed_partitions=changed,
+        correction_months=(),
+        backfill_month_count=0,
+        available_months={"202502", "202503", "202504", "202505"},
+    )
+    assert l1_months == ["202503"]
+    label_months = sorted(label_invalid_months(set(l1_months)))
+    pit_months = sorted(short_pit_invalid_months(set(l1_months), neighbor_backfill=1))
+    assert label_months == ["202502", "202503", "202504"]
+    assert pit_months == ["202502", "202503"]
+    assert "202504" not in pit_months

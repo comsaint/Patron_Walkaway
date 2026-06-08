@@ -11,6 +11,7 @@ import pyarrow.parquet as pq
 from trainer_hightier.config import DuckDbRuntimeConfig
 import pandas as pd
 
+from trainer_hightier.utils.cache_invalidation_v1 import label_invalid_months
 from trainer_hightier.utils.labels_cache_v1 import (
     label_semantic_fingerprint,
     labels_cache_is_hit,
@@ -139,7 +140,7 @@ def test_sharded_labels_cache_hit_on_second_call(tmp_path: Path) -> None:
 
 
 def test_sharded_labels_invalid_month_recomputes_shard(tmp_path: Path) -> None:
-    """Dirty month should miss only that month's shards (P3-T-10 prep)."""
+    """P3-T-10: dirty month safety window recomputes only affected month×shard entries."""
     paths = _tiny_labels_inputs(tmp_path)
     kwargs = dict(
         cleaned_bet_parquet=paths["bet"],
@@ -152,8 +153,73 @@ def test_sharded_labels_invalid_month_recomputes_shard(tmp_path: Path) -> None:
         use_cache=True,
     )
     materialize_labels_v1_sharded_cached(**kwargs)
-    rerun = materialize_labels_v1_sharded_cached(**kwargs, invalid_months=("202406",))
+    expanded = sorted(label_invalid_months({"202406"}))
+    assert expanded == ["202405", "202406", "202407"]
+    rerun = materialize_labels_v1_sharded_cached(
+        **kwargs,
+        invalid_months=tuple(expanded),
+    )
+    assert rerun["labels_cache_hit"] is False
     assert "202406:0" in rerun["labels_cache_miss_shards"]
+
+
+def test_labels_miss_when_entity_set_fingerprint_changes(tmp_path: Path, monkeypatch) -> None:
+    """P3-T-5: entity set fp change forces labels rematerialize."""
+    calls: list[str] = []
+
+    def _fake_materialize(**_kwargs: object) -> Path:
+        calls.append("materialize")
+        out = tmp_path / "walkaway_labels.parquet"
+        pq.write_table(pa.table({"bet_id": [1.0], "canonical_id": ["c1"], "label": [0]}), out)
+        return out
+
+    monkeypatch.setattr(
+        "trainer_hightier.utils.labels_cache_v1.materialize_walkaway_labels_from_cleaned_bet",
+        _fake_materialize,
+    )
+    base = dict(
+        cleaned_bet_parquet=tmp_path / "bet",
+        canonical_mapping_parquet=tmp_path / "map",
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        cache_root=tmp_path / "cache",
+        out_parquet=tmp_path / "walkaway_labels.parquet",
+        use_cache=True,
+    )
+    materialize_labels_v1_cached(**base, entity_set_fingerprint="entity_fp_a" * 4)
+    materialize_labels_v1_cached(**base, entity_set_fingerprint="entity_fp_b" * 4)
+    assert calls == ["materialize", "materialize"]
+
+
+def test_sharded_labels_miss_when_entity_set_fingerprint_changes(tmp_path: Path, monkeypatch) -> None:
+    """P3-T-5 (sharded): entity set fp change rematerializes all month×shard entries."""
+    shard_calls: list[str] = []
+    real = __import__(
+        "trainer_hightier.utils.labels_cache_v1",
+        fromlist=["_materialize_labels_shard"],
+    )._materialize_labels_shard
+
+    def _spy_shard(**kwargs: object) -> Path:
+        shard_calls.append(str(kwargs.get("entity_set_fingerprint")))
+        return real(**kwargs)
+
+    monkeypatch.setattr(
+        "trainer_hightier.utils.labels_cache_v1._materialize_labels_shard",
+        _spy_shard,
+    )
+    paths = _tiny_labels_inputs(tmp_path)
+    base = dict(
+        cleaned_bet_parquet=paths["bet"],
+        canonical_mapping_parquet=paths["map"],
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        cache_root=tmp_path / "cache_sharded_fp",
+        out_parquet=paths["out"],
+        canonical_shard_count=1,
+        use_cache=True,
+    )
+    materialize_labels_v1_sharded_cached(**base, entity_set_fingerprint="entity_fp_a" * 4)
+    materialize_labels_v1_sharded_cached(**base, entity_set_fingerprint="entity_fp_b" * 4)
+    assert len(shard_calls) == 2
+    assert shard_calls[0] != shard_calls[1]
 
 
 def test_materialize_labels_use_sharded_flag(tmp_path: Path, monkeypatch) -> None:

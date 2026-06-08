@@ -29,6 +29,7 @@ from trainer_hightier.utils.entity_set_v1 import (
 from trainer_hightier.utils.patron_session_metrics import materialize_adt_allowed_players_parquet
 from trainer_hightier.tests.test_bet_preprocess import _bet_row, read_cleaned_bet_dataset
 from trainer_hightier.utils.source_manifest_v2 import sha256_file_bytes
+from trainer_hightier.utils.universe_cache_v1 import selected_universe_membership_fingerprint
 
 _hpre = importlib.import_module("trainer_hightier.02_preprocess")
 
@@ -65,7 +66,8 @@ def test_entity_set_quantile_delta_records_added_players(tmp_path: Path) -> None
         ),
         rank_pq,
     )
-    rank_fp = sha256_file_bytes(rank_pq)
+    rank_fp_99 = selected_universe_membership_fingerprint(rank_pq, quantile=0.99)
+    rank_fp_50 = selected_universe_membership_fingerprint(rank_pq, quantile=0.5)
     t_pay = pd.Timestamp("2025-05-27 09:00:00")
     df = pd.DataFrame(
         [
@@ -93,7 +95,7 @@ def test_entity_set_quantile_delta_records_added_players(tmp_path: Path) -> None
     materialize_entity_set_v1_cached(
         base_cleaned_parquet=base,
         rank_table_path=rank_pq,
-        rank_fingerprint_sha256_hex=rank_fp,
+        selected_universe_fingerprint_sha256_hex=rank_fp_99,
         selected_quantile=0.99,
         training_scope=scope,
         source_manifest_v2_fingerprint_sha256_hex=source_fp,
@@ -105,7 +107,7 @@ def test_entity_set_quantile_delta_records_added_players(tmp_path: Path) -> None
     lo = materialize_entity_set_v1_cached(
         base_cleaned_parquet=base,
         rank_table_path=rank_pq,
-        rank_fingerprint_sha256_hex=rank_fp,
+        selected_universe_fingerprint_sha256_hex=rank_fp_50,
         selected_quantile=0.5,
         training_scope=scope,
         source_manifest_v2_fingerprint_sha256_hex=source_fp,
@@ -117,6 +119,75 @@ def test_entity_set_quantile_delta_records_added_players(tmp_path: Path) -> None
     assert int(lo.get("entity_delta_row_count") or 0) == 1
     assert lo.get("entity_delta_previous_quantile") == 0.99
     assert Path(str(lo.get("entity_delta_added_player_ids_path") or "")).is_file()
+
+
+def test_entity_set_quantile_increase_writes_no_delta(tmp_path: Path) -> None:
+    """P3-T-9: stricter quantile (0.5→0.99) does not emit quantile-delta rows."""
+    rank_pq = tmp_path / "rank.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "canonical_id": ["c1", "c2", "c3"],
+                "player_id": [10, 20, 30],
+                "adt": [10.0, 50.0, 90.0],
+                "adt_rank": [1, 2, 3],
+                "adt_percentile": [0.0, 0.5, 1.0],
+                "has_slow_window_coverage": [True, True, True],
+            }
+        ),
+        rank_pq,
+    )
+    rank_fp_50 = selected_universe_membership_fingerprint(rank_pq, quantile=0.5)
+    rank_fp_99 = selected_universe_membership_fingerprint(rank_pq, quantile=0.99)
+    t_pay = pd.Timestamp("2025-05-27 09:00:00")
+    df = pd.DataFrame(
+        [
+            _bet_row(bet_id=1, player_id=10, payout_complete_dtm=t_pay),
+            _bet_row(bet_id=2, player_id=30, payout_complete_dtm=t_pay),
+        ]
+    )
+    raw = tmp_path / "gmwds_t_bet.parquet"
+    pq.write_table(pa.Table.from_pandas(df), raw)
+    base = tmp_path / "base_ds"
+    _hpre.preprocess_bets_from_parquet_streaming(
+        raw,
+        base,
+        cfg=BetPreprocessConfig(
+            data_scope=L0PreprocessDataScopeConfig(),
+            preprocess_registry_yaml=default_preprocess_registry_yaml_path(),
+            dedup_hash_buckets=1,
+        ),
+    )
+    scope = TRAINING_DATA_SCOPE_TEST_UNBOUNDED
+    source_fp = "abc123" * 10 + "abcd"
+    cache = tmp_path / "cache"
+    duck = DuckDbRuntimeConfig()
+    materialize_entity_set_v1_cached(
+        base_cleaned_parquet=base,
+        rank_table_path=rank_pq,
+        selected_universe_fingerprint_sha256_hex=rank_fp_50,
+        selected_quantile=0.5,
+        training_scope=scope,
+        source_manifest_v2_fingerprint_sha256_hex=source_fp,
+        duckdb_runtime=duck,
+        cache_root=cache,
+        output_parquet=tmp_path / "out_lo",
+        use_cache=False,
+    )
+    hi = materialize_entity_set_v1_cached(
+        base_cleaned_parquet=base,
+        rank_table_path=rank_pq,
+        selected_universe_fingerprint_sha256_hex=rank_fp_99,
+        selected_quantile=0.99,
+        training_scope=scope,
+        source_manifest_v2_fingerprint_sha256_hex=source_fp,
+        duckdb_runtime=duck,
+        cache_root=cache,
+        output_parquet=tmp_path / "out_hi",
+        use_cache=False,
+    )
+    assert hi.get("entity_delta_row_count") in (None, 0)
+    assert hi.get("entity_delta_manifest_path") is None
 
 
 def test_entity_set_matches_legacy_segment_row_set(tmp_path: Path) -> None:
@@ -140,7 +211,7 @@ def test_entity_set_matches_legacy_segment_row_set(tmp_path: Path) -> None:
     )
     rank_pq = tmp_path / "rank.parquet"
     _write_rank_table(rank_pq)
-    rank_fp = sha256_file_bytes(rank_pq)
+    rank_fp = selected_universe_membership_fingerprint(rank_pq, quantile=0.99)
     t_pay = pd.Timestamp("2025-05-27 09:00:00")
     df = pd.DataFrame(
         [
@@ -174,7 +245,7 @@ def test_entity_set_matches_legacy_segment_row_set(tmp_path: Path) -> None:
     first = materialize_entity_set_v1_cached(
         base_cleaned_parquet=base,
         rank_table_path=rank_pq,
-        rank_fingerprint_sha256_hex=rank_fp,
+        selected_universe_fingerprint_sha256_hex=rank_fp,
         selected_quantile=0.99,
         training_scope=scope,
         source_manifest_v2_fingerprint_sha256_hex=source_fp,
@@ -191,7 +262,7 @@ def test_entity_set_matches_legacy_segment_row_set(tmp_path: Path) -> None:
     second = materialize_entity_set_v1_cached(
         base_cleaned_parquet=base,
         rank_table_path=rank_pq,
-        rank_fingerprint_sha256_hex=rank_fp,
+        selected_universe_fingerprint_sha256_hex=rank_fp,
         selected_quantile=0.99,
         training_scope=scope,
         source_manifest_v2_fingerprint_sha256_hex=source_fp,
@@ -217,3 +288,159 @@ def test_retire_bet_segment_cache_sidecar(tmp_path: Path) -> None:
 def test_training_scope_fingerprint_stable() -> None:
     scope = TRAINING_DATA_SCOPE_TEST_UNBOUNDED
     assert training_scope_fingerprint(scope) == training_scope_fingerprint(scope)
+
+
+def test_entity_set_cache_hit_uses_membership_not_rank_bytes(tmp_path: Path) -> None:
+    """Entity set cache must hit when membership unchanged but rank parquet bytes differ."""
+    rank_pq = tmp_path / "rank.parquet"
+    rank_jitter = tmp_path / "rank_jitter.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "canonical_id": ["vip"],
+                "player_id": [100],
+                "adt": [1_000_000.0],
+                "adt_rank": [1],
+                "adt_percentile": [1.0],
+                "has_slow_window_coverage": [True],
+            }
+        ),
+        rank_pq,
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "canonical_id": ["vip"],
+                "player_id": [100],
+                "adt": [1_000_000.00000001],
+                "adt_rank": [1],
+                "adt_percentile": [1.0],
+                "has_slow_window_coverage": [True],
+            }
+        ),
+        rank_jitter,
+    )
+    membership_fp = selected_universe_membership_fingerprint(rank_pq, quantile=0.99)
+    assert membership_fp == selected_universe_membership_fingerprint(rank_jitter, quantile=0.99)
+    assert sha256_file_bytes(rank_pq) != sha256_file_bytes(rank_jitter)
+    t_pay = pd.Timestamp("2025-05-27 09:00:00")
+    df = pd.DataFrame([_bet_row(bet_id=1, player_id=100, payout_complete_dtm=t_pay)])
+    raw = tmp_path / "gmwds_t_bet.parquet"
+    pq.write_table(pa.Table.from_pandas(df), raw)
+    base = tmp_path / "base_ds"
+    _hpre.preprocess_bets_from_parquet_streaming(
+        raw,
+        base,
+        cfg=BetPreprocessConfig(
+            data_scope=L0PreprocessDataScopeConfig(),
+            preprocess_registry_yaml=default_preprocess_registry_yaml_path(),
+            dedup_hash_buckets=1,
+        ),
+    )
+    scope = TRAINING_DATA_SCOPE_TEST_UNBOUNDED
+    source_fp = "abc123" * 10 + "abcd"
+    cache = tmp_path / "cache"
+    out = tmp_path / "entity_out"
+    duck = DuckDbRuntimeConfig()
+    materialize_entity_set_v1_cached(
+        base_cleaned_parquet=base,
+        rank_table_path=rank_pq,
+        selected_universe_fingerprint_sha256_hex=membership_fp,
+        selected_quantile=0.99,
+        training_scope=scope,
+        source_manifest_v2_fingerprint_sha256_hex=source_fp,
+        duckdb_runtime=duck,
+        cache_root=cache,
+        output_parquet=out,
+        use_cache=False,
+    )
+    second = materialize_entity_set_v1_cached(
+        base_cleaned_parquet=base,
+        rank_table_path=rank_jitter,
+        selected_universe_fingerprint_sha256_hex=membership_fp,
+        selected_quantile=0.99,
+        training_scope=scope,
+        source_manifest_v2_fingerprint_sha256_hex=source_fp,
+        duckdb_runtime=duck,
+        cache_root=cache,
+        output_parquet=out,
+        use_cache=True,
+    )
+    assert second["entity_set_cache_hit"] is True
+
+
+def test_p2_t1_quantile_change_misses_then_hits_entity_set(tmp_path: Path) -> None:
+    """P2-T-1: quantile change misses entity set; same quantile + membership hits without base rebuild."""
+    rank_pq = tmp_path / "rank.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "canonical_id": ["c1", "c2", "c3"],
+                "player_id": [10, 20, 30],
+                "adt": [10.0, 50.0, 90.0],
+                "adt_rank": [1, 2, 3],
+                "adt_percentile": [0.0, 0.5, 1.0],
+                "has_slow_window_coverage": [True, True, True],
+            }
+        ),
+        rank_pq,
+    )
+    fp_99 = selected_universe_membership_fingerprint(rank_pq, quantile=0.99)
+    fp_50 = selected_universe_membership_fingerprint(rank_pq, quantile=0.5)
+    assert fp_99 != fp_50
+    t_pay = pd.Timestamp("2025-05-27 09:00:00")
+    df = pd.DataFrame([_bet_row(bet_id=1, player_id=30, payout_complete_dtm=t_pay)])
+    raw = tmp_path / "gmwds_t_bet.parquet"
+    pq.write_table(pa.Table.from_pandas(df), raw)
+    base = tmp_path / "base_ds"
+    _hpre.preprocess_bets_from_parquet_streaming(
+        raw,
+        base,
+        cfg=BetPreprocessConfig(
+            data_scope=L0PreprocessDataScopeConfig(),
+            preprocess_registry_yaml=default_preprocess_registry_yaml_path(),
+            dedup_hash_buckets=1,
+        ),
+    )
+    scope = TRAINING_DATA_SCOPE_TEST_UNBOUNDED
+    source_fp = "abc123" * 10 + "abcd"
+    cache = tmp_path / "cache"
+    duck = DuckDbRuntimeConfig()
+    materialize_entity_set_v1_cached(
+        base_cleaned_parquet=base,
+        rank_table_path=rank_pq,
+        selected_universe_fingerprint_sha256_hex=fp_99,
+        selected_quantile=0.99,
+        training_scope=scope,
+        source_manifest_v2_fingerprint_sha256_hex=source_fp,
+        duckdb_runtime=duck,
+        cache_root=cache,
+        output_parquet=tmp_path / "out_99",
+        use_cache=False,
+    )
+    lo = materialize_entity_set_v1_cached(
+        base_cleaned_parquet=base,
+        rank_table_path=rank_pq,
+        selected_universe_fingerprint_sha256_hex=fp_50,
+        selected_quantile=0.5,
+        training_scope=scope,
+        source_manifest_v2_fingerprint_sha256_hex=source_fp,
+        duckdb_runtime=duck,
+        cache_root=cache,
+        output_parquet=tmp_path / "out_50",
+        use_cache=True,
+    )
+    assert lo["entity_set_cache_hit"] is False
+    hi = materialize_entity_set_v1_cached(
+        base_cleaned_parquet=base,
+        rank_table_path=rank_pq,
+        selected_universe_fingerprint_sha256_hex=fp_99,
+        selected_quantile=0.99,
+        training_scope=scope,
+        source_manifest_v2_fingerprint_sha256_hex=source_fp,
+        duckdb_runtime=duck,
+        cache_root=cache,
+        output_parquet=tmp_path / "out_99",
+        use_cache=True,
+    )
+    assert hi["entity_set_cache_hit"] is True

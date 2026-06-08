@@ -264,6 +264,9 @@ def build_pipeline_debug(metrics: dict[str, Any]) -> dict[str, Any]:
             "adt_rank_canonical_count": metrics.get("universe_adt_rank_canonical_count"),
             "selected_universe_canonical_count": metrics.get("selected_universe_canonical_count"),
             "selected_universe_player_count": metrics.get("selected_universe_player_count"),
+            "selected_universe_fingerprint_sha256_hex": metrics.get(
+                "selected_universe_fingerprint_sha256_hex",
+            ),
         },
         "entity_set_v1": {
             "cache_hit": metrics.get("entity_set_cache_hit"),
@@ -289,6 +292,11 @@ def build_pipeline_debug(metrics: dict[str, Any]) -> dict[str, Any]:
             "entity_set_fingerprint_sha256_hex": metrics.get("entity_set_policy_fingerprint_sha256_hex"),
             "delta_fill_shards": metrics.get("short_term_pit_delta_fill_shards"),
             "entity_delta_fill_elapsed_seconds": metrics.get("entity_delta_fill_elapsed_seconds"),
+        },
+        "assembly_v1": {
+            "cache_hit": metrics.get("assembly_cache_hit"),
+            "policy_fingerprint_sha256_hex": metrics.get("assembly_policy_fingerprint_sha256_hex"),
+            "manifest_path": metrics.get("assembly_manifest_path"),
         },
         "entity_set_delta": {
             "row_count": metrics.get("entity_delta_row_count"),
