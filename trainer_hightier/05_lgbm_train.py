@@ -556,6 +556,9 @@ def train_lgbm_from_splits(
     output_dir: Path,
     feature_columns: tuple[str, ...],
     persist_training_metrics: bool = True,
+    train_parquet: Path | None = None,
+    sample_policy_meta: dict[str, Any] | None = None,
+    feature_screening_meta: dict[str, Any] | None = None,
 ) -> Step5Result:
     """Train LightGBM on Step 4 splits; optional Optuna; pick threshold on val; write artifacts.
 
@@ -563,6 +566,11 @@ def train_lgbm_from_splits(
         feature_columns: Model input columns (excluding label / payout_ts). Required; use
             :func:`~trainer_hightier.feature_experiment.candidate_registry_loader.baseline_features_for_main_trainer`
             or full-candidate tuples from the candidate registry snapshot.
+        train_parquet: Optional sampled train split; defaults to ``splits_dir/train.parquet``.
+        sample_policy_meta: Optional downsampling disclosure block from
+            :func:`~trainer_hightier.utils.train_negative_sampling.materialize_sampled_train_parquet`.
+        feature_screening_meta: Optional screening hook disclosure from
+            :func:`~trainer_hightier.utils.feature_screening_hook.resolve_step5_feature_columns`.
     """
 
     if not feature_columns:
@@ -573,7 +581,7 @@ def train_lgbm_from_splits(
     feat_cols = tuple(feature_columns)
     cfg = step5 or Step5TrainConfig()
     sd = Path(splits_dir).resolve()
-    train_p = sd / "train.parquet"
+    train_p = Path(train_parquet).resolve() if train_parquet is not None else sd / "train.parquet"
     val_p = sd / "val.parquet"
     test_p = sd / "test.parquet"
     for pth in (train_p, val_p, test_p):
@@ -830,6 +838,30 @@ def train_lgbm_from_splits(
         **policy_meta,
     }
     report.update(study_summary)
+    if isinstance(sample_policy_meta, dict) and sample_policy_meta:
+        report["sample_policy"] = dict(sample_policy_meta)
+        report["sample_policy_fingerprint"] = sample_policy_meta.get("sample_policy_fingerprint")
+        report["val_test_evaluation_unsampled"] = bool(
+            sample_policy_meta.get("val_test_evaluation_unsampled", True),
+        )
+        if sample_policy_meta.get("enabled"):
+            report["train_rows_before_sampling"] = sample_policy_meta.get("train_rows_before")
+            report["train_rows_after_sampling"] = sample_policy_meta.get("train_rows_after")
+            report["train_negatives_before_sampling"] = sample_policy_meta.get("train_negatives_before")
+            report["train_negatives_after_sampling"] = sample_policy_meta.get("train_negatives_after")
+            report["train_evaluation_sampled"] = True
+        else:
+            report["train_evaluation_sampled"] = False
+    if isinstance(feature_screening_meta, dict) and feature_screening_meta:
+        report["feature_screening"] = dict(feature_screening_meta)
+        report["feature_selection_policy_fingerprint"] = feature_screening_meta.get(
+            "feature_selection_policy_fingerprint",
+        )
+        report["feature_selection_manifest_fingerprint"] = feature_screening_meta.get(
+            "feature_selection_manifest_fingerprint",
+        )
+        report["step5_feature_screening_enabled"] = bool(feature_screening_meta.get("enabled"))
+        report["step5_selected_feature_count"] = feature_screening_meta.get("selected_feature_count")
 
     out_dir = Path(output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -337,6 +337,8 @@ def build_pipeline_debug(metrics: dict[str, Any]) -> dict[str, Any]:
         },
         "session_dedup_hash_buckets_effective": metrics.get("session_dedup_hash_buckets_effective"),
         "bet_dedup_hash_buckets_effective": metrics.get("bet_dedup_hash_buckets_effective"),
+        "training_acceleration": metrics.get("training_acceleration_policy"),
+        "feature_screening_summary": metrics.get("feature_screening_summary"),
     }
 
 
@@ -364,6 +366,14 @@ def _build_gates_block(metrics: dict[str, Any]) -> dict[str, Any]:
             "verdict": metrics.get("step6_deploy_e2e_verdict"),
             "exit_code": metrics.get("step6_deploy_e2e_exit_code"),
         }
+    step35 = metrics.get("step35_indexed_replay_gate_summary")
+    if isinstance(step35, dict) and step35:
+        gates["step35_indexed_replay_cold_build"] = step35
+    accel = metrics.get("training_acceleration_policy")
+    if isinstance(accel, dict):
+        nested = accel.get("step35_indexed_replay_gate_summary")
+        if isinstance(nested, dict) and nested:
+            gates.setdefault("step35_indexed_replay_cold_build", nested)
     return gates
 
 

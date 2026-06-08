@@ -47,6 +47,7 @@ from trainer_hightier.config import (
     DEFAULT_RUN_PROFILE_NAME,
     DEFAULT_TRAINING_FEATURE_SERVICE,
     DEFAULT_TRAINING_SHORT_TERM_MATERIALIZE_BATCH_SIZE,
+    DEFAULT_STEP35_MISS_PATH,
     SHORT_TERM_TRIAL_BET_COLUMNS,
     TRAINING_SHORT_TERM_PIT_CACHE_BASENAME,
     DuckDbRuntimeConfig,
@@ -62,7 +63,20 @@ from trainer_hightier.config import (
     Step6ParityConfig,
     SessionPreprocessConfig,
     Step4SplitConfig,
+    SamplePolicy,
+    FeatureScreeningPolicy,
+    TrainingScopePolicy,
+    TrainingRunKind,
+    TRAINING_RUN_KIND_SPEED,
+    DATA_COMPLETENESS_MODE_STRICT,
+    ResolvedTrainingScope,
     TrainingDataScopeConfig,
+    feature_selection_policy_fingerprint,
+    resolve_training_scope,
+    sample_policy_fingerprint,
+    training_scope_policy_fingerprint,
+    validate_sample_policy_for_run,
+    validate_feature_screening_policy,
     configs_from_run_profile,
     get_run_profile,
     list_run_profile_names,
@@ -227,6 +241,8 @@ class HighTierTrainArgs:
     force_refresh_short_term_pit: bool = False
     #: Offline Step 3.5 batch size (decoupled from scorer ``hightier_scorer_max_bets_per_cycle``).
     training_short_term_materialize_batch_size: int = DEFAULT_TRAINING_SHORT_TERM_MATERIALIZE_BATCH_SIZE
+    #: Step 3.5 cache miss materializer (``indexed_replay`` default; fail-fast, no auto fallback).
+    step35_miss_path: str = DEFAULT_STEP35_MISS_PATH
     #: ``--run-profile`` CLI name (MLflow param); programmatic callers default to :data:`DEFAULT_RUN_PROFILE_NAME`.
     run_profile_name: str = DEFAULT_RUN_PROFILE_NAME
     #: Explicit patron sampling ratio for logs (e.g. ``0.01`` vs ``0.10``). When ``None`` and ADT bet filter is on,
@@ -234,6 +250,14 @@ class HighTierTrainArgs:
     patron_sampling_ratio: float | None = None
     #: Drop training rows outside inclusive ``gaming_day_event`` bounds before Step 3.5 / split.
     training_data_scope: TrainingDataScopeConfig = field(default_factory=TrainingDataScopeConfig)
+    #: Target horizon / completeness policy (SSOT Training Acceleration).
+    training_scope_policy: TrainingScopePolicy = field(default_factory=TrainingScopePolicy)
+    #: Train-only negative downsampling (Step 4 → Step 5 layer).
+    sample_policy: SamplePolicy = field(default_factory=SamplePolicy)
+    #: Optional feature screening hook (default off).
+    feature_screening_policy: FeatureScreeningPolicy = field(default_factory=FeatureScreeningPolicy)
+    #: ``release_promoted`` forbids ``neg_sample_frac < 1.0``.
+    training_run_kind: TrainingRunKind = TRAINING_RUN_KIND_SPEED
 
 
 def _repo_root() -> Path:
@@ -334,6 +358,9 @@ def _mlflow_initial_string_params(args: HighTierTrainArgs) -> dict[str, str]:
     }
     if args.patron_sampling_ratio is not None:
         out["patron_sampling_ratio"] = str(float(args.patron_sampling_ratio))[:64]
+    out["training_run_kind"] = str(args.training_run_kind)
+    out["recent_full_months"] = str(args.training_scope_policy.recent_full_months)
+    out["neg_sample_frac"] = str(float(args.sample_policy.neg_sample_frac))
     return out
 
 
@@ -1127,6 +1154,176 @@ COPY (
     return p
 
 
+def _init_training_acceleration_metrics(
+    args: HighTierTrainArgs,
+    metrics: dict[str, Any],
+) -> ResolvedTrainingScope:
+    """Resolve acceleration policies, validate guards, and seed run-report fields."""
+    validate_sample_policy_for_run(args.sample_policy, run_kind=args.training_run_kind)
+    validate_feature_screening_policy(args.feature_screening_policy)
+    resolved = resolve_training_scope(args.training_scope_policy)
+    scope_fp = training_scope_policy_fingerprint(resolved)
+    sample_fp = sample_policy_fingerprint(args.sample_policy)
+    screening_fp = feature_selection_policy_fingerprint(args.feature_screening_policy)
+    block: dict[str, Any] = {
+        "training_run_kind": str(args.training_run_kind),
+        "training_scope_policy_fingerprint": scope_fp,
+        "sample_policy_fingerprint": sample_fp,
+        "feature_selection_policy_fingerprint": screening_fp,
+        "resolved_target_scope": resolved.manifest_block(),
+        "sample_policy": args.sample_policy.manifest_block(),
+        "feature_screening_policy": args.feature_screening_policy.manifest_block(),
+        "training_scope_completeness": None,
+        "step35_indexed_replay_gate_summary": None,
+        "cache_hit_miss_summary": None,
+        "negative_sampling_summary": None,
+        "feature_screening_summary": None,
+    }
+    metrics["training_acceleration_policy"] = block
+    metrics["training_scope_policy_fingerprint"] = scope_fp
+    metrics["sample_policy_fingerprint"] = sample_fp
+    metrics["feature_selection_policy_fingerprint"] = screening_fp
+    metrics["_resolved_training_scope"] = resolved
+    return resolved
+
+
+def _apply_training_scope_horizon_to_parquet(
+    parquet_path: Path,
+    *,
+    resolved: ResolvedTrainingScope,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> tuple[Path, dict[str, Any]]:
+    """Keep only rows in resolved target months and inclusive target date bounds."""
+    if not resolved.horizon_enabled:
+        return parquet_path, {"horizon_filter_applied": False}
+    if resolved.target_start_date is None or resolved.target_end_date is None:
+        raise ValueError("resolved training scope missing target_start_date/target_end_date")
+
+    import duckdb
+
+    from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
+
+    p = Path(parquet_path).resolve()
+    if "gaming_day_event" not in pq.read_schema(p).names:
+        raise ValueError(
+            f"training parquet missing gaming_day_event before horizon filter; path={p}",
+        )
+    months_sql = ", ".join(f"'{ym}'" for ym in resolved.target_months)
+    start = resolved.target_start_date.isoformat()
+    end = resolved.target_end_date.isoformat()
+    p_esc = str(p).replace("\\", "/").replace("'", "''")
+    tmp = p.parent / f"{p.stem}.__horizon_filter__.parquet"
+    tmp_esc = str(tmp).replace("\\", "/").replace("'", "''")
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        n_before = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{p_esc}')").fetchone()[0])
+        con.execute(
+            f"""
+            COPY (
+                SELECT *
+                FROM read_parquet('{p_esc}')
+                WHERE strftime(CAST(gaming_day_event AS DATE), '%Y%m') IN ({months_sql})
+                  AND CAST(gaming_day_event AS DATE) >= DATE '{start}'
+                  AND CAST(gaming_day_event AS DATE) <= DATE '{end}'
+            ) TO '{tmp_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+            """,
+        )
+        n_after = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{tmp_esc}')").fetchone()[0])
+    finally:
+        con.close()
+    if n_after == 0:
+        raise ValueError(
+            "training scope horizon removed all rows "
+            f"(before={n_before}, resolved={resolved.manifest_block()})",
+        )
+    tmp.replace(p)
+    summary = {
+        "horizon_filter_applied": True,
+        "rows_before": n_before,
+        "rows_after": n_after,
+        "target_months": list(resolved.target_months),
+    }
+    logger.info(
+        "[Step 4] training scope horizon %s: rows %d -> %d (%s)",
+        resolved.manifest_block(),
+        n_before,
+        n_after,
+        p.name,
+    )
+    return p, summary
+
+
+def _audit_training_scope_completeness(
+    parquet_path: Path,
+    *,
+    resolved: ResolvedTrainingScope,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> dict[str, Any]:
+    """Audit per-month row counts; strict mode fails on empty full target months."""
+    if not resolved.horizon_enabled:
+        return {"skipped": True, "reason": "horizon_disabled"}
+
+    import duckdb
+
+    from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
+
+    p = Path(parquet_path).resolve()
+    p_esc = str(p).replace("\\", "/").replace("'", "''")
+    schema_names = pq.read_schema(p).names
+    censored_expr = (
+        "SUM(CASE WHEN walkaway_censored = TRUE THEN 1 ELSE 0 END)"
+        if "walkaway_censored" in schema_names
+        else "0"
+    )
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        rows = con.execute(
+            f"""
+            SELECT
+                strftime(CAST(gaming_day_event AS DATE), '%Y%m') AS ym,
+                COUNT(*) AS row_count,
+                MIN(CAST(gaming_day_event AS DATE)) AS min_day,
+                MAX(CAST(gaming_day_event AS DATE)) AS max_day,
+                {censored_expr} AS censored_rows
+            FROM read_parquet('{p_esc}')
+            GROUP BY 1
+            ORDER BY 1
+            """,
+        ).fetchall()
+    finally:
+        con.close()
+
+    by_month: dict[str, dict[str, Any]] = {}
+    for ym, row_count, min_day, max_day, censored_rows in rows:
+        by_month[str(ym)] = {
+            "row_count": int(row_count),
+            "min_gaming_day_event": str(min_day),
+            "max_gaming_day_event": str(max_day),
+            "censored_row_count": int(censored_rows),
+            "is_partial_month": str(ym) in resolved.partial_target_months,
+        }
+
+    full_months = [ym for ym in resolved.target_months if ym not in resolved.partial_target_months]
+    empty_full_months = [ym for ym in full_months if by_month.get(ym, {}).get("row_count", 0) == 0]
+    report: dict[str, Any] = {
+        "expected_target_months": list(resolved.target_months),
+        "full_target_months": full_months,
+        "partial_target_months": sorted(resolved.partial_target_months),
+        "by_month": by_month,
+        "empty_full_target_months": empty_full_months,
+        "data_completeness_mode": str(resolved.policy.data_completeness_mode),
+    }
+    if empty_full_months:
+        msg = f"training scope completeness: empty full target month(s) {empty_full_months}"
+        if resolved.policy.data_completeness_mode == DATA_COMPLETENESS_MODE_STRICT:
+            raise ValueError(msg)
+        logger.warning("[Step 4] %s (mode=warn)", msg)
+        report["completeness_warnings"] = [msg]
+    return report
+
+
 def _apply_training_data_scope_to_parquet(
     parquet_path: Path,
     *,
@@ -1187,7 +1384,7 @@ def _prepare_training_features_parquet(
     args: HighTierTrainArgs,
     metrics: dict[str, Any] | None = None,
 ) -> Path:
-    """Sync ``gaming_day_event`` and apply optional training-row date scope."""
+    """Sync ``gaming_day_event``, apply date scope, optional target horizon, completeness audit."""
 
     fp = _ensure_training_parquet_gaming_day_event_column(
         parquet_path,
@@ -1198,8 +1395,29 @@ def _prepare_training_features_parquet(
         scope=args.training_data_scope,
         duckdb_runtime=args.duckdb_runtime,
     )
+    resolved_raw = metrics.get("_resolved_training_scope") if metrics is not None else None
+    resolved = (
+        resolved_raw
+        if isinstance(resolved_raw, ResolvedTrainingScope)
+        else resolve_training_scope(args.training_scope_policy)
+    )
+    fp, horizon_summary = _apply_training_scope_horizon_to_parquet(
+        fp,
+        resolved=resolved,
+        duckdb_runtime=args.duckdb_runtime,
+    )
+    completeness = _audit_training_scope_completeness(
+        fp,
+        resolved=resolved,
+        duckdb_runtime=args.duckdb_runtime,
+    )
     if metrics is not None:
         metrics["training_data_scope"] = args.training_data_scope.manifest_block()
+        accel = metrics.get("training_acceleration_policy")
+        if isinstance(accel, dict):
+            accel["horizon_filter"] = horizon_summary
+            accel["training_scope_completeness"] = completeness
+        metrics["training_scope_completeness"] = completeness
     return fp
 
 
@@ -1367,6 +1585,7 @@ def _ensure_fe_enriched_training_parquet_for_step4(
             previous_entity_set_fingerprint_sha256_hex=prev_entity_fp,
             recompute_months=recompute_months,
             force_refresh=force_short_refresh,
+            step35_miss_path=str(args.step35_miss_path),
         )
     mat_short_sec = round(time.perf_counter() - t_m0, 3)
 
@@ -1468,6 +1687,23 @@ def _ensure_fe_enriched_training_parquet_for_step4(
             metrics["entity_delta_fill_elapsed_seconds"] = short_cache_meta.get(
                 "entity_delta_fill_elapsed_seconds",
             )
+            accel = metrics.get("training_acceleration_policy")
+            if isinstance(accel, dict):
+                accel["cache_hit_miss_summary"] = {
+                    "step35_miss_path": short_cache_meta.get("step35_miss_path"),
+                    "cache_hit": short_cache_meta.get("cache_hit"),
+                    "cache_hit_ratio": short_cache_meta.get("cache_hit_ratio"),
+                    "cache_hit_shards": short_cache_meta.get("cache_hit_shards"),
+                    "cache_miss_shards": short_cache_meta.get("cache_miss_shards"),
+                    "cache_reason_counts": short_cache_meta.get("cache_reason_counts"),
+                    "step35_materializer_by_shard": short_cache_meta.get(
+                        "step35_materializer_by_shard",
+                    ),
+                    "step35_indexed_replay_shard_seconds": short_cache_meta.get(
+                        "step35_indexed_replay_shard_seconds",
+                    ),
+                    "indexed_replay_gate_mode": short_cache_meta.get("indexed_replay_gate_mode"),
+                }
         metrics["main_trainer_mid_term_snapshot_parquet"] = str(mid_snap_out.resolve()) if mid_cols else None
         metrics["feature_cadence_audit"] = audit
         metrics["feature_cadence_audit_path"] = str(audit_path.resolve())
@@ -1568,6 +1804,16 @@ def _maybe_run_step4(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None)
         periods = _step4_gaming_day_periods_from_report(res.report)
         if periods is not None:
             metrics["step4_split_periods"] = periods
+        accel = metrics.get("training_acceleration_policy")
+        if isinstance(accel, dict):
+            report = dict(res.report)
+            report["target_scope"] = accel.get("resolved_target_scope")
+            report["training_scope_completeness"] = metrics.get("training_scope_completeness")
+            res.split_report_json.write_text(
+                json.dumps(report, indent=2, default=str),
+                encoding="utf-8",
+            )
+            res = replace(res, report=report)
     logger.info("[Step 4] splits written %s (%.3fs)", res.splits_dir.resolve(), elapsed)
 
 
@@ -1640,6 +1886,23 @@ def fit_model(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None)
             "Pass --feature-candidate-registry <path> or restore the YAML.",
         ) from exc
     feat_cols = baseline_features_for_main_trainer(snap)
+    from trainer_hightier.utils.feature_screening_hook import resolve_step5_feature_columns
+
+    feat_cols, screening_meta = resolve_step5_feature_columns(
+        baseline_features=feat_cols,
+        policy=args.feature_screening_policy,
+    )
+    if metrics is not None:
+        metrics["feature_screening_summary"] = screening_meta
+        accel = metrics.get("training_acceleration_policy")
+        if isinstance(accel, dict):
+            accel["feature_screening_summary"] = screening_meta
+    logger.info(
+        "[Step 5] model input features n=%d (baseline=%d screening=%s)",
+        len(feat_cols),
+        screening_meta.get("baseline_feature_count"),
+        "enabled" if screening_meta.get("enabled") else "noop",
+    )
     _step5_splits_have_feature_columns(splits_dir, feat_cols, registry_path=snap.path)
     logger.info(
         "[Step 5] baseline features from registry %s (n=%s)",
@@ -1654,6 +1917,20 @@ def fit_model(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None)
     }
     try:
         step5_out_dir = Path(args.step5_bundle_dir).resolve() if args.step5_bundle_dir is not None else Path(args.output_dir).resolve()
+        from trainer_hightier.utils.train_negative_sampling import materialize_sampled_train_parquet
+
+        train_source = splits_dir / "train.parquet"
+        sampled_train_p, sample_meta = materialize_sampled_train_parquet(
+            train_parquet=train_source,
+            splits_dir=splits_dir,
+            policy=args.sample_policy,
+            force_refresh=bool(args.ignore_caches),
+        )
+        if metrics is not None:
+            metrics["negative_sampling_summary"] = sample_meta
+            accel = metrics.get("training_acceleration_policy")
+            if isinstance(accel, dict):
+                accel["negative_sampling_summary"] = sample_meta
         logger.info(
             "[Step 5] training: train_lgbm_from_splits (splits_dir=%s, n_features=%d, skip_optuna=%s, out_dir=%s) …",
             splits_dir.resolve(),
@@ -1663,6 +1940,9 @@ def fit_model(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None)
         )
         result = _b5.train_lgbm_from_splits(
             splits_dir=splits_dir,
+            train_parquet=sampled_train_p,
+            sample_policy_meta=sample_meta,
+            feature_screening_meta=screening_meta,
             duckdb_runtime=args.duckdb_runtime,
             objective_min_precision=float(args.objective.min_precision),
             random_seed=int(args.random_seed),
@@ -2382,6 +2662,7 @@ def run_training(args: HighTierTrainArgs) -> None:
             report_parent = exec_args.step5_bundle_dir.resolve() if exec_args.step5_bundle_dir else versions_root
             writer = BundleReportWriter(report_parent)
             metrics["report_writer"] = writer
+            _init_training_acceleration_metrics(exec_args, metrics)
             if exec_args.step5_bundle_dir is not None:
                 metrics["model_version"] = model_version
                 metrics["model_bundle_dir"] = str(exec_args.step5_bundle_dir.resolve())
