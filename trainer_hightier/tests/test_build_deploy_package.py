@@ -15,28 +15,18 @@ import pytest
 from sklearn.dummy import DummyClassifier
 
 from trainer_hightier.build_deploy_package import (
+    _REPO_ROOT,
     _bump_patch_version,
     _pip_freeze_package_name,
     _read_pyproject_version,
+    _temporary_pyproject_version,
+    _wheel_package_version,
     _write_pyproject_version,
     build_deploy_package,
 )
 from trainer_hightier.config import FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME
 from trainer_hightier.core.model_bundle_paths import DEPLOY_E2E_GATE_REPORT_FILENAME
 from trainer_hightier.serving.adt_allowlist import sha256_file
-
-
-@pytest.fixture(autouse=True)
-def _disable_pyproject_version_bump(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Tests must not mutate repo ``trainer_hightier/pyproject.toml`` on every pack."""
-
-    import trainer_hightier.build_deploy_package as bdp
-
-    def _read_only_version(*, pyproj: Path | None = None) -> str:
-        path = (pyproj or bdp._REPO_ROOT / "trainer_hightier" / "pyproject.toml").expanduser().resolve()
-        return bdp._read_pyproject_version(path)
-
-    monkeypatch.setattr(bdp, "bump_pyproject_patch_version", _read_only_version)
 
 
 def test_bump_patch_version_increments_numeric_patch() -> None:
@@ -54,6 +44,110 @@ def test_bump_pyproject_patch_version_writes_toml(tmp_path: Path) -> None:
     assert _read_pyproject_version(pyproj) == "2.4.8"
     _write_pyproject_version(pyproj, "9.0.0")
     assert _read_pyproject_version(pyproj) == "9.0.0"
+
+
+def test_wheel_package_version_bump_is_transient_plan(tmp_path: Path) -> None:
+    pyproj = tmp_path / "pyproject.toml"
+    pyproj.write_text('[project]\nname = "trainer-hightier"\nversion = "1.0.3"\n', encoding="utf-8")
+    assert _wheel_package_version(pyproj=pyproj, bump_version=False) == "1.0.3"
+    assert _read_pyproject_version(pyproj) == "1.0.3"
+    assert _wheel_package_version(pyproj=pyproj, bump_version=True) == "1.0.4"
+    assert _read_pyproject_version(pyproj) == "1.0.3"
+
+
+def test_temporary_pyproject_version_restores_original_bytes(tmp_path: Path) -> None:
+    pyproj = tmp_path / "pyproject.toml"
+    original = '[project]\nname = "trainer-hightier"\nversion = "3.1.0"\n'
+    pyproj.write_text(original, encoding="utf-8")
+    with _temporary_pyproject_version(pyproj, "3.1.1"):
+        assert _read_pyproject_version(pyproj) == "3.1.1"
+    assert pyproj.read_text(encoding="utf-8") == original
+
+
+def _minimal_pack_argv(
+    *,
+    model_src: Path,
+    snap_src: Path,
+    mapping: Path,
+    out: Path,
+    extra: list[str] | None = None,
+) -> list[str]:
+    return [
+        "--model-source",
+        str(model_src),
+        "--snapshot-manifest-source",
+        str(snap_src),
+        "--mapping-source",
+        str(mapping),
+        "--output-dir",
+        str(out),
+        "--skip-step6-gate",
+        "--skip-deploy-e2e-gate",
+        *(extra or []),
+    ]
+
+
+def test_pack_default_preserves_repo_pyproject_version(tmp_path: Path) -> None:
+    pyproj = _REPO_ROOT / "trainer_hightier" / "pyproject.toml"
+    before_text = pyproj.read_text(encoding="utf-8")
+    before_version = _read_pyproject_version(pyproj)
+
+    model_src = tmp_path / "model_pyproj_default"
+    snap_src = tmp_path / "snap_pyproj_default"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_slow_bet_fixture(slow)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    _write_frozen_registry_abc_fixture(model_src)
+    man = {"version": "mv", "slow_patron_parquet": str(slow.resolve()), "adt_allowlist_parquet": str(allow.resolve())}
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-pyproj-default.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "bundle-pyproj-default"
+    build_deploy_package(_minimal_pack_argv(model_src=model_src, snap_src=snap_src, mapping=mapping, out=out))
+
+    assert pyproj.read_text(encoding="utf-8") == before_text
+    assert _read_pyproject_version(pyproj) == before_version
+
+
+def test_pack_bump_version_restores_repo_pyproject(tmp_path: Path) -> None:
+    pyproj = _REPO_ROOT / "trainer_hightier" / "pyproject.toml"
+    before_text = pyproj.read_text(encoding="utf-8")
+    before_version = _read_pyproject_version(pyproj)
+    bumped_version = _bump_patch_version(before_version)
+
+    model_src = tmp_path / "model_pyproj_bump"
+    snap_src = tmp_path / "snap_pyproj_bump"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_slow_bet_fixture(slow)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    _write_frozen_registry_abc_fixture(model_src)
+    man = {"version": "mv", "slow_patron_parquet": str(slow.resolve()), "adt_allowlist_parquet": str(allow.resolve())}
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-pyproj-bump.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "bundle-pyproj-bump"
+    build_deploy_package(
+        _minimal_pack_argv(
+            model_src=model_src,
+            snap_src=snap_src,
+            mapping=mapping,
+            out=out,
+            extra=["--bump-version"],
+        )
+    )
+
+    assert pyproj.read_text(encoding="utf-8") == before_text
+    assert _read_pyproject_version(pyproj) == before_version
+    whls = list((out / "wheels").glob(f"trainer_hightier-{bumped_version}-*.whl"))
+    assert whls, f"expected wheel with transient version {bumped_version}"
 
 
 _PARQUET_MANIFEST_SUFFIX = "_parquet"

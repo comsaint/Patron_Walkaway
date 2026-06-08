@@ -3,7 +3,7 @@
 Layout (resolved ``--output-dir``, default ``trainer_hightier.config.DEFAULT_DEPLOY_OUTPUT_ROOT`` / bundle ``model_version``):
 
 - ``main.py`` — standalone entrypoint (``python main.py`` after ``pip install -r requirements.txt``)
-- ``wheels/trainer_hightier-*.whl`` — serving package wheel (``pip wheel --no-deps`` from ``trainer_hightier/pyproject.toml``; patch version auto-bumped unless ``--no-bump-version``)
+- ``wheels/trainer_hightier-*.whl`` — serving package wheel (``pip wheel --no-deps`` from ``trainer_hightier/pyproject.toml``; optional ``--bump-version`` bumps patch only for the wheel build and restores ``pyproject.toml``)
 - ``requirements.txt`` — local wheel line (transitive deps from PyPI / internal index per wheel metadata)
 - ``.env.example`` — optional ClickHouse / log overrides for :mod:`trainer_hightier.deploy.main`
 - ``models/`` — ``model.pkl``, ``training_metrics.json``, ``feature_candidate_registry.snapshot.yaml`` (frozen feature registry YAML from Step 5), ``model_version``, …
@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -166,9 +167,17 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="Skip deploy E2E gate report check (default: require pass in strict mode).",
     )
     pr.add_argument(
+        "--bump-version",
+        action="store_true",
+        help=(
+            "Bump trainer_hightier patch version only for the wheel build; "
+            "pyproject.toml on disk is restored afterward."
+        ),
+    )
+    pr.add_argument(
         "--no-bump-version",
         action="store_true",
-        help="Skip auto-incrementing trainer_hightier/pyproject.toml patch version before wheel build.",
+        help=argparse.SUPPRESS,
     )
     return pr.parse_args(argv)
 
@@ -888,7 +897,11 @@ def _write_pyproject_version(pyproj: Path, version: str) -> None:
 
 
 def bump_pyproject_patch_version(*, pyproj: Path | None = None) -> str:
-    """Bump ``trainer_hightier`` wheel patch version in ``pyproject.toml``; return new version."""
+    """Persistently bump ``trainer_hightier`` patch version in ``pyproject.toml``; return new version.
+
+    Packager wheel builds do not call this; use :func:`_wheel_package_version` with a transient
+    :func:`_temporary_pyproject_version` context instead.
+    """
 
     path = (pyproj or (_REPO_ROOT / "trainer_hightier" / "pyproject.toml")).expanduser().resolve()
     if not path.is_file():
@@ -898,6 +911,33 @@ def bump_pyproject_patch_version(*, pyproj: Path | None = None) -> str:
     _write_pyproject_version(path, bumped)
     logger.info("[pack] bumped trainer_hightier package version %s -> %s", current, bumped)
     return bumped
+
+
+def _wheel_package_version(*, pyproj: Path, bump_version: bool) -> str:
+    """Resolve wheel package version without mutating *pyproj* unless *bump_version* is requested."""
+
+    current = _read_pyproject_version(pyproj)
+    if not bump_version:
+        return current
+    bumped = _bump_patch_version(current)
+    logger.info(
+        "[pack] wheel build will use transient bumped package version %s -> %s",
+        current,
+        bumped,
+    )
+    return bumped
+
+
+@contextmanager
+def _temporary_pyproject_version(pyproj: Path, version: str):
+    """Temporarily set ``[project].version`` in *pyproj*; restore original bytes on exit."""
+
+    original = pyproj.read_text(encoding="utf-8")
+    _write_pyproject_version(pyproj, version)
+    try:
+        yield
+    finally:
+        pyproj.write_text(original, encoding="utf-8")
 
 
 def _clean_trainer_hightier_staging_build_dir() -> None:
@@ -915,7 +955,7 @@ def _clean_trainer_hightier_staging_build_dir() -> None:
         )
 
 
-def _build_trainer_hightier_wheel(*, wheels_dir: Path, bump_version: bool = True) -> tuple[str, str | None]:
+def _build_trainer_hightier_wheel(*, wheels_dir: Path, bump_version: bool = False) -> tuple[str, str | None]:
     """Build ``trainer_hightier`` wheel into *wheels_dir*; return (wheel filename, package version)."""
     wheels_dir.mkdir(parents=True, exist_ok=True)
     for stale in wheels_dir.glob("trainer_hightier-*.whl"):
@@ -924,17 +964,19 @@ def _build_trainer_hightier_wheel(*, wheels_dir: Path, bump_version: bool = True
     pyproj = pkg_root / "pyproject.toml"
     if not pyproj.is_file():
         raise FileNotFoundError(f"trainer_hightier pyproject missing: {pyproj}")
-    package_version: str | None
-    if bump_version:
-        package_version = bump_pyproject_patch_version(pyproj=pyproj)
-    else:
-        package_version = _read_pyproject_version(pyproj)
+    package_version = _wheel_package_version(pyproj=pyproj, bump_version=bump_version)
     _clean_trainer_hightier_staging_build_dir()
-    subprocess.run(
-        [sys.executable, "-m", "pip", "wheel", ".", "-w", str(wheels_dir), "--no-deps", "--no-cache-dir"],
-        check=True,
-        cwd=str(pkg_root),
+    version_ctx = (
+        _temporary_pyproject_version(pyproj, package_version)
+        if bump_version
+        else nullcontext()
     )
+    with version_ctx:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "wheel", ".", "-w", str(wheels_dir), "--no-deps", "--no-cache-dir"],
+            check=True,
+            cwd=str(pkg_root),
+        )
     matches = sorted(wheels_dir.glob("trainer_hightier-*.whl"))
     if not matches:
         raise FileNotFoundError(f"No trainer_hightier wheel found in {wheels_dir}")
@@ -1255,9 +1297,11 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     _copy_feast_repo_to_bundle(root)
     wheels_dir = root / "wheels"
+    if bool(args.bump_version) and bool(args.no_bump_version):
+        raise SystemExit("Cannot pass both --bump-version and --no-bump-version")
     wheel_name, package_version = _build_trainer_hightier_wheel(
         wheels_dir=wheels_dir,
-        bump_version=not bool(args.no_bump_version),
+        bump_version=bool(args.bump_version),
     )
     _write_bundle_main_py(root / "main.py")
     _write_bundle_collect_diag_py(root / "collect_diag.py")
