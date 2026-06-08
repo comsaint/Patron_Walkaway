@@ -61,6 +61,7 @@ doc/
 | Feast online refresh | IP | **active** | [implementation/active/Feast Online Refresh…](implementation/active/Feast%20Online%20Refresh%20-%20IMPLEMENTATION_PLAN.md) |
 | Feast post-startup supervisor | IP | **active** | [implementation/active/Feast Post-Startup…](implementation/active/Feast%20Post-Startup%20Refresh%20Supervisor%20-%20IMPLEMENTATION_PLAN.md) |
 | Feature experimentation | IP + WP | **active** | [working/active/Feature experimentation…](working/active/Feature%20experimentation%20-%20WORKING_PLAN.md) |
+| Training acceleration & scope | SSOT + IP + WP | **active** | [ssot/Training Acceleration…](ssot/Training%20Acceleration%20and%20Scope%20-%20SSOT.md) · [implementation/active/Training Acceleration…](implementation/active/Training%20Acceleration%20and%20Scope%20-%20IMPLEMENTATION_PLAN.md) · [working/active/Training Acceleration…](working/active/Training%20Acceleration%20and%20Scope%20-%20WORKING_PLAN.md) |
 | Data pipeline | IP | **active** | [implementation/active/Data pipeline…](implementation/active/Data%20pipeline%20-%20IMPLEMENTATION_PLAN.md) |
 | Production Flight Recorder | IP + WP + Runbook | **active** | [runbooks/active/Production Flight Recorder…](runbooks/active/Production%20Flight%20Recorder%20-%20RUNBOOK.md) |
 | Player cooldown / suppression | IP | **active** | [implementation/active/Player Alert Suppression…](implementation/active/Player%20Alert%20Suppression%20Switch%20-%20IMPLEMENTATION_PLAN.md) |
