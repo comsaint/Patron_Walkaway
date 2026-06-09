@@ -109,7 +109,7 @@ pytest trainer_hightier/tests/test_training_scope_policy.py -q
 |----|------|-------|-----|
 | TA-WP-2.1 | Target-month resolution | `config.py`, `trainer.py` | 由 `as_of_date + recent_full_months + include_current_partial_month` 解析 selected months |
 | TA-WP-2.2 | Target-row filtering at assembly | `03_build_training_data.py`, `trainer.py` | 只 filter target rows；primitive materialization 仍依 entity set / source coverage |
-| TA-WP-2.3 | Step 3 month pruning at assembly boundary | `03_build_training_data.py`, `trainer.py` | Feast / slow-snap month batching 只 iterate selected target months；不得先全量 assemble 17–18 個月再於 Step 3 後做 horizon filter |
+| TA-WP-2.3 | Step 3 month pruning at assembly boundary | `03_build_training_data.py`, `trainer.py` | Feast / slow-snap month batching 只 iterate selected target months；不得先全量 assemble 17–18 個月再於 Step 3 後做 horizon filter（patch plan：[Step 3 Month Prune Patch - PATCH_PLAN.md](Step%203%20Month%20Prune%20Patch%20-%20PATCH_PLAN.md)） |
 | TA-WP-2.4 | Completeness audit | `03_build_training_data.py` 或 helper | 輸出 expected months、missing `gaming_day_event` dates、per-month row/censored counts |
 | TA-WP-2.5 | `warn/strict` branch | `trainer.py` | `strict` 缺 full-month dates → fail；`warn` → report only |
 | TA-WP-2.6 | Split reporting | `04_split_dataset.py` | censored exclusion、selected target months、month-level counts 寫入 artifact |
