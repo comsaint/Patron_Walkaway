@@ -409,7 +409,7 @@ class TrainingScopePolicy:
     rows within ``TrainingDataScopeConfig``).
     """
 
-    recent_full_months: int | None = 3  # default recent 3 full months...
+    recent_full_months: int | None = 6  # experiment: recent 6 full months (was 3)
     include_current_partial_month: bool = True  # ... and include current partial month
     as_of_date: date | None = None
     data_completeness_mode: DataCompletenessMode = DATA_COMPLETENESS_MODE_WARN
@@ -690,7 +690,7 @@ class HighTierObjectiveConfig:
     # Align naming with ``trainer.training.high_roller_segmentation`` when wiring segment thresholds.
     theo_train_quantile: float = 0.95
     # Require precision >= this value on the **segment** when choosing a score threshold.
-    min_precision: float = 0.60
+    min_precision: float = 0.50
     # Placeholder paths for later steps (Parquet / DuckDB exports).
     segment_scores_parquet: Path | None = None
     labels_parquet: Path | None = None
@@ -843,7 +843,9 @@ class Step5LgbFixedConfig:
     objective: str = "binary"
     metric: str = "binary_logloss"
     verbosity: int = -1
-    n_jobs: int = 1
+    n_jobs: int = -1
+    device: str | None = None
+    gpu_device_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -899,7 +901,7 @@ class Step5TrainConfig:
     #: When ``True``, use :data:`baseline_*` hyperparameters only (no Optuna).
     skip_optuna: bool = False
     #: ``study.optimize(..., timeout=...)`` wall-clock cap in seconds.
-    optuna_timeout_sec: float = 60 * 60 * 3  # Optuna wall-clock budget
+    optuna_timeout_sec: float = 60 * 60  # Optuna wall-clock budget (1h default)
     #: Optuna TPE search bounds (ignored when ``skip_optuna`` is ``True``).
     optuna_search: Step5OptunaSearchConfig = field(default_factory=Step5OptunaSearchConfig)
     #: LightGBM kwargs not tuned by Optuna (objective, metric, verbosity, n_jobs).

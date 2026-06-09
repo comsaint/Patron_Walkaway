@@ -392,7 +392,7 @@ def _lgb_fixed_params(cfg: Step5TrainConfig, seed: int) -> dict[str, Any]:
     """Return non-tuned LightGBM kwargs from :attr:`Step5TrainConfig.lgb_fixed`."""
 
     fixed = cfg.lgb_fixed
-    return {
+    out: dict[str, Any] = {
         "objective": fixed.objective,
         "metric": fixed.metric,
         "verbosity": int(fixed.verbosity),
@@ -400,6 +400,12 @@ def _lgb_fixed_params(cfg: Step5TrainConfig, seed: int) -> dict[str, Any]:
         "random_state": int(seed),
         "n_jobs": int(fixed.n_jobs),
     }
+    device = fixed.device
+    if device is not None and str(device).strip():
+        out["device"] = str(device).strip()
+        if str(device).strip().lower() == "gpu":
+            out["gpu_device_id"] = int(fixed.gpu_device_id)
+    return out
 
 
 def _baseline_tunable_params(cfg: Step5TrainConfig) -> dict[str, Any]:
