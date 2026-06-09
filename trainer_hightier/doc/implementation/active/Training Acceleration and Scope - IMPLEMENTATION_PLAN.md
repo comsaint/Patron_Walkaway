@@ -102,6 +102,14 @@ Two-path strategy aligned with SSOT §5.1.1:
 | **Hit** | month shard exists and covers requested columns / universe | read month-sharded short-PIT cache |
 | **Miss** | shard missing, column fill needed, or cold-build | `materialize_short_term_replay_indexed_prototype` (`emit_opt`) |
 
+Quantile-aware reuse strategy aligned with `Cache Redesign - SSOT.md` §5.3:
+
+- **Primitive cache ownership is bet-level / month-sharded, not quantile-owned**. ADT quantile selects which target `bet_id` rows are requested; it must not by itself redefine short-PIT primitive semantics.
+- **Quantile increase (`0.95 -> 0.99`)**: treat the new target universe as a subset candidate. When requested `bet_id` rows are a subset of an existing looser-quantile shard, reuse existing shard rows by filtering to the requested target set and publish a new manifest for the stricter entity-set / universe fingerprint.
+- **Quantile decrease (`0.99 -> 0.95`)**: reuse the stricter shard for overlapping rows and materialize only newly included target rows via delta fill, then merge into the looser-quantile shard output.
+- **Exact universe match remains the strongest hit signal**, but it is not the only acceptable reuse mode; subset-hit and delta-fill are first-class outcomes when source, mapping, primitive schema, and feature semantics are unchanged.
+- **Bounded correctness guard**: any subset/delta reuse path must still validate output row count, unique `bet_id`, requested column coverage, and source / mapping / policy fingerprints before publish.
+
 Policy fields:
 
 ```text
@@ -211,7 +219,7 @@ When enabled:
 
 ### WS-B: Step 3.5 Indexed Replay Miss-Path Integration
 
-**Goal**：cache miss / cold-build 預設走 indexed replay，保留 month shard hit path。
+**Goal**：cache miss / cold-build 預設走 indexed replay，保留 month shard hit path，並讓 quantile 升降時至少可 partial reuse Step 3.5 cache。
 
 **Approach**
 
@@ -219,13 +227,20 @@ When enabled:
 - Expand code fingerprint to include indexed replay module + gate mode.
 - Keep bounded path available for benchmark oracle only.
 - Record miss-path timings and materializer choice in run report.
+- Introduce **quantile-aware shard reuse**:
+  - subset reuse for stricter quantiles (`looser -> stricter`)
+  - delta fill for looser quantiles (`stricter -> looser`)
+- Reframe short-PIT shard compatibility around **requested bet universe compatibility**, not only exact entity-set fingerprint equality.
+- Keep manifest-level provenance strict: source inventory, mapping fingerprint, primitive schema, output schema, and target-universe validation must still pass before a subset-hit or delta-fill publish is accepted.
 
 **Deliverables**
 
 - Miss-path integration in `short_term_pit_cache.py`.
 - Materializer policy fingerprint in cache manifest.
 - Run report fields: `step35_miss_path`, shard hit/miss counts, replay timings.
+- Quantile-aware reuse contract for Step 3.5 manifests (`exact_hit`, `subset_hit`, `delta_fill`, `cold_build`).
 - Regression tests on hit path unchanged + miss path wired.
+- Quantile change tests covering `0.95 -> 0.99` subset reuse and `0.99 -> 0.95` delta fill.
 
 **Dependencies**
 
@@ -324,6 +339,7 @@ When enabled:
 - Gate evaluator with hard parity + waiver artifact.
 - Benchmark/report schema aligned with SSOT DL-001.
 - Fail-fast on miss-path or hard parity failure.
+- Quantile-up subset reuse and quantile-down delta-fill paths documented and observable in cache/run artifacts.
 
 **Milestone**
 
@@ -334,6 +350,8 @@ When enabled:
 - Shard hit path unchanged.
 - Miss path produces gate artifact with decision basis.
 - Step 4.5 parity gate remains separate and still enforced.
+- Quantile-up run can reuse existing looser-quantile Step 3.5 shard via subset-hit path.
+- Quantile-down run can reuse stricter shard rows and only materialize delta rows.
 
 ### Phase 3 - Train-Only Negative Downsampling
 
@@ -377,6 +395,10 @@ When enabled:
 - `neg_sample_frac` change → miss sampled train + model only.
 - Feature screening change → miss selection manifest + model only.
 - Primitive caches (cleaned, labels, Feast, short/mid/slow shards) remain reusable when coverage exists.
+- ADT quantile change must not invalidate source cleaning or ADT rank table.
+- Stricter quantile (`looser -> stricter`) should prefer subset reuse over cold rebuild when requested `bet_id` rows are already covered by an existing shard.
+- Looser quantile (`stricter -> looser`) should prefer delta fill over full rebuild when only additional target rows are missing.
+- Exact universe mismatch alone is insufficient reason to force Step 3.5 cold rebuild if requested-row compatibility and primitive correctness checks pass.
 
 ### 6.2 Step 3.5 Correctness and Gate
 
