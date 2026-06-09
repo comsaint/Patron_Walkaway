@@ -1839,6 +1839,13 @@ def _maybe_build_training_dataset(args: HighTierTrainArgs, *, metrics: dict[str,
     ensure_res = _b3.ensure_feast_registry_ready(feast_repo.resolve(), auto_apply=args.auto_feast_apply)
     if metrics is not None:
         metrics["feast_auto_apply"] = _b3.feast_registry_ensure_result_to_metrics(ensure_res)
+    target_scope: ResolvedTrainingScope | None = None
+    if metrics is not None:
+        resolved_raw = metrics.get("_resolved_training_scope")
+        if isinstance(resolved_raw, ResolvedTrainingScope):
+            target_scope = resolved_raw
+    if target_scope is None:
+        target_scope = resolve_training_scope(args.training_scope_policy)
     cfg = _b3.BuildTrainingDataArgs(
         feast_repo=feast_repo.resolve(),
         cleaned_bet_parquet=cleaned_bet_path.resolve(),
@@ -1852,6 +1859,7 @@ def _maybe_build_training_dataset(args: HighTierTrainArgs, *, metrics: dict[str,
         training_set_keep_last_n_versions=10,
         feast_retrieval_cache_enabled=bool(args.feast_retrieval_cache) and not bool(args.ignore_caches),
         auto_feast_apply=bool(args.auto_feast_apply),
+        target_scope=target_scope,
     )
     out = _b3.build_training_data(cfg)
     _prepare_training_features_parquet(out, args=args, metrics=metrics)

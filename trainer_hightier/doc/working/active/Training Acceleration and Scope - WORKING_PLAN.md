@@ -109,15 +109,17 @@ pytest trainer_hightier/tests/test_training_scope_policy.py -q
 |----|------|-------|-----|
 | TA-WP-2.1 | Target-month resolution | `config.py`, `trainer.py` | 由 `as_of_date + recent_full_months + include_current_partial_month` 解析 selected months |
 | TA-WP-2.2 | Target-row filtering at assembly | `03_build_training_data.py`, `trainer.py` | 只 filter target rows；primitive materialization 仍依 entity set / source coverage |
-| TA-WP-2.3 | Completeness audit | `03_build_training_data.py` 或 helper | 輸出 expected months、missing `gaming_day_event` dates、per-month row/censored counts |
-| TA-WP-2.4 | `warn/strict` branch | `trainer.py` | `strict` 缺 full-month dates → fail；`warn` → report only |
-| TA-WP-2.5 | Split reporting | `04_split_dataset.py` | censored exclusion、selected target months、month-level counts 寫入 artifact |
-| TA-WP-2.6 | Cache invalidation alignment | `utils/cache_invalidation_v1.py`, `trainer.py` | horizon change 只 invalidate assembly/split/sample/model |
-| TA-WP-2.7 | Focused tests | `tests/test_training_scope_policy.py`, split tests | horizon resolution、target-vs-source boundary、strict/warn |
+| TA-WP-2.3 | Step 3 month pruning at assembly boundary | `03_build_training_data.py`, `trainer.py` | Feast / slow-snap month batching 只 iterate selected target months；不得先全量 assemble 17–18 個月再於 Step 3 後做 horizon filter |
+| TA-WP-2.4 | Completeness audit | `03_build_training_data.py` 或 helper | 輸出 expected months、missing `gaming_day_event` dates、per-month row/censored counts |
+| TA-WP-2.5 | `warn/strict` branch | `trainer.py` | `strict` 缺 full-month dates → fail；`warn` → report only |
+| TA-WP-2.6 | Split reporting | `04_split_dataset.py` | censored exclusion、selected target months、month-level counts 寫入 artifact |
+| TA-WP-2.7 | Cache invalidation alignment | `utils/cache_invalidation_v1.py`, `trainer.py` | horizon change 只 invalidate assembly/split/sample/model |
+| TA-WP-2.8 | Focused tests | `tests/test_training_scope_policy.py`, split tests, Step 3 integration smoke | horizon resolution、target-vs-source boundary、strict/warn，且 recent horizon run 不得觸發非 target month Feast assembly |
 
 **Stage 2 DoD：**
 
 - `recent_full_months=3` 只影響 target rows
+- Step 3 在 assembly boundary 就只物化 / assemble selected target months，不接受先全量月批次再裁 target rows 的實作
 - val/test 仍保有最新 eligible uncensored rows
 - run artifact 能解釋 selected months、completeness、censored counts
 
@@ -127,6 +129,7 @@ pytest trainer_hightier/tests/test_training_scope_policy.py -q
 pytest trainer_hightier/tests/test_training_scope_policy.py -q
 pytest trainer_hightier/tests/test_split_dataset.py -q
 # 代表 run：比較 3m vs 6m invalidation 範圍（手動或 integration smoke）
+# 代表 run：recent_full_months=3 時，Step 3 日誌 / artifact 僅涵蓋 target months
 ```
 
 ---
@@ -277,7 +280,7 @@ Stage 3–4 與 Stage 5 可在 Batch A 完成後部分並行，但 **Stage 5 不
 
 | 項目 | 門檻 |
 |------|------|
-| Target scope | `recent_full_months=3` 只縮 target rows |
+| Target scope | `recent_full_months=3` 只縮 target rows，且 Step 3 只 assemble target months |
 | Primitive reuse | horizon change 不重算 L0–L5 primitives（coverage 足夠時） |
 | Step 3.5 miss-path | 預設 indexed replay；`fe__*` hard parity 綠燈 |
 | Waiver governance | `parity.passed=false` 保留；`hard_parity_passed` + pinned waiver 可 integration |
@@ -292,6 +295,7 @@ Stage 3–4 與 Stage 5 可在 Batch A 完成後部分並行，但 **Stage 5 不
 **立即停止並回頭修正：**
 
 - target scope 導致 primitive cache 被重算
+- recent horizon run 仍對非 target months 做 Step 3 Feast / slow-snap assembly
 - Step 3.5 hit path regression
 - gate artifact 無法區分 `hard_parity_passed` 與 `waiver_accepted`
 - sampling 改變 val/test row count 或 metrics contract

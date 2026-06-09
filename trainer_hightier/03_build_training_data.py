@@ -52,6 +52,7 @@ import pyarrow.parquet as pq
 
 from trainer_hightier.config import (
     DuckDbRuntimeConfig,
+    ResolvedTrainingScope,
     SHORT_TERM_TRIAL_BET_COLUMNS,
     configs_from_run_profile,
     get_run_profile,
@@ -157,6 +158,49 @@ def _build_training_data_module_sha256_hex() -> str:
 
 def _month_yyyymm(month_start: date) -> str:
     return f"{month_start.year:04d}{month_start.month:02d}"
+
+
+def _filter_month_starts_for_target_scope(
+    months: list[date],
+    resolved: ResolvedTrainingScope | None,
+) -> list[date]:
+    """Keep only month-starts whose ``YYYYMM`` is in resolved target scope."""
+
+    if resolved is None or not resolved.horizon_enabled:
+        return months
+    allowed = set(resolved.target_months)
+    filtered = [month_start for month_start in months if _month_yyyymm(month_start) in allowed]
+    if not filtered:
+        raise ValueError(
+            "target scope month prune matched no prediction_visible months "
+            f"(resolved={resolved.manifest_block()}, "
+            f"available={[ _month_yyyymm(m) for m in months ]})",
+        )
+    logger.info(
+        "[Step 3] target scope month prune: %d -> %d month(s) (%s)",
+        len(months),
+        len(filtered),
+        sorted(_month_yyyymm(m) for m in filtered),
+    )
+    return filtered
+
+
+def _entity_month_end_exclusive(
+    month_start: date,
+    *,
+    resolved: ResolvedTrainingScope | None,
+) -> date:
+    """Return exclusive upper bound for entity ``prediction_visible_ts_cf`` filter."""
+
+    month_end_exclusive = _add_one_month_calendar(month_start)
+    if resolved is None or not resolved.horizon_enabled:
+        return month_end_exclusive
+    yyyymm = _month_yyyymm(month_start)
+    if yyyymm in resolved.partial_target_months and resolved.target_end_date is not None:
+        partial_end_exclusive = resolved.target_end_date + timedelta(days=1)
+        if partial_end_exclusive < month_end_exclusive:
+            return partial_end_exclusive
+    return month_end_exclusive
 
 
 def _cleaned_artifact_fingerprint_token(block: dict[str, Any]) -> str:
@@ -541,6 +585,7 @@ class BuildTrainingDataArgs:
     training_set_keep_last_n_versions: int = 10
     feast_retrieval_cache_enabled: bool = True
     auto_feast_apply: bool = True
+    target_scope: ResolvedTrainingScope | None = None
 
 
 def _validate_prereqs(
@@ -767,6 +812,7 @@ def _training_manifest(
     row_count: int | None,
     labels_parquet: Path,
     versioned_parquet: Path | None,
+    target_scope: ResolvedTrainingScope | None = None,
 ) -> dict[str, Any]:
     blob: dict[str, Any] = {
         "output_parquet": str(output_parquet.resolve()),
@@ -777,6 +823,8 @@ def _training_manifest(
     }
     if versioned_parquet is not None:
         blob["versioned_output_parquet"] = str(Path(versioned_parquet).resolve())
+    if target_scope is not None and target_scope.horizon_enabled:
+        blob["target_scope"] = target_scope.manifest_block()
     return blob
 
 
@@ -916,6 +964,7 @@ def build_training_data(cfg: BuildTrainingDataArgs) -> Path:
             )
             if not months:
                 raise ValueError("No prediction_visible_ts_cf months found for Feast batch retrieval.")
+            months = _filter_month_starts_for_target_scope(months, cfg.target_scope)
             batch_feats: list[Path] = []
 
             groups_plan = _feast_group_plan(cfg.feature_service_name.strip()) if use_group_cache else ()
@@ -927,7 +976,7 @@ def build_training_data(cfg: BuildTrainingDataArgs) -> Path:
             )
 
             for mi, ms in enumerate(months):
-                me = _add_one_month_calendar(ms)
+                me = _entity_month_end_exclusive(ms, resolved=cfg.target_scope)
                 ent_fp = Path(batch_tmp) / f"entity_{mi:04d}.parquet"
                 nrow = _write_entity_parquet(
                     cfg.cleaned_bet_parquet,
@@ -1055,11 +1104,25 @@ def build_training_data(cfg: BuildTrainingDataArgs) -> Path:
                 bool(use_group_cache),
             )
         else:
+            entity_month_start: date | None = None
+            entity_month_end_exclusive: date | None = None
+            if cfg.target_scope is not None and cfg.target_scope.horizon_enabled:
+                if (
+                    cfg.target_scope.target_start_date is None
+                    or cfg.target_scope.target_end_date is None
+                ):
+                    raise ValueError(
+                        "target_scope enabled but missing target_start_date/target_end_date",
+                    )
+                entity_month_start = cfg.target_scope.target_start_date
+                entity_month_end_exclusive = cfg.target_scope.target_end_date + timedelta(days=1)
             nrow = _write_entity_parquet(
                 cfg.cleaned_bet_parquet,
                 entity_pq,
                 duckdb_runtime=cfg.duckdb_runtime,
                 max_rows=cfg.max_entity_rows,
+                month_start=entity_month_start,
+                month_end_exclusive=entity_month_end_exclusive,
             )
             if nrow <= 0:
                 logger.warning("Entity parquet is empty (%s)", entity_pq)
@@ -1101,6 +1164,7 @@ def build_training_data(cfg: BuildTrainingDataArgs) -> Path:
                 row_count=n_rows,
                 labels_parquet=cfg.labels_parquet,
                 versioned_parquet=versioned_out,
+                target_scope=cfg.target_scope,
             ),
             indent=2,
         ),

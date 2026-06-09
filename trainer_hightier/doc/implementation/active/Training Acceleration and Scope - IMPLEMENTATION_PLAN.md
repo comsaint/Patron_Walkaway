@@ -87,7 +87,7 @@ target_end_date
 Responsibilities:
 
 - Resolve selected target months from `as_of_date` and horizon policy.
-- Filter **target rows only** at assembly / Step 3 output boundary.
+- Restrict Step 3 assembly / month batching to **selected target months only**; do not first assemble all historical months and then apply horizon filtering afterward.
 - Emit completeness audit for full target months (`gaming_day_event` date coverage, row counts, censored counts).
 - Persist `training_scope_policy_fingerprint` into run manifest.
 
@@ -192,8 +192,9 @@ When enabled:
 **Approach**
 
 - Add `TrainingScopePolicy` dataclass in `config.py`.
-- Wire policy resolution into `trainer.py` before Step 3 assembly and Step 4 split reporting.
+- Wire policy resolution into `trainer.py` and `03_build_training_data.py` before Step 3 month batching / assembly and Step 4 split reporting.
 - Keep primitive materialization driven by entity set / source coverage, not by target horizon alone.
+- Preserve feature source history for short / mid / slow / labels, but restrict Step 3 entity/output months to the selected target months.
 - Extend split reporting with censored-row and target-month summaries.
 
 **Deliverables**

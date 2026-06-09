@@ -409,8 +409,8 @@ class TrainingScopePolicy:
     rows within ``TrainingDataScopeConfig``).
     """
 
-    recent_full_months: int | None = None
-    include_current_partial_month: bool = True
+    recent_full_months: int | None = 3  # default recent 3 full months...
+    include_current_partial_month: bool = True  # ... and include current partial month
     as_of_date: date | None = None
     data_completeness_mode: DataCompletenessMode = DATA_COMPLETENESS_MODE_WARN
 
@@ -457,7 +457,7 @@ class ResolvedTrainingScope:
 class SamplePolicy:
     """Train-only negative downsampling policy (SSOT TA-008)."""
 
-    neg_sample_frac: float = 1.0
+    neg_sample_frac: float = 0.3  # default 30% downsampling
     neg_sample_seed: int = DEFAULT_RANDOM_SEED
     neg_sample_scope: str = NEG_SAMPLE_SCOPE_TRAIN_ONLY
 
