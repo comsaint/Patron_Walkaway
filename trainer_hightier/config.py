@@ -457,7 +457,7 @@ class ResolvedTrainingScope:
 class SamplePolicy:
     """Train-only negative downsampling policy (SSOT TA-008)."""
 
-    neg_sample_frac: float = 0.3  # default 30% downsampling
+    neg_sample_frac: float = 1.0  # default off; speed runs may lower in trainer CLI later
     neg_sample_seed: int = DEFAULT_RANDOM_SEED
     neg_sample_scope: str = NEG_SAMPLE_SCOPE_TRAIN_ONLY
 
@@ -917,7 +917,7 @@ class Step5TrainConfig:
     baseline_reg_alpha: float = 0.1
     baseline_reg_lambda: float = 1.0
     #: When ``True``, final artifact model refits on train+val (test remains holdout-only).
-    refit_train_plus_val: bool = True
+    refit_train_plus_val: bool = False
     player_alert_policy: PlayerAlertPolicyConfig = field(default_factory=PlayerAlertPolicyConfig)
 
 
@@ -948,12 +948,12 @@ class Step6ParityConfig:
     #: Optional short smoke replay on a subsample (diagnostic only).
     run_short_smoke_in_step6: bool = False
     #: Wall-clock budget for parity + deploy bundle build + deploy E2E (seconds).
-    step6_total_timeout_seconds: int = 600
+    step6_total_timeout_seconds: int = 1800
     #: Retry the full Step 6 sequence once on failure (shared timeout window).
     step6_auto_retry_once: bool = True
     #: Run production-like deploy E2E (fresh bundle venv) after parity.
     step6_deploy_e2e_enabled: bool = True
-    #: Scorability sample size for deploy E2E gate (keep small for 10-minute budget).
+    #: Scorability sample size for deploy E2E gate (keep small for 30-minute Step 6 budget).
     step6_deploy_e2e_max_bets: int = 500
     #: Compare training short-term features against raw ``t_bet`` partition recompute.
     run_raw_source_sanity: bool = True
