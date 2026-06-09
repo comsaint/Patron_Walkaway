@@ -12,6 +12,7 @@ from trainer_hightier.utils.cache_invalidation_v1 import (
     sample_policy_change_invalidates_layers,
     shift_calendar_month,
     short_pit_invalid_months,
+    training_scope_change_invalidates_layers,
     union_changed_partition_months,
 )
 
@@ -134,3 +135,17 @@ def test_sample_policy_change_invalidates_only_sampled_train_and_model() -> None
     assert layers == ("sampled_train_cache", "model_artifacts")
     assert "short_term_pit_cache" not in layers
     assert "assembled_training_dataset" not in layers
+
+
+def test_training_scope_change_invalidates_assembly_not_primitives() -> None:
+    """Target horizon change must not invalidate L0–L5 primitive caches (TA-WP-2.11)."""
+    layers = training_scope_change_invalidates_layers()
+    assert layers == (
+        "assembled_training_dataset",
+        "training_splits",
+        "sampled_train_cache",
+        "model_artifacts",
+    )
+    assert "short_term_pit_cache" not in layers
+    assert "l1_bet_clean" not in layers
+    assert "l5_short_term_pit_primitive" not in layers

@@ -155,3 +155,16 @@ FEATURE_SCREENING_DOWNSTREAM_LAYERS: Final[tuple[str, ...]] = (
 def feature_screening_change_invalidates_layers() -> tuple[str, ...]:
     """Return artifact layers invalidated by screening policy/manifest change (SSOT §6.3)."""
     return FEATURE_SCREENING_DOWNSTREAM_LAYERS
+
+
+TRAINING_SCOPE_DOWNSTREAM_LAYERS: Final[tuple[str, ...]] = (
+    "assembled_training_dataset",
+    "training_splits",
+    "sampled_train_cache",
+    "model_artifacts",
+)
+
+
+def training_scope_change_invalidates_layers() -> tuple[str, ...]:
+    """Return artifact layers invalidated by target-horizon policy change (SSOT TA-007)."""
+    return TRAINING_SCOPE_DOWNSTREAM_LAYERS

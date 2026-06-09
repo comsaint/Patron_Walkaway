@@ -102,6 +102,29 @@ def test_init_training_acceleration_metrics_seeds_report_block() -> None:
     assert block["step35_indexed_replay_gate_summary"] is None
 
 
+def test_horizon_filter_skipped_when_scope_disabled(tmp_path: Path) -> None:
+    """TA-WP-2.11: ``recent_full_months=None`` must not apply horizon row filter."""
+    path = tmp_path / "training.parquet"
+    table = pa.table(
+        {
+            "gaming_day_event": [
+                date(2026, 3, 1),
+                date(2025, 12, 31),
+            ],
+            "walkaway_censored": [False, False],
+        },
+    )
+    pq.write_table(table, path)
+    resolved = resolve_training_scope(TrainingScopePolicy(recent_full_months=None))
+    out, summary = _apply_training_scope_horizon_to_parquet(
+        path,
+        resolved=resolved,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+    )
+    assert out == path
+    assert summary["horizon_filter_applied"] is False
+
+
 def test_horizon_filter_keeps_only_target_month_rows(tmp_path: Path) -> None:
     """Horizon filter should drop rows outside selected target months."""
     path = tmp_path / "training.parquet"
