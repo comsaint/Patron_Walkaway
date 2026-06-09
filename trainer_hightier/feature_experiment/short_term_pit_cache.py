@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,6 +54,12 @@ REASON_FORCE_REFRESH: Final[str] = "force_refresh"
 REASON_SHARD_MISSING: Final[str] = "shard_missing"
 REASON_MANIFEST_MISSING: Final[str] = "manifest_missing"
 REASON_ENTITY_DELTA_FILL: Final[str] = "entity_delta_fill"
+REASON_SUBSET_HIT: Final[str] = "subset_hit"
+
+MATERIALIZE_MODE_EXACT_HIT: Final[str] = "exact_hit"
+MATERIALIZE_MODE_SUBSET_HIT: Final[str] = "subset_hit"
+MATERIALIZE_MODE_DELTA_FILL: Final[str] = "delta_fill"
+MATERIALIZE_MODE_COLD_BUILD: Final[str] = "cold_build"
 
 
 @dataclass(frozen=True)
@@ -282,6 +289,243 @@ def _load_json(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _shard_primitive_layer_compatible(
+    manifest: dict[str, Any],
+    *,
+    yyyymm: str,
+    code_fp: str,
+    policy_fp: dict[str, Any],
+    mapping_sha256: str,
+    columns_fp: str,
+    primitive_fp: str,
+) -> bool:
+    """Return True when shard manifest matches primitive layer (ignores entity/universe)."""
+    if int(manifest.get("schema_version", -1)) != SHORT_TERM_PIT_CACHE_SCHEMA_VERSION:
+        return False
+    if str(manifest.get("yyyymm", "")).strip() != yyyymm:
+        return False
+    if str(manifest.get("code_fingerprint", "")).strip() != code_fp:
+        return False
+    if manifest.get("policy_fingerprint") != policy_fp:
+        return False
+    if str(manifest.get("canonical_mapping_sha256", "")).strip() != mapping_sha256:
+        return False
+    have_primitive = str(manifest.get("primitive_schema_fingerprint", "")).strip()
+    if have_primitive:
+        return have_primitive == primitive_fp
+    schema_fp = str(
+        manifest.get("output_schema_fingerprint") or manifest.get("columns_fingerprint") or "",
+    ).strip()
+    return schema_fp == columns_fp
+
+
+def _count_requested_bets_missing_from_shard(
+    *,
+    training_parquet: Path,
+    shard_parquet: Path,
+    yyyymm: str,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> int:
+    """Count requested month bet_ids absent from an existing shard."""
+    tp_esc = _path_esc(training_parquet)
+    shard_esc = _path_esc(shard_parquet)
+    ym = str(yyyymm).strip()
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        row = con.execute(
+            f"""
+            SELECT COUNT(*)::BIGINT AS missing_cnt
+            FROM (
+              SELECT DISTINCT TRY_CAST(bet_id AS DOUBLE) AS bet_id
+              FROM read_parquet('{tp_esc}')
+              WHERE payout_complete_dtm IS NOT NULL
+                AND TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
+                AND strftime(CAST(payout_complete_dtm AS TIMESTAMPTZ), '%Y%m') = '{ym}'
+            ) AS req
+            LEFT JOIN (
+              SELECT DISTINCT TRY_CAST(bet_id AS DOUBLE) AS bet_id
+              FROM read_parquet('{shard_esc}')
+            ) AS parent USING (bet_id)
+            WHERE parent.bet_id IS NULL
+            """,
+        ).fetchone()
+    finally:
+        con.close()
+    return int(row[0]) if row else 0
+
+
+def _filter_shard_to_requested_month_bets(
+    *,
+    shard_parquet: Path,
+    training_parquet: Path,
+    out_parquet: Path,
+    yyyymm: str,
+    out_columns: tuple[str, ...],
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> None:
+    """Filter a looser shard down to the requested month bet universe."""
+    shard_esc = _path_esc(shard_parquet)
+    tp_esc = _path_esc(training_parquet)
+    out_esc = _path_esc(out_parquet)
+    ym = str(yyyymm).strip()
+    col_sql = ", ".join(f'"{c}"' for c in out_columns)
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        con.execute(
+            f"""
+            COPY (
+              SELECT {col_sql}
+              FROM read_parquet('{shard_esc}') AS shard_rows
+              INNER JOIN (
+                SELECT DISTINCT TRY_CAST(bet_id AS DOUBLE) AS bet_id
+                FROM read_parquet('{tp_esc}')
+                WHERE payout_complete_dtm IS NOT NULL
+                  AND TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
+                  AND strftime(CAST(payout_complete_dtm AS TIMESTAMPTZ), '%Y%m') = '{ym}'
+              ) AS req USING (bet_id)
+            ) TO '{out_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+            """,
+        )
+    finally:
+        con.close()
+
+
+def _count_duplicate_bet_ids_in_shard(
+    shard_parquet: Path,
+    *,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> int:
+    """Return count of duplicate ``bet_id`` rows in a shard parquet."""
+    shard_esc = _path_esc(shard_parquet)
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        row = con.execute(
+            f"""
+            SELECT COUNT(*)::BIGINT AS dup_cnt
+            FROM (
+              SELECT TRY_CAST(bet_id AS DOUBLE) AS bet_id
+              FROM read_parquet('{shard_esc}')
+              WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
+              GROUP BY 1
+              HAVING COUNT(*) > 1
+            )
+            """,
+        ).fetchone()
+    finally:
+        con.close()
+    return int(row[0]) if row else 0
+
+
+def _validate_published_shard(
+    *,
+    shard_parquet: Path,
+    training_parquet: Path,
+    yyyymm: str,
+    out_columns: tuple[str, ...],
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> bool:
+    """Return True when shard matches requested universe and has unique bet_ids."""
+    if not _shard_covers_requested_columns(shard_parquet, out_columns):
+        return False
+    _, expected_rows = compute_shard_universe_fingerprint(
+        training_parquet,
+        yyyymm=yyyymm,
+        duckdb_runtime=duckdb_runtime,
+    )
+    out_stat = _parquet_quick_stat(shard_parquet)
+    if int(out_stat.get("num_rows", -1)) != int(expected_rows):
+        return False
+    return _count_duplicate_bet_ids_in_shard(shard_parquet, duckdb_runtime=duckdb_runtime) == 0
+
+
+def _stamp_hit_shard_manifest_mode(cache_root: Path, yyyymm: str) -> None:
+    """Backfill ``materialize_mode=exact_hit`` on compatible hit shard manifests."""
+    mpath = _shard_manifest_path(cache_root, yyyymm)
+    manifest = _load_json(mpath)
+    if not manifest:
+        return
+    if str(manifest.get("materialize_mode", "")).strip() == MATERIALIZE_MODE_EXACT_HIT:
+        return
+    manifest["materialize_mode"] = MATERIALIZE_MODE_EXACT_HIT
+    mpath.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _try_subset_reuse_shard(
+    *,
+    cache_root: Path,
+    yyyymm: str,
+    training_parquet: Path,
+    shard_out: Path,
+    duckdb_runtime: DuckDbRuntimeConfig,
+    code_fp: str,
+    policy_fp: dict[str, Any],
+    mapping_sha256: str,
+    columns_fp: str,
+    primitive_fp: str,
+    out_columns: tuple[str, ...],
+) -> bool:
+    """Reuse a looser cached shard when requested bet_ids are a strict subset."""
+    shard_p = _shard_parquet_path(cache_root, yyyymm)
+    if not shard_p.is_file():
+        return False
+    manifest = _load_json(_shard_manifest_path(cache_root, yyyymm)) or {}
+    if not _shard_primitive_layer_compatible(
+        manifest,
+        yyyymm=yyyymm,
+        code_fp=code_fp,
+        policy_fp=policy_fp,
+        mapping_sha256=mapping_sha256,
+        columns_fp=columns_fp,
+        primitive_fp=primitive_fp,
+    ):
+        return False
+    if not _shard_covers_requested_columns(shard_p, out_columns):
+        return False
+    missing = _count_requested_bets_missing_from_shard(
+        training_parquet=training_parquet,
+        shard_parquet=shard_p,
+        yyyymm=yyyymm,
+        duckdb_runtime=duckdb_runtime,
+    )
+    if missing > 0:
+        return False
+    tmp_out = shard_out.parent / "data.__subset__.parquet"
+    _filter_shard_to_requested_month_bets(
+        shard_parquet=shard_p,
+        training_parquet=training_parquet,
+        out_parquet=tmp_out,
+        yyyymm=yyyymm,
+        out_columns=out_columns,
+        duckdb_runtime=duckdb_runtime,
+    )
+    if not _validate_published_shard(
+        shard_parquet=tmp_out,
+        training_parquet=training_parquet,
+        yyyymm=yyyymm,
+        out_columns=out_columns,
+        duckdb_runtime=duckdb_runtime,
+    ):
+        tmp_out.unlink(missing_ok=True)
+        return False
+    _, num_rows = compute_shard_universe_fingerprint(
+        training_parquet,
+        yyyymm=yyyymm,
+        duckdb_runtime=duckdb_runtime,
+    )
+    tmp_out.replace(shard_out)
+    logger.info(
+        "[short_term_pit] subset_hit yyyymm=%s parent_rows=%d requested_rows=%d parent_entity_fp=%s",
+        yyyymm,
+        int(manifest.get("training_universe_num_rows", -1)),
+        num_rows,
+        str(manifest.get("entity_set_fingerprint", ""))[:16],
+    )
+    return True
+
+
 def _shard_manifest_compatible(
     manifest: dict[str, Any],
     *,
@@ -353,6 +597,8 @@ def _write_shard_manifest(
     universe_fp: str,
     num_rows: int,
     out_stat: dict[str, Any],
+    materialize_mode: str | None = None,
+    parent_entity_set_fingerprint: str | None = None,
 ) -> None:
     mpath = _shard_manifest_path(cache_root, yyyymm)
     mpath.parent.mkdir(parents=True, exist_ok=True)
@@ -374,6 +620,10 @@ def _write_shard_manifest(
         "training_universe_num_rows": int(num_rows),
         "output_parquet_stat": out_stat,
     }
+    if materialize_mode is not None:
+        payload["materialize_mode"] = str(materialize_mode)
+    if parent_entity_set_fingerprint is not None:
+        payload["parent_entity_set_fingerprint"] = str(parent_entity_set_fingerprint)
     mpath.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
@@ -460,22 +710,212 @@ def plan_short_term_pit_cache(
     )
 
 
+def _write_month_missing_targets_parquet(
+    *,
+    training_parquet: Path,
+    shard_parquet: Path,
+    out_parquet: Path,
+    yyyymm: str,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> int:
+    """Write training rows whose bet_ids are absent from shard; return row count."""
+    tp_esc = _path_esc(training_parquet)
+    shard_esc = _path_esc(shard_parquet)
+    out_esc = _path_esc(out_parquet)
+    ym = str(yyyymm).strip()
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        con.execute(
+            f"""
+            COPY (
+              SELECT t.*
+              FROM read_parquet('{tp_esc}') AS t
+              INNER JOIN (
+                SELECT req.bet_id
+                FROM (
+                  SELECT DISTINCT TRY_CAST(bet_id AS DOUBLE) AS bet_id
+                  FROM read_parquet('{tp_esc}')
+                  WHERE payout_complete_dtm IS NOT NULL
+                    AND TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
+                    AND strftime(CAST(payout_complete_dtm AS TIMESTAMPTZ), '%Y%m') = '{ym}'
+                ) AS req
+                LEFT JOIN (
+                  SELECT DISTINCT TRY_CAST(bet_id AS DOUBLE) AS bet_id
+                  FROM read_parquet('{shard_esc}')
+                ) AS parent USING (bet_id)
+                WHERE parent.bet_id IS NULL
+              ) AS miss
+                ON TRY_CAST(t.bet_id AS DOUBLE) = miss.bet_id
+            ) TO '{out_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+            """,
+        )
+        row = con.execute(
+            f"SELECT COUNT(*)::BIGINT FROM read_parquet('{out_esc}')",
+        ).fetchone()
+    finally:
+        con.close()
+    return int(row[0]) if row else 0
+
+
 def _shard_delta_fill_eligible(
     *,
     cache_root: Path,
     yyyymm: str,
     previous_entity_set_fp: str,
-    added_player_ids: tuple[int, ...],
+    added_player_ids: tuple[int, ...] = (),
+    training_parquet: Path | None = None,
+    duckdb_runtime: DuckDbRuntimeConfig | None = None,
+    code_fp: str | None = None,
+    policy_fp: dict[str, Any] | None = None,
+    mapping_sha256: str | None = None,
+    columns_fp: str | None = None,
+    primitive_fp: str | None = None,
+    out_columns: tuple[str, ...] | None = None,
 ) -> bool:
     """Return True when an existing shard can merge quantile-delta rows."""
-    if not added_player_ids or not str(previous_entity_set_fp).strip():
+    prev_fp = str(previous_entity_set_fp).strip()
+    if not prev_fp:
         return False
     shard_p = _shard_parquet_path(cache_root, yyyymm)
     if not shard_p.is_file():
         return False
     manifest = _load_json(_shard_manifest_path(cache_root, yyyymm)) or {}
     have_fp = str(manifest.get("entity_set_fingerprint", "")).strip()
-    return have_fp == str(previous_entity_set_fp).strip()
+    if have_fp != prev_fp:
+        return False
+    if code_fp is not None and policy_fp is not None and mapping_sha256 is not None:
+        if columns_fp is None or primitive_fp is None:
+            raise ValueError(
+                "columns_fp and primitive_fp are required when code_fp is provided",
+            )
+        if not _shard_primitive_layer_compatible(
+            manifest,
+            yyyymm=yyyymm,
+            code_fp=code_fp,
+            policy_fp=policy_fp,
+            mapping_sha256=mapping_sha256,
+            columns_fp=columns_fp,
+            primitive_fp=primitive_fp,
+        ):
+            return False
+        if out_columns is not None and not _shard_covers_requested_columns(shard_p, out_columns):
+            return False
+    if training_parquet is not None and duckdb_runtime is not None:
+        missing = _count_requested_bets_missing_from_shard(
+            training_parquet=training_parquet,
+            shard_parquet=shard_p,
+            yyyymm=yyyymm,
+            duckdb_runtime=duckdb_runtime,
+        )
+        return missing > 0
+    return bool(added_player_ids)
+
+
+def _try_delta_fill_shard(
+    *,
+    cache_root: Path,
+    yyyymm: str,
+    training_parquet: Path,
+    shard_out: Path,
+    previous_entity_set_fp: str,
+    added_player_ids: tuple[int, ...],
+    cleaned_bet_parquet: Path,
+    canonical_mapping_parquet: Path,
+    short_term_columns: tuple[str, ...],
+    trial_columns: tuple[str, ...],
+    batch_size: int,
+    duckdb_runtime: DuckDbRuntimeConfig,
+    code_fp: str,
+    policy_fp: dict[str, Any],
+    mapping_sha256: str,
+    columns_fp: str,
+    primitive_fp: str,
+    out_columns: tuple[str, ...],
+) -> tuple[bool, str | None]:
+    """Materialize only missing bet rows and merge into an existing month shard."""
+    if not _shard_delta_fill_eligible(
+        cache_root=cache_root,
+        yyyymm=yyyymm,
+        previous_entity_set_fp=previous_entity_set_fp,
+        added_player_ids=added_player_ids,
+        training_parquet=training_parquet,
+        duckdb_runtime=duckdb_runtime,
+        code_fp=code_fp,
+        policy_fp=policy_fp,
+        mapping_sha256=mapping_sha256,
+        columns_fp=columns_fp,
+        primitive_fp=primitive_fp,
+        out_columns=out_columns,
+    ):
+        return False, None
+    shard_p = _shard_parquet_path(cache_root, yyyymm)
+    manifest = _load_json(_shard_manifest_path(cache_root, yyyymm)) or {}
+    parent_fp = str(manifest.get("entity_set_fingerprint", "")).strip() or None
+    missing_targets = shard_out.parent / "targets.__delta_missing__.parquet"
+    missing_rows = _write_month_missing_targets_parquet(
+        training_parquet=training_parquet,
+        shard_parquet=shard_p,
+        out_parquet=missing_targets,
+        yyyymm=yyyymm,
+        duckdb_runtime=duckdb_runtime,
+    )
+    if missing_rows <= 0:
+        missing_targets.unlink(missing_ok=True)
+        return False, None
+    delta_tmp = shard_out.parent / "data.__delta__.parquet"
+    materialize_fe_derived_short_term_parquet(
+        cleaned_bet_parquet=cleaned_bet_parquet,
+        training_parquet_for_bet_ids=missing_targets,
+        out_parquet=delta_tmp,
+        duckdb_runtime=duckdb_runtime,
+        canonical_mapping_parquet=canonical_mapping_parquet,
+        short_term_columns=short_term_columns,
+        trial_columns=trial_columns,
+        batch_size=int(batch_size),
+        payout_yyyymm=yyyymm,
+    )
+    missing_targets.unlink(missing_ok=True)
+    shard_backup = shard_out.parent / "data.__delta_backup__.parquet"
+    shutil.copy2(shard_out, shard_backup)
+    try:
+        _merge_delta_rows_into_shard(
+            shard_parquet=shard_out,
+            delta_parquet=delta_tmp,
+            out_columns=out_columns,
+            duckdb_runtime=duckdb_runtime,
+        )
+        if not _validate_published_shard(
+            shard_parquet=shard_out,
+            training_parquet=training_parquet,
+            yyyymm=yyyymm,
+            out_columns=out_columns,
+            duckdb_runtime=duckdb_runtime,
+        ):
+            logger.warning(
+                "[short_term_pit] delta_fill validation failed yyyymm=%s; restoring parent shard",
+                yyyymm,
+            )
+            shard_backup.replace(shard_out)
+            return False, None
+    finally:
+        delta_tmp.unlink(missing_ok=True)
+        shard_backup.unlink(missing_ok=True)
+    _, expected_rows = compute_shard_universe_fingerprint(
+        training_parquet,
+        yyyymm=yyyymm,
+        duckdb_runtime=duckdb_runtime,
+    )
+    logger.info(
+        "[short_term_pit] delta_fill yyyymm=%s missing_rows=%d parent_rows=%d "
+        "requested_rows=%d parent_entity_fp=%s",
+        yyyymm,
+        missing_rows,
+        int(manifest.get("training_universe_num_rows", -1)),
+        expected_rows,
+        str(parent_fp or "")[:16],
+    )
+    return True, parent_fp
 
 
 def _merge_delta_rows_into_shard(
@@ -734,6 +1174,7 @@ def materialize_fe_derived_short_term_parquet_with_cache(
     shard_months = list_training_payout_months(tp, duckdb_runtime=duckdb_runtime)
 
     delta_fill_shards: list[str] = []
+    subset_hit_shards: list[str] = []
     replay_shard_seconds: dict[str, float] = {}
     materializer_by_shard: dict[str, str] = {}
     t_delta = time.perf_counter()
@@ -746,35 +1187,51 @@ def materialize_fe_derived_short_term_parquet_with_cache(
     for yyyymm in plan.miss_shards:
         shard_out = _shard_parquet_path(root, yyyymm)
         shard_out.parent.mkdir(parents=True, exist_ok=True)
-        used_delta = _shard_delta_fill_eligible(
+        parent_entity_fp: str | None = None
+        materialize_mode = MATERIALIZE_MODE_COLD_BUILD
+        delta_ok, delta_parent_fp = _try_delta_fill_shard(
             cache_root=root,
             yyyymm=yyyymm,
+            training_parquet=tp,
+            shard_out=shard_out,
             previous_entity_set_fp=prev_entity_fp,
             added_player_ids=added_ids,
+            cleaned_bet_parquet=cleaned_bet_parquet,
+            canonical_mapping_parquet=cmap,
+            short_term_columns=short_term_columns,
+            trial_columns=trial_columns,
+            batch_size=int(batch_size),
+            duckdb_runtime=duckdb_runtime,
+            code_fp=code_fp,
+            policy_fp=policy_fp,
+            mapping_sha256=mapping_sha256,
+            columns_fp=columns_fp,
+            primitive_fp=primitive_fp,
+            out_columns=out_cols,
         )
-        if used_delta:
-            delta_tmp = shard_out.parent / "data.__delta__.parquet"
-            materialize_fe_derived_short_term_parquet(
-                cleaned_bet_parquet=cleaned_bet_parquet,
-                training_parquet_for_bet_ids=tp,
-                out_parquet=delta_tmp,
-                duckdb_runtime=duckdb_runtime,
-                canonical_mapping_parquet=cmap,
-                short_term_columns=short_term_columns,
-                trial_columns=trial_columns,
-                batch_size=int(batch_size),
-                payout_yyyymm=yyyymm,
-                restrict_player_ids=added_ids,
-            )
-            _merge_delta_rows_into_shard(
-                shard_parquet=shard_out,
-                delta_parquet=delta_tmp,
-                out_columns=out_cols,
-                duckdb_runtime=duckdb_runtime,
-            )
-            delta_tmp.unlink(missing_ok=True)
+        if delta_ok:
+            parent_entity_fp = delta_parent_fp
             delta_fill_shards.append(yyyymm)
-            materializer_by_shard[yyyymm] = STEP35_MISS_PATH_BOUNDED
+            materialize_mode = MATERIALIZE_MODE_DELTA_FILL
+            materializer_by_shard[yyyymm] = MATERIALIZE_MODE_DELTA_FILL
+        elif _try_subset_reuse_shard(
+            cache_root=root,
+            yyyymm=yyyymm,
+            training_parquet=tp,
+            shard_out=shard_out,
+            duckdb_runtime=duckdb_runtime,
+            code_fp=code_fp,
+            policy_fp=policy_fp,
+            mapping_sha256=mapping_sha256,
+            columns_fp=columns_fp,
+            primitive_fp=primitive_fp,
+            out_columns=out_cols,
+        ):
+            prev_manifest = _load_json(_shard_manifest_path(root, yyyymm)) or {}
+            parent_entity_fp = str(prev_manifest.get("entity_set_fingerprint", "")).strip() or None
+            subset_hit_shards.append(yyyymm)
+            materialize_mode = MATERIALIZE_MODE_SUBSET_HIT
+            materializer_by_shard[yyyymm] = MATERIALIZE_MODE_SUBSET_HIT
         else:
             engine, elapsed = _materialize_miss_shard(
                 step35_miss_path=miss_path,
@@ -789,6 +1246,7 @@ def materialize_fe_derived_short_term_parquet_with_cache(
                 yyyymm=yyyymm,
                 out_columns=out_cols,
             )
+            materialize_mode = MATERIALIZE_MODE_COLD_BUILD
             materializer_by_shard[yyyymm] = engine
             if elapsed > 0:
                 replay_shard_seconds[yyyymm] = elapsed
@@ -811,7 +1269,15 @@ def materialize_fe_derived_short_term_parquet_with_cache(
             universe_fp=universe_fp,
             num_rows=num_rows,
             out_stat=_parquet_quick_stat(shard_out),
+            materialize_mode=materialize_mode,
+            parent_entity_set_fingerprint=parent_entity_fp,
         )
+
+    exact_hit_shards: list[str] = []
+    for yyyymm in plan.hit_shards:
+        materializer_by_shard[yyyymm] = MATERIALIZE_MODE_EXACT_HIT
+        exact_hit_shards.append(yyyymm)
+        _stamp_hit_shard_manifest_mode(root, yyyymm)
 
     _assemble_short_term_shards(
         plan.shard_paths,
@@ -834,10 +1300,18 @@ def materialize_fe_derived_short_term_parquet_with_cache(
     )
 
     total_shards = len(shard_months)
-    hit_ratio = float(len(plan.hit_shards) / total_shards) if total_shards else 1.0
+    cold_build_shards = [
+        ym
+        for ym in plan.miss_shards
+        if ym not in subset_hit_shards and ym not in delta_fill_shards
+    ]
+    effective_hits = len(plan.hit_shards) + len(subset_hit_shards) + len(delta_fill_shards)
+    hit_ratio = float(effective_hits / total_shards) if total_shards else 1.0
     reason_counts = dict(plan.reason_counts)
     if delta_fill_shards:
         reason_counts[REASON_ENTITY_DELTA_FILL] = int(len(delta_fill_shards))
+    if subset_hit_shards:
+        reason_counts[REASON_SUBSET_HIT] = int(len(subset_hit_shards))
     meta = {
         "cache_root": str(root),
         "cache_hit_shards": list(plan.hit_shards),
@@ -845,13 +1319,16 @@ def materialize_fe_derived_short_term_parquet_with_cache(
         "cache_reason_counts": reason_counts,
         "cache_hit_ratio": round(hit_ratio, 6),
         "short_term_pit_primitive_hit_ratio": round(hit_ratio, 6),
-        "cache_hit": len(plan.miss_shards) == 0 and not force_refresh,
+        "cache_hit": len(cold_build_shards) == 0 and not force_refresh,
         "training_materialize_batch_size": int(batch_size),
         "shard_months": list(shard_months),
         "short_term_pit_recompute_months": list(recompute_months),
         "short_term_pit_source_invalid_months": list(source_invalid_months),
         "entity_set_fingerprint_sha256_hex": entity_set_fingerprint_sha256_hex,
         "short_term_pit_delta_fill_shards": list(delta_fill_shards),
+        "short_term_pit_subset_hit_shards": list(subset_hit_shards),
+        "short_term_pit_exact_hit_shards": list(exact_hit_shards),
+        "short_term_pit_cold_build_shards": list(cold_build_shards),
         "entity_delta_fill_elapsed_seconds": round(time.perf_counter() - t_delta, 6),
         "step35_miss_path": miss_path,
         "step35_materializer_by_shard": materializer_by_shard,
@@ -859,12 +1336,18 @@ def materialize_fe_derived_short_term_parquet_with_cache(
         "indexed_replay_gate_mode": INDEXED_REPLAY_GATE_MODE_HARD_FE,
     }
     logger.info(
-        "[short_term_pit] cache summary hit=%d miss=%d ratio=%.3f miss_path=%s reasons=%s -> %s",
+        "[short_term_pit] cache summary hit=%d miss=%d ratio=%.3f "
+        "exact=%d cold=%d subset=%d delta=%d miss_path=%s reasons=%s materializer=%s -> %s",
         len(plan.hit_shards),
         len(plan.miss_shards),
         hit_ratio,
+        len(exact_hit_shards),
+        len(cold_build_shards),
+        len(subset_hit_shards),
+        len(delta_fill_shards),
         miss_path,
-        plan.reason_counts,
+        reason_counts,
+        materializer_by_shard,
         dst.name,
     )
     return dst, meta

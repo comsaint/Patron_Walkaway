@@ -291,7 +291,16 @@ def build_pipeline_debug(metrics: dict[str, Any]) -> dict[str, Any]:
             "source_invalid_months": metrics.get("short_term_pit_source_invalid_months"),
             "entity_set_fingerprint_sha256_hex": metrics.get("entity_set_policy_fingerprint_sha256_hex"),
             "delta_fill_shards": metrics.get("short_term_pit_delta_fill_shards"),
+            "subset_hit_shards": metrics.get("short_term_pit_subset_hit_shards"),
+            "exact_hit_shards": metrics.get("short_term_pit_exact_hit_shards"),
+            "cold_build_shards": metrics.get("short_term_pit_cold_build_shards"),
             "entity_delta_fill_elapsed_seconds": metrics.get("entity_delta_fill_elapsed_seconds"),
+            "step35_miss_path": metrics.get("step35_miss_path"),
+            "step35_materializer_by_shard": metrics.get("step35_materializer_by_shard"),
+            "step35_indexed_replay_shard_seconds": metrics.get(
+                "step35_indexed_replay_shard_seconds",
+            ),
+            "cache_reason_counts": metrics.get("cache_reason_counts"),
         },
         "assembly_v1": {
             "cache_hit": metrics.get("assembly_cache_hit"),

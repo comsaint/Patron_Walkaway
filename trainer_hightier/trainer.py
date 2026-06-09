@@ -1684,8 +1684,25 @@ def _ensure_fe_enriched_training_parquet_for_step4(
             metrics["short_term_pit_delta_fill_shards"] = short_cache_meta.get(
                 "short_term_pit_delta_fill_shards",
             )
+            metrics["short_term_pit_subset_hit_shards"] = short_cache_meta.get(
+                "short_term_pit_subset_hit_shards",
+            )
+            metrics["short_term_pit_exact_hit_shards"] = short_cache_meta.get(
+                "short_term_pit_exact_hit_shards",
+            )
+            metrics["short_term_pit_cold_build_shards"] = short_cache_meta.get(
+                "short_term_pit_cold_build_shards",
+            )
             metrics["entity_delta_fill_elapsed_seconds"] = short_cache_meta.get(
                 "entity_delta_fill_elapsed_seconds",
+            )
+            metrics["step35_miss_path"] = short_cache_meta.get("step35_miss_path")
+            metrics["cache_reason_counts"] = short_cache_meta.get("cache_reason_counts")
+            metrics["step35_materializer_by_shard"] = short_cache_meta.get(
+                "step35_materializer_by_shard",
+            )
+            metrics["step35_indexed_replay_shard_seconds"] = short_cache_meta.get(
+                "step35_indexed_replay_shard_seconds",
             )
             accel = metrics.get("training_acceleration_policy")
             if isinstance(accel, dict):
@@ -1696,6 +1713,18 @@ def _ensure_fe_enriched_training_parquet_for_step4(
                     "cache_hit_shards": short_cache_meta.get("cache_hit_shards"),
                     "cache_miss_shards": short_cache_meta.get("cache_miss_shards"),
                     "cache_reason_counts": short_cache_meta.get("cache_reason_counts"),
+                    "short_term_pit_delta_fill_shards": short_cache_meta.get(
+                        "short_term_pit_delta_fill_shards",
+                    ),
+                    "short_term_pit_subset_hit_shards": short_cache_meta.get(
+                        "short_term_pit_subset_hit_shards",
+                    ),
+                    "short_term_pit_exact_hit_shards": short_cache_meta.get(
+                        "short_term_pit_exact_hit_shards",
+                    ),
+                    "short_term_pit_cold_build_shards": short_cache_meta.get(
+                        "short_term_pit_cold_build_shards",
+                    ),
                     "step35_materializer_by_shard": short_cache_meta.get(
                         "step35_materializer_by_shard",
                     ),
