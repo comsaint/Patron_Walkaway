@@ -1,8 +1,8 @@
 # Feature layers (naming SSOT): raw | short (PIT per bet_id) | mid (daily snapshot ASOF) | long (monthly).
 # Short includes bet__* and short-horizon fe__*; allowed_training_supplier short_term_pit_builder.
 # source feast_trial_1h on bet__* is a legacy registry label—not a separate horizon from fe_derived short.
-registry_version: v0.7
-updated_at: '2026-06-04'
+registry_version: v0.8
+updated_at: '2026-06-09'
 features:
 - feature_id: wager
   group_id: baseline_model
@@ -1157,3 +1157,109 @@ features:
   time_horizon: short_term
   max_lookback: PT1H
   allowed_training_supplier: external_txn_lite_materializer
+- feature_id: fe__hot__wager_today_over_peer_p95__adt_decile
+  group_id: group_hot_patron_robust
+  source: hot_patron_experiment
+  semantic_owner: trainer_hightier/feature_experiment/hot_patron_features.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: Same-day peer lookup is not valid for future val/test until rewritten as rolling/as-of cohort stats.
+  time_horizon: mid_term
+  max_lookback: P1D
+  allowed_training_supplier: hot_patron_join_layer
+- feature_id: fe__hot__avg_wager_today_over_peer_p95__adt_decile
+  group_id: group_hot_patron_robust
+  source: hot_patron_experiment
+  semantic_owner: trainer_hightier/feature_experiment/hot_patron_features.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: Same-day peer lookup is not valid for future val/test until rewritten as rolling/as-of cohort stats.
+  time_horizon: mid_term
+  max_lookback: P1D
+  allowed_training_supplier: hot_patron_join_layer
+- feature_id: fe__hot__wager_w15m_over_peer_p95__adt_decile
+  group_id: group_hot_patron_robust
+  source: hot_patron_experiment
+  semantic_owner: trainer_hightier/feature_experiment/hot_patron_features.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: Same-day peer lookup is not valid for future val/test until rewritten as rolling/as-of cohort stats.
+  time_horizon: short_term
+  max_lookback: PT15M
+  allowed_training_supplier: hot_patron_join_layer
+- feature_id: fe__hot__wager_per_hr_over_peer_p95
+  group_id: group_hot_patron_robust
+  source: hot_patron_experiment
+  semantic_owner: trainer_hightier/feature_experiment/hot_patron_features.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: Same-day peer lookup is not valid for future val/test until rewritten as rolling/as-of cohort stats.
+  time_horizon: mid_term
+  max_lookback: P1D
+  allowed_training_supplier: hot_patron_join_layer
+- feature_id: fe__hot__games_today_over_peer_p95
+  group_id: group_hot_patron_robust
+  source: hot_patron_experiment
+  semantic_owner: trainer_hightier/feature_experiment/hot_patron_features.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: Same-day peer lookup is not valid for future val/test until rewritten as rolling/as-of cohort stats.
+  time_horizon: mid_term
+  max_lookback: P1D
+  allowed_training_supplier: hot_patron_join_layer
+- feature_id: fe__hot__mid_term_history_sparse_flag
+  group_id: group_hot_patron_robust
+  source: hot_patron_experiment
+  semantic_owner: trainer_hightier/feature_experiment/hot_patron_features.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: Cold-start indicator (missing snapshot or <3 gaming days w180d).
+  time_horizon: long_term
+  max_lookback: P180D
+  allowed_training_supplier: hot_patron_join_layer
+- feature_id: fe__hot__wager_today_over_own_p95__w180d
+  group_id: group_hot_patron_robust
+  source: hot_patron_experiment
+  semantic_owner: trainer_hightier/feature_experiment/hot_patron_features.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: Self-normalized wager vs implied daily theo p95 proxy.
+  time_horizon: long_term
+  max_lookback: P180D
+  allowed_training_supplier: hot_patron_join_layer
+- feature_id: fe__hot__peer_wager_z__adt_decile
+  group_id: group_hot_patron_robust
+  source: hot_patron_experiment
+  semantic_owner: trainer_hightier/feature_experiment/hot_patron_features.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  note: Same-day peer lookup is not valid for future val/test until rewritten as rolling/as-of cohort stats.
+  time_horizon: mid_term
+  max_lookback: P1D
+  allowed_training_supplier: hot_patron_join_layer

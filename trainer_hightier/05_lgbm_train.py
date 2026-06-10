@@ -63,6 +63,8 @@ STEP5_GROUP_COLUMNS: Final[frozenset[str]] = frozenset({PLAYER_ID_COLUMN, GAME_I
 EVALUATION_GRAIN_PLAYER_GAME: Final[str] = "player_game"
 
 DEFAULT_MODEL_FILENAME: Final[str] = "model.pkl"
+_VAL_ALERTS_PER_HR_SOFT_CAP: Final[float] = 3.0
+_VAL_ALERTS_PENALTY_WEIGHT: Final[float] = 0.005
 DEFAULT_METRICS_FILENAME: Final[str] = "training_metrics.json"
 
 
@@ -303,6 +305,25 @@ def _prepare_xy(df: pd.DataFrame, *, feature_columns: tuple[str, ...]) -> tuple[
         categorical_columns=CAT_COLUMNS,
     )
     return X, y
+
+
+def _val_optuna_objective_score(
+    pick: ThresholdPickResult,
+    *,
+    val_window_hours: float | None,
+    alert_count_at_pick: int,
+    objective_min_precision: float,
+) -> float:
+    """Maximize recall at precision floor; penalize excessive validation alert rate."""
+
+    if not pick.feasible:
+        return float(pick.precision) - float(objective_min_precision) - 1.0
+    recall = float(pick.recall)
+    if val_window_hours is None or val_window_hours <= 0:
+        return recall
+    alerts_per_hour = float(alert_count_at_pick) / float(val_window_hours)
+    penalty = max(0.0, alerts_per_hour - _VAL_ALERTS_PER_HR_SOFT_CAP) * _VAL_ALERTS_PENALTY_WEIGHT
+    return recall - penalty
 
 
 def pick_threshold_precision_floor(
@@ -657,11 +678,12 @@ def train_lgbm_from_splits(
             val_pg.scores,
             min_precision=float(objective_min_precision),
         )
-        objective_val: float
-        if pick.feasible:
-            objective_val = float(pick.recall)
-        else:
-            objective_val = float(pick.precision) - float(objective_min_precision) - 1.0
+        objective_val = _val_optuna_objective_score(
+            pick,
+            val_window_hours=wh_val,
+            alert_count_at_pick=int(pick.alert_count),
+            objective_min_precision=float(objective_min_precision),
+        )
         return model, pick, objective_val
 
     t0 = time.perf_counter()
