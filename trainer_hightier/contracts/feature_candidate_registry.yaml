@@ -1161,12 +1161,12 @@ features:
   group_id: group_hot_patron_robust
   source: hot_patron_experiment
   semantic_owner: trainer_hightier/feature_experiment/hot_patron_features.py
-  status: experimental
+  status: disabled
   enabled_for:
   - candidate
   - ablation
-  drop_reason_code: null
-  note: Same-day peer lookup is not valid for future val/test until rewritten as rolling/as-of cohort stats.
+  drop_reason_code: hot_patron_coverage_and_test_regression
+  note: Tried in 2026-06 hot-patron mission; same-day peer lookup missed future val/test and was not promoted.
   time_horizon: mid_term
   max_lookback: P1D
   allowed_training_supplier: hot_patron_join_layer
@@ -1174,12 +1174,12 @@ features:
   group_id: group_hot_patron_robust
   source: hot_patron_experiment
   semantic_owner: trainer_hightier/feature_experiment/hot_patron_features.py
-  status: experimental
+  status: disabled
   enabled_for:
   - candidate
   - ablation
-  drop_reason_code: null
-  note: Same-day peer lookup is not valid for future val/test until rewritten as rolling/as-of cohort stats.
+  drop_reason_code: hot_patron_coverage_and_test_regression
+  note: Tried in 2026-06 hot-patron mission; same-day peer lookup missed future val/test and was not promoted.
   time_horizon: mid_term
   max_lookback: P1D
   allowed_training_supplier: hot_patron_join_layer
@@ -1187,12 +1187,12 @@ features:
   group_id: group_hot_patron_robust
   source: hot_patron_experiment
   semantic_owner: trainer_hightier/feature_experiment/hot_patron_features.py
-  status: experimental
+  status: disabled
   enabled_for:
   - candidate
   - ablation
-  drop_reason_code: null
-  note: Same-day peer lookup is not valid for future val/test until rewritten as rolling/as-of cohort stats.
+  drop_reason_code: hot_patron_coverage_and_test_regression
+  note: Tried in 2026-06 hot-patron mission; same-day peer lookup missed future val/test and was not promoted.
   time_horizon: short_term
   max_lookback: PT15M
   allowed_training_supplier: hot_patron_join_layer
@@ -1200,12 +1200,12 @@ features:
   group_id: group_hot_patron_robust
   source: hot_patron_experiment
   semantic_owner: trainer_hightier/feature_experiment/hot_patron_features.py
-  status: experimental
+  status: disabled
   enabled_for:
   - candidate
   - ablation
-  drop_reason_code: null
-  note: Same-day peer lookup is not valid for future val/test until rewritten as rolling/as-of cohort stats.
+  drop_reason_code: hot_patron_coverage_and_test_regression
+  note: Tried in 2026-06 hot-patron mission; same-day peer lookup missed future val/test and was not promoted.
   time_horizon: mid_term
   max_lookback: P1D
   allowed_training_supplier: hot_patron_join_layer
@@ -1213,12 +1213,12 @@ features:
   group_id: group_hot_patron_robust
   source: hot_patron_experiment
   semantic_owner: trainer_hightier/feature_experiment/hot_patron_features.py
-  status: experimental
+  status: disabled
   enabled_for:
   - candidate
   - ablation
-  drop_reason_code: null
-  note: Same-day peer lookup is not valid for future val/test until rewritten as rolling/as-of cohort stats.
+  drop_reason_code: hot_patron_coverage_and_test_regression
+  note: Tried in 2026-06 hot-patron mission; same-day peer lookup missed future val/test and was not promoted.
   time_horizon: mid_term
   max_lookback: P1D
   allowed_training_supplier: hot_patron_join_layer
@@ -1226,13 +1226,12 @@ features:
   group_id: group_hot_patron_robust
   source: hot_patron_experiment
   semantic_owner: trainer_hightier/feature_experiment/hot_patron_features.py
-  status: active
+  status: disabled
   enabled_for:
-  - baseline
   - candidate
   - ablation
-  drop_reason_code: null
-  note: Cold-start indicator (missing snapshot or <3 gaming days w180d).
+  drop_reason_code: hot_patron_coverage_and_test_regression
+  note: Tried in 2026-06 hot-patron mission; safe-only Optuna regressed test op precision vs baseline.
   time_horizon: long_term
   max_lookback: P180D
   allowed_training_supplier: hot_patron_join_layer
@@ -1240,13 +1239,12 @@ features:
   group_id: group_hot_patron_robust
   source: hot_patron_experiment
   semantic_owner: trainer_hightier/feature_experiment/hot_patron_features.py
-  status: active
+  status: disabled
   enabled_for:
-  - baseline
   - candidate
   - ablation
-  drop_reason_code: null
-  note: Self-normalized wager vs implied daily theo p95 proxy.
+  drop_reason_code: hot_patron_coverage_and_test_regression
+  note: Tried in 2026-06 hot-patron mission; safe-only Optuna regressed test op precision vs baseline.
   time_horizon: long_term
   max_lookback: P180D
   allowed_training_supplier: hot_patron_join_layer
@@ -1254,12 +1252,12 @@ features:
   group_id: group_hot_patron_robust
   source: hot_patron_experiment
   semantic_owner: trainer_hightier/feature_experiment/hot_patron_features.py
-  status: experimental
+  status: disabled
   enabled_for:
   - candidate
   - ablation
-  drop_reason_code: null
-  note: Same-day peer lookup is not valid for future val/test until rewritten as rolling/as-of cohort stats.
+  drop_reason_code: hot_patron_coverage_and_test_regression
+  note: Tried in 2026-06 hot-patron mission; same-day peer lookup missed future val/test and was not promoted.
   time_horizon: mid_term
   max_lookback: P1D
   allowed_training_supplier: hot_patron_join_layer

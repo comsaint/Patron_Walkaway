@@ -690,7 +690,7 @@ class HighTierObjectiveConfig:
     # Align naming with ``trainer.training.high_roller_segmentation`` when wiring segment thresholds.
     theo_train_quantile: float = 0.95
     # Require precision >= this value on the **segment** when choosing a score threshold.
-    min_precision: float = 0.50
+    min_precision: float = 0.60
     # Placeholder paths for later steps (Parquet / DuckDB exports).
     segment_scores_parquet: Path | None = None
     labels_parquet: Path | None = None
