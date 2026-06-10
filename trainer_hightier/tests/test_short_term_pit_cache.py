@@ -16,6 +16,7 @@ from trainer_hightier.feature_experiment.short_term_pit_cache import (
     REASON_FORCE_REFRESH,
     REASON_UNIVERSE_CHANGED,
     _merge_delta_rows_into_shard,
+    _policy_fingerprint,
     _shard_delta_fill_eligible,
     compute_shard_universe_fingerprint,
     list_training_payout_months,
@@ -26,6 +27,12 @@ from trainer_hightier.feature_experiment.short_term_pit_cache import (
 
 # Minimal fixtures use bounded DuckDB materializer (indexed replay needs full-month infra).
 _STEP35_MISS_KW = {"step35_miss_path": STEP35_MISS_PATH_BOUNDED}
+
+
+def test_policy_fingerprint_rejects_invalid_step35_miss_path() -> None:
+    """Step 3.5 cache policy must only accept known miss-path engines."""
+    with pytest.raises(ValueError, match="step35_miss_path must be"):
+        _policy_fingerprint(batch_size=64, step35_miss_path="legacy_bounded")
 
 
 def _write_training_parquet(path: Path, rows: list[dict[str, object]]) -> None:

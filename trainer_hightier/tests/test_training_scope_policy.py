@@ -57,6 +57,14 @@ def test_horizon_disabled_when_recent_full_months_none() -> None:
     assert resolved.target_months == ()
 
 
+def test_resolve_training_scope_rejects_non_positive_recent_full_months() -> None:
+    """Horizon policy must reject zero or negative month counts."""
+    with pytest.raises(ValueError, match="recent_full_months must be positive"):
+        resolve_training_scope(TrainingScopePolicy(recent_full_months=0))
+    with pytest.raises(ValueError, match="recent_full_months must be positive"):
+        resolve_training_scope(TrainingScopePolicy(recent_full_months=-2))
+
+
 def test_policy_fingerprints_are_stable() -> None:
     """Fingerprints must be deterministic for identical policy inputs."""
     policy = TrainingScopePolicy(recent_full_months=3, as_of_date=date(2026, 6, 8))

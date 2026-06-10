@@ -243,3 +243,44 @@ def test_materialize_sampled_train_cache_hit(tmp_path: Path) -> None:
     assert meta2["train_rows_after"] == meta1["train_rows_after"]
     assert meta2["val_test_evaluation_unsampled"] is True
 
+
+def test_downsample_train_negatives_rejects_invalid_frac() -> None:
+    from trainer_hightier.utils.train_negative_sampling import downsample_train_negatives
+
+    df = _synthetic_train_frame(n_neg=10, n_pos=2)
+    with pytest.raises(ValueError, match="neg_sample_frac"):
+        downsample_train_negatives(df, neg_sample_frac=0.0, neg_sample_seed=1)
+    with pytest.raises(ValueError, match="neg_sample_frac"):
+        downsample_train_negatives(df, neg_sample_frac=1.5, neg_sample_seed=1)
+
+
+def test_downsample_train_negatives_rejects_missing_label_column() -> None:
+    from trainer_hightier.utils.train_negative_sampling import downsample_train_negatives
+
+    df = pd.DataFrame({"bet_id": [1.0, 2.0]})
+    with pytest.raises(ValueError, match="missing label column"):
+        downsample_train_negatives(df, neg_sample_frac=0.5, neg_sample_seed=1)
+
+
+def test_downsample_train_negatives_rejects_null_labels() -> None:
+    from trainer_hightier.utils.train_negative_sampling import downsample_train_negatives
+
+    df = pd.DataFrame({"walkaway_label": [0, None], "bet_id": [1.0, 2.0]})
+    with pytest.raises(ValueError, match="null_ratio"):
+        downsample_train_negatives(df, neg_sample_frac=0.5, neg_sample_seed=1)
+
+
+def test_sampled_train_cache_identity_requires_non_empty_fingerprints() -> None:
+    from trainer_hightier.utils.train_negative_sampling import sampled_train_cache_identity
+
+    with pytest.raises(ValueError, match="train_source_fingerprint"):
+        sampled_train_cache_identity(
+            train_source_fingerprint_sha256_hex="",
+            sample_policy_fingerprint="aa" * 32,
+        )
+    with pytest.raises(ValueError, match="sample_policy_fingerprint"):
+        sampled_train_cache_identity(
+            train_source_fingerprint_sha256_hex="bb" * 32,
+            sample_policy_fingerprint="",
+        )
+

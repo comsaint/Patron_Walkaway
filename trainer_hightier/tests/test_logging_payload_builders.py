@@ -16,6 +16,7 @@ from trainer_hightier.config import (
 from trainer_hightier.reporting.writer import (
     build_metrics_detailed,
     build_pipeline_debug,
+    build_run_report,
     build_run_summary,
 )
 from trainer_hightier.trainer import HighTierTrainArgs
@@ -232,3 +233,119 @@ def test_build_metrics_detailed_and_pipeline_debug_smoke() -> None:
     assert sm["elapsed_seconds"] == 22.0
     assert sm["diff_summary"]["unchanged"] == 1192
     assert sm["changed_partitions"]["t_bet"] == []
+
+
+def test_build_pipeline_debug_includes_training_acceleration_and_screening() -> None:
+    """Accelerated runs must disclose policy and screening blocks in pipeline_debug."""
+    accel = {
+        "training_scope_policy_fingerprint": "aa" * 32,
+        "sample_policy_fingerprint": "bb" * 32,
+        "step35_indexed_replay_gate_summary": None,
+    }
+    screening = {"enabled": True, "selected_feature_count": 42}
+    metrics = {
+        "training_acceleration_policy": accel,
+        "feature_screening_summary": screening,
+    }
+    dbg = build_pipeline_debug(metrics)
+    assert dbg["training_acceleration"] == accel
+    assert dbg["feature_screening_summary"] == screening
+
+
+def test_build_run_report_gates_step35_from_top_level_metrics(tmp_path) -> None:
+    """Top-level Step 3.5 gate summary must surface under run_report gates."""
+    gate = {
+        "decision": "integrate_candidate_with_bet_pack_waiver",
+        "hard_parity_passed": True,
+        "waiver_accepted": True,
+        "final_integration_met": True,
+    }
+    args = HighTierTrainArgs(
+        output_dir=tmp_path,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        step5=Step5TrainConfig(run_step5=False),
+    )
+    metrics = {
+        "model_version": "mv-gate",
+        "step35_indexed_replay_gate_summary": gate,
+        "step5_optuna_skipped": True,
+        "step5_threshold": 0.5,
+        "optuna_max_time_sec_configured": 1.0,
+        "optuna_max_trials_configured": None,
+        "optuna_wall_time_sec_actual": None,
+        "optuna_trials_completed": 0,
+        "optuna_trials_total": 0,
+        "optuna_stopping_reason": "optuna_skipped",
+        "optuna_best_value": None,
+        "val_ap": 0.5,
+        "val_precision": 0.6,
+        "test_ap": 0.49,
+        "test_precision": 0.59,
+    }
+    report = build_run_report(metrics, args, status="success")
+    assert report["gates"]["step35_indexed_replay_cold_build"] == gate
+
+
+def test_build_run_report_gates_step35_from_nested_acceleration_policy(tmp_path) -> None:
+    """Nested acceleration policy gate summary is a fallback when top-level is absent."""
+    gate = {
+        "decision": "continue_prototype",
+        "hard_parity_passed": True,
+        "waiver_accepted": False,
+        "final_integration_met": False,
+    }
+    args = HighTierTrainArgs(
+        output_dir=tmp_path,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        step5=Step5TrainConfig(run_step5=False),
+    )
+    metrics = {
+        "model_version": "mv-nested-gate",
+        "training_acceleration_policy": {"step35_indexed_replay_gate_summary": gate},
+        "step5_optuna_skipped": True,
+        "step5_threshold": 0.5,
+        "optuna_max_time_sec_configured": 1.0,
+        "optuna_max_trials_configured": None,
+        "optuna_wall_time_sec_actual": None,
+        "optuna_trials_completed": 0,
+        "optuna_trials_total": 0,
+        "optuna_stopping_reason": "optuna_skipped",
+        "optuna_best_value": None,
+        "val_ap": 0.5,
+        "val_precision": 0.6,
+        "test_ap": 0.49,
+        "test_precision": 0.59,
+    }
+    report = build_run_report(metrics, args, status="success")
+    assert report["gates"]["step35_indexed_replay_cold_build"] == gate
+
+
+def test_build_run_report_prefers_top_level_step35_gate_over_nested(tmp_path) -> None:
+    """Top-level gate summary wins when both top-level and nested copies exist."""
+    top_gate = {"decision": "integrate_candidate", "source": "top"}
+    nested_gate = {"decision": "stop_indexed_replay", "source": "nested"}
+    args = HighTierTrainArgs(
+        output_dir=tmp_path,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        step5=Step5TrainConfig(run_step5=False),
+    )
+    metrics = {
+        "model_version": "mv-gate-priority",
+        "step35_indexed_replay_gate_summary": top_gate,
+        "training_acceleration_policy": {"step35_indexed_replay_gate_summary": nested_gate},
+        "step5_optuna_skipped": True,
+        "step5_threshold": 0.5,
+        "optuna_max_time_sec_configured": 1.0,
+        "optuna_max_trials_configured": None,
+        "optuna_wall_time_sec_actual": None,
+        "optuna_trials_completed": 0,
+        "optuna_trials_total": 0,
+        "optuna_stopping_reason": "optuna_skipped",
+        "optuna_best_value": None,
+        "val_ap": 0.5,
+        "val_precision": 0.6,
+        "test_ap": 0.49,
+        "test_precision": 0.59,
+    }
+    report = build_run_report(metrics, args, status="success")
+    assert report["gates"]["step35_indexed_replay_cold_build"] == top_gate
