@@ -230,6 +230,20 @@ def test_filter_month_starts_legacy_returns_all_months() -> None:
     assert _bt3._filter_month_starts_for_target_scope(months, resolved) == months
 
 
+def test_filter_month_starts_raises_when_no_target_month_overlap() -> None:
+    """Fail fast when prediction-visible months do not intersect resolved target scope."""
+    months = [date(2024, 1, 1), date(2024, 2, 1)]
+    resolved = resolve_training_scope(
+        TrainingScopePolicy(
+            recent_full_months=3,
+            include_current_partial_month=True,
+            as_of_date=date(2026, 6, 8),
+        ),
+    )
+    with pytest.raises(ValueError, match="target scope month prune matched no prediction_visible months"):
+        _bt3._filter_month_starts_for_target_scope(months, resolved)
+
+
 def test_entity_month_end_exclusive_caps_partial_target_month() -> None:
     """Partial target month entity rows must stop at ``target_end_date``, not calendar month end."""
     resolved = resolve_training_scope(
@@ -316,6 +330,73 @@ def test_build_training_data_month_batch_prunes_before_entity_writes(
     june_start, june_end = entity_calls[-1]
     assert june_start == date(2026, 6, 1)
     assert june_end == date(2026, 6, 9)
+
+
+def test_build_training_data_non_month_batch_scopes_entity_to_target_dates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Non-month-batch Step 3 must bound entity extraction to resolved target dates."""
+    resolved = resolve_training_scope(
+        TrainingScopePolicy(
+            recent_full_months=3,
+            include_current_partial_month=True,
+            as_of_date=date(2026, 6, 8),
+        ),
+    )
+    entity_calls: list[tuple[date | None, date | None]] = []
+
+    def _spy_write_entity(
+        _cleaned_bet: Path,
+        _entity_out: Path,
+        *,
+        duckdb_runtime: DuckDbRuntimeConfig,
+        max_rows: int | None,
+        month_start: date | None = None,
+        month_end_exclusive: date | None = None,
+    ) -> int:
+        entity_calls.append((month_start, month_end_exclusive))
+        return 1
+
+    def _fake_join_labels(**kwargs: object) -> int:
+        out = kwargs["output_parquet"]
+        assert isinstance(out, Path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.table({"gaming_day_event": [date(2026, 3, 1)]}), out)
+        return 1
+
+    monkeypatch.setattr(_bt3, "ensure_feast_registry_ready", lambda *args, **kwargs: None)
+    monkeypatch.setattr(_bt3, "_validate_prereqs", lambda **kwargs: None)
+    monkeypatch.setattr(_bt3, "_maybe_materialize_derived", lambda _cfg: None)
+    monkeypatch.setattr(
+        _bt3,
+        "cleaned_bet_artifact_fingerprint_block",
+        lambda _path: {"shard_list_sha256_hex": "cc" * 32},
+    )
+    monkeypatch.setattr(_bt3, "_write_entity_parquet", _spy_write_entity)
+    monkeypatch.setattr(_bt3, "_feast_features_to_parquet", lambda **kwargs: None)
+    monkeypatch.setattr(_bt3, "_join_labels_to_features", _fake_join_labels)
+
+    cfg = _bt3.BuildTrainingDataArgs(
+        feast_repo=tmp_path / "feast_repo",
+        cleaned_bet_parquet=tmp_path / "cleaned_bet",
+        labels_parquet=tmp_path / "labels.parquet",
+        output_parquet=tmp_path / "training_data" / "training_set.parquet",
+        feature_service_name="walkaway_bet_v1",
+        materialize_derived_features=False,
+        max_entity_rows=None,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        feast_entity_batch_by_calendar_month=False,
+        feast_retrieval_cache_enabled=False,
+        auto_feast_apply=False,
+        target_scope=resolved,
+    )
+    out = _bt3.build_training_data(cfg)
+    assert out.is_file()
+    assert len(entity_calls) == 1
+    month_start, month_end_exclusive = entity_calls[0]
+    assert month_start == date(2026, 3, 1)
+    assert month_end_exclusive == date(2026, 6, 9)
 
 
 @patch("trainer_hightier.trainer._prepare_training_features_parquet")
