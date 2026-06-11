@@ -267,3 +267,87 @@ def test_materialize_sampled_train_cache_hit(tmp_path: Path) -> None:
     assert meta2["train_rows_after"] == meta1["train_rows_after"]
     assert meta2["val_test_evaluation_unsampled"] is True
 
+
+def test_train_lgbm_from_splits_discloses_sampling_and_screening(tmp_path: Path) -> None:
+    """Training metrics report must embed acceleration disclosure blocks for audit."""
+    from dataclasses import replace
+
+    from trainer_hightier.config import (
+        DuckDbRuntimeConfig,
+        FeatureScreeningPolicy,
+        SamplePolicy,
+        Step5TrainConfig,
+        feature_selection_policy_fingerprint,
+        sample_policy_fingerprint,
+    )
+    from trainer_hightier.feature_experiment.candidate_registry_loader import load_candidate_registry
+
+    snap = load_candidate_registry(None)
+    feat_cols = snap.model_feature_columns
+    splits = tmp_path / "splits"
+    splits.mkdir()
+    n = 48
+    rng = np.random.default_rng(11)
+    payout = pd.date_range("2025-01-05", periods=n, freq="h")
+    rows: dict[str, object] = {
+        _b5.LABEL_COLUMN: np.array(([0, 1] * (n // 2 + 2))[:n], dtype=np.int8),
+        _b5.PAYOUT_TS_COLUMN: payout,
+        _b5.BET_ID_COLUMN: np.arange(n, dtype=float),
+        _b5.PLAYER_ID_COLUMN: np.array([1 + (i % 4) for i in range(n)], dtype=int),
+        _b5.GAME_ID_COLUMN: np.array([100.0 + (i % 3) for i in range(n)], dtype=float),
+    }
+    for col in feat_cols:
+        if col in _b5.CAT_COLUMNS:
+            rows[col] = [f"cv_{i % 3}" for i in range(n)]
+        else:
+            rows[col] = rng.standard_normal(n)
+    df = pd.DataFrame(rows)
+    for split_name in ("train", "val", "test"):
+        df.to_parquet(splits / f"{split_name}.parquet", index=False)
+
+    sample_policy = SamplePolicy(neg_sample_frac=0.4, neg_sample_seed=5)
+    sample_meta = {
+        "enabled": True,
+        "sample_policy_fingerprint": sample_policy_fingerprint(sample_policy),
+        "val_test_evaluation_unsampled": True,
+        "train_rows_before": n,
+        "train_rows_after": 30,
+        "train_negatives_before": 40,
+        "train_negatives_after": 16,
+    }
+    screening_policy = FeatureScreeningPolicy(enabled=False)
+    screening_meta = {
+        "enabled": False,
+        "noop": True,
+        "selected_feature_count": len(feat_cols),
+        "feature_selection_policy_fingerprint": feature_selection_policy_fingerprint(screening_policy),
+        "feature_selection_manifest_fingerprint": None,
+    }
+    step5 = replace(
+        Step5TrainConfig(),
+        skip_optuna=True,
+        lgb_n_estimators_cap=8,
+        refit_train_plus_val=False,
+    )
+    out_dir = tmp_path / "step5_out"
+    result = _b5.train_lgbm_from_splits(
+        splits_dir=splits,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        objective_min_precision=0.5,
+        random_seed=1,
+        step5=step5,
+        output_dir=out_dir,
+        feature_columns=feat_cols,
+        persist_training_metrics=False,
+        sample_policy_meta=sample_meta,
+        feature_screening_meta=screening_meta,
+    )
+    report = result.report
+    assert report["sample_policy"] == sample_meta
+    assert report["sample_policy_fingerprint"] == sample_meta["sample_policy_fingerprint"]
+    assert report["train_evaluation_sampled"] is True
+    assert report["train_rows_after_sampling"] == 30
+    assert report["feature_screening"] == screening_meta
+    assert report["step5_feature_screening_enabled"] is False
+    assert report["step5_selected_feature_count"] == len(feat_cols)
+

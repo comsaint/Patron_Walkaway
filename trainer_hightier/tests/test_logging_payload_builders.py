@@ -298,3 +298,23 @@ def test_build_run_report_step35_gate_from_nested_acceleration_only(tmp_path) ->
     }
     report = build_run_report(metrics, args, status="success")
     assert report["gates"]["step35_indexed_replay_cold_build"] == step35
+
+
+def test_build_pipeline_debug_surfaces_acceleration_summaries() -> None:
+    """Pipeline debug must expose screening and downsampling summaries for run audit."""
+    screening = {"enabled": True, "selected_feature_count": 12}
+    sampling = {"enabled": True, "train_rows_after": 4000, "val_test_evaluation_unsampled": True}
+    metrics = {
+        "model_version": "mv-debug",
+        "training_acceleration_policy": {
+            "training_run_kind": "speed",
+            "feature_screening_summary": screening,
+            "negative_sampling_summary": sampling,
+        },
+        "feature_screening_summary": screening,
+    }
+    dbg = build_pipeline_debug(metrics)
+    accel = dbg["training_acceleration"]
+    assert accel["training_run_kind"] == "speed"
+    assert accel["negative_sampling_summary"] == sampling
+    assert dbg["feature_screening_summary"] == screening

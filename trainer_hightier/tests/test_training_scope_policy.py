@@ -102,6 +102,21 @@ def test_init_training_acceleration_metrics_seeds_report_block() -> None:
     assert block["step35_indexed_replay_gate_summary"] is None
 
 
+def test_horizon_filter_requires_gaming_day_event_column(tmp_path: Path) -> None:
+    """Horizon filter must fail fast when training parquet lacks ``gaming_day_event``."""
+    path = tmp_path / "missing_gde.parquet"
+    pq.write_table(pa.table({"walkaway_label": [0, 1]}), path)
+    resolved = resolve_training_scope(
+        TrainingScopePolicy(recent_full_months=1, as_of_date=date(2026, 6, 8)),
+    )
+    with pytest.raises(ValueError, match="missing gaming_day_event"):
+        _apply_training_scope_horizon_to_parquet(
+            path,
+            resolved=resolved,
+            duckdb_runtime=DuckDbRuntimeConfig(),
+        )
+
+
 def test_horizon_filter_keeps_only_target_month_rows(tmp_path: Path) -> None:
     """Horizon filter should drop rows outside selected target months."""
     path = tmp_path / "training.parquet"

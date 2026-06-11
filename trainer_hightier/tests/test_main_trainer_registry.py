@@ -13,7 +13,9 @@ import pytest
 
 from trainer_hightier.config import (
     DuckDbRuntimeConfig,
+    FeatureScreeningPolicy,
     HighTierObjectiveConfig,
+    SamplePolicy,
     Step4SplitConfig,
     Step5TrainConfig,
 )
@@ -107,6 +109,65 @@ def test_fit_model_registry_missing_file_raises(tmp_path: Path) -> None:
     )
     with pytest.raises(FileNotFoundError, match="Feature candidate registry file not found"):
         fit_model(args, metrics=None)
+
+
+@patch("trainer_hightier.trainer._b5.train_lgbm_from_splits")
+def test_fit_model_wires_screening_and_sampling_into_step5(
+    mock_train: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Step 5 must receive sampled train parquet plus screening/sampling disclosure blocks."""
+
+    snap0 = load_candidate_registry(None)
+    baseline = snap0.model_feature_columns
+    manifest_p = tmp_path / "selected_features.json"
+    selected = list(baseline[: max(2, len(baseline) // 2)])
+    manifest_p.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "feature_screening_manifest_v1",
+                "selected_features": selected,
+                "method": "fqg_allowlist_v0",
+                "fqg_version": "v0",
+                "evidence_refs": [],
+            },
+        ),
+        encoding="utf-8",
+    )
+    splits = tmp_path / "splits"
+    _write_minimal_step5_splits(splits, drop_columns=frozenset(), feature_columns=baseline)
+    mock_train.return_value = MagicMock(
+        report={"val_ap": 0.1},
+        model_path=tmp_path / "model.pkl",
+        metrics_path=tmp_path / "m.json",
+        threshold=0.5,
+    )
+    metrics: dict[str, object] = {
+        "training_acceleration_policy": {},
+    }
+    args = HighTierTrainArgs(
+        output_dir=tmp_path / "out",
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        objective=HighTierObjectiveConfig(),
+        step4_split=Step4SplitConfig(splits_output_dir=splits.resolve()),
+        step5=Step5TrainConfig(run_step5=True, skip_optuna=True),
+        feature_screening_policy=FeatureScreeningPolicy(enabled=True, manifest_path=manifest_p),
+        sample_policy=SamplePolicy(neg_sample_frac=0.5, neg_sample_seed=3),
+    )
+    fit_model(args, metrics=metrics)
+
+    kwargs = mock_train.call_args.kwargs
+    assert kwargs["feature_columns"] == tuple(selected)
+    assert kwargs["sample_policy_meta"]["enabled"] is True
+    assert kwargs["feature_screening_meta"]["enabled"] is True
+    assert kwargs["train_parquet"].resolve() == (splits / "train_sampled.parquet").resolve()
+    assert metrics["negative_sampling_summary"]["enabled"] is True
+    assert metrics["feature_screening_summary"]["selected_feature_count"] == len(selected)
+    accel = metrics["training_acceleration_policy"]
+    assert isinstance(accel, dict)
+    assert accel["negative_sampling_summary"]["enabled"] is True
+    assert accel["feature_screening_summary"]["selected_feature_count"] == len(selected)
 
 
 def test_fit_model_preflight_missing_parquet_column(tmp_path: Path) -> None:

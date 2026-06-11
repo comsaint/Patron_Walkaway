@@ -379,6 +379,23 @@ def test_p3_t7_new_primitive_column_misses_when_not_in_shard(short_cache_fixture
     assert meta["cache_miss_shards"] == ["202406"]
 
 
+def test_step35_miss_path_invalid_rejected(short_cache_fixture: dict[str, Path]) -> None:
+    """Miss-path policy must fail fast before cache materialization work starts."""
+    runtime = DuckDbRuntimeConfig()
+    with pytest.raises(ValueError, match="step35_miss_path must be"):
+        materialize_fe_derived_short_term_parquet_with_cache(
+            cleaned_bet_parquet=short_cache_fixture["cleaned"],
+            training_parquet_for_bet_ids=short_cache_fixture["training"],
+            out_parquet=short_cache_fixture["out"],
+            duckdb_runtime=runtime,
+            canonical_mapping_parquet=short_cache_fixture["mapping"],
+            short_term_columns=("fe__bets_cnt__w15m",),
+            trial_columns=tuple(SHORT_TERM_TRIAL_BET_COLUMNS[:1]),
+            batch_size=2000,
+            step35_miss_path="legacy_oracle",
+        )
+
+
 def test_global_manifest_written(short_cache_fixture: dict[str, Path]) -> None:
     runtime = DuckDbRuntimeConfig()
     materialize_fe_derived_short_term_parquet_with_cache(
