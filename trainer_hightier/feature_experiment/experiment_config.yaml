@@ -26,4 +26,4 @@ run_profile: default
 external_sources:
   t_casino_txn:
     enabled: true
-    raw_parquet: data/new tables/partition_202605
+    cleaned_root: trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_casino_txn

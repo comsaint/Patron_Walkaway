@@ -37,6 +37,10 @@
 
 ### 1.7 `t_casino_txn` txn_lite v0（Wave 1b 第一切片）
 
+> **狀態：PAUSED / DEFERRED（2026-06-10）**  
+> 上游 **data source incident** 期間，優先完成 **L0 only** 接入（見 `t_casino_txn Source Integration - IMPLEMENTATION_PLAN.md`、SSOT §5.2）。  
+> 本節之 experiment 步驟、Gate 1 與 registry promote **暫停**；既有 `materialize_txn_lite.py` 與歷史 ablation 僅作背景參考，**不得**作 quarantine 期間之 model 決策。incident 關閉且 L0 DQ 通過後再恢復本節。
+
 **目的**：在 isolated feature experiment 中驗證 `group_txn_lite_cashflow` 是否帶來 Gate 1 增量，且不影響 production trainer。
 
 | 項目 | v0 決策 |
@@ -597,12 +601,13 @@ python -m trainer_hightier.feature_experiment.run_pipeline \
 
 | 層級 | 文件 |
 |------|------|
-| SSOT | `Data pipeline - SSOT.md` |
+| SSOT | `Data pipeline - SSOT.md`（§5.2 外部來源 L0） |
 | Implementation Plan | `Feature experimentation - IMPLEMENTATION_PLAN.md` |
+| **`t_casino_txn` L0（現行主線）** | `t_casino_txn Source Integration - IMPLEMENTATION_PLAN.md` |
 | Working Plan（本檔） | `Feature experimentation - WORKING_PLAN.md` |
 | Source findings | `doc/FINDINGS.md`（例如 `t_casino_txn` [FND-19]） |
 | Raw schema dictionary | `schema/GDP_GMWDS_Raw_Schema_Dictionary.md`（例如 §5 `t_casino_txn`） |
 
 ---
 
-*文件版本：依 registry / experiment 慣例自行 bump；本檔對齊 SSOT 與 Implementation Plan，並已納入 **FQG v0（§1.5、§4.0）**、**外部事件來源 experiment-only 接入（§1.6、Wave 1b）**、以及 **txn_lite v0（§1.7，BUYIN/CASHOUT only、不含 CHANGE）** 之執行與驗收敘述。*
+*文件版本：依 registry / experiment 慣例自行 bump；本檔對齊 SSOT 與 Implementation Plan，並已納入 **FQG v0（§1.5、§4.0）**、**外部事件來源 experiment-only 接入（§1.6、Wave 1b）**、以及 **txn_lite v0（§1.7，BUYIN/CASHOUT only、不含 CHANGE）** 之執行與驗收敘述。**§1.7 自 2026-06-10 起標 PAUSED**；`t_casino_txn` L0 主線見獨立 Source Integration IP。*

@@ -67,8 +67,8 @@ def test_pick_threshold_all_negative_early_exit() -> None:
     assert rep.alert_count == 0
 
 
-def test_aggregate_bets_to_player_game_max_score_and_label() -> None:
-    """Same player-game aggregates with max score and any-positive label."""
+def test_aggregate_bets_to_player_game_top3_mean_and_label() -> None:
+    """Same player-game aggregates with top-3 mean score and any-positive label."""
 
     df = pd.DataFrame(
         {
@@ -92,7 +92,7 @@ def test_aggregate_bets_to_player_game_max_score_and_label() -> None:
     assert out.bet_count == 4
     assert out.excluded_bets == 0
     assert set(out.y_true.tolist()) <= {0, 1}
-    assert float(out.scores.max()) == pytest.approx(0.9)
+    assert float(out.scores.max()) == pytest.approx(0.6)
     pos_games = int(np.sum(out.y_true == 1))
     assert pos_games == 1
     assert list(out.candidates.columns) == [
@@ -105,9 +105,35 @@ def test_aggregate_bets_to_player_game_max_score_and_label() -> None:
         "bet_id",
     ]
     game100 = out.candidates.loc[out.candidates["game_id"] == 100.0].iloc[0]
-    assert float(game100["player_game_score"]) == pytest.approx(0.9)
+    assert float(game100["player_game_score"]) == pytest.approx(0.6)
     assert int(game100["player_game_label"]) == 1
     assert float(game100["bet_id"]) == pytest.approx(2.0)
+
+
+def test_aggregate_bets_to_player_game_top3_mean_three_or_more_bets() -> None:
+    """Groups with 3+ bets average only the top three scores."""
+
+    df = pd.DataFrame(
+        {
+            "player_id": [1, 1, 1, 1],
+            "game_id": [100.0, 100.0, 100.0, 100.0],
+            "walkaway_label": [0, 0, 0, 0],
+            "payout_complete_dtm": pd.to_datetime(
+                [
+                    "2026-06-01 10:00:00",
+                    "2026-06-01 10:01:00",
+                    "2026-06-01 10:02:00",
+                    "2026-06-01 10:03:00",
+                ],
+            ),
+            "bet_id": [1.0, 2.0, 3.0, 4.0],
+        }
+    )
+    scores = np.array([0.91, 0.95, 0.88, 0.10], dtype=np.float64)
+    out = aggregate_bets_to_player_game(df, scores, split_name="val")
+    game100 = out.candidates.iloc[0]
+    assert float(game100["player_game_score"]) == pytest.approx((0.95 + 0.91 + 0.88) / 3.0)
+    assert float(game100["bet_id"]) == pytest.approx(4.0)
 
 
 def test_aggregate_bets_to_player_game_preserves_large_integer_game_ids() -> None:

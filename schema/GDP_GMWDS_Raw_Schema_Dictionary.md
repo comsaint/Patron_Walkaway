@@ -8,7 +8,7 @@
 - `gaming_day`（本批資料）觀察範圍約為 **2024-07-02 ~ 2026-02-13**。
 - **統計方法聲明**：本文件中的 `值域/格式/枚舉`、最大/最小值與 NULL 佔比等描述，皆是透過 **全表掃描（Full Table Scan）** 與 **Parquet 物理層 Metadata** 計算得出（例如掃描 4.38 億筆 t_bet 與 7400 萬筆 t_session），**並非**抽樣推估，因此枚舉值是窮盡的。唯獨 `範例值` 欄位是為了展示格式而提取的少數量本。
 
-**Ingestion 欄位說明（本專案 Parquet projection）**：值為 **Included** 或 **Excluded**；依據為 `trainer/training/data_sources.py` 之 `_BET_INGEST_READ_COLS_ORDERED`（`t_bet`）、`trainer_hightier/02_preprocess.py` 之 `SESSION_PREPROCESS_READ_COLS_ORDERED`（`t_session`）。`t_shoe`、`t_game` 之相關載入未定義於此約定。
+**Ingestion 欄位說明（本專案 Parquet projection）**：值為 **Included** 或 **Excluded**；依據為 `trainer/training/data_sources.py` 之 `_BET_INGEST_READ_COLS_ORDERED`（`t_bet`）、`trainer_hightier/02_preprocess.py` 之 `SESSION_PREPROCESS_READ_COLS_ORDERED`（`t_session`）。`t_casino_txn` 依 `trainer_hightier/utils/txn_l0_schema.py` + L0 preprocess（見 §5）。`t_shoe`、`t_game` 之相關載入未定義於此約定。
 
 
 ---
@@ -332,84 +332,105 @@
 
 **表級資訊（簡版）**
 
-- **資料來源**：`data/new tables/t_casino_txn__part_202605.parquet`（2026-05 分區樣本，約 4,607,563 列，約 412.6 MB）。
+- **DDL ground truth**：`schema/schema.txt` → `GDP_GMWDS_Raw.t_casino_txn`（ClickHouse）。
+- **Dictionary / L0 cast 契約**：本文件 §5 + `trainer_hightier/utils/txn_l0_schema.py`（65 raw 欄位 + 6 L0 derived 欄位）。
+- **Raw 資料來源**：`data/t_casino_txn/partition_YYYYMM/part_*.parquet`（正式來源；`data/new tables` 僅歷史 exploration sample）。
+- **L0 cleaned 輸出**：`trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_casino_txn/partition_YYYYMM/cleaned.parquet`。
 - **粒度（Grain）**：一筆 raw row = 一個 casino transaction 的一個 CDC/ETL 版本；delete-aware dedup 後一筆 = 一個 logical casino transaction。
-- **唯一鍵（參考）**：`casino_txn_id`；raw 檔有 4,442,245 個 distinct id，需先處理 delete marker 與重複版本。
-- **時區**：Parquet 時間欄位為 `timestamp[ms, tz=UTC]`；下游使用/對帳若以 `Asia/Shanghai` 為準，需統一轉換。
-- **資料可用性**：目前為新表樣本，尚未納入 `trainer_hightier` ingestion；所有欄位暫標 `Excluded`。
+- **唯一鍵（參考）**：`casino_txn_id`（ClickHouse `PRIMARY KEY` 含 `topology_id`, `gaming_day`；L0 logical key 仍為 `casino_txn_id`）。
+- **ENGINE**：`ReplicatedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}')`
+- **PARTITION BY**：`toYYYYMM(gaming_day)`（本地 raw 目錄為 `partition_YYYYMM`）
+- **PRIMARY KEY**：`(casino_txn_id, topology_id, gaming_day)`
+- **ORDER BY**：`(casino_txn_id, topology_id, gaming_day)`
+- **型別欄**：`型別 (ClickHouse DDL)` 逐字對齊 `schema/schema.txt`；`可空 (DDL)` = `Nullable(...)` 包裝時為 Y；`L0 DuckDB cast` = `txn_l0_schema.py` materialize cast（Parquet 讀取後 explicit cast，非 ClickHouse runtime 型別）。
+- **時區**：DDL 事件時間欄位為 `DateTime64(3, 'Asia/Shanghai')`；Parquet 匯出常為 `timestamp[ms, tz=UTC]`；L0 materialize 一律 cast 為 DuckDB `TIMESTAMPTZ`。
+- **Pipeline 狀態**：L0 preprocess **已接入**（`not_model_eligible` quarantine）；L1 `txn_lite` 為 experiment-only。
 - **已知資料狀況（本批觀察）**：
-  - `__ts_ms` **100% NULL**，不可作 CDC 排序；需以 delete-aware 規則先排除任一版本帶 `__op='d'` 或 `__deleted='True'` 的 `casino_txn_id`，剩餘版本再以 `__etl_insert_Dtm DESC, updated_dtm DESC` 取最新。
+  - `__ts_ms` **100% NULL**，不可作 CDC 排序；需 delete-aware dedup + `__etl_insert_Dtm DESC, updated_dtm DESC`。
   - `bet_id` **100% NULL**，`session_id` 約 **96.17%** 空，不能直接 join 到 `t_bet` / `t_session`。
-  - `complete_dtm` 約 **99.89%** 空，`receive_dtm` **100% NULL**；PIT event time 建議用 `start_dtm`。
-  - `gaming_day` 是帳務/分區欄位，不能當 event time；觀察到 `gaming_day` 與 `start_dtm` 可相差多日。
+  - `complete_dtm` 約 **99.89%** 空，`receive_dtm` **100% NULL**；PIT event time 用 `start_dtm`（L0 物化為 `txn_event_ts`）。
+  - `gaming_day` 是帳務/分區欄位，不能當 event time。
   - `TD_FILL`、`TD_CREDIT`、`TRANSFER`、`QUICK_TRANSFER` 幾乎或完全沒有 `player_id`，第一版 player-level 特徵應排除。
   - `BUYIN` 的 Cash 類大量為 `status='SUBMITTED'` 且 `buyin_status='SUCCESS'`；不可只保留 `COMPLETED`。
 
-| 欄位名稱 | 型別 | 可空/空字串率 | 業務定義 | 值域/格式/枚舉 | 範例值 | 注意事項/已知問題 | Ingestion |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `casino_txn_id` | Int64 | 0.00% | 交易唯一識別碼。 | distinct id: 4,442,245（2026-05 樣本） | `205502130` | [DQ Rule] **Delete-aware dedup**：先排除任一版本帶 delete marker 的 id，再取最新版本；見 [FND-19]。 | Excluded |
-| `uuid` | String | 0.00% | 交易 UUID。 | distinct uuid: 4,442,246 |  | raw rows 中與 `casino_txn_id` 接近一對一，但仍以 `casino_txn_id` 作 logical key。 | Excluded |
-| `topology_id` | Int32 | 0.00% | 拓撲/設備位置 ID。 |  |  | 可與 topology 表或桌台位置表關聯；本批未驗證。 | Excluded |
-| `gaming_day` | Date32 | 0.00% | 營業日/帳務日。 | 2026-05-01 ~ 2026-05-28 | `2026-05-02` | 不可作 event time；可與 `start_dtm` 相差多日。 | Excluded |
-| `type` | String | 0.00% | 交易大類。 | `CHANGE`, `BUYIN`, `CASHOUT`, `UPDATE_OWNER`, `TRANSFER`, `TD_FILL`, `TD_CREDIT`, `QUICK_TRANSFER` | `CASHOUT` | player-level txn-lite 第一版建議只用 `BUYIN`/`CASHOUT`，`CHANGE` 僅作 activity proxy。 | Excluded |
-| `action` | String | 0.00% | 交易操作動作。 | `SUBMIT`, `CANCEL` | `SUBMIT` | 有效事件需 `action='SUBMIT'`；`CANCEL` 應排除。 | Excluded |
-| `start_dtm` | DateTime64(3, UTC) | 0.00% | 交易事件開始/發生時間。 | 2026-04-22 18:58:16+08:00 ~ 2026-05-28 10:21:10+08:00（顯示為本地時區） |  | **PIT event time 首選**。 | Excluded |
-| `end_dtm` | DateTime64(3, UTC) | 0.00% | 交易結束時間。 |  |  | 有少量 `end_dtm < start_dtm` / 秒級倒序現象；不建議作 PIT anchor。 | Excluded |
-| `receive_dtm` | DateTime64(3, UTC) | 100.00% | 接收時間。 |  |  | 本批全空。 | Excluded |
-| `complete_dtm` | DateTime64(3, UTC) | 99.89% | 完成時間。 |  |  | 幾乎全空，不適合作 event time。 | Excluded |
-| `status` | String | 0.00% | 交易狀態。 | `COMPLETED`, `SUBMITTED`, `CANCELED` | `COMPLETED` | 通用有效 filter 為 `status <> 'CANCELED'`；BUYIN 需 type-specific 規則。 | Excluded |
-| `user_id` | Int32 | 92.44% | 操作員/使用者 ID。 |  |  | 稀疏欄位。 | Excluded |
-| `auth_token` | String | 100.00% | 授權 token。 |  |  | 本批全空；若未來有值也屬敏感欄位。 | Excluded |
-| `player_id` | Int64 | 1.01% | Smart Table 系統內部玩家識別碼。 |  |  | player-level PIT feature 需非 NULL；部分 duplicate id 的 `player_id` 會被 remap，需注意 canonical mapping。 | Excluded |
-| `chip_ids_in` | String | 2.88% | 交易流入籌碼 ID 清單。 | JSON-like string array | `["e04f..."]` | 籌碼清單可很長；第一版 cashflow 特徵不建議解析 chip-level。 | Excluded |
-| `chip_ids_out` | String | 4.66% | 交易流出籌碼 ID 清單。 | JSON-like string array | `["e04f..."]` | 籌碼清單可很長；BUYIN/CASHOUT 方向需依 `type` 與欄位語意判定。 | Excluded |
-| `updated_dtm` | DateTime64(3, UTC) | 7.76% | 交易最後更新時間。 |  |  | 可作 dedup tie-breaker，但不能先於 delete-aware 排除使用。 | Excluded |
-| `txn_value` | Decimal(19,4) | 0.00% | 交易金額/籌碼價值。 | 0 ~ 250,000,000（本批觀察） | `10000.0000` | 無負值；cashflow count/sum 建議要求 `txn_value > 0`。`CHANGE.txn_value` 不代表 win/loss 方向。 | Excluded |
-| `dealer_id` | Int32 | 7.54% | 荷官 ID。 |  |  |  | Excluded |
-| `supervisor_id` | Int32 | 8.04% | 主管 ID。 |  |  |  | Excluded |
-| `dealer_name` | String | 7.54% | 荷官姓名。 |  |  | PII/員工資訊，對外分享需遮罩。 | Excluded |
-| `supervisor_name` | String | 8.04% | 主管姓名。 |  |  | PII/員工資訊，對外分享需遮罩。 | Excluded |
-| `player_type` | String | 0.71% | 玩家類型。 | 常見：`KNOWN`, `ANONYMOUS`, `RATED`, `CASINO` | `KNOWN` | `CASINO` 多見於 operational transaction，未必有玩家 ID。 | Excluded |
-| `location` | String | 0.00% | 交易位置/桌台/籠房代碼。 | Many distinct values | `GMCNB0211` | 可作 table/location context；第一版 txn-lite 不建議直接作 player cashflow。 | Excluded |
-| `user_name` | String | 92.24% | 操作員帳號/名稱。 |  |  | PII/員工資訊。 | Excluded |
-| `player_name` | String | 1.01% | 玩家姓名。 |  |  | PII，對外分享需遮罩。 | Excluded |
-| `casino_player_id` | String | 18.33% | 會員/卡號識別。 |  |  | 部分 `player_id` remap 時此欄較穩定，但大量 ANONYMOUS 為空。 | Excluded |
-| `sub_type` | String | 0.03% | 交易子類型。 | `Cash`, `Prize Redemption`, `Front Money`, `Marker`, `TITO`, `CHANGE`, `CHIP_EXCHANGE`, etc. | `Cash` | BUYIN subtype 應分開建 feature，`Prize Redemption` 行為語意與一般 cash buyin 不同。 | Excluded |
-| `agent_name` | String | 100.00% | 代理名稱。 |  |  | 本批全空。 | Excluded |
-| `agent_id` | String | 100.00% | 代理 ID。 |  |  | 本批全空。 | Excluded |
-| `buyin_status` | String | 95.19% | BUYIN 內部狀態。 | `SUCCESS`, `PROVISIONAL_SUCCESS`, `PROVISIONAL_REJECT`, 空字串 | `SUCCESS` | Cash BUYIN 大量是 `SUBMITTED` + `SUCCESS`；有效 BUYIN filter 需納入。 | Excluded |
-| `document_id` | String | 100.00% | 文件/單據 ID。 |  |  | 本批全空。 | Excluded |
-| `chipset_label_in` | String | 2.88% | 流入籌碼組標籤。 |  |  | 與 `chip_ids_in` 對應。 | Excluded |
-| `chipset_label_out` | String | 4.66% | 流出籌碼組標籤。 |  |  | 與 `chip_ids_out` 對應。 | Excluded |
-| `pit_name` | String | 0.00% | pit / 區域名稱。 | Many distinct values | `GMCPIT02` | 可作位置上下文。 | Excluded |
-| `gaming_area` | String | 0.00% | 博彩區名稱。 | `Mass`, `Premium Mass`, `Horizon`, `Horizon Plus`, `Cage Treasury`, etc. | `Mass` | `Cage Treasury` 多為籠房交易，與桌面下注語意不同。 | Excluded |
-| `associated_with_session` | Int32 | 0.00% | 是否關聯 session。 | 0/1 | `0` | 只有部分 BUYIN 有 session coverage；不可作主要 join key。 | Excluded |
-| `sent_to_cms` | Int32 | 10.39% | 是否送至 CMS。 | 0/1/NULL | `0` | 空值與類型相關。 | Excluded |
-| `session_id` | Int64 | 96.17% | 關聯 session ID。 |  |  | 幾乎全空，不能作第一版 join key。 | Excluded |
-| `device_type` | String | 0.00% | 交易設備類型。 | Many distinct values |  |  | Excluded |
-| `approver_name` | String | 99.79% | 核准者名稱。 |  |  | 稀疏且含員工資訊。 | Excluded |
-| `bet_id` | Int64 | 100.00% | 關聯下注 ID。 |  |  | 本批全空，不能 join `t_bet`。 | Excluded |
-| `marker_balance` | Decimal(19,4) | 7.56% | Marker 餘額。 |  |  |  | Excluded |
-| `rim_balance` | Decimal(19,4) | 7.56% | RIM/相關餘額。 |  |  |  | Excluded |
-| `cashier_id` | Int64 | 92.47% | cashier ID。 |  |  | 稀疏欄位。 | Excluded |
-| `cashier_name` | String | 92.47% | cashier 名稱。 |  |  | PII/員工資訊。 | Excluded |
-| `user_employee_number` | String | 92.44% | 操作員員工編號。 |  |  | 員工資訊。 | Excluded |
-| `dealer_employee_number` | String | 7.54% | 荷官員工編號。 |  |  | 員工資訊。 | Excluded |
-| `supervisor_employee_number` | String | 8.04% | 主管員工編號。 |  |  | 員工資訊。 | Excluded |
-| `cashier_employee_number` | String | 92.47% | cashier 員工編號。 |  |  | 員工資訊。 | Excluded |
-| `approver_employee_number` | String | 99.79% | 核准者員工編號。 |  |  | 員工資訊。 | Excluded |
-| `all_valid_chipsets` | UInt8 | 0.00% | 籌碼組是否皆有效。 | 0/1 | `1` | 可作 chip parsing DQ；第一版不解析。 | Excluded |
-| `above_threshold` | UInt8 | 0.00% | 是否超過門檻。 | 0/1 | `0` | 可能對大額交易有用，需確認門檻定義。 | Excluded |
-| `group_code` | String | 100.00% | 團碼。 |  |  | 本批全空。 | Excluded |
-| `rep_code` | String | 100.00% | 業代/公關代碼。 |  |  | 本批全空。 | Excluded |
-| `program_id` | Int32 | 100.00% | 行銷計畫 ID。 |  |  | 本批全空。 | Excluded |
-| `mixed_stack` | UInt8 | 0.00% | 是否混合籌碼疊。 | 0/1 | `0` |  | Excluded |
-| `currency_label` | String | 6.08% | 幣別/籌碼幣別標籤。 | `0`, `1`, NULL | `0` | 需向來源確認 `0`/`1` 語意。 | Excluded |
-| `cv_face_rec_id` | Int64 | 6.54% | 電腦視覺人臉辨識 ID。 |  |  | 生物辨識/敏感欄位；建模使用需審慎。 | Excluded |
-| `cv_id` | String | 7.76% | 電腦視覺 ID。 |  |  | 生物辨識/敏感欄位。 | Excluded |
-| `manual` | String | 93.67% | 手動標記。 |  |  | 稀疏欄位，需確認枚舉語意。 | Excluded |
-| `__ts_ms` | Int64 | 100.00% | CDC 時間戳。 |  |  | 本批全空，不可作 CDC 排序。 | Excluded |
-| `__op` | String | 0.00% | CDC 操作類型。 | `c`, `u`, `d` | `u` | 有 delete marker；需先 delete-aware 排除。 | Excluded |
-| `__deleted` | String | 0.00% | 軟刪除標記。 | `False`, `True` | `False` | `True` 與 `__op='d'` 表示 logical transaction 應排除。 | Excluded |
-| `__etl_insert_Dtm` | DateTime64(3, UTC) | 0.00% | 匯入資料倉儲的時間。 | 2026-04-22 18:59:14+08:00 ~ 2026-05-28 10:21:17+08:00（顯示為本地時區） |  | Dedup 排序主欄位，但不可當 event time。 | Excluded |
+**Ingestion 欄位說明（本表）**：**Included (L0)** = 保留於 L0 cleaned source parquet（全 65 raw 欄位）；**L0 derived** = L0 物化新增欄位（見下表）；**not_model_eligible** = quarantine 期間不得進 model/registry promote（與 Ingestion 正交）。
+
+| 欄位名稱 | 型別 (ClickHouse DDL) | 可空 (DDL) | DEFAULT (DDL) | L0 DuckDB cast | 可空/空字串率 (樣本) | 業務定義 | 值域/格式/枚舉 | 範例值 | 注意事項/已知問題 | Ingestion |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `casino_txn_id` | `Int64` | N |  | `BIGINT` | 0.00% | 交易唯一識別碼。 | distinct id: 4,442,245（2026-05 樣本） | `205502130` | [DQ Rule] **Delete-aware dedup**：先排除任一版本帶 delete marker 的 id，再取最新版本；見 [FND-19]。 | Included (L0) |
+| `uuid` | `String` | N |  | `VARCHAR` | 0.00% | 交易 UUID。 | distinct uuid: 4,442,246 |  | raw rows 中與 `casino_txn_id` 接近一對一，但仍以 `casino_txn_id` 作 logical key。 | Included (L0) |
+| `topology_id` | `Int32` | N |  | `INTEGER` | 0.00% | 拓撲/設備位置 ID。 |  |  | 可與 topology 表或桌台位置表關聯；本批未驗證。 | Included (L0) |
+| `gaming_day` | `Date32` | N |  | `DATE` | 0.00% | 營業日/帳務日。 | 2026-05-01 ~ 2026-05-28 | `2026-05-02` | 不可作 event time；可與 `start_dtm` 相差多日。 | Included (L0) |
+| `type` | `String` | N |  | `VARCHAR` | 0.00% | 交易大類。 | `CHANGE`, `BUYIN`, `CASHOUT`, `UPDATE_OWNER`, `TRANSFER`, `TD_FILL`, `TD_CREDIT`, `QUICK_TRANSFER` | `CASHOUT` | player-level txn-lite 第一版建議只用 `BUYIN`/`CASHOUT`，`CHANGE` 僅作 activity proxy。 | Included (L0) |
+| `action` | `Nullable(String)` | Y |  | `VARCHAR` | 0.00% | 交易操作動作。 | `SUBMIT`, `CANCEL` | `SUBMIT` | 有效事件需 `action='SUBMIT'`；`CANCEL` 應排除。 | Included (L0) |
+| `start_dtm` | `Nullable(DateTime64(3, 'Asia/Shanghai'))` | Y |  | `TIMESTAMPTZ` | 0.00% | 交易事件開始/發生時間。 | 2026-04-22 18:58:16+08:00 ~ 2026-05-28 10:21:10+08:00（顯示為本地時區） |  | **PIT event time 首選**。 | Included (L0) |
+| `end_dtm` | `Nullable(DateTime64(3, 'Asia/Shanghai'))` | Y |  | `TIMESTAMPTZ` | 0.00% | 交易結束時間。 |  |  | 有少量 `end_dtm < start_dtm` / 秒級倒序現象；不建議作 PIT anchor。 | Included (L0) |
+| `receive_dtm` | `Nullable(DateTime64(3, 'Asia/Shanghai'))` | Y |  | `TIMESTAMPTZ` | 100.00% | 接收時間。 |  |  | 本批全空。 | Included (L0) |
+| `complete_dtm` | `Nullable(DateTime64(3, 'Asia/Shanghai'))` | Y |  | `TIMESTAMPTZ` | 99.89% | 完成時間。 |  |  | 幾乎全空，不適合作 event time。 | Included (L0) |
+| `status` | `Nullable(String)` | Y |  | `VARCHAR` | 0.00% | 交易狀態。 | `COMPLETED`, `SUBMITTED`, `CANCELED` | `COMPLETED` | 通用有效 filter 為 `status <> 'CANCELED'`；BUYIN 需 type-specific 規則。 | Included (L0) |
+| `user_id` | `Nullable(Int32)` | Y |  | `INTEGER` | 92.44% | 操作員/使用者 ID。 |  |  | 稀疏欄位。 | Included (L0) |
+| `auth_token` | `Nullable(String)` | Y |  | `VARCHAR` | 100.00% | 授權 token。 |  |  | 本批全空；若未來有值也屬敏感欄位。 | Included (L0) |
+| `player_id` | `Nullable(Int64)` | Y |  | `BIGINT` | 1.01% | Smart Table 系統內部玩家識別碼。 |  |  | player-level PIT feature 需非 NULL；部分 duplicate id 的 `player_id` 會被 remap，需注意 canonical mapping。 | Included (L0) |
+| `chip_ids_in` | `Nullable(String)` | Y |  | `VARCHAR` | 2.88% | 交易流入籌碼 ID 清單。 | JSON-like string array | `["e04f..."]` | 籌碼清單可很長；第一版 cashflow 特徵不建議解析 chip-level。 | Included (L0) |
+| `chip_ids_out` | `Nullable(String)` | Y |  | `VARCHAR` | 4.66% | 交易流出籌碼 ID 清單。 | JSON-like string array | `["e04f..."]` | 籌碼清單可很長；BUYIN/CASHOUT 方向需依 `type` 與欄位語意判定。 | Included (L0) |
+| `updated_dtm` | `Nullable(DateTime64(3, 'Asia/Shanghai'))` | Y |  | `TIMESTAMPTZ` | 7.76% | 交易最後更新時間。 |  |  | 可作 dedup tie-breaker，但不能先於 delete-aware 排除使用。 | Included (L0) |
+| `txn_value` | `Nullable(Decimal(19, 4))` | Y |  | `DECIMAL(19,4)` | 0.00% | 交易金額/籌碼價值。 | 0 ~ 250,000,000（本批觀察） | `10000.0000` | 無負值；cashflow count/sum 建議要求 `txn_value > 0`。`CHANGE.txn_value` 不代表 win/loss 方向。 | Included (L0) |
+| `dealer_id` | `Nullable(Int32)` | Y |  | `INTEGER` | 7.54% | 荷官 ID。 |  |  |  | Included (L0) |
+| `supervisor_id` | `Nullable(Int32)` | Y |  | `INTEGER` | 8.04% | 主管 ID。 |  |  |  | Included (L0) |
+| `dealer_name` | `Nullable(String)` | Y |  | `VARCHAR` | 7.54% | 荷官姓名。 |  |  | PII/員工資訊，對外分享需遮罩。 | Included (L0) |
+| `supervisor_name` | `Nullable(String)` | Y |  | `VARCHAR` | 8.04% | 主管姓名。 |  |  | PII/員工資訊，對外分享需遮罩。 | Included (L0) |
+| `player_type` | `Nullable(String)` | Y |  | `VARCHAR` | 0.71% | 玩家類型。 | 常見：`KNOWN`, `ANONYMOUS`, `RATED`, `CASINO` | `KNOWN` | `CASINO` 多見於 operational transaction，未必有玩家 ID。 | Included (L0) |
+| `location` | `Nullable(String)` | Y |  | `VARCHAR` | 0.00% | 交易位置/桌台/籠房代碼。 | Many distinct values | `GMCNB0211` | 可作 table/location context；第一版 txn-lite 不建議直接作 player cashflow。 | Included (L0) |
+| `user_name` | `Nullable(String)` | Y |  | `VARCHAR` | 92.24% | 操作員帳號/名稱。 |  |  | PII/員工資訊。 | Included (L0) |
+| `player_name` | `Nullable(String)` | Y |  | `VARCHAR` | 1.01% | 玩家姓名。 |  |  | PII，對外分享需遮罩。 | Included (L0) |
+| `casino_player_id` | `Nullable(String)` | Y |  | `VARCHAR` | 18.33% | 會員/卡號識別。 |  |  | 部分 `player_id` remap 時此欄較穩定，但大量 ANONYMOUS 為空。 | Included (L0) |
+| `sub_type` | `Nullable(String)` | Y |  | `VARCHAR` | 0.03% | 交易子類型。 | `Cash`, `Prize Redemption`, `Front Money`, `Marker`, `TITO`, `CHANGE`, `CHIP_EXCHANGE`, etc. | `Cash` | BUYIN subtype 應分開建 feature，`Prize Redemption` 行為語意與一般 cash buyin 不同。 | Included (L0) |
+| `agent_name` | `Nullable(String)` | Y |  | `VARCHAR` | 100.00% | 代理名稱。 |  |  | 本批全空。 | Included (L0) |
+| `agent_id` | `Nullable(String)` | Y |  | `VARCHAR` | 100.00% | 代理 ID。 |  |  | 本批全空。 | Included (L0) |
+| `buyin_status` | `Nullable(String)` | Y |  | `VARCHAR` | 95.19% | BUYIN 內部狀態。 | `SUCCESS`, `PROVISIONAL_SUCCESS`, `PROVISIONAL_REJECT`, 空字串 | `SUCCESS` | Cash BUYIN 大量是 `SUBMITTED` + `SUCCESS`；有效 BUYIN filter 需納入。 | Included (L0) |
+| `document_id` | `Nullable(String)` | Y |  | `VARCHAR` | 100.00% | 文件/單據 ID。 |  |  | 本批全空。 | Included (L0) |
+| `chipset_label_in` | `Nullable(String)` | Y |  | `VARCHAR` | 2.88% | 流入籌碼組標籤。 |  |  | 與 `chip_ids_in` 對應。 | Included (L0) |
+| `chipset_label_out` | `Nullable(String)` | Y |  | `VARCHAR` | 4.66% | 流出籌碼組標籤。 |  |  | 與 `chip_ids_out` 對應。 | Included (L0) |
+| `pit_name` | `Nullable(String)` | Y |  | `VARCHAR` | 0.00% | pit / 區域名稱。 | Many distinct values | `GMCPIT02` | 可作位置上下文。 | Included (L0) |
+| `gaming_area` | `Nullable(String)` | Y |  | `VARCHAR` | 0.00% | 博彩區名稱。 | `Mass`, `Premium Mass`, `Horizon`, `Horizon Plus`, `Cage Treasury`, etc. | `Mass` | `Cage Treasury` 多為籠房交易，與桌面下注語意不同。 | Included (L0) |
+| `associated_with_session` | `Nullable(Int32)` | Y |  | `INTEGER` | 0.00% | 是否關聯 session。 | 0/1 | `0` | 只有部分 BUYIN 有 session coverage；不可作主要 join key。 | Included (L0) |
+| `sent_to_cms` | `Nullable(Int32)` | Y |  | `INTEGER` | 10.39% | 是否送至 CMS。 | 0/1/NULL | `0` | 空值與類型相關。 | Included (L0) |
+| `session_id` | `Nullable(Int64)` | Y |  | `BIGINT` | 96.17% | 關聯 session ID。 |  |  | 幾乎全空，不能作第一版 join key。 | Included (L0) |
+| `device_type` | `Nullable(String)` | Y |  | `VARCHAR` | 0.00% | 交易設備類型。 | Many distinct values |  |  | Included (L0) |
+| `approver_name` | `Nullable(String)` | Y |  | `VARCHAR` | 99.79% | 核准者名稱。 |  |  | 稀疏且含員工資訊。 | Included (L0) |
+| `bet_id` | `Nullable(Int64)` | Y |  | `BIGINT` | 100.00% | 關聯下注 ID。 |  |  | 本批全空，不能 join `t_bet`。 | Included (L0) |
+| `marker_balance` | `Nullable(Decimal(19, 4))` | Y |  | `DECIMAL(19,4)` | 7.56% | Marker 餘額。 |  |  |  | Included (L0) |
+| `rim_balance` | `Nullable(Decimal(19, 4))` | Y |  | `DECIMAL(19,4)` | 7.56% | RIM/相關餘額。 |  |  |  | Included (L0) |
+| `cashier_id` | `Nullable(Int64)` | Y |  | `BIGINT` | 92.47% | cashier ID。 |  |  | 稀疏欄位。 | Included (L0) |
+| `cashier_name` | `Nullable(String)` | Y |  | `VARCHAR` | 92.47% | cashier 名稱。 |  |  | PII/員工資訊。 | Included (L0) |
+| `user_employee_number` | `Nullable(String)` | Y |  | `VARCHAR` | 92.44% | 操作員員工編號。 |  |  | 員工資訊。 | Included (L0) |
+| `dealer_employee_number` | `Nullable(String)` | Y |  | `VARCHAR` | 7.54% | 荷官員工編號。 |  |  | 員工資訊。 | Included (L0) |
+| `supervisor_employee_number` | `Nullable(String)` | Y |  | `VARCHAR` | 8.04% | 主管員工編號。 |  |  | 員工資訊。 | Included (L0) |
+| `cashier_employee_number` | `Nullable(String)` | Y |  | `VARCHAR` | 92.47% | cashier 員工編號。 |  |  | 員工資訊。 | Included (L0) |
+| `approver_employee_number` | `Nullable(String)` | Y |  | `VARCHAR` | 99.79% | 核准者員工編號。 |  |  | 員工資訊。 | Included (L0) |
+| `all_valid_chipsets` | `Nullable(UInt8)` | Y |  | `UTINYINT` | 0.00% | 籌碼組是否皆有效。 | 0/1 | `1` | 可作 chip parsing DQ；第一版不解析。 | Included (L0) |
+| `above_threshold` | `Nullable(UInt8)` | Y |  | `UTINYINT` | 0.00% | 是否超過門檻。 | 0/1 | `0` | 可能對大額交易有用，需確認門檻定義。 | Included (L0) |
+| `group_code` | `Nullable(String)` | Y |  | `VARCHAR` | 100.00% | 團碼。 |  |  | 本批全空。 | Included (L0) |
+| `rep_code` | `Nullable(String)` | Y |  | `VARCHAR` | 100.00% | 業代/公關代碼。 |  |  | 本批全空。 | Included (L0) |
+| `program_id` | `Nullable(Int32)` | Y |  | `INTEGER` | 100.00% | 行銷計畫 ID。 |  |  | 本批全空。 | Included (L0) |
+| `mixed_stack` | `Nullable(UInt8)` | Y |  | `UTINYINT` | 0.00% | 是否混合籌碼疊。 | 0/1 | `0` |  | Included (L0) |
+| `currency_label` | `Nullable(String)` | Y |  | `VARCHAR` | 6.08% | 幣別/籌碼幣別標籤。 | `0`, `1`, NULL | `0` | 需向來源確認 `0`/`1` 語意。 | Included (L0) |
+| `cv_face_rec_id` | `Nullable(Int64)` | Y |  | `BIGINT` | 6.54% | 電腦視覺人臉辨識 ID。 |  |  | 生物辨識/敏感欄位；建模使用需審慎。 | Included (L0) |
+| `cv_id` | `Nullable(String)` | Y |  | `VARCHAR` | 7.76% | 電腦視覺 ID。 |  |  | 生物辨識/敏感欄位。 | Included (L0) |
+| `manual` | `Nullable(String)` | Y |  | `VARCHAR` | 93.67% | 手動標記。 |  |  | 稀疏欄位，需確認枚舉語意。 | Included (L0) |
+| `__ts_ms` | `Nullable(Int64)` | Y | now() | `BIGINT` | 100.00% | CDC 時間戳。 |  |  | 本批全空，不可作 CDC 排序。 | Included (L0) |
+| `__op` | `Nullable(String)` | Y |  | `VARCHAR` | 0.00% | CDC 操作類型。 | `c`, `u`, `d` | `u` | 有 delete marker；需先 delete-aware 排除。 | Included (L0) |
+| `__deleted` | `Nullable(String)` | Y |  | `VARCHAR` | 0.00% | 軟刪除標記。 | `False`, `True` | `False` | `True` 與 `__op='d'` 表示 logical transaction 應排除。 | Included (L0) |
+| `__etl_insert_Dtm` | `DateTime` | N | now() | `TIMESTAMPTZ` | 0.00% | 匯入資料倉儲的時間。 | 2026-04-22 18:59:14+08:00 ~ 2026-05-28 10:21:17+08:00（顯示為本地時區） |  | DDL 為 `DateTime`（非 DateTime64）；L0 cast 為 `TIMESTAMPTZ`；dedup 排序主欄位，不可當 event time。 | Included (L0) |
+
+### 5.1 L0 derived 欄位（`txn_l0_preprocess.py` 物化）
+
+| 欄位名稱 | L0 DuckDB 型別 | 業務定義 | 注意事項 |
+| --- | --- | --- | --- |
+| `txn_event_ts` | TIMESTAMPTZ | 事件時間（= raw `start_dtm`） | PIT event anchor；L1 join 使用 |
+| `txn_observed_at_raw` | TIMESTAMPTZ | raw 入湖時間（= raw `__etl_insert_Dtm`） | 稽核用；勿直接作 PIT available gate |
+| `txn_available_ts` | TIMESTAMPTZ | logical observed-at（保守 available time） | registry correction + 128s cap |
+| `observed_at_correction_rule_id` | VARCHAR | 套用之 correction rule id | 例如 `TXN-INGEST-FIX-001:v1` |
+| `is_suspicious_non_positive_txn_value` | BOOLEAN | 非正 `txn_value` 標記 | 保留列、供 DQ |
+| `is_suspicious_observed_before_event_raw` | BOOLEAN | raw observed-before-event 標記 | 保留列、供 DQ |
 

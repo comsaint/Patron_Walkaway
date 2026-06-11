@@ -105,6 +105,72 @@ def build_training_metrics_document(
     return body
 
 
+def _build_thresholding_block(metrics: dict[str, Any], args: Any) -> dict[str, Any]:
+    """Build threshold policy metadata for run summary."""
+
+    thr = metrics.get("step5_threshold")
+    selected = float(thr) if isinstance(thr, (int, float)) else None
+    policy = str(metrics.get("step5_selection_policy") or "min_precision")
+    if policy == "alert_band_precision":
+        return {
+            "policy": policy,
+            "policy_param": {
+                "target_alerts_per_hour": metrics.get("step5_target_alerts_per_hour"),
+                "deployment_target_alerts_per_hour": metrics.get(
+                    "step5_deployment_target_alerts_per_hour",
+                ),
+            },
+            "selected_threshold": selected,
+            "alert_band_scalar_score": metrics.get("step5_alert_band_scalar_score"),
+            "val_op_precision_at_1_alerts_per_hour": metrics.get(
+                "val_op_precision_at_1_alerts_per_hour",
+            ),
+            "val_op_precision_at_2_alerts_per_hour": metrics.get(
+                "val_op_precision_at_2_alerts_per_hour",
+            ),
+            "test_op_precision_at_1_alerts_per_hour": metrics.get(
+                "test_op_precision_at_1_alerts_per_hour",
+            ),
+            "test_op_precision_at_2_alerts_per_hour": metrics.get(
+                "test_op_precision_at_2_alerts_per_hour",
+            ),
+        }
+    return {
+        "policy": "min_precision",
+        "policy_param": {"min_precision": float(args.objective.min_precision)},
+        "selected_threshold": selected,
+        "val_pick_feasible": metrics.get("step5_val_pick_feasible"),
+    }
+
+
+def _build_alert_band_analysis(metrics: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract alert-band operational metrics when present in flat Step 5 report."""
+
+    if metrics.get("step5_selection_policy") != "alert_band_precision":
+        return None
+
+    def _split_band(prefix: str) -> dict[str, Any]:
+        return {
+            "scalar_score": metrics.get(f"{prefix}_alert_band_scalar_score"),
+            "min_precision": metrics.get(f"{prefix}_alert_band_min_precision"),
+            "mean_precision": metrics.get(f"{prefix}_alert_band_mean_precision"),
+            "precision_at_1_alerts_per_hour": metrics.get(
+                f"{prefix}_op_precision_at_1_alerts_per_hour",
+            ),
+            "precision_at_2_alerts_per_hour": metrics.get(
+                f"{prefix}_op_precision_at_2_alerts_per_hour",
+            ),
+            "recall_at_1_alerts_per_hour": metrics.get(
+                f"{prefix}_op_recall_at_1_alerts_per_hour",
+            ),
+            "recall_at_2_alerts_per_hour": metrics.get(
+                f"{prefix}_op_recall_at_2_alerts_per_hour",
+            ),
+        }
+
+    return {"val": _split_band("val"), "test": _split_band("test")}
+
+
 def build_run_summary(metrics: dict[str, Any], args: Any) -> dict[str, Any]:
     """Build cross-run comparison summary (nested under ``run_report.json``)."""
 
@@ -121,7 +187,6 @@ def build_run_summary(metrics: dict[str, Any], args: Any) -> dict[str, Any]:
     feat_cols = metrics.get("step5_feature_columns")
     n_feat = len(feat_cols) if isinstance(feat_cols, list) else None
     feat_hash = _feature_list_sha256_hex(feat_cols) if isinstance(feat_cols, list) else None
-    thr = metrics.get("step5_threshold")
     if "step5_optuna_skipped" not in metrics:
         opt_enabled = False
     else:
@@ -139,11 +204,7 @@ def build_run_summary(metrics: dict[str, Any], args: Any) -> dict[str, Any]:
             "patron_sampling_ratio_source": patron_src,
         },
         "model": {"algorithm": "lightgbm", "n_features_used": n_feat, "feature_list_sha256_hex": feat_hash},
-        "thresholding": {
-            "policy": "min_precision",
-            "policy_param": {"min_precision": float(args.objective.min_precision)},
-            "selected_threshold": float(thr) if isinstance(thr, (int, float)) else None,
-        },
+        "thresholding": _build_thresholding_block(metrics, args),
         "metrics": {
             "val": {
                 "ap": metrics.get("val_ap"),
@@ -198,14 +259,30 @@ def build_metrics_detailed(metrics: dict[str, Any]) -> dict[str, Any]:
         keys = ("ap", "precision", "recall", "f1")
         return {k: metrics.get(f"{prefix}_{k}") for k in keys}
 
+    policy = str(metrics.get("step5_selection_policy") or "min_precision")
+    threshold_analysis: dict[str, Any] = {
+        "selection_policy": policy,
+        "selected_threshold": metrics.get("step5_threshold"),
+        "val_pick_feasible": metrics.get("step5_val_pick_feasible"),
+    }
+    if policy == "alert_band_precision":
+        threshold_analysis.update(
+            {
+                "target_alerts_per_hour": metrics.get("step5_target_alerts_per_hour"),
+                "deployment_target_alerts_per_hour": metrics.get(
+                    "step5_deployment_target_alerts_per_hour",
+                ),
+                "alert_band_scalar_score": metrics.get("step5_alert_band_scalar_score"),
+                "alert_band": _build_alert_band_analysis(metrics),
+            },
+        )
+    else:
+        threshold_analysis["selection_policy"] = f"min_precision={metrics.get('step5_min_precision')}"
+
     return {
         "run_id": run_id,
         "split_metrics": {"train": _split("train"), "val": _split("val"), "test": _split("test")},
-        "threshold_analysis": {
-            "selection_policy": f"min_precision={metrics.get('step5_min_precision')}",
-            "selected_threshold": metrics.get("step5_threshold"),
-            "val_pick_feasible": metrics.get("step5_val_pick_feasible"),
-        },
+        "threshold_analysis": threshold_analysis,
         "budget_points": {
             "alerts_per_hour": {
                 "train": metrics.get("train_alerts_per_hour"),

@@ -24,6 +24,7 @@ class HightierModelBundle:
     category_categories: Mapping[str, list[Any]]
     model_version: str
     training_metrics: dict[str, Any]
+    score_aggregation: str
 
 
 def _read_model_version(bundle_dir: Path) -> str:
@@ -80,6 +81,7 @@ def load_hightier_model_bundle(
         cc = {}
     mv = _read_model_version(d)
     metrics = _read_training_metrics(d)
+    score_agg = str(raw.get("score_aggregation") or metrics.get("score_aggregation") or "max")
     return HightierModelBundle(
         bundle_dir=d,
         model=model,
@@ -89,6 +91,7 @@ def load_hightier_model_bundle(
         category_categories=cc,
         model_version=mv,
         training_metrics=metrics,
+        score_aggregation=score_agg,
     )
 
 

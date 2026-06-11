@@ -57,7 +57,7 @@ from trainer_hightier.feature_experiment.feature_registry import (
 import trainer_hightier.feature_experiment.feature_registry as _feat_registry
 from trainer_hightier.feature_experiment.materialize_fe_derived import materialize_fe_derived_parquet
 from trainer_hightier.feature_experiment.materialize_txn_lite import (
-    default_raw_casino_txn_parquet,
+    default_cleaned_casino_txn_root,
     materialize_txn_lite_parquet,
     write_txn_lite_sidecars,
 )
@@ -936,12 +936,17 @@ def main() -> None:
     ext_root = cfg_yaml.get("external_sources")
     txn_cfg = ext_root.get("t_casino_txn") if isinstance(ext_root, dict) else None
     if isinstance(txn_cfg, dict) and bool(txn_cfg.get("enabled")):
-        raw_txn = Path(str(txn_cfg.get("raw_parquet", default_raw_casino_txn_parquet())))
+        cleaned_txn_root = Path(
+            str(txn_cfg.get("cleaned_root", default_cleaned_casino_txn_root())),
+        )
         txn_lite_path = (paths.run_dir / "txn_lite.parquet").resolve()
-        logger.info("[FE] materializing txn_lite (BUYIN/CASHOUT) → %s", txn_lite_path)
+        logger.info(
+            "[FE] materializing txn_lite (L0 cleaned, BUYIN/CASHOUT) → %s",
+            txn_lite_path,
+        )
         t_txn = time.perf_counter()
         txn_meta = materialize_txn_lite_parquet(
-            raw_casino_txn_parquet=raw_txn,
+            cleaned_casino_txn_root=cleaned_txn_root,
             training_parquet_for_bet_ids=step3_in,
             out_parquet=txn_lite_path,
             duckdb_runtime=duck,

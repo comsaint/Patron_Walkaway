@@ -119,6 +119,11 @@ from trainer_hightier.serving.state_db import (
     set_last_processed_etl_insert,
 )
 
+import importlib as _importlib
+
+_step5 = _importlib.import_module("trainer_hightier.05_lgbm_train")
+top3_mean_bet_scores = _step5.top3_mean_bet_scores
+
 logger = logging.getLogger(__name__)
 
 _LAST_SCORER_CYCLE_METRICS: dict[str, Any] | None = None
@@ -1073,7 +1078,7 @@ def _build_player_game_alert_frame(
     scored_at_iso: str,
     model_version: str,
 ) -> tuple[pd.DataFrame, int]:
-    """One alert row per ``player_id + game_id`` when ``max(score) >= threshold``."""
+    """One alert row per ``player_id + game_id`` when ``top3_mean(score) >= threshold``."""
 
     if staged.empty:
         return pd.DataFrame(), 0
@@ -1098,13 +1103,21 @@ def _build_player_game_alert_frame(
         return pd.DataFrame(), excluded
     work["_bet_id_sort"] = pd.to_numeric(work["bet_id"], errors="coerce").fillna(-1)
     work = work.sort_values(
-        by=["_score", "payout_complete_dtm", "_bet_id_sort"],
-        ascending=[False, True, True],
+        by=["player_id", "game_id", "payout_complete_dtm", "_bet_id_sort"],
+        ascending=[True, True, True, True],
+        kind="mergesort",
     )
-    rep = work.groupby(["player_id", "game_id"], as_index=False, dropna=True).first()
-    counts = work.groupby(["player_id", "game_id"], dropna=True).size().reset_index(name="player_game_bet_count")
+    rep = work.groupby(["player_id", "game_id"], as_index=False, dropna=True).last()
+    score_agg = (
+        work.groupby(["player_id", "game_id"], dropna=True)["_score"]
+        .apply(top3_mean_bet_scores)
+        .reset_index(name="player_game_score")
+    )
+    counts = work.groupby(["player_id", "game_id"], dropna=True).size().reset_index(
+        name="player_game_bet_count",
+    )
+    rep = rep.merge(score_agg, on=["player_id", "game_id"], how="left")
     rep = rep.merge(counts, on=["player_id", "game_id"], how="left")
-    rep["player_game_score"] = rep["_score"]
     thr = float(threshold)
     alerted = rep.loc[rep["player_game_score"] >= thr].copy()
     if alerted.empty:
@@ -1171,6 +1184,15 @@ def score_once(
     from trainer_hightier.serving.flight_recorder import scorer_hooks as _flight_rec
 
     cfg = default_hightier_serving_config()
+    expected_agg = _step5.PLAYER_GAME_SCORE_AGGREGATION
+    if str(bundle.score_aggregation) != expected_agg:
+        logger.warning(
+            "[hightier_scorer] score_aggregation_mismatch: bundle=%r serving=%r; "
+            "threshold=%.6f may not match aggregation policy",
+            bundle.score_aggregation,
+            expected_agg,
+            float(bundle.threshold),
+        )
     cap = int(cfg.hightier_scorer_max_bets_per_cycle)
     last_etl = get_last_processed_etl_insert(conn)
     _flight_rec.on_score_once_begin(

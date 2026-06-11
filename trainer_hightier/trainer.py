@@ -1981,6 +1981,7 @@ def fit_model(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None)
             sample_policy_meta=sample_meta,
             feature_screening_meta=screening_meta,
             duckdb_runtime=args.duckdb_runtime,
+            objective=args.objective,
             objective_min_precision=float(args.objective.min_precision),
             random_seed=int(args.random_seed),
             step5=args.step5,

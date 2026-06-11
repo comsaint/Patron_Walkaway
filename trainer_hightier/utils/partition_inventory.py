@@ -75,6 +75,35 @@ def _table_partition_roots(data_root: Path) -> tuple[Path, Path]:
     return root / "t_bet", root / "t_session"
 
 
+def casino_txn_partition_root(data_root: Path) -> Path:
+    """Return ``data/t_casino_txn`` table root under a repo ``data`` directory."""
+
+    return Path(data_root).resolve() / "t_casino_txn"
+
+
+def list_casino_txn_raw_partition_dirs(txn_root: Path) -> list[Path]:
+    """List ``partition_YYYYMM/`` directories under ``data/t_casino_txn``."""
+
+    root = Path(txn_root).resolve()
+    if not root.is_dir():
+        return []
+    out: list[Path] = []
+    for part_dir in sorted(root.iterdir()):
+        if part_dir.is_dir() and _TABLE_PARTITION_MONTH_RE.match(part_dir.name):
+            if any(part_dir.glob("part_*.parquet")):
+                out.append(part_dir)
+    return out
+
+
+def scan_casino_txn_partition_root(txn_root: Path) -> list[PartitionParquetStat]:
+    """Scan ``partition_YYYYMM/part_*.parquet`` shards under ``data/t_casino_txn``."""
+
+    root = Path(txn_root).resolve()
+    if root.name != "t_casino_txn" and (root / "t_casino_txn").is_dir():
+        root = root / "t_casino_txn"
+    return _scan_table_partition_shards(root, "t_casino_txn")
+
+
 def _has_table_partition_shards(table_root: Path) -> bool:
     """True when *table_root* contains ``partition_YYYYMM/`` monthly folders."""
     tr = Path(table_root).resolve()

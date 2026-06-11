@@ -494,3 +494,111 @@ tables:
       introduced_at: '2026-05-06T00:00:00Z'
       doc_ref: schema/time_semantics_registry.yaml#t_session
       ticket_ref: TBD
+  gmwds_t_casino_txn:
+    table: t_casino_txn
+    preprocess_rule_id: preprocess_txn_l0_v1
+    description: L0 cleaned source layer for CDC casino transaction events (all types; quarantine not_model_eligible).
+    semantics:
+      logical_key_col: casino_txn_id
+      event_time_col: start_dtm
+      observed_at_col: __etl_insert_Dtm
+      available_time_col: txn_available_ts
+      apply_stage: before_ranked_deduped
+      timezone: UTC
+      quarantine_flag: not_model_eligible
+      notes:
+      - L0 retains all type values; BUYIN/CASHOUT filtering is L1 only.
+      - Raw observed-before-event rows require registered bulk episode coverage or preflight hard-fails.
+      - Logical observed-at uses GREATEST(LEAST(raw_observed, event + cap), event).
+    dedup:
+      partition_key: casino_txn_id
+      winner_order:
+      - col: __etl_insert_Dtm
+        order: desc
+        nulls: last
+      - col: updated_dtm
+        order: desc
+        nulls: last
+      delete_markers:
+      - __op = 'd'
+      - __deleted = 'True'
+    hard_exclude:
+      mode: drop_row
+      required_non_null:
+      - casino_txn_id
+      - start_dtm
+      - __etl_insert_Dtm
+    bulk_historical_ingest_episodes:
+      synthetic_observed_at_contract:
+        description: 'Logical observed-at for t_casino_txn L0: cap ingest delay at residual P95 (128s) and floor at event time.
+          Raw __etl_insert_Dtm is retained as txn_observed_at_raw.
+
+          '
+        event_time_col: start_dtm
+        source_observed_at_col: __etl_insert_Dtm
+        ingest_delay_cap_sec: 128
+        residual_p95_reference:
+          artifact: data/t_casino_txn/partition_202505
+          methodology: DuckDB quantile_cont on (epoch(__etl_insert_Dtm)-epoch(start_dtm)) excluding ETL calendar day 2025-05-27
+          measured_p95_sec: 128
+          measured_at: '2026-06-10T00:00:00Z'
+        logical_observed_at_expr: "GREATEST(\n  LEAST(\n    TRY_CAST(__etl_insert_Dtm AS TIMESTAMPTZ),\n    TRY_CAST(start_dtm AS TIMESTAMPTZ) + INTERVAL 128 SECOND\n  ),\n      TRY_CAST(start_dtm AS TIMESTAMPTZ)\n)\n"
+        notes:
+        - Rows with raw __etl_insert_Dtm < start_dtm are allowed only when covered by a registered episode (v1 TXN-BULK-INGEST-2025-05-27).
+        - Do not use gaming_day as event time or PIT anchor.
+      episodes:
+      - episode_id: TXN-BULK-INGEST-2025-05-27
+        evidence: Known bulk noon stamp; tail observed-before-event rows on ETL calendar day 2025-05-27
+        match_rule_sql: 'CAST(date_trunc(''day'', TRY_CAST(__etl_insert_Dtm AS TIMESTAMPTZ)) AS DATE) = DATE ''2025-05-27''
+
+          '
+        note: Allows raw observed-before-event rows on this ETL day; logical observed-at correction applies via TXN-INGEST-FIX-001.
+    integration_contract:
+      raw_path_pattern: data/t_casino_txn/partition_YYYYMM/part_*.parquet
+      cleaned_output_root: trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_casino_txn
+      cleaning_policy_id: t_casino_txn_l0_v2_schema
+      schema_contract_id: gmwds_t_casino_txn_l0_schema_v1
+      schema_dictionary_ref: schema/GDP_GMWDS_Raw_Schema_Dictionary.md#5
+      schema_ddl_ref: schema/schema.txt#t_casino_txn
+      partial_partition_policy:
+        min_post_dedup_rows_absolute: 100000
+        row_ratio_vs_sibling_median_threshold: 0.20
+        max_shard_count_for_complete_month: 3
+    templates:
+    - template_id: TPL-TXN-OBSERVED-DELAY-P95-CAP
+      reason_code: upstream_correction
+      default_action:
+        type: normalize_observed_at
+        params:
+          mode: cap_observed_after_event_with_event_floor
+          output_observed_col: txn_available_ts
+    active_rules:
+    - fix_rule_id: TXN-INGEST-FIX-001
+      fix_rule_version: v1
+      enabled: true
+      priority: 5
+      reason_code: upstream_correction
+      template_ref: TPL-TXN-OBSERVED-DELAY-P95-CAP
+      match_condition_sql: 'TRY_CAST(__etl_insert_Dtm AS TIMESTAMPTZ) IS NOT NULL AND TRY_CAST(start_dtm AS TIMESTAMPTZ) IS NOT NULL
+
+        '
+      action:
+        type: normalize_observed_at
+        params:
+          mode: cap_observed_after_event_with_event_floor
+          event_time_col: start_dtm
+          source_observed_col: __etl_insert_Dtm
+          output_observed_col: txn_available_ts
+          cap_delay_sec: 128
+      owner: data-assets
+      introduced_at: '2026-06-10T00:00:00Z'
+      doc_ref: doc/ssot/Data pipeline - SSOT.md#5.2
+      ticket_ref: TBD
+    manifest_binding:
+      required_fields:
+      - ingestion_fix_rule_id
+      - ingestion_fix_rule_version
+      - applied_fix_rules
+      recommended_fields:
+      - fix_registry_uri
+      - preflight_observed_before_event_evidence

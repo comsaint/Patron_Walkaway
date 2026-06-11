@@ -1439,8 +1439,8 @@ def test_build_player_game_alert_frame_dedupes_same_game() -> None:
     )
     assert excluded == 0
     assert len(alerts) == 1
-    assert float(alerts.iloc[0]["player_game_score"]) == pytest.approx(0.95)
-    assert float(alerts.iloc[0]["bet_id"]) == pytest.approx(2.0)
+    assert float(alerts.iloc[0]["player_game_score"]) == pytest.approx((0.95 + 0.91 + 0.88) / 3.0)
+    assert float(alerts.iloc[0]["bet_id"]) == pytest.approx(3.0)
     assert int(alerts.iloc[0]["player_game_bet_count"]) == 3
 
 

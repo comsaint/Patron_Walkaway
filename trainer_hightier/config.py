@@ -1,4 +1,4 @@
-"""High-tier patron objective: fixed precision target → report alert rate.
+"""High-tier patron objective: alert-band precision at fixed operational capacity.
 
 This package is intentionally small vs ``trainer/``. Wire real IO and
 segmentation in later steps.
@@ -89,13 +89,26 @@ FE_SHORT_TERM_DEPLOY_PARQUET_BASENAME: Final[str] = "fe_short_term_features.parq
 SHORT_TERM_PIT_CACHE_DEPLOY_BASENAME: Final[str] = FE_SHORT_TERM_DEPLOY_PARQUET_BASENAME
 # Step 3.5 training artifact: per-row PIT values for training ``bet_id`` only.
 TRAINING_SHORT_TERM_PIT_CACHE_BASENAME: Final[str] = "_main_trainer_fe_short_term.parquet"
-# Feature-experiment Wave 1b: ``t_casino_txn`` txn_lite (BUYIN/CASHOUT only; see FND-19).
-DEFAULT_T_CASINO_TXN_RAW_PARQUET: Final[Path] = (
-    _REPO_ROOT / "data" / "new tables" / "partition_202605"
+# L0 ``t_casino_txn`` source integration (see Data pipeline SSOT §5.2).
+TXN_L0_RAW_ROOT: Final[Path] = _REPO_ROOT / "data" / "t_casino_txn"
+TXN_L0_CLEANED_ROOT: Final[Path] = (
+    TRAINER_HIGHTIER_PACKAGE_DIR / "artifacts" / "cleaned" / "cleaned__gmwds_t_casino_txn"
 )
-TXN_LITE_CLEANING_POLICY_ID: Final[str] = "t_casino_txn_v0_fnd19"
-TXN_LITE_SOURCE_CONTRACT_REF: Final[str] = "doc/FINDINGS.md#FND-19"
-TXN_LITE_MATERIALIZER_VERSION: Final[str] = "txn_lite_cashflow_v0"
+TXN_L0_CLEANING_POLICY_ID: Final[str] = "t_casino_txn_l0_v2_schema"
+TXN_L0_SOURCE_CONTRACT_REF: Final[str] = "doc/ssot/Data pipeline - SSOT.md#5.2"
+TXN_L0_REGISTRY_TABLE_KEY: Final[str] = "gmwds_t_casino_txn"
+TXN_L0_EVENT_TIME_COLUMN: Final[str] = "start_dtm"
+TXN_L0_OBSERVED_AT_COLUMN: Final[str] = "__etl_insert_Dtm"
+TXN_L0_LOGICAL_KEY_COLUMN: Final[str] = "casino_txn_id"
+TXN_L0_INGEST_FIX_RULE_ID: Final[str] = "TXN-INGEST-FIX-001"
+TXN_L0_PARTIAL_MIN_POST_DEDUP_ROWS: Final[int] = 100_000
+TXN_L0_PARTIAL_ROW_RATIO_VS_MEDIAN: Final[float] = 0.20
+TXN_L0_PARTIAL_MAX_SHARD_COUNT: Final[int] = 3
+# Feature-experiment Wave 1b: ``t_casino_txn`` txn_lite (BUYIN/CASHOUT only; see FND-19).
+DEFAULT_T_CASINO_TXN_CLEANED_ROOT: Final[Path] = TXN_L0_CLEANED_ROOT
+TXN_LITE_CLEANING_POLICY_ID: Final[str] = "t_casino_txn_l0_v2_schema+l1_fnd19"
+TXN_LITE_SOURCE_CONTRACT_REF: Final[str] = "doc/ssot/Data pipeline - SSOT.md#5.2"
+TXN_LITE_MATERIALIZER_VERSION: Final[str] = "txn_lite_cashflow_v1_l0"
 TXN_LITE_INCLUDED_TYPES: Final[tuple[str, ...]] = ("BUYIN", "CASHOUT")
 TXN_LITE_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     "txn__has_cash_out__w15m",
@@ -683,13 +696,20 @@ class CanonicalMappingConfig:
 
 @dataclass(frozen=True)
 class HighTierObjectiveConfig:
-    """Defaults for high-tier segment + precision-floor reporting."""
+    """Defaults for high-tier segment + threshold selection / reporting."""
 
     # Quantile in (0, 1) on patron **ADT** (from ``canonical_patron_profile.csv``): bet preprocess keeps
     # only bets tied (via canonical mapping) to patrons at or above this ADT quantile (~top ``1 - q``).
     # Align naming with ``trainer.training.high_roller_segmentation`` when wiring segment thresholds.
     theo_train_quantile: float = 0.95
-    # Require precision >= this value on the **segment** when choosing a score threshold.
+    #: ``alert_band_precision``: maximize operational precision at ``target_alerts_per_hour``.
+    #: ``min_precision``: legacy recall@precision-floor picker (backward compatibility).
+    selection_policy: Literal["alert_band_precision", "min_precision"] = "alert_band_precision"
+    #: Target operational alert rates (alerts/hour) for band objective and reporting.
+    target_alerts_per_hour: tuple[float, ...] = (1.0, 2.0)
+    #: Deployed score threshold is calibrated to this alerts/hour target on validation.
+    deployment_target_alerts_per_hour: float = 1.0
+    #: Legacy precision floor when ``selection_policy='min_precision'``.
     min_precision: float = 0.60
     # Placeholder paths for later steps (Parquet / DuckDB exports).
     segment_scores_parquet: Path | None = None

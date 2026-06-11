@@ -3,6 +3,10 @@
 本文件屬於 **Implementation Plan 層**，對齊 `Data pipeline - SSOT.md` 中新增的特徵候選治理需求，定義「如何落地」候選生成、候選篩選、長窗低成本物化與訓練視窗策略實驗。  
 本文件不展開 ticket 級任務拆分；任務拆解應在後續 working plan 文件承接。
 
+> **狀態（2026-06-10）— `t_casino_txn` / txn_lite**  
+> 因上游 **data source incident**，`t_casino_txn` 之 **L0 接入與清洗**已改由獨立 workstream 處理：`t_casino_txn Source Integration - IMPLEMENTATION_PLAN.md`（對齊 SSOT §5.2）。  
+> 本文件 §2.5 / Workstream C2 仍描述 **L1 feature experimentation** 架構，但 **txn_lite 實作與 Gate 1 promote 暫 defer**；quarantine 期間 cleaned artifact 為 **`not_model_eligible`**，歷史 ablation 結果**不得**作 registry 或 model 決策依據。incident 關閉且 L0 可信後，再恢復 Working Plan §1.7。
+
 ## 0) 對齊範圍與非目標
 
 - 對齊來源：`trainer_hightier/doc/ssot/Data pipeline - SSOT.md`
@@ -95,9 +99,10 @@
   - 可進入模型的 cleaned output schema 與 source contract version
 - `feature_experiment` runner 僅消費已清洗、PIT-safe 的 materialized feature parquet，不直接把 raw source table join 入訓練集。
 - Registry v0 對外部事件特徵只宣告 `feature_id`、`group_id`、`source`、`time_horizon`、`max_lookback`、`status`、`enabled_for` 與治理註記；不重複來源表清洗規則或 SQL。
-- `t_casino_txn` 為第一個目標外部事件來源案例；其清洗細節不在本文件展開，來源依據為：
+- `t_casino_txn` 為第一個目標外部事件來源案例。**L0 清洗**（source-grain、全 type、quarantine）見 `t_casino_txn Source Integration - IMPLEMENTATION_PLAN.md` 與 SSOT §5.2；**L1 特徵清洗**（例如 BUYIN/CASHOUT only）仍依：
   - `doc/FINDINGS.md` **[FND-19]**
   - `schema/GDP_GMWDS_Raw_Schema_Dictionary.md` **§5. t_casino_txn**
+  - quarantine 解除前，L1 materializer 不得 consume 未標記可信的 cleaned artifact
 
 ## 3) 實作工作流（Workstreams）
 

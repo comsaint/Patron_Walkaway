@@ -199,8 +199,14 @@ def test_build_metrics_detailed_and_pipeline_debug_smoke() -> None:
         "train_recall": 0.2,
         "train_f1": 0.3,
         "step5_min_precision": 0.6,
+        "step5_selection_policy": "alert_band_precision",
+        "step5_target_alerts_per_hour": [1.0, 2.0],
         "step5_threshold": 0.42,
         "step5_val_pick_feasible": True,
+        "val_op_precision_at_1_alerts_per_hour": 0.55,
+        "val_op_precision_at_2_alerts_per_hour": 0.52,
+        "test_op_precision_at_1_alerts_per_hour": 0.53,
+        "test_op_precision_at_2_alerts_per_hour": 0.50,
         "step5_feature_columns": ["x"],
         "session_clean_cache_hit": True,
         "prepare_training_frame_seconds": 1.0,
@@ -211,6 +217,8 @@ def test_build_metrics_detailed_and_pipeline_debug_smoke() -> None:
     }
     md = build_metrics_detailed(metrics)
     assert md["split_metrics"]["train"]["ap"] == 0.55
+    assert md["threshold_analysis"]["selection_policy"] == "alert_band_precision"
+    assert md["threshold_analysis"]["alert_band"]["val"]["precision_at_1_alerts_per_hour"] == 0.55
     assert md["feature_columns"] == ["x"]
     assert md["split_periods"]["basis"] == "gaming_day_event"
     dbg = build_pipeline_debug(metrics)

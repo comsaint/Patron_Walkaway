@@ -13,6 +13,7 @@
 
 - 範圍（In Scope）
 - 離線來源為分區 Parquet（`t_bet` / `t_session`，以月份分區）。
+- **外部 raw 事件來源之 L0 接入與清洗**（例如 `t_casino_txn`）：產出 **source-grain cleaned layer** 與 DQ sidecar；**不含** bet-grain 特徵物化、registry promotion 或 model baseline 變更（見 §5.2）。
 - 本地增量資料處理、快取與 artifact 管理。
 - 特徵契約治理（Feast feature views/services）與離線 historical retrieval。
 - 特徵候選生命週期治理（候選生成、候選分組、**特徵品質閘門 FQG**、候選篩選與升級/淘汰規則）。
@@ -25,6 +26,7 @@
 - 生產 ClickHouse schema/engine/operator 調整與上線流程。
 - 即時線上 serving 基礎設施變更（online feature serving infra）。
 - 模型演算法策略本身（例如改用何種模型家族）之最終決策。
+- **外部來源之 feature crafting**（`txn__*` 等 bet-grain 欄位）、**Gate 1 / ablation 結論**、**registry baseline promotion**——須待來源可信且獨立實驗通過後另案處理；在 **source quarantine** 期間一律不得進 model。
 
 ## 3) 利害關係人與使用者
 
@@ -90,6 +92,76 @@
 - **勿**用訓練 cache 供應 production 未見 `bet_id`；生產打分見 Scorer SSOT（live PIT 主路徑）。
 - `bet__*` 與 short `fe__*` 屬**同一 short 層**；registry `source: feast_trial_1h` 為歷史標籤，訓練供應為 `short_term_pit_builder`。
 
+### 5.2) 外部 raw 事件來源接入（L0 only；`t_casino_txn` v1）
+
+在既有 `t_bet` / `t_session` L0 之外，允許納入 **CDC 事件表** 作為 **cleaned source layer** 輸入。第一案為 `t_casino_txn`（細節見 `doc/FINDINGS.md` **[FND-19]**、`schema/GDP_GMWDS_Raw_Schema_Dictionary.md` §5）。
+
+**分層原則（強制）**
+
+| 層 | 產物 | 本階段 |
+|----|------|--------|
+| **L0 cleaned source** | `cleaned__gmwds_t_casino_txn/`（source-grain parquet + manifest） | **In scope** |
+| **L1 feature materialize** | bet-grain `txn__*` 欄位、experiment materializer | **Out of scope**（另案） |
+| **Training / model** | Step 3.5 enrich、registry、Gate 1 | **Out of scope**；quarantine 期間 **not_model_eligible** |
+
+**時間語意（`t_casino_txn` v1，已鎖定）**
+
+| 欄位語意 | 欄位 | 規則 |
+|----------|------|------|
+| **Event time** | `start_dtm` | 業務事件發生時間；PIT 比較基準（對 bet 為 `payout_complete_dtm` 時，屬 L1 議題，L0 僅物化並保留） |
+| **Observed-at** | `__etl_insert_Dtm` | 入湖可觀測時間 |
+| **Available time（保守）** | `txn_available_ts` | **v1 定義為 logical observed-at**：`GREATEST(LEAST(__etl_insert_Dtm, start_dtm + 128s), start_dtm)`；不假設 raw `start_dtm` 即時可見，也不允許事件發生前可見 |
+| **Raw path** | `data/t_casino_txn/partition_YYYYMM/part_*.parquet` | 固定本地來源根目錄；不使用 `data/new tables` 單檔樣本作正式來源 |
+| **Partition / audit** | `gaming_day` / `partition_YYYYMM` | 僅分區與稽核；**不得**作 event time 或 PIT anchor；月份分區允許因 casino day cutover spill 到鄰近日 |
+| **型別契約（L0 materialize）** | DuckDB `TIMESTAMPTZ` | L0 explicit CAST 與 registry SQL 一律使用 `TIMESTAMPTZ`（非 `TIMESTAMP`）；**DDL ground truth** = `schema/schema.txt` → `GDP_GMWDS_Raw.t_casino_txn`；L0 cast 契約 = `txn_l0_schema.py`；人類可讀欄位說明 = dictionary §5 |
+
+**L0 清洗（v1，已鎖定）**
+
+- **Logical key**：`casino_txn_id`；delete-aware dedup（任一版本 `__op='d'` 或 `__deleted='True'` → 整筆 logical id 排除）。
+- **Dedup 排序**：`__etl_insert_Dtm DESC, updated_dtm DESC`。
+- **Type 範圍**：L0 **保留所有 `type`**（不在 L0 過濾為 BUYIN/CASHOUT only）；type/status 篩選留待 **L1 feature materializer**。
+- **Hard exclude（列級）**：缺 `casino_txn_id` 或缺 `start_dtm` 或缺 `__etl_insert_Dtm` → 不進 cleaned output（sidecar 記錄計數）。
+- **Raw observed-before-event preflight（來源級）**：raw `__etl_insert_Dtm < start_dtm` 必須被 preflight 捕捉並輸出 evidence。若無登錄 correction rule 覆蓋 → **hard-fail**；若符合已登錄 bulk/correction episode → 可 materialize，但必須寫入 logical `txn_available_ts`、保留 raw `__etl_insert_Dtm`、標記 `observed_at_correction_rule_id`，並在 sidecar 記錄修正列數。
+- **登錄 correction（v1）**：`TXN-BULK-INGEST-2025-05-27`；`ingest_delay_cap_sec = 128`（txn residual P95，排除 2025-05-27 bulk observed-at day）；logical observed-at:
+  `GREATEST(LEAST(TRY_CAST(__etl_insert_Dtm AS TIMESTAMPTZ), TRY_CAST(start_dtm AS TIMESTAMPTZ) + INTERVAL 128 SECOND), TRY_CAST(start_dtm AS TIMESTAMPTZ))`。
+- **Partial partition 偵測（audit-only，非 hard-fail）**：月份分區邊界可能僅含部分 shard 或列數明顯低於同批 sibling 月份。L0 materialize 須寫入 sidecar `partition_coverage` / `is_partial_partition`，供下游 **不得** 將該月視為完整月。閾值（與 `preprocess_l0_data_contract_registry.yaml` → `integration_contract.partial_partition_policy` 一致）：
+  - `post_dedup_rows < 100_000` → `post_dedup_rows_below_absolute_floor`
+  - `post_dedup_rows / sibling_median_post_dedup_rows < 0.20`（sibling 取自已 materialize 之其他 `partition_YYYYMM` sidecar）→ `post_dedup_rows_below_sibling_median_ratio`
+  - `shard_count ≤ 3`（`part_*.parquet` 計數）→ `shard_count_at_or_below_partial_threshold`
+  - 任一 reason 觸發即 `is_partial_partition: true`；**仍產出 cleaned parquet**（quarantine 語意不變）。
+- **Suspicious 列**：保留於 cleaned output 並打 **invalid/suspicious flag**（例如非正 `txn_value`、非預期 type/status 組合）；供 DQ 與事故調查。
+- **Join 備註**：`bet_id` / `session_id` 在 raw 多為 NULL；L0 不承諾 bet-grain join；實體鍵以 `player_id` 保留供稽核（canonical 映射屬後續議題）。
+
+**Source quarantine（資料事故期間，強制）**
+
+- 因上游 **data source incident**，`t_casino_txn` cleaned artifact 預設標記 **`not_model_eligible`**。
+- Quarantine 期間：允許 **ingest、L0 preprocess、DQ report、investigation**；**禁止** registry 引用、Step 3.5 enrich、feature experiment 之 Gate 1 結論作為 promote 依據。
+- 解除 quarantine 須有 **explicit decision record**（非本文件範圍）。
+
+**Quarantine exit checklist（SSOT gate；全部必須成立）**
+
+| 類別 | 退出條件（必須成立） | 必備證據 |
+|------|----------------------|----------|
+| **Schema contract** | `schema/schema.txt`、dictionary §5、`txn_l0_schema.py` 三者無 drift；欄位順序、ClickHouse 型別、nullable/default、L0 cast 契約一致。 | 自動驗證測試與對應 fingerprint / contract reference。 |
+| **Source completeness** | 擬解除 quarantine 的來源快照不得靜默納入 `is_partial_partition: true` 月份；partial 月必須補齊重跑，或在 decision record 中明示排除。 | `source_metadata.json`、`txn_l0_materialization_report.json` 之 `partition_coverage` 與 `partial_partition_reasons`。 |
+| **CDC correctness** | delete-aware dedup、delete marker 排除、observed-before-event correction 均已穩定；不得存在**未登錄** correction episode 或未解釋的 CDC 邏輯漂移。 | `txn_l0_preflight_report.json`、`txn_l0_materialization_report.json`、correction rule evidence。 |
+| **Time semantics / PIT safety** | `start_dtm` / `txn_available_ts` / `__etl_insert_Dtm` 的角色定義維持一致，且不得存在未受控的 observed-before-event 或 PIT leakage。 | preflight evidence、delay distribution、PIT 驗證結果與對應 rule id。 |
+| **Business semantics** | 擬用於 model 的 `type` / `status` / `sub_type` 規則已被明確定義並經 domain review；特別是 `BUYIN`、`CASHOUT`、`Prize Redemption` 等邊界案例需有明示納入/排除決策。 | 規則說明、DQ 切片、domain sign-off 或等價決策紀錄。 |
+| **Join / entity readiness** | 首個 model-eligible use case 的 join grain 與實體鍵已鎖定，且不得偷偷依賴已知高缺失鍵（如 `bet_id`、`session_id`）作核心連接。 | use-case 說明、coverage 摘要、key 選擇 rationale。 |
+| **Promotion evidence boundary** | quarantine 期間的 `txn_lite` / Gate 1 歷史結果最多只能作背景參考，**不能單獨**作為解除 quarantine 或 registry promote 依據。 | decision record 需明列採納與排除的證據來源。 |
+| **Governance release** | 解除 `not_model_eligible` 必須是**顯式、可追溯、可回退**的治理決策，至少要指明適用 snapshot / 月份範圍、允許用途、已知排除項、批准人與回退條件。 | explicit decision record。 |
+
+- **退出範圍預設為 snapshot-scoped**：除非 decision record 明確說明，解除 quarantine 應僅適用於經審核之特定 snapshot / 月份範圍，不應自動外推至未審核的新分區。
+
+**L0 契約產物（每輪 materialize 至少一份）**
+
+- Cleaned parquet（`cleaned__gmwds_t_casino_txn/`）。
+- `txn_l0_materialization_report.json`（row counts、dedup、null rate、type 分布、delay 分布、raw observed-before-event evidence、correction rule application、`partition_coverage`、schema/cleaning fingerprint）。
+- `txn_l0_preflight_report.json`（preflight evidence、`shard_count`）。
+- `source_metadata.json`（`cleaning_policy_id`、`source_contract_ref`、raw partition fingerprint、`is_partial_partition`、`partial_partition_reasons`）。
+
+**實作計畫**：`doc/implementation/active/t_casino_txn Source Integration - IMPLEMENTATION_PLAN.md`。
+
 ## 6) 架構真相（Architecture SSOT）
 
 - DuckDB：本地資料處理與查詢執行引擎（含 spill 與記憶體上限控制）。
@@ -105,11 +177,13 @@
 
 - 輸入（Inputs）
 - 分區 Parquet snapshot（`t_bet__part_YYYYMM.parquet`、`t_session__part_YYYYMM.parquet`）。
+- 外部事件來源分區 Parquet（`t_casino_txn` 固定為 `data/t_casino_txn/partition_YYYYMM/part_*.parquet`）；須可追溯至 `source_manifest_v2` 或等價 inventory（Phase D，見 txn Source Integration IP）。
 - 特徵與資料處理設定（YAML/Python 設定檔；不以環境變數作為主要控制面）。
 - 標籤與映射相關依賴（例如 canonical mapping、labels artifacts）。
 
 - 輸出（Outputs）
-- 清洗後分區資料（cleaned layer）。
+- 清洗後分區資料（cleaned layer）：`t_bet`、`t_session`、以及 **外部來源**（例如 `cleaned__gmwds_t_casino_txn/`）。
+- 外部來源 L0 sidecar：`txn_l0_materialization_report.json`、`txn_l0_preflight_report.json`、`source_metadata.json`（§5.2；含 `partition_coverage` / partial partition 訊號）。
 - 特徵分區資料（feature layer，例如 trial/slow）。
 - 訓練資料快照（training set parquet）。
 - 候選篩選報表（group-level uplift、去冗餘決策、淘汰理由）。
@@ -177,6 +251,8 @@
 - 候選篩選 Gate 0/1/2 採 **v0 數值門檻**（缺失率、常數率、非法值、PIT、ΔAP、ΔR@Pmin、相關係數群聚等）；細節以 `Feature experimentation - WORKING_PLAN.md` §1.4 為準；**Gate 0 之輸入特徵集合不得包含 FQG BLOCK 欄位**。
 - 候選群組升級之業務護欄：`ΔR@Pmin > 0`（嚴格上升）且 `val alerts/hour ≤ 120`，超限需觸發容量告警並於決策紀錄揭露。
 - 訓練視窗策略升級採 **v0 穩健性規則**：固定 val 內 **K 子區間**上之 **median 與 P25**（對 ΔAP、ΔR@Pmin）與絕對 **round runtime** 上限；細節同上。
+- **`t_casino_txn` L0 v1（2026-06）**：外部來源先接 **cleaned source layer only**；`txn_available_ts` 採 logical observed-at（txn residual P95 cap 128s + event-time floor）；L0 保留全 type；**source quarantine / not_model_eligible** 直至上游事故關閉；feature crafting 與 registry 另案（見 txn Source Integration IP）。
+- Feature experimentation 中 `txn_lite` / Gate 1 歷史結果 **不得**作為 quarantine 期間之 model 或 registry 決策依據。
 
 ## 12) 開放問題（Open Questions）
 
@@ -187,6 +263,8 @@
 - Step 4 的預設時間切分邊界（例如 70/15/15 或固定最近 N 天）與回退規則應如何標準化。
 - Gate v0／視窗穩健性 v0 之**審閱週期**與升級為 **v1** 之觸發條件（例如資料量級顯著改變、標籤定義變更）。
 - **FQG L2** 之時間穩定性與 MNAR heuristics 是否需要依資料域再校準（§1.5 標註之 first pass 後調整）。
+- `t_casino_txn`：`player_id` vs `canonical_id` 作為未來 L1 join grain 是否升級（L0 先保留 `player_id`）。
+- `t_casino_txn`：available time 是否在 v2 引入 type-specific complete 時間，或是否將 `TXN-CORRECTION-2025-10-16` 登錄為額外 correction episode（會使 residual cap 接近 122s）。
 
 ## 13) 與其他文件的邊界
 
@@ -194,3 +272,5 @@
 - `RUNBOOK.md`：定義「怎麼操作、怎麼除錯」。
 - `README.md`：定義「快速導覽與入口」。
 - 實作計畫與執行拆解文件（若需要）應獨立於本文件，且必須追溯本 SSOT。
+- **`t_casino_txn` source integration**：`t_casino_txn Source Integration - IMPLEMENTATION_PLAN.md`（L0 only）；**不得**與 `Feature experimentation - IMPLEMENTATION_PLAN.md` 之 feature crafting 混寫。
+- **Feature experimentation**：txn_lite 歷史實驗為背景參考；quarantine 期間不作 feature 決策依據。

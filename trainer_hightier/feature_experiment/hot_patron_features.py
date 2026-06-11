@@ -162,7 +162,7 @@ def _mad_series(s: pd.Series) -> float:
 
 
 def _peer_lookup_from_train_parquet(train_parquet: Path) -> pd.DataFrame:
-    """Build train-only peer stats via DuckDB (fast on large train split)."""
+    """Build train-only historical ADT-decile peer stats (PIT-safe for future val/test days)."""
 
     tp = str(Path(train_parquet).resolve()).replace("\\", "/")
     con = duckdb.connect(database=":memory:")
@@ -170,9 +170,9 @@ def _peer_lookup_from_train_parquet(train_parquet: Path) -> pd.DataFrame:
         sql = f"""
 WITH base AS (
   SELECT
-    gaming_day_event,
     player_id,
     game_id,
+    gaming_day_event,
     patron__adt__w180d_m1snap,
     TRY_CAST(fe__canonical__wager_sum__today AS DOUBLE) AS wager_today,
     TRY_CAST(fe__canonical__avg_wager__today AS DOUBLE) AS avg_wager_today,
@@ -188,7 +188,6 @@ enriched AS (
   FROM base
 )
 SELECT
-  gaming_day_event,
   _adt_decile,
   quantile_cont(wager_today, 0.95) AS _peer_p95__fe__canonical__wager_sum__today,
   median(wager_today) AS _peer_med__fe__canonical__wager_sum__today,
@@ -202,7 +201,7 @@ SELECT
   quantile_cont(wager_hr, 0.95) AS _peer_p95__wager_hr,
   quantile_cont(games_today, 0.95) AS _peer_p95__games_today
 FROM enriched
-GROUP BY gaming_day_event, _adt_decile
+GROUP BY _adt_decile
 """
         return con.execute(sql).fetchdf()
     finally:
@@ -210,7 +209,7 @@ GROUP BY gaming_day_event, _adt_decile
 
 
 def _peer_lookup_from_train(train_df: pd.DataFrame) -> pd.DataFrame:
-    """Build train-only peer p95 / median-MAD lookup keyed by gaming day + ADT decile."""
+    """Build train-only historical peer p95 / median-MAD lookup keyed by ADT decile."""
 
     need = (
         "gaming_day_event",
@@ -228,7 +227,7 @@ def _peer_lookup_from_train(train_df: pd.DataFrame) -> pd.DataFrame:
     hrs = pd.to_numeric(tr["fe__canonical__elapsed_sec_since_first_bet__today"], errors="coerce") / 3600.0
     tr["_wager_hr"] = pd.to_numeric(tr["fe__canonical__wager_sum__today"], errors="coerce") / hrs.clip(lower=0.1)
     tr["_games_today"] = tr.groupby(["player_id", "gaming_day_event"])["game_id"].transform("nunique")
-    peer_grp = ["gaming_day_event", "_adt_decile"]
+    peer_grp = ["_adt_decile"]
     agg_map: dict[str, tuple[str, object]] = {
         "_peer_p95__wager_hr": ("_wager_hr", lambda s: s.quantile(0.95)),
         "_peer_p95__games_today": ("_games_today", lambda s: s.quantile(0.95)),
@@ -268,10 +267,8 @@ def materialize_hot_patron_features(
     peer_grp = ["gaming_day_event", "_adt_decile"]
     if peer_lookup is not None and not peer_lookup.empty:
         lookup = peer_lookup.copy()
-        out["gaming_day_event"] = out["gaming_day_event"].astype(str)
-        lookup["gaming_day_event"] = lookup["gaming_day_event"].astype(str)
         lookup["_adt_decile"] = pd.to_numeric(lookup["_adt_decile"], errors="coerce")
-        out = out.merge(lookup, on=peer_grp, how="left")
+        out = out.merge(lookup, on=["_adt_decile"], how="left")
         for feat, base in _PEER_BASE_COLS.items():
             p95 = out[f"_peer_p95__{base}"]
             num = pd.to_numeric(out[base], errors="coerce")
@@ -396,8 +393,7 @@ COPY (
     FROM base
     LEFT JOIN games USING (player_id, _gd)
     LEFT JOIN read_parquet('{lp}') AS lk
-      ON base._gd = CAST(lk.gaming_day_event AS VARCHAR)
-     AND base._adt_decile = lk._adt_decile
+      ON base._adt_decile = lk._adt_decile
   )
   SELECT
     * EXCLUDE (

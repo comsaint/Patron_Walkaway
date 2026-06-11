@@ -38,7 +38,7 @@ def _materialize_hot_splits(
     splits_dir: Path,
     out_splits_dir: Path,
 ) -> dict[str, dict[str, float]]:
-    """Materialize hot features on each split using train-only peer lookup."""
+    """Materialize hot features on each split using train-only ADT-decile peer lookup."""
 
     from trainer_hightier.feature_experiment.hot_patron_features import (
         _peer_lookup_from_train_parquet,
@@ -66,6 +66,9 @@ def _materialize_hot_splits(
     for split in ("train", "val", "test"):
         src = Path(splits_dir) / f"{split}.parquet"
         df = pd.read_parquet(src)
+        drop_hot = [c for c in HOT_PATRON_FEATURE_COLUMNS if c in df.columns]
+        if drop_hot:
+            df = df.drop(columns=drop_hot)
         hot_cols_df = materialize_hot_patron_features(df, peer_lookup=peer_lookup)
         hot_only = hot_cols_df[list(HOT_PATRON_FEATURE_COLUMNS)]
         merged = pd.concat([df.reset_index(drop=True), hot_only.reset_index(drop=True)], axis=1)
@@ -74,6 +77,9 @@ def _materialize_hot_splits(
     sampled_src = Path(splits_dir) / "train_sampled.parquet"
     if sampled_src.is_file():
         df_s = pd.read_parquet(sampled_src)
+        drop_hot_s = [c for c in HOT_PATRON_FEATURE_COLUMNS if c in df_s.columns]
+        if drop_hot_s:
+            df_s = df_s.drop(columns=drop_hot_s)
         hot_s = materialize_hot_patron_features(df_s, peer_lookup=peer_lookup)
         merged_s = pd.concat(
             [df_s.reset_index(drop=True), hot_s[list(HOT_PATRON_FEATURE_COLUMNS)].reset_index(drop=True)],

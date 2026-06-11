@@ -2,7 +2,7 @@
 
 本目錄為 `trainer_hightier` 規劃與營運文件的唯一入口。文件依 **SSOT → Implementation Plan → Working Plan** 三層組織；事故、決策紀錄、Runbook 另列。
 
-**最後整理：** 2026-06-08
+**最後整理：** 2026-06-10
 
 ---
 
@@ -63,6 +63,7 @@ doc/
 | Feature experimentation | IP + WP | **active** | [working/active/Feature experimentation…](working/active/Feature%20experimentation%20-%20WORKING_PLAN.md) |
 | Training acceleration & scope | SSOT + IP + WP | **active** | [ssot/Training Acceleration…](ssot/Training%20Acceleration%20and%20Scope%20-%20SSOT.md) · [implementation/active/Training Acceleration…](implementation/active/Training%20Acceleration%20and%20Scope%20-%20IMPLEMENTATION_PLAN.md) · [working/active/Training Acceleration…](working/active/Training%20Acceleration%20and%20Scope%20-%20WORKING_PLAN.md) · [Step 3 month prune patch](working/active/Step%203%20Month%20Prune%20Patch%20-%20PATCH_PLAN.md) |
 | Data pipeline | IP | **active** | [implementation/active/Data pipeline…](implementation/active/Data%20pipeline%20-%20IMPLEMENTATION_PLAN.md) |
+| `t_casino_txn` source integration（L0 only） | SSOT §5.2 + IP + WP | **active**（**quarantine / not_model_eligible**） | [ssot/Data pipeline - SSOT.md §5.2](ssot/Data%20pipeline%20-%20SSOT.md) · [implementation/active/t_casino_txn Source Integration…](implementation/active/t_casino_txn%20Source%20Integration%20-%20IMPLEMENTATION_PLAN.md) · [working/active/t_casino_txn Source Integration…](working/active/t_casino_txn%20Source%20Integration%20-%20WORKING_PLAN.md) |
 | Production Flight Recorder | IP + WP + Runbook | **active** | [runbooks/active/Production Flight Recorder…](runbooks/active/Production%20Flight%20Recorder%20-%20RUNBOOK.md) |
 | Player cooldown / suppression | IP | **active** | [implementation/active/Player Alert Suppression…](implementation/active/Player%20Alert%20Suppression%20Switch%20-%20IMPLEMENTATION_PLAN.md) |
 | Deploy Windows logging | IP | **active** | [implementation/active/Deploy Main Windows…](implementation/active/Deploy%20Main%20Windows%20Console%20+%20File%20Logging%20-%20IMPLEMENTATION_PLAN.md) |

@@ -609,3 +609,159 @@ ORDER BY (shoe_id,
  shoe_start_dtm)
 SETTINGS index_granularity = 8192;
 
+-- GDP_GMWDS_Raw.t_casino_txn definition
+
+CREATE TABLE GDP_GMWDS_Raw.t_casino_txn
+(
+
+    `casino_txn_id` Int64,
+
+    `uuid` String,
+
+    `topology_id` Int32,
+
+    `gaming_day` Date32,
+
+    `type` String,
+
+    `action` Nullable(String),
+
+    `start_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `end_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `receive_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `complete_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `status` Nullable(String),
+
+    `user_id` Nullable(Int32),
+
+    `auth_token` Nullable(String),
+
+    `player_id` Nullable(Int64),
+
+    `chip_ids_in` Nullable(String),
+
+    `chip_ids_out` Nullable(String),
+
+    `updated_dtm` Nullable(DateTime64(3,
+ 'Asia/Shanghai')),
+
+    `txn_value` Nullable(Decimal(19,
+ 4)),
+
+    `dealer_id` Nullable(Int32),
+
+    `supervisor_id` Nullable(Int32),
+
+    `dealer_name` Nullable(String),
+
+    `supervisor_name` Nullable(String),
+
+    `player_type` Nullable(String),
+
+    `location` Nullable(String),
+
+    `user_name` Nullable(String),
+
+    `player_name` Nullable(String),
+
+    `casino_player_id` Nullable(String),
+
+    `sub_type` Nullable(String),
+
+    `agent_name` Nullable(String),
+
+    `agent_id` Nullable(String),
+
+    `buyin_status` Nullable(String),
+
+    `document_id` Nullable(String),
+
+    `chipset_label_in` Nullable(String),
+
+    `chipset_label_out` Nullable(String),
+
+    `pit_name` Nullable(String),
+
+    `gaming_area` Nullable(String),
+
+    `associated_with_session` Nullable(Int32),
+
+    `sent_to_cms` Nullable(Int32),
+
+    `session_id` Nullable(Int64),
+
+    `device_type` Nullable(String),
+
+    `approver_name` Nullable(String),
+
+    `bet_id` Nullable(Int64),
+
+    `marker_balance` Nullable(Decimal(19,
+ 4)),
+
+    `rim_balance` Nullable(Decimal(19,
+ 4)),
+
+    `cashier_id` Nullable(Int64),
+
+    `cashier_name` Nullable(String),
+
+    `user_employee_number` Nullable(String),
+
+    `dealer_employee_number` Nullable(String),
+
+    `supervisor_employee_number` Nullable(String),
+
+    `cashier_employee_number` Nullable(String),
+
+    `approver_employee_number` Nullable(String),
+
+    `all_valid_chipsets` Nullable(UInt8),
+
+    `above_threshold` Nullable(UInt8),
+
+    `group_code` Nullable(String),
+
+    `rep_code` Nullable(String),
+
+    `program_id` Nullable(Int32),
+
+    `mixed_stack` Nullable(UInt8),
+
+    `currency_label` Nullable(String),
+
+    `cv_face_rec_id` Nullable(Int64),
+
+    `cv_id` Nullable(String),
+
+    `manual` Nullable(String),
+
+    `__ts_ms` Nullable(Int64) DEFAULT now(),
+
+    `__op` Nullable(String),
+
+    `__deleted` Nullable(String),
+
+    `__etl_insert_Dtm` DateTime DEFAULT now()
+)
+ENGINE = ReplicatedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}',
+ '{replica}')
+PARTITION BY toYYYYMM(gaming_day)
+PRIMARY KEY (casino_txn_id,
+ topology_id,
+ gaming_day)
+ORDER BY (casino_txn_id,
+ topology_id,
+ gaming_day)
+SETTINGS index_granularity = 8192;
+
+
+

@@ -1,7 +1,9 @@
-"""Materialize ``txn__*`` player cashflow features from ``t_casino_txn`` (experiment-only).
+"""Materialize ``txn__*`` player cashflow features from L0 cleaned ``t_casino_txn``.
 
-Scope v0: BUYIN + CASHOUT only (no CHANGE). Cleaning follows ``doc/FINDINGS.md`` FND-19.
-PIT: txn ``start_dtm`` must be strictly before training ``payout_complete_dtm``.
+Scope v0: BUYIN + CASHOUT only (no CHANGE). L1 filters follow ``doc/FINDINGS.md`` FND-19.
+Input: ``cleaned__gmwds_t_casino_txn/`` (not raw). Partial partitions are skipped via sidecar.
+PIT: both ``txn_event_ts`` and ``txn_available_ts`` must be before training
+``payout_complete_dtm``.
 """
 
 from __future__ import annotations
@@ -9,15 +11,16 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import shutil
 from pathlib import Path
 from typing import Any, Final
 
 import duckdb
 
 from trainer_hightier.config import (
-    DEFAULT_T_CASINO_TXN_RAW_PARQUET,
+    DEFAULT_T_CASINO_TXN_CLEANED_ROOT,
+    TXN_L0_CLEANING_POLICY_ID,
     TXN_LITE_CLEANING_POLICY_ID,
-    TXN_LITE_FEATURE_COLUMNS,
     TXN_LITE_INCLUDED_TYPES,
     TXN_LITE_MATERIALIZER_VERSION,
     TXN_LITE_SOURCE_CONTRACT_REF,
@@ -28,33 +31,17 @@ from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
 
 logger = logging.getLogger(__name__)
 
-_CLEAN_BASE_CTE: Final[str] = """
-ranked AS (
-  SELECT
-    t.*,
-    MAX(CASE WHEN t.__op = 'd' OR t.__deleted = 'True' THEN 1 ELSE 0 END)
-      OVER (PARTITION BY t.casino_txn_id) AS has_delete,
-    ROW_NUMBER() OVER (
-      PARTITION BY t.casino_txn_id
-      ORDER BY t.__etl_insert_Dtm DESC NULLS LAST,
-               t.updated_dtm DESC NULLS LAST
-    ) AS rn
-  FROM {raw} AS t
-),
-clean_base AS (
-  SELECT *
-  FROM ranked
-  WHERE rn = 1 AND has_delete = 0
-),
-txn_valid AS (
+_TXN_VALID_BODY: Final[str] = """
   SELECT
     TRY_CAST(player_id AS BIGINT) AS player_id,
-    CAST(start_dtm AS TIMESTAMPTZ) AS start_dtm,
+    CAST(txn_event_ts AS TIMESTAMPTZ) AS event_ts,
+    CAST(txn_available_ts AS TIMESTAMPTZ) AS available_ts,
     UPPER(TRIM(CAST(type AS VARCHAR))) AS type,
     UPPER(TRIM(CAST(sub_type AS VARCHAR))) AS sub_type,
     CAST(txn_value AS DOUBLE) AS txn_value
-  FROM clean_base
-  WHERE start_dtm IS NOT NULL
+  FROM {cleaned} AS t
+  WHERE txn_event_ts IS NOT NULL
+    AND txn_available_ts IS NOT NULL
     AND txn_value IS NOT NULL
     AND CAST(txn_value AS DOUBLE) > 0
     AND action = 'SUBMIT'
@@ -74,27 +61,71 @@ txn_valid AS (
         )
       )
     )
-)
-""".strip()
+"""
 
 
 def _path_esc(path: Path) -> str:
     return str(Path(path).resolve()).replace("\\", "/").replace("'", "''")
 
 
-def resolve_raw_casino_txn_read_sql(path: Path) -> str:
-    """Return a DuckDB ``read_parquet`` source for a file or hive-style part directory."""
+def discover_cleaned_txn_partitions(
+    cleaned_root: Path,
+    *,
+    exclude_partial: bool = True,
+) -> tuple[list[Path], list[str], list[str]]:
+    """Return eligible ``cleaned.parquet`` paths and included/excluded partition names."""
 
-    p = Path(path).resolve()
-    if p.is_file():
-        return f"read_parquet('{_path_esc(p)}')"
-    if p.is_dir():
-        parts = sorted(p.glob("*.parquet"))
-        if not parts:
-            raise FileNotFoundError(f"No parquet parts under raw_casino_txn directory: {p}")
-        glob_path = _path_esc(p / "*.parquet")
-        return f"read_parquet('{glob_path}')"
-    raise FileNotFoundError(f"raw_casino_txn path not found: {p}")
+    root = Path(cleaned_root).resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"cleaned casino_txn root not found: {root}")
+    included_paths: list[Path] = []
+    included_names: list[str] = []
+    excluded_names: list[str] = []
+    for part_dir in sorted(root.glob("partition_*")):
+        if not part_dir.is_dir():
+            continue
+        cleaned_path = part_dir / "cleaned.parquet"
+        if not cleaned_path.is_file():
+            continue
+        if exclude_partial:
+            meta_path = part_dir / "source_metadata.json"
+            if meta_path.is_file():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    meta = {}
+                if bool(meta.get("is_partial_partition")):
+                    excluded_names.append(part_dir.name)
+                    continue
+        included_paths.append(cleaned_path)
+        included_names.append(part_dir.name)
+    return included_paths, included_names, excluded_names
+
+
+def resolve_cleaned_casino_txn_read_sql(
+    cleaned_root: Path,
+    *,
+    exclude_partial: bool = True,
+) -> tuple[str, list[str], list[str]]:
+    """Build DuckDB ``read_parquet`` source over non-partial L0 cleaned partitions."""
+
+    paths, included_names, excluded_names = discover_cleaned_txn_partitions(
+        cleaned_root,
+        exclude_partial=exclude_partial,
+    )
+    if not paths:
+        raise FileNotFoundError(
+            f"No eligible cleaned partitions under {cleaned_root} "
+            f"(excluded_partial={excluded_names})",
+        )
+    if len(paths) == 1:
+        return f"read_parquet('{_path_esc(paths[0])}')", included_names, excluded_names
+    entries = ", ".join(f"'{_path_esc(p)}'" for p in paths)
+    return f"read_parquet([{entries}], union_by_name=true)", included_names, excluded_names
+
+
+def _txn_valid_cte(cleaned_read: str) -> str:
+    return f"txn_valid AS ({_TXN_VALID_BODY.format(cleaned=cleaned_read)})"
 
 
 def _join_lookback_hours(extra_window_hours: tuple[int, ...]) -> int:
@@ -111,7 +142,7 @@ def _cash_out_sum_sql(hours: int) -> str:
     suffix = f"w{hours}h"
     return (
         f"CAST(SUM(CASE WHEN type = 'CASHOUT'"
-        f" AND start_dtm >= pcd - INTERVAL {hours} HOUR AND start_dtm < pcd"
+        f" AND event_ts >= pcd - INTERVAL {hours} HOUR AND event_ts < pcd"
         f" THEN txn_value ELSE 0 END) AS DOUBLE) AS txn__cash_out_sum__{suffix}"
     )
 
@@ -122,7 +153,7 @@ def _buyin_cash_sum_sql(hours: int) -> str:
     suffix = f"w{hours}h"
     return (
         f"CAST(SUM(CASE WHEN type = 'BUYIN' AND sub_type = 'CASH'"
-        f" AND start_dtm >= pcd - INTERVAL {hours} HOUR AND start_dtm < pcd"
+        f" AND event_ts >= pcd - INTERVAL {hours} HOUR AND event_ts < pcd"
         f" THEN txn_value ELSE 0 END) AS DOUBLE) AS txn__buyin_cash_sum__{suffix}"
     )
 
@@ -130,7 +161,7 @@ def _buyin_cash_sum_sql(hours: int) -> str:
 def _build_materialize_copy_sql(
     *,
     train_esc: str,
-    raw_read: str,
+    cleaned_read: str,
     extra_window_hours: tuple[int, ...],
 ) -> str:
     """Build DuckDB COPY SQL for bet-grain txn_lite features."""
@@ -146,7 +177,7 @@ def _build_materialize_copy_sql(
         extra_agg_sql = ",\n  " + ",\n  ".join(extra_agg)
 
     inner = f"""
-WITH {_CLEAN_BASE_CTE.format(raw=raw_read)},
+WITH {_txn_valid_cte(cleaned_read)},
 train_rows AS (
   SELECT
     TRY_CAST(bet_id AS DOUBLE) AS bet_id,
@@ -164,35 +195,36 @@ joined AS (
     txn.type,
     txn.sub_type,
     txn.txn_value,
-    txn.start_dtm
+    txn.event_ts
   FROM train_rows AS tr
   LEFT JOIN txn_valid AS txn
     ON tr.player_id = txn.player_id
-   AND txn.start_dtm < tr.pcd
-   AND txn.start_dtm >= tr.pcd - INTERVAL {lookback_h} HOUR
+   AND txn.event_ts < tr.pcd
+   AND txn.available_ts <= tr.pcd
+   AND txn.event_ts >= tr.pcd - INTERVAL {lookback_h} HOUR
 )
 SELECT
   bet_id,
   MAX(CASE
     WHEN type = 'CASHOUT'
-     AND start_dtm >= pcd - INTERVAL 15 MINUTE
-     AND start_dtm < pcd
+     AND event_ts >= pcd - INTERVAL 15 MINUTE
+     AND event_ts < pcd
     THEN 1 ELSE 0 END) AS txn__has_cash_out__w15m,
   CAST(SUM(CASE
     WHEN type = 'CASHOUT'
-     AND start_dtm >= pcd - INTERVAL 1 HOUR AND start_dtm < pcd
+     AND event_ts >= pcd - INTERVAL 1 HOUR AND event_ts < pcd
     THEN 1 ELSE 0 END) AS DOUBLE) AS txn__cash_out_cnt__w1h,
   CAST(SUM(CASE
     WHEN type = 'CASHOUT'
-     AND start_dtm >= pcd - INTERVAL 1 HOUR AND start_dtm < pcd
+     AND event_ts >= pcd - INTERVAL 1 HOUR AND event_ts < pcd
     THEN txn_value ELSE 0 END) AS DOUBLE) AS txn__cash_out_sum__w1h,
   CAST(SUM(CASE
     WHEN type = 'BUYIN' AND sub_type = 'CASH'
-     AND start_dtm >= pcd - INTERVAL 1 HOUR AND start_dtm < pcd
+     AND event_ts >= pcd - INTERVAL 1 HOUR AND event_ts < pcd
     THEN txn_value ELSE 0 END) AS DOUBLE) AS txn__buyin_cash_sum__w1h,
   MAX(CASE
     WHEN type = 'BUYIN' AND sub_type = 'PRIZE REDEMPTION'
-     AND start_dtm >= pcd - INTERVAL 1 HOUR AND start_dtm < pcd
+     AND event_ts >= pcd - INTERVAL 1 HOUR AND event_ts < pcd
     THEN 1 ELSE 0 END) AS txn__buyin_prize_redemption_flag__w1h{extra_agg_sql}
 FROM joined
 GROUP BY bet_id, pcd
@@ -227,53 +259,65 @@ FROM ({inner}) AS agg
 
 
 def parquet_fingerprint(path: Path) -> str:
-    """Return a short SHA-256 hex digest of raw input bytes (file or part directory)."""
+    """Return a short SHA-256 hex digest of one parquet file."""
 
     p = Path(path).resolve()
-    digest = hashlib.sha256()
-    if p.is_file():
-        files = [p]
-    elif p.is_dir():
-        files = sorted(p.glob("*.parquet"))
-        if not files:
-            raise FileNotFoundError(f"No parquet parts under: {p}")
-    else:
+    if not p.is_file():
         raise FileNotFoundError(f"Parquet source not found for fingerprint: {p}")
-    for fp in files:
-        digest.update(fp.name.encode("utf-8"))
-        with fp.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1 << 20), b""):
-                digest.update(chunk)
+    digest = hashlib.sha256()
+    digest.update(p.name.encode("utf-8"))
+    with p.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()[:16]
+
+
+def cleaned_partitions_fingerprint(paths: list[Path]) -> str:
+    """Return a short digest over eligible cleaned partition parquet paths."""
+
+    digest = hashlib.sha256()
+    for fp in sorted(Path(p).resolve() for p in paths):
+        digest.update(str(fp).encode("utf-8"))
+        digest.update(parquet_fingerprint(fp).encode("utf-8"))
     return digest.hexdigest()[:16]
 
 
 def materialize_txn_lite_parquet(
     *,
-    raw_casino_txn_parquet: Path,
+    cleaned_casino_txn_root: Path,
     training_parquet_for_bet_ids: Path,
     out_parquet: Path,
     duckdb_runtime: DuckDbRuntimeConfig,
     extra_window_hours: tuple[int, ...] = (),
+    exclude_partial_partitions: bool = True,
 ) -> dict[str, Any]:
     """Build bet-grain ``txn__*`` columns for training rows (player_id × PIT).
 
     Args:
-        raw_casino_txn_parquet: Raw ``t_casino_txn`` partition Parquet.
+        cleaned_casino_txn_root: L0 ``cleaned__gmwds_t_casino_txn/`` root directory.
         training_parquet_for_bet_ids: Step-3 training parquet (needs ``bet_id``,
             ``player_id``, ``payout_complete_dtm``).
         out_parquet: Output Parquet path (``bet_id`` + ``txn__*`` columns).
         duckdb_runtime: DuckDB PRAGMA settings.
         extra_window_hours: Optional longer lookbacks (e.g. ``(4, 24)``) for window
             ablation; adds sum/net columns only (not in registry until promoted).
+        exclude_partial_partitions: Skip partitions with ``is_partial_partition`` sidecar.
 
     Returns:
         Materialization audit dict (row counts, fingerprints, policy id).
     """
 
-    raw = Path(raw_casino_txn_parquet).resolve()
+    cleaned_root = Path(cleaned_casino_txn_root).resolve()
     train = Path(training_parquet_for_bet_ids).resolve()
     out = Path(out_parquet).resolve()
-    raw_read = resolve_raw_casino_txn_read_sql(raw)
+    cleaned_read, included_partitions, excluded_partitions = resolve_cleaned_casino_txn_read_sql(
+        cleaned_root,
+        exclude_partial=exclude_partial_partitions,
+    )
+    included_paths, _, _ = discover_cleaned_txn_partitions(
+        cleaned_root,
+        exclude_partial=exclude_partial_partitions,
+    )
     if not train.is_file():
         raise FileNotFoundError(f"training_parquet_for_bet_ids missing: {train}")
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -281,20 +325,19 @@ def materialize_txn_lite_parquet(
     tq, oq = _path_esc(train), _path_esc(out)
     copy_sql = _build_materialize_copy_sql(
         train_esc=tq,
-        raw_read=raw_read,
+        cleaned_read=cleaned_read,
         extra_window_hours=extra_window_hours,
     )
     out_feature_cols = txn_lite_feature_columns(extra_window_hours=extra_window_hours)
+    valid_cte = _txn_valid_cte(cleaned_read)
 
     con = duckdb.connect(database=":memory:")
     try:
         apply_duckdb_runtime_pragmas(con, duckdb_runtime)
         con.execute(f"COPY ({copy_sql}) TO '{oq}' (FORMAT PARQUET, COMPRESSION SNAPPY)")
-        raw_n = int(con.execute(
-            f"SELECT COUNT(*) FROM {raw_read}",
-        ).fetchone()[0])
+        cleaned_n = int(con.execute(f"SELECT COUNT(*) FROM {cleaned_read}").fetchone()[0])
         valid_n = int(con.execute(
-            f"WITH {_CLEAN_BASE_CTE.format(raw=raw_read)} SELECT COUNT(*) FROM txn_valid",
+            f"WITH {valid_cte} SELECT COUNT(*) FROM txn_valid",
         ).fetchone()[0])
         train_n = int(con.execute(
             f"SELECT COUNT(*) FROM read_parquet('{tq}')",
@@ -309,16 +352,22 @@ def materialize_txn_lite_parquet(
         "source_name": "t_casino_txn",
         "source_contract_ref": TXN_LITE_SOURCE_CONTRACT_REF,
         "cleaning_policy_id": TXN_LITE_CLEANING_POLICY_ID,
+        "l0_cleaning_policy_id": TXN_L0_CLEANING_POLICY_ID,
         "materializer_code_version": TXN_LITE_MATERIALIZER_VERSION,
+        "input_layer": "l0_cleaned",
+        "not_model_eligible": True,
         "types_included": list(TXN_LITE_INCLUDED_TYPES),
         "types_excluded_note": "CHANGE, TD_FILL, TD_CREDIT, TRANSFER, UPDATE_OWNER excluded v0",
-        "pit_event_time": "start_dtm",
-        "join_grain": "player_id x payout_complete_dtm (strictly before)",
-        "raw_input_path": str(raw),
-        "raw_read_sql": raw_read,
-        "raw_input_fingerprint": parquet_fingerprint(raw),
+        "pit_event_time": "txn_event_ts",
+        "pit_available_time": "txn_available_ts",
+        "join_grain": "player_id x payout_complete_dtm (event before, available by cutoff)",
+        "cleaned_input_root": str(cleaned_root),
+        "cleaned_read_sql": cleaned_read,
+        "included_partitions": included_partitions,
+        "excluded_partial_partitions": excluded_partitions,
+        "cleaned_input_fingerprint": cleaned_partitions_fingerprint(included_paths),
         "materialized_artifact_fingerprint": parquet_fingerprint(out),
-        "raw_row_count": raw_n,
+        "cleaned_row_count": cleaned_n,
         "valid_txn_row_count": valid_n,
         "training_row_count": train_n,
         "materialized_bet_row_count": out_n,
@@ -326,19 +375,20 @@ def materialize_txn_lite_parquet(
         "feature_columns": list(out_feature_cols),
     }
     logger.info(
-        "[txn_lite] materialized %d bet rows (valid_txn=%d raw=%d) → %s",
+        "[txn_lite] materialized %d bet rows (valid_txn=%d cleaned=%d partitions=%d) → %s",
         out_n,
         valid_n,
-        raw_n,
+        cleaned_n,
+        len(included_partitions),
         out,
     )
     return meta
 
 
-def default_raw_casino_txn_parquet() -> Path:
-    """Default raw partition path for txn_lite v0."""
+def default_cleaned_casino_txn_root() -> Path:
+    """Default L0 cleaned root for txn_lite v1."""
 
-    return DEFAULT_T_CASINO_TXN_RAW_PARQUET.resolve()
+    return DEFAULT_T_CASINO_TXN_CLEANED_ROOT.resolve()
 
 
 def write_txn_lite_sidecars(
@@ -362,7 +412,15 @@ def write_txn_lite_sidecars(
                 "source_name": "t_casino_txn",
                 "source_contract_ref": TXN_LITE_SOURCE_CONTRACT_REF,
                 "cleaning_policy_id": TXN_LITE_CLEANING_POLICY_ID,
+                "l0_cleaning_policy_id": TXN_L0_CLEANING_POLICY_ID,
                 "materializer": "trainer_hightier/feature_experiment/materialize_txn_lite.py",
+                "input_layer": "l0_cleaned",
+                "not_model_eligible": True,
+                "included_partitions": materialization_meta.get("included_partitions", []),
+                "excluded_partial_partitions": materialization_meta.get(
+                    "excluded_partial_partitions",
+                    [],
+                ),
             },
             indent=2,
         ),
@@ -370,7 +428,5 @@ def write_txn_lite_sidecars(
     )
     dest = root / "materialized_features.parquet"
     if artifact_path != dest.resolve():
-        import shutil
-
         shutil.copy2(artifact_path, dest)
     return mat_path, src_path

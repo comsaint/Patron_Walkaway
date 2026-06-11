@@ -2,8 +2,8 @@
 
 No standalone CLI — invoked from :mod:`trainer_hightier.trainer`. Reads
 ``train.parquet`` / ``val.parquet`` / ``test.parquet`` under the Step 4 splits
-directory; picks a validation threshold under ``HighTierObjectiveConfig.min_precision``;
-writes ``model.pkl`` under the given ``output_dir`` (bundle dir when called from ``run_training``).
+directory; picks a validation threshold under ``HighTierObjectiveConfig`` (default:
+alert-band precision at 1–2 alerts/hour); writes ``model.pkl`` under the given ``output_dir`` (bundle dir when called from ``run_training``).
 ``training_metrics.json`` is written when ``persist_training_metrics=True`` (feature experiments);
 main trainer passes ``False`` and uses :class:`~trainer_hightier.reporting.writer.BundleReportWriter`.
 
@@ -29,6 +29,10 @@ import optuna
 from optuna.trial import TrialState
 import pandas as pd
 import pyarrow.parquet as pq
+from trainer_hightier.evaluation.alert_band_objective import (
+    alert_band_metrics_block,
+    evaluate_alert_band_on_candidates,
+)
 from trainer_hightier.evaluation.metrics_blocks import (
     metrics_at_threshold,
     split_metrics_block,
@@ -41,6 +45,7 @@ from trainer_hightier.evaluation.player_alert_policy import (
 from trainer_hightier.config import (
     ALERT_HORIZON_MIN,
     DuckDbRuntimeConfig,
+    HighTierObjectiveConfig,
     OptunaFloatParamRange,
     OptunaIntParamRange,
     Step5OptunaSearchConfig,
@@ -61,6 +66,7 @@ ALERT_TS_COLUMN: Final[str] = "alert_ts"
 CAT_COLUMNS: Final[frozenset[str]] = frozenset({"bet_type", "type_of_bet"})
 STEP5_GROUP_COLUMNS: Final[frozenset[str]] = frozenset({PLAYER_ID_COLUMN, GAME_ID_COLUMN})
 EVALUATION_GRAIN_PLAYER_GAME: Final[str] = "player_game"
+PLAYER_GAME_SCORE_AGGREGATION: Final[str] = "top3_mean"
 
 DEFAULT_MODEL_FILENAME: Final[str] = "model.pkl"
 _VAL_ALERTS_PER_HR_SOFT_CAP: Final[float] = 3.0
@@ -192,6 +198,17 @@ def _coerce_group_id_series(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce").astype("Int64")
 
 
+def top3_mean_bet_scores(values: np.ndarray) -> float:
+    """Return mean of the highest up-to-3 bet scores in one player-game group."""
+
+    vals = np.asarray(values, dtype=np.float64).reshape(-1)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return float("nan")
+    top = np.sort(vals)[-min(3, int(vals.size)) :]
+    return float(np.mean(top))
+
+
 def aggregate_bets_to_player_game(
     df: pd.DataFrame,
     scores: np.ndarray,
@@ -200,8 +217,10 @@ def aggregate_bets_to_player_game(
 ) -> PlayerGameAggregationResult:
     """Aggregate bet-level scores/labels to one row per ``player_id + game_id``.
 
-    Score uses ``max``; label uses ``max`` (any positive within the game).
-    Rows with null keys or non-finite scores are excluded with a warning.
+    Score uses ``top3_mean`` (mean of highest up-to-3 bet scores); label uses
+    ``max`` (any positive within the game). Representative ``alert_ts`` / ``bet_id``
+    come from the chronologically last bet in the group. Rows with null keys or
+    non-finite scores are excluded with a warning.
     """
 
     if len(df) != int(len(scores)):
@@ -255,19 +274,23 @@ def aggregate_bets_to_player_game(
         )
     work["_bet_id_sort"] = pd.to_numeric(work[BET_ID_COLUMN], errors="coerce").fillna(-1)
     work = work.sort_values(
-        by=["_score", PAYOUT_TS_COLUMN, "_bet_id_sort"],
-        ascending=[False, True, True],
+        by=[PLAYER_ID_COLUMN, GAME_ID_COLUMN, PAYOUT_TS_COLUMN, "_bet_id_sort"],
+        ascending=[True, True, True, True],
         kind="mergesort",
     )
+
+    def _agg_top3_mean(series: pd.Series) -> float:
+        return top3_mean_bet_scores(series.to_numpy())
+
     grouped = (
         work.groupby([PLAYER_ID_COLUMN, GAME_ID_COLUMN], as_index=False, dropna=True)
         .agg(
-            player_game_score=("_score", "max"),
+            player_game_score=("_score", _agg_top3_mean),
             player_game_label=(LABEL_COLUMN, "max"),
             bet_count=(LABEL_COLUMN, "count"),
         )
     )
-    rep = work.groupby([PLAYER_ID_COLUMN, GAME_ID_COLUMN], as_index=False, dropna=True).first()
+    rep = work.groupby([PLAYER_ID_COLUMN, GAME_ID_COLUMN], as_index=False, dropna=True).last()
     candidates = grouped.merge(
         rep[[PLAYER_ID_COLUMN, GAME_ID_COLUMN, PAYOUT_TS_COLUMN, BET_ID_COLUMN]],
         on=[PLAYER_ID_COLUMN, GAME_ID_COLUMN],
@@ -305,6 +328,85 @@ def _prepare_xy(df: pd.DataFrame, *, feature_columns: tuple[str, ...]) -> tuple[
         categorical_columns=CAT_COLUMNS,
     )
     return X, y
+
+
+def _resolve_objective_config(
+    objective: HighTierObjectiveConfig | None,
+    objective_min_precision: float,
+) -> HighTierObjectiveConfig:
+    """Merge explicit objective config with legacy ``objective_min_precision`` override."""
+
+    if objective is not None:
+        return objective
+    return HighTierObjectiveConfig(min_precision=float(objective_min_precision))
+
+
+def _pick_validation_threshold(
+    val_pg: PlayerGameAggregationResult,
+    *,
+    objective_cfg: HighTierObjectiveConfig,
+    val_window_hours: float | None,
+) -> tuple[ThresholdPickResult, float, dict[str, Any] | None]:
+    """Return threshold pick, Optuna scalar score, and optional band metadata."""
+
+    if objective_cfg.selection_policy == "min_precision":
+        pick = pick_threshold_precision_floor(
+            val_pg.y_true,
+            val_pg.scores,
+            min_precision=float(objective_cfg.min_precision),
+        )
+        objective_val = _val_optuna_objective_score(
+            pick,
+            val_window_hours=val_window_hours,
+            alert_count_at_pick=int(pick.alert_count),
+            objective_min_precision=float(objective_cfg.min_precision),
+        )
+        return pick, objective_val, None
+
+    band = evaluate_alert_band_on_candidates(
+        val_pg.candidates,
+        window_hours=val_window_hours,
+        target_alerts_per_hour=tuple(objective_cfg.target_alerts_per_hour),
+        deployment_target_alerts_per_hour=float(objective_cfg.deployment_target_alerts_per_hour),
+        split_prefix="val",
+    )
+    deploy = next(
+        (
+            p
+            for p in band.points
+            if math.isclose(p.target_alerts_per_hour, float(objective_cfg.deployment_target_alerts_per_hour))
+        ),
+        band.points[0],
+    )
+    pick = ThresholdPickResult(
+        threshold=float(band.deployment_threshold),
+        feasible=True,
+        precision=float(deploy.precision),
+        recall=float(deploy.recall),
+        alert_count=int(deploy.alerts),
+        n_samples=int(len(val_pg.y_true)),
+    )
+    band_meta = {
+        "scalar_score": float(band.scalar_score),
+        "min_precision": float(band.min_precision),
+        "mean_precision": float(band.mean_precision),
+        "deployment_target_alerts_per_hour": float(objective_cfg.deployment_target_alerts_per_hour),
+        "target_alerts_per_hour": list(objective_cfg.target_alerts_per_hour),
+        "points": [
+            {
+                "target_alerts_per_hour": float(p.target_alerts_per_hour),
+                "target_alert_count": int(p.target_alert_count),
+                "threshold": float(p.threshold),
+                "precision": float(p.precision),
+                "recall": float(p.recall),
+                "alerts": int(p.alerts),
+                "alerts_per_hour": p.alerts_per_hour,
+                "true_positives": int(p.true_positives),
+            }
+            for p in band.points
+        ],
+    }
+    return pick, float(band.scalar_score), band_meta
 
 
 def _val_optuna_objective_score(
@@ -586,6 +688,7 @@ def train_lgbm_from_splits(
     train_parquet: Path | None = None,
     sample_policy_meta: dict[str, Any] | None = None,
     feature_screening_meta: dict[str, Any] | None = None,
+    objective: HighTierObjectiveConfig | None = None,
 ) -> Step5Result:
     """Train LightGBM on Step 4 splits; optional Optuna; pick threshold on val; write artifacts.
 
@@ -607,6 +710,7 @@ def train_lgbm_from_splits(
         )
     feat_cols = tuple(feature_columns)
     cfg = step5 or Step5TrainConfig()
+    objective_cfg = _resolve_objective_config(objective, float(objective_min_precision))
     sd = Path(splits_dir).resolve()
     train_p = Path(train_parquet).resolve() if train_parquet is not None else sd / "train.parquet"
     val_p = sd / "val.parquet"
@@ -662,7 +766,7 @@ def train_lgbm_from_splits(
             f"got positives={val_pos}, n={len(y_va)}.",
         )
 
-    def _evaluate_hp(hp: dict[str, Any]) -> tuple[lgb.LGBMClassifier, ThresholdPickResult, float]:
+    def _evaluate_hp(hp: dict[str, Any]) -> tuple[lgb.LGBMClassifier, ThresholdPickResult, float, dict[str, Any] | None]:
         model = _train_one_lgbm(
             X_tr,
             y_tr,
@@ -673,24 +777,18 @@ def train_lgbm_from_splits(
         )
         val_scores = model.predict_proba(X_va)[:, 1]
         val_pg = aggregate_bets_to_player_game(df_va, val_scores, split_name="val")
-        pick = pick_threshold_precision_floor(
-            val_pg.y_true,
-            val_pg.scores,
-            min_precision=float(objective_min_precision),
-        )
-        objective_val = _val_optuna_objective_score(
-            pick,
+        val_pick, objective_val, band_meta = _pick_validation_threshold(
+            val_pg,
+            objective_cfg=objective_cfg,
             val_window_hours=wh_val,
-            alert_count_at_pick=int(pick.alert_count),
-            objective_min_precision=float(objective_min_precision),
         )
-        return model, pick, objective_val
+        return model, val_pick, objective_val, band_meta
 
     t0 = time.perf_counter()
 
     if cfg.skip_optuna:
         best_hp = _baseline_lgb_params(cfg, random_seed)
-        model, val_pick, _obj = _evaluate_hp(best_hp)
+        model, val_pick, _obj, val_band_meta = _evaluate_hp(best_hp)
         study_summary = {
             "optuna_max_time_sec_configured": float(cfg.optuna_timeout_sec),
             "optuna_max_trials_configured": None,
@@ -707,7 +805,7 @@ def train_lgbm_from_splits(
 
         def objective(trial: optuna.Trial) -> float:
             hp = _suggest_lgb_params(trial, cfg, random_seed)
-            _, _, obj_inner = _evaluate_hp(hp)
+            _, _, obj_inner, _ = _evaluate_hp(hp)
             return float(obj_inner)
 
         study = optuna.create_study(direction="maximize", sampler=sampler)
@@ -751,7 +849,7 @@ def train_lgbm_from_splits(
             study_summary["optuna_best_params"] = {}
             study_summary["optuna_stopping_reason"] = "no_completed_trials"
             best_hp = _baseline_lgb_params(cfg, random_seed)
-        model, val_pick, _ = _evaluate_hp(best_hp)
+        model, val_pick, _, val_band_meta = _evaluate_hp(best_hp)
 
     final_model = model
     refit_best_iteration: int | None = None
@@ -769,11 +867,11 @@ def train_lgbm_from_splits(
     val_scores = final_model.predict_proba(X_va)[:, 1]
     test_scores = final_model.predict_proba(X_te)[:, 1]
 
-    if not val_pick.feasible:
+    if objective_cfg.selection_policy == "min_precision" and not val_pick.feasible:
         logger.warning(
             "Step 5: no threshold achieves min_precision=%.4f on validation; reporting best achievable "
             "precision=%.4f recall=%.4f at threshold=%.6f.",
-            float(objective_min_precision),
+            float(objective_cfg.min_precision),
             val_pick.precision,
             val_pick.recall,
             val_pick.threshold,
@@ -822,6 +920,24 @@ def train_lgbm_from_splits(
         thr,
         window_hours=wh_test,
     )
+    band_blocks: dict[str, Any] = {}
+    if objective_cfg.selection_policy == "alert_band_precision":
+        band_blocks.update(
+            alert_band_metrics_block(
+                "val",
+                pg_va.candidates,
+                window_hours=wh_val,
+                target_alerts_per_hour=tuple(objective_cfg.target_alerts_per_hour),
+            )
+        )
+        band_blocks.update(
+            alert_band_metrics_block(
+                "test",
+                pg_te.candidates,
+                window_hours=wh_test,
+                target_alerts_per_hour=tuple(objective_cfg.target_alerts_per_hour),
+            )
+        )
 
     elapsed = round(time.perf_counter() - t0, 3)
     policy_meta = build_player_alert_policy_metadata(cfg.player_alert_policy)
@@ -831,7 +947,7 @@ def train_lgbm_from_splits(
         "player_cooldown_simulated_min": int(ALERT_HORIZON_MIN),
         "player_cooldown_alert_ts_source": PAYOUT_TS_COLUMN,
         "player_game_group_key": [PLAYER_ID_COLUMN, GAME_ID_COLUMN],
-        "score_aggregation": "max",
+        "score_aggregation": PLAYER_GAME_SCORE_AGGREGATION,
         "label_aggregation": "max",
         "step5_threshold_grain": EVALUATION_GRAIN_PLAYER_GAME,
         "step5_seconds": elapsed,
@@ -840,7 +956,10 @@ def train_lgbm_from_splits(
         "step5_val_pick_feasible": val_pick.feasible,
         "step5_val_precision_at_pick": val_pick.precision,
         "step5_val_recall_at_pick": val_pick.recall,
-        "step5_min_precision": float(objective_min_precision),
+        "step5_selection_policy": objective_cfg.selection_policy,
+        "step5_target_alerts_per_hour": list(objective_cfg.target_alerts_per_hour),
+        "step5_deployment_target_alerts_per_hour": float(objective_cfg.deployment_target_alerts_per_hour),
+        "step5_min_precision": float(objective_cfg.min_precision),
         "step5_optuna_skipped": bool(cfg.skip_optuna),
         "step5_refit_train_plus_val": bool(cfg.refit_train_plus_val),
         "step5_refit_rows": int(len(y_tr) + len(y_va)) if bool(cfg.refit_train_plus_val) else int(len(y_tr)),
@@ -863,9 +982,13 @@ def train_lgbm_from_splits(
         **block_tr_op,
         **block_va_op,
         **block_te_op,
+        **band_blocks,
         **policy_meta,
     }
     report.update(study_summary)
+    if val_band_meta is not None:
+        report["step5_val_alert_band"] = val_band_meta
+        report["step5_alert_band_scalar_score"] = val_band_meta.get("scalar_score")
     if isinstance(sample_policy_meta, dict) and sample_policy_meta:
         report["sample_policy"] = dict(sample_policy_meta)
         report["sample_policy_fingerprint"] = sample_policy_meta.get("sample_policy_fingerprint")
@@ -902,7 +1025,14 @@ def train_lgbm_from_splits(
                 "categorical_columns": list(CAT_COLUMNS),
                 "category_categories": {c: union_cats[c].tolist() for c in cat_cols},
                 "threshold": thr,
-                "min_precision": float(objective_min_precision),
+                "score_aggregation": PLAYER_GAME_SCORE_AGGREGATION,
+                "selection_policy": objective_cfg.selection_policy,
+                "target_alerts_per_hour": list(objective_cfg.target_alerts_per_hour),
+                "deployment_target_alerts_per_hour": float(objective_cfg.deployment_target_alerts_per_hour),
+                "min_precision": float(objective_cfg.min_precision),
+                "alert_band_scalar_score": (
+                    val_band_meta.get("scalar_score") if isinstance(val_band_meta, dict) else None
+                ),
                 "val_pick_feasible": val_pick.feasible,
                 "refit_train_plus_val": bool(cfg.refit_train_plus_val),
                 "refit_best_iteration": refit_best_iteration,
