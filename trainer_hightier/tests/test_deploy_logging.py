@@ -88,6 +88,11 @@ def test_configure_deploy_log_noise_filters_lowers_feast_verbosity() -> None:
 
 
 def test_configure_deploy_log_noise_filters_suppresses_copy_deprecation_message() -> None:
+    from trainer_hightier.serving import ch_adapter
+
+    # Other tests may have applied the filters already; pytest then restores the global
+    # warnings filters, so force a re-apply past the idempotency flag.
+    ch_adapter._LOG_NOISE_FILTERS_APPLIED = False
     deploy_main._configure_deploy_log_noise_filters()
     with warnings.catch_warnings(record=True) as caught:
         warnings.warn(

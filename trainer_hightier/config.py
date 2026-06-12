@@ -185,6 +185,8 @@ CASINO_PLAYER_ID_CLEAN_SQL: Final[str] = (
 )
 WALKAWAY_GAP_MIN: Final[int] = 30
 ALERT_HORIZON_MIN: Final[int] = 15
+#: Offline train/eval player-level alert cooldown (Step 5 operational simulation).
+PLAYER_ALERT_COOLDOWN_MIN: Final[int] = 60
 LABELS_CANONICAL_SHARD_COUNT: Final[int] = 32
 DEFAULT_USE_SHARDED_LABELS_CACHE: Final[bool] = False
 LABEL_LOOKAHEAD_MIN: Final[int] = 45
@@ -908,7 +910,7 @@ class PlayerAlertPolicyConfig:
     """Shared train/serve player-level alert suppression policy."""
 
     suppression_enabled: bool = True
-    cooldown_min: int = ALERT_HORIZON_MIN
+    cooldown_min: int = PLAYER_ALERT_COOLDOWN_MIN
     threshold_selection_enabled: bool = False
     sample_weight_enabled: bool = False
 
@@ -1132,7 +1134,9 @@ class HightierServingConfig:
     scorer_feast_mid_smoke_columns: tuple[str, ...] = SCORER_FEAST_MID_SMOKE_COLUMNS
     #: Optional training mid snapshot parquet for bootstrap seed; ``None`` uses package default when present.
     training_mid_snapshot_parquet: Path | None = None
-    player_alert_policy: PlayerAlertPolicyConfig = field(default_factory=PlayerAlertPolicyConfig)
+    player_alert_policy: PlayerAlertPolicyConfig = field(
+        default_factory=lambda: PlayerAlertPolicyConfig(cooldown_min=ALERT_HORIZON_MIN),
+    )
 
 
 _DEFAULT_HIGHTIER_SERVING: HightierServingConfig = HightierServingConfig()

@@ -11,6 +11,7 @@ import pytest
 from trainer_hightier.config import (
     ALERT_HORIZON_MIN,
     HightierServingConfig,
+    PLAYER_ALERT_COOLDOWN_MIN,
     PlayerAlertPolicyConfig,
     Step5TrainConfig,
 )
@@ -191,14 +192,15 @@ def test_conservative_recall_counts_suppressed_positive_as_missed() -> None:
 
 
 def test_player_alert_policy_config_defaults_enable_suppression() -> None:
-    """Shared train/serve policy defaults to suppression on with 15-minute cooldown."""
+    """Shared train policy defaults to suppression on with 60-minute offline cooldown."""
 
     policy = PlayerAlertPolicyConfig()
     assert policy.suppression_enabled is True
-    assert policy.cooldown_min == ALERT_HORIZON_MIN
+    assert policy.cooldown_min == PLAYER_ALERT_COOLDOWN_MIN
     assert policy.threshold_selection_enabled is False
     assert policy.sample_weight_enabled is False
-    assert Step5TrainConfig().player_alert_policy.suppression_enabled is True
+    assert Step5TrainConfig().player_alert_policy.cooldown_min == PLAYER_ALERT_COOLDOWN_MIN
+    assert HightierServingConfig().player_alert_policy.cooldown_min == ALERT_HORIZON_MIN
     assert HightierServingConfig().player_alert_policy.suppression_enabled is True
 
 
@@ -207,7 +209,7 @@ def test_build_player_alert_policy_metadata_keys() -> None:
 
     meta = build_player_alert_policy_metadata(PlayerAlertPolicyConfig())
     assert meta["player_alert_policy_suppression_enabled"] is True
-    assert meta["player_alert_policy_cooldown_min"] == ALERT_HORIZON_MIN
+    assert meta["player_alert_policy_cooldown_min"] == PLAYER_ALERT_COOLDOWN_MIN
     assert meta["player_alert_policy_train_alert_ts_source"] == "payout_complete_dtm"
     assert meta["player_alert_policy_operational_metrics_reported"] is True
 

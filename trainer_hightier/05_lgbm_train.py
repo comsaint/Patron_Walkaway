@@ -25,8 +25,13 @@ from typing import Any, Final
 import duckdb
 import lightgbm as lgb
 import numpy as np
-import optuna
-from optuna.trial import TrialState
+
+try:
+    import optuna
+    from optuna.trial import TrialState
+except ModuleNotFoundError:  # serving bundles omit the "training" extra; only needed when skip_optuna=False
+    optuna = None  # type: ignore[assignment]
+    TrialState = None  # type: ignore[assignment]
 import pandas as pd
 import pyarrow.parquet as pq
 from trainer_hightier.evaluation.alert_band_objective import (
@@ -43,7 +48,6 @@ from trainer_hightier.evaluation.player_alert_policy import (
 )
 
 from trainer_hightier.config import (
-    ALERT_HORIZON_MIN,
     DuckDbRuntimeConfig,
     HighTierObjectiveConfig,
     OptunaFloatParamRange,
@@ -346,6 +350,7 @@ def _pick_validation_threshold(
     *,
     objective_cfg: HighTierObjectiveConfig,
     val_window_hours: float | None,
+    cooldown_min: int,
 ) -> tuple[ThresholdPickResult, float, dict[str, Any] | None]:
     """Return threshold pick, Optuna scalar score, and optional band metadata."""
 
@@ -368,6 +373,7 @@ def _pick_validation_threshold(
         window_hours=val_window_hours,
         target_alerts_per_hour=tuple(objective_cfg.target_alerts_per_hour),
         deployment_target_alerts_per_hour=float(objective_cfg.deployment_target_alerts_per_hour),
+        cooldown_min=cooldown_min,
         split_prefix="val",
     )
     deploy = next(
@@ -710,6 +716,7 @@ def train_lgbm_from_splits(
         )
     feat_cols = tuple(feature_columns)
     cfg = step5 or Step5TrainConfig()
+    cooldown_min = int(cfg.player_alert_policy.cooldown_min)
     objective_cfg = _resolve_objective_config(objective, float(objective_min_precision))
     sd = Path(splits_dir).resolve()
     train_p = Path(train_parquet).resolve() if train_parquet is not None else sd / "train.parquet"
@@ -781,6 +788,7 @@ def train_lgbm_from_splits(
             val_pg,
             objective_cfg=objective_cfg,
             val_window_hours=wh_val,
+            cooldown_min=cooldown_min,
         )
         return model, val_pick, objective_val, band_meta
 
@@ -801,6 +809,12 @@ def train_lgbm_from_splits(
             "optuna_best_params": {},
         }
     else:
+        if optuna is None:
+            raise ModuleNotFoundError(
+                "optuna is required when skip_optuna=False; "
+                'install the "training" extra (pip install trainer-hightier[training]) '
+                "or set Step5TrainConfig.skip_optuna=True"
+            )
         sampler = optuna.samplers.TPESampler(seed=int(random_seed))
 
         def objective(trial: optuna.Trial) -> float:
@@ -906,18 +920,21 @@ def train_lgbm_from_splits(
         "train",
         pg_tr.candidates,
         thr,
+        cooldown_min=cooldown_min,
         window_hours=wh_train,
     )
     block_va_op = operational_simulated_metrics_block(
         "val",
         pg_va.candidates,
         thr,
+        cooldown_min=cooldown_min,
         window_hours=wh_val,
     )
     block_te_op = operational_simulated_metrics_block(
         "test",
         pg_te.candidates,
         thr,
+        cooldown_min=cooldown_min,
         window_hours=wh_test,
     )
     band_blocks: dict[str, Any] = {}
@@ -928,6 +945,7 @@ def train_lgbm_from_splits(
                 pg_va.candidates,
                 window_hours=wh_val,
                 target_alerts_per_hour=tuple(objective_cfg.target_alerts_per_hour),
+                cooldown_min=cooldown_min,
             )
         )
         band_blocks.update(
@@ -936,6 +954,7 @@ def train_lgbm_from_splits(
                 pg_te.candidates,
                 window_hours=wh_test,
                 target_alerts_per_hour=tuple(objective_cfg.target_alerts_per_hour),
+                cooldown_min=cooldown_min,
             )
         )
 
@@ -944,7 +963,7 @@ def train_lgbm_from_splits(
     report: dict[str, Any] = {
         "evaluation_grain": EVALUATION_GRAIN_PLAYER_GAME,
         "player_cooldown_simulated": True,
-        "player_cooldown_simulated_min": int(ALERT_HORIZON_MIN),
+        "player_cooldown_simulated_min": cooldown_min,
         "player_cooldown_alert_ts_source": PAYOUT_TS_COLUMN,
         "player_game_group_key": [PLAYER_ID_COLUMN, GAME_ID_COLUMN],
         "score_aggregation": PLAYER_GAME_SCORE_AGGREGATION,

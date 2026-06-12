@@ -1206,7 +1206,7 @@ def score_once(
         allowlist_ids=allowlist_ids,
     )
     if batch is None:
-        _flight_rec.on_score_once_empty()
+        _flight_rec.on_score_once_empty(model_version=str(bundle.model_version))
         _record_scorer_cycle_metrics(
             model_version=str(bundle.model_version),
             cycle_readiness={},
