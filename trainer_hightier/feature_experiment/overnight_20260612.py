@@ -727,6 +727,174 @@ def run_ceiling(*, model_dirs: tuple[Path, ...], cooldown_min: int) -> dict[str,
     return results
 
 
+_FP_CREDIT_HORIZONS_MIN: Final[tuple[int, ...]] = (15, 30, 45, 60, 90, 120, 180)
+
+
+def _player_walkaway_moments(split_parquet: Path) -> tuple[pd.DataFrame, pd.Timestamp]:
+    """Per-player walkaway moments (start of >30min gap or terminal) from one split."""
+
+    src = str(Path(split_parquet).resolve()).replace("\\", "/")
+    con = duckdb.connect(database=":memory:")
+    con.execute("PRAGMA threads=8")
+    try:
+        df = con.execute(
+            f"""
+            WITH b AS (
+              SELECT TRY_CAST(player_id AS BIGINT) AS pid,
+                     CAST(payout_complete_dtm AS TIMESTAMP) AS ts
+              FROM read_parquet('{src}')
+              WHERE TRY_CAST(player_id AS BIGINT) IS NOT NULL
+                AND payout_complete_dtm IS NOT NULL
+            ),
+            m AS (
+              SELECT pid, ts, LEAD(ts) OVER (PARTITION BY pid ORDER BY ts) AS next_ts
+              FROM b
+            )
+            SELECT pid, ts AS walk_ts,
+                   (next_ts IS NULL) AS is_terminal
+            FROM m
+            WHERE next_ts IS NULL
+               OR next_ts - ts > INTERVAL {_WALKAWAY_GAP_MIN} MINUTE
+            ORDER BY pid, walk_ts
+            """,
+        ).fetchdf()
+        wmax = con.execute(
+            f"SELECT MAX(CAST(payout_complete_dtm AS TIMESTAMP)) FROM read_parquet('{src}')",
+        ).fetchone()[0]
+    finally:
+        con.close()
+    df["walk_ts"] = pd.to_datetime(df["walk_ts"])
+    return df, pd.Timestamp(wmax)
+
+
+def _time_to_next_walkaway(
+    candidates: pd.DataFrame,
+    moments: pd.DataFrame,
+) -> pd.DataFrame:
+    """Attach minutes from each candidate alert_ts to the next walkaway moment at/after it."""
+
+    cand = candidates.copy()
+    cand["pid"] = pd.to_numeric(cand["player_id"], errors="coerce").astype("int64")
+    cand["_ts"] = pd.to_datetime(cand["alert_ts"], errors="coerce").dt.tz_localize(None)
+    cand = cand.dropna(subset=["_ts"]).sort_values("_ts", kind="mergesort")
+    mm = moments.dropna(subset=["walk_ts"]).sort_values("walk_ts", kind="mergesort").copy()
+    merged = pd.merge_asof(
+        cand,
+        mm[["pid", "walk_ts", "is_terminal"]],
+        left_on="_ts",
+        right_on="walk_ts",
+        by="pid",
+        direction="forward",
+        allow_exact_matches=True,
+    )
+    merged["minutes_to_walkaway"] = (
+        (merged["walk_ts"] - merged["_ts"]).dt.total_seconds() / 60.0
+    )
+    return merged
+
+
+def run_fp_error_profile(*, model_dirs: tuple[Path, ...], rate: float) -> dict[str, Any]:
+    """Profile high-score false positives: how soon do alerted players actually walk away?"""
+
+    from trainer_hightier.evaluation.alert_band_objective import (
+        target_alert_count,
+        threshold_for_target_operational_alerts,
+    )
+
+    val_p = MATRIX_SPLITS / "val.parquet"
+    test_p = MATRIX_SPLITS / "test.parquet"
+    wh_val = _window_hours(val_p)
+    moments, test_wmax = _player_walkaway_moments(test_p)
+    results: dict[str, Any] = {
+        "design": {
+            "protocol": (
+                "raised = test player-game with score >= val-picked threshold at target rate; "
+                "minutes_to_walkaway = time from alert_ts to next per-player >30min-gap moment; "
+                "credit@X = alert counted correct if player walks away within X min of alert_ts"
+            ),
+            "budget_rate_per_hour": float(rate),
+            "credit_horizons_min": list(_FP_CREDIT_HORIZONS_MIN),
+            "label_horizon_min": 15,
+            "walkaway_gap_min": _WALKAWAY_GAP_MIN,
+            "caveat": "walkaway moments rebuilt at player_id grain (labels use canonical_id)",
+            "test_window_end": str(test_wmax),
+        },
+        "models": {},
+    }
+    for md in model_dirs:
+        key = Path(md).name
+        t0 = time.perf_counter()
+        cand_val = _score_candidates(Path(md), val_p, "val")
+        cand_test = _score_candidates(Path(md), test_p, "test")
+        budget = target_alert_count(wh_val, rate)
+        pick = threshold_for_target_operational_alerts(
+            cand_val,
+            budget,
+            window_hours=wh_val,
+            requested_alerts_per_hour=rate,
+            cooldown_min=120,
+        )
+        raised = cand_test.loc[
+            pd.to_numeric(cand_test["player_game_score"], errors="coerce") >= pick.threshold
+        ].copy()
+        prof = _time_to_next_walkaway(raised, moments)
+        lbl = pd.to_numeric(prof["player_game_label"], errors="coerce").fillna(0).astype(int)
+        mins = prof["minutes_to_walkaway"]
+        n = int(len(prof))
+        n_label_pos = int((lbl == 1).sum())
+        fp = prof.loc[lbl == 0].copy()
+        fp_mins = fp["minutes_to_walkaway"]
+        credit_curve = {}
+        for x in _FP_CREDIT_HORIZONS_MIN:
+            credited = int(((mins <= float(x)) & mins.notna()).sum())
+            credit_curve[f"credit_le_{x}m"] = {
+                "credited_alerts": credited,
+                "precision": credited / max(n, 1),
+            }
+        fp_buckets = {
+            "le_15m_anomaly": int((fp_mins <= 15).sum()),
+            "15_30m": int(((fp_mins > 15) & (fp_mins <= 30)).sum()),
+            "30_60m": int(((fp_mins > 30) & (fp_mins <= 60)).sum()),
+            "60_90m": int(((fp_mins > 60) & (fp_mins <= 90)).sum()),
+            "90_120m": int(((fp_mins > 90) & (fp_mins <= 120)).sum()),
+            "120_180m": int(((fp_mins > 120) & (fp_mins <= 180)).sum()),
+            "180_360m": int(((fp_mins > 180) & (fp_mins <= 360)).sum()),
+            "gt_360m": int((fp_mins > 360).sum()),
+            "no_walkaway_in_window": int(fp_mins.isna().sum()),
+        }
+        fp_with_future_walk = fp.loc[fp_mins.notna()]
+        fp_term = int(
+            fp_with_future_walk["is_terminal"].fillna(False).astype(bool).sum(),
+        )
+        results["models"][key] = {
+            "threshold": pick.threshold,
+            "raised_alerts": n,
+            "label_positive": n_label_pos,
+            "label_negative": int((lbl == 0).sum()),
+            "precision_label_15m": n_label_pos / max(n, 1),
+            "fp_minutes_to_walkaway_quantiles": {
+                f"p{int(q * 100)}": (
+                    round(float(fp_mins.quantile(q)), 1) if fp_mins.notna().any() else None
+                )
+                for q in (0.1, 0.25, 0.5, 0.75, 0.9)
+            },
+            "fp_buckets": fp_buckets,
+            "fp_eventually_walks_away_share": round(
+                float(int(fp_mins.notna().sum()) / max(int((lbl == 0).sum()), 1)), 4
+            ),
+            "fp_terminal_moment_share_of_future_walk": round(
+                float(fp_term / max(len(fp_with_future_walk), 1)), 4
+            ),
+            "credit_horizon_precision": credit_curve,
+        }
+        print(f"[fperr] {key} done in {time.perf_counter() - t0:.0f}s", flush=True)
+        (OUT_ROOT / "fp_error_profile.json").write_text(
+            json.dumps(results, indent=2, default=str),
+            encoding="utf-8",
+        )
+    return results
+
+
 def run_controlled_optuna(*, arm: str, seed: int, timeout_sec: float) -> dict[str, Any]:
     """Time-boxed Optuna on one arm with the guarded default search space."""
 
@@ -797,6 +965,9 @@ def main() -> None:
     p_ceil = sub.add_parser("ceiling", help="precision vs alert-budget curve")
     p_ceil.add_argument("--model-dirs", type=Path, nargs="+", required=True)
     p_ceil.add_argument("--cooldown-min", type=int, default=120)
+    p_fp = sub.add_parser("fperr", help="high-score false-positive error profile")
+    p_fp.add_argument("--model-dirs", type=Path, nargs="+", required=True)
+    p_fp.add_argument("--rate", type=float, default=1.0)
     args = parser.parse_args()
     if args.cmd == "prep":
         out = run_prep(with_txn=bool(args.with_txn))
@@ -810,6 +981,11 @@ def main() -> None:
         out = run_ceiling(
             model_dirs=tuple(args.model_dirs),
             cooldown_min=int(args.cooldown_min),
+        )
+    elif args.cmd == "fperr":
+        out = run_fp_error_profile(
+            model_dirs=tuple(args.model_dirs),
+            rate=float(args.rate),
         )
     elif args.cmd == "optuna":
         out = run_controlled_optuna(
