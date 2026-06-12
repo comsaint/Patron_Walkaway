@@ -727,6 +727,103 @@ def run_ceiling(*, model_dirs: tuple[Path, ...], cooldown_min: int) -> dict[str,
     return results
 
 
+BANKROLL_COLS: Final[tuple[str, ...]] = (
+    "fe__bankroll__cum_loss__today",
+    "fe__bankroll__cum_loss_over_wager__today",
+    "fe__bankroll__cum_loss_over_theo__today",
+)
+BANKROLL_SPLITS: Final[Path] = OUT_ROOT / "splits_bankroll"
+
+
+def _bankroll_copy_sql(src_parquet: Path) -> str:
+    """Augment one matrix split with PIT (exclusive, gaming-day) bankroll columns.
+
+    Convention matches existing ``fe__canonical__*__today``: cumulative over prior
+    bets of the same ``canonical_id`` within ``gaming_day_event``, ordered by
+    ``(payout_complete_dtm, bet_id)``, EXCLUDING the current row.
+    """
+
+    src = str(Path(src_parquet).resolve()).replace("\\", "/")
+    win = (
+        "PARTITION BY canonical_id, gaming_day_event "
+        "ORDER BY payout_complete_dtm, bet_id "
+        "ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING"
+    )
+    return f"""
+    WITH c AS (
+      SELECT *,
+        SUM(casino_win) OVER w AS _cum_loss,
+        SUM(wager) OVER w AS _cum_wager,
+        SUM(theo_win) OVER w AS _cum_theo
+      FROM read_parquet('{src}')
+      WINDOW w AS ({win})
+    )
+    SELECT * EXCLUDE (_cum_loss, _cum_wager, _cum_theo),
+      COALESCE(_cum_loss, 0.0) AS fe__bankroll__cum_loss__today,
+      CASE WHEN _cum_wager > 0 THEN _cum_loss / _cum_wager END
+        AS fe__bankroll__cum_loss_over_wager__today,
+      CASE WHEN _cum_theo > 0 THEN _cum_loss / _cum_theo END
+        AS fe__bankroll__cum_loss_over_theo__today
+    FROM c
+    """.strip()
+
+
+def run_bankroll(*, seeds: tuple[int, ...]) -> dict[str, Any]:
+    """Materialize bankroll-augmented splits, then train add_txn vs add_txn+bankroll."""
+
+    duck, _, _ = configs_from_run_profile(get_run_profile("default"))
+    BANKROLL_SPLITS.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(database=":memory:")
+    con.execute("PRAGMA threads=8")
+    try:
+        for split in _SPLIT_NAMES:
+            out_p = BANKROLL_SPLITS / f"{split}.parquet"
+            if out_p.is_file():
+                print(f"[bankroll] {split} already materialized; skip", flush=True)
+                continue
+            sql = _bankroll_copy_sql(MATRIX_SPLITS / f"{split}.parquet")
+            dst = str(out_p.resolve()).replace("\\", "/")
+            con.execute(f"COPY ({sql}) TO '{dst}' (FORMAT PARQUET, COMPRESSION SNAPPY)")
+            print(f"[bankroll] materialized {split}", flush=True)
+    finally:
+        con.close()
+
+    base_txn = tuple(dict.fromkeys(tuple(MODEL_FEATURE_COLUMNS) + TXN_COLS))
+    arms = {
+        "add_txn": base_txn,
+        "add_txn_bankroll": tuple(dict.fromkeys(base_txn + BANKROLL_COLS)),
+    }
+    min_prec = HighTierObjectiveConfig().min_precision
+    report_path = OUT_ROOT / "bankroll_report.json"
+    results: dict[str, Any] = (
+        json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {}
+    )
+    for arm, cols in arms.items():
+        for seed in seeds:
+            key = f"{arm}_seed{seed}"
+            if key in results:
+                print(f"[bankroll] {key} already done; skip", flush=True)
+                continue
+            t0 = time.perf_counter()
+            print(f"[bankroll] start {key} n_features={len(cols)}", flush=True)
+            res = _b5.train_lgbm_from_splits(
+                splits_dir=BANKROLL_SPLITS,
+                duckdb_runtime=duck,
+                objective_min_precision=min_prec,
+                random_seed=int(seed),
+                step5=Step5TrainConfig(run_step5=True, skip_optuna=True),
+                output_dir=OUT_ROOT / f"bankroll_{key}",
+                feature_columns=cols,
+            )
+            row = _metric_slice(dict(res.report))
+            row["elapsed_sec"] = round(time.perf_counter() - t0, 1)
+            row["n_features"] = len(cols)
+            results[key] = row
+            report_path.write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
+            print(f"[bankroll] done {key} in {row['elapsed_sec']}s", flush=True)
+    return results
+
+
 _FP_CREDIT_HORIZONS_MIN: Final[tuple[int, ...]] = (15, 30, 45, 60, 90, 120, 180)
 
 
@@ -968,6 +1065,8 @@ def main() -> None:
     p_fp = sub.add_parser("fperr", help="high-score false-positive error profile")
     p_fp.add_argument("--model-dirs", type=Path, nargs="+", required=True)
     p_fp.add_argument("--rate", type=float, default=1.0)
+    p_bank = sub.add_parser("bankroll", help="train add_txn vs add_txn+bankroll")
+    p_bank.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
     args = parser.parse_args()
     if args.cmd == "prep":
         out = run_prep(with_txn=bool(args.with_txn))
@@ -987,6 +1086,8 @@ def main() -> None:
             model_dirs=tuple(args.model_dirs),
             rate=float(args.rate),
         )
+    elif args.cmd == "bankroll":
+        out = run_bankroll(seeds=tuple(args.seeds))
     elif args.cmd == "optuna":
         out = run_controlled_optuna(
             arm=str(args.arm),
