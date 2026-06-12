@@ -212,6 +212,30 @@ def test_materialize_sampled_train_disabled_uses_source_train(tmp_path: Path) ->
     assert meta["enabled"] is False
 
 
+def test_downsample_train_negatives_rejects_missing_label_column() -> None:
+    from trainer_hightier.utils.train_negative_sampling import downsample_train_negatives
+
+    df = pd.DataFrame({"bet_id": [1.0, 2.0]})
+    with pytest.raises(ValueError, match="missing label column"):
+        downsample_train_negatives(df, neg_sample_frac=0.5, neg_sample_seed=1)
+
+
+def test_downsample_train_negatives_rejects_null_labels() -> None:
+    from trainer_hightier.utils.train_negative_sampling import downsample_train_negatives
+
+    df = pd.DataFrame({"walkaway_label": [0.0, None], "bet_id": [1.0, 2.0]})
+    with pytest.raises(ValueError, match="null_ratio"):
+        downsample_train_negatives(df, neg_sample_frac=0.5, neg_sample_seed=1)
+
+
+def test_downsample_train_negatives_rejects_invalid_frac() -> None:
+    from trainer_hightier.utils.train_negative_sampling import downsample_train_negatives
+
+    df = _synthetic_train_frame(n_neg=10, n_pos=2)
+    with pytest.raises(ValueError, match="neg_sample_frac must be in"):
+        downsample_train_negatives(df, neg_sample_frac=0.0, neg_sample_seed=1)
+
+
 def test_materialize_sampled_train_cache_hit(tmp_path: Path) -> None:
     from trainer_hightier.config import SamplePolicy
     from trainer_hightier.utils.train_negative_sampling import materialize_sampled_train_parquet

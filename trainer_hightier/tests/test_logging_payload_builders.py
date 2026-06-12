@@ -16,6 +16,7 @@ from trainer_hightier.config import (
 from trainer_hightier.reporting.writer import (
     build_metrics_detailed,
     build_pipeline_debug,
+    build_run_report,
     build_run_summary,
 )
 from trainer_hightier.trainer import HighTierTrainArgs
@@ -232,3 +233,68 @@ def test_build_metrics_detailed_and_pipeline_debug_smoke() -> None:
     assert sm["elapsed_seconds"] == 22.0
     assert sm["diff_summary"]["unchanged"] == 1192
     assert sm["changed_partitions"]["t_bet"] == []
+
+
+def test_build_run_report_surfaces_training_acceleration_and_step35_gate(tmp_path) -> None:
+    """Run report must expose acceleration policy and Step 3.5 cold-build gate for audit."""
+    args = HighTierTrainArgs(
+        output_dir=tmp_path,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        step5=Step5TrainConfig(run_step5=False),
+    )
+    step35 = {"verdict": "pass", "cold_build_count": 2, "cold_build_ms": 1200}
+    accel = {
+        "training_run_kind": "speed",
+        "training_scope_policy_fingerprint": "a" * 64,
+        "step35_indexed_replay_gate_summary": step35,
+    }
+    metrics = {
+        "model_version": "mv-accel",
+        "step5_optuna_skipped": True,
+        "step5_threshold": 0.5,
+        "optuna_max_time_sec_configured": 1.0,
+        "optuna_max_trials_configured": None,
+        "optuna_wall_time_sec_actual": None,
+        "optuna_trials_completed": 0,
+        "optuna_trials_total": 0,
+        "optuna_stopping_reason": "optuna_skipped",
+        "optuna_best_value": None,
+        "val_ap": 0.5,
+        "val_precision": 0.6,
+        "test_ap": 0.49,
+        "test_precision": 0.59,
+        "training_acceleration_policy": accel,
+        "step35_indexed_replay_gate_summary": step35,
+    }
+    report = build_run_report(metrics, args, status="success")
+    assert report["pipeline_debug"]["training_acceleration"] == accel
+    assert report["gates"]["step35_indexed_replay_cold_build"] == step35
+
+
+def test_build_run_report_step35_gate_from_nested_acceleration_only(tmp_path) -> None:
+    """Nested acceleration block alone should still populate the Step 3.5 gate summary."""
+    args = HighTierTrainArgs(
+        output_dir=tmp_path,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        step5=Step5TrainConfig(run_step5=False),
+    )
+    step35 = {"verdict": "warn", "cold_build_count": 1}
+    metrics = {
+        "model_version": "mv-nested",
+        "step5_optuna_skipped": True,
+        "step5_threshold": 0.5,
+        "optuna_max_time_sec_configured": 1.0,
+        "optuna_max_trials_configured": None,
+        "optuna_wall_time_sec_actual": None,
+        "optuna_trials_completed": 0,
+        "optuna_trials_total": 0,
+        "optuna_stopping_reason": "optuna_skipped",
+        "optuna_best_value": None,
+        "val_ap": 0.5,
+        "val_precision": 0.6,
+        "test_ap": 0.49,
+        "test_precision": 0.59,
+        "training_acceleration_policy": {"step35_indexed_replay_gate_summary": step35},
+    }
+    report = build_run_report(metrics, args, status="success")
+    assert report["gates"]["step35_indexed_replay_cold_build"] == step35
