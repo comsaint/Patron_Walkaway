@@ -654,6 +654,79 @@ def run_pg_grain_diag() -> dict[str, Any]:
     return out
 
 
+_CEILING_RATES: Final[tuple[float, ...]] = (0.1, 0.25, 0.5, 1.0, 2.0)
+
+
+def run_ceiling(*, model_dirs: tuple[Path, ...], cooldown_min: int) -> dict[str, Any]:
+    """Precision-vs-alert-budget curve: how strict must the budget be to reach 75%?"""
+
+    from trainer_hightier.evaluation.alert_band_objective import (
+        target_alert_count,
+        threshold_for_target_operational_alerts,
+    )
+    from trainer_hightier.evaluation.player_alert_policy import (
+        operational_simulated_metrics_block,
+    )
+
+    val_p = MATRIX_SPLITS / "val.parquet"
+    test_p = MATRIX_SPLITS / "test.parquet"
+    wh_val = _window_hours(val_p)
+    wh_test = _window_hours(test_p)
+    results: dict[str, Any] = {
+        "design": {
+            "protocol": (
+                "per-budget val threshold pick under cooldown sim, then test eval; "
+                "rates in alerts/hour"
+            ),
+            "cooldown_min": int(cooldown_min),
+            "rates": list(_CEILING_RATES),
+            "window_hours": {"val": wh_val, "test": wh_test},
+        },
+        "models": {},
+    }
+    for md in model_dirs:
+        key = Path(md).name
+        t0 = time.perf_counter()
+        cand_val = _score_candidates(Path(md), val_p, "val")
+        cand_test = _score_candidates(Path(md), test_p, "test")
+        rows: dict[str, Any] = {}
+        for rate in _CEILING_RATES:
+            budget = target_alert_count(wh_val, rate)
+            pick = threshold_for_target_operational_alerts(
+                cand_val,
+                budget,
+                window_hours=wh_val,
+                requested_alerts_per_hour=rate,
+                cooldown_min=int(cooldown_min),
+            )
+            blk = operational_simulated_metrics_block(
+                "test",
+                cand_test,
+                pick.threshold,
+                cooldown_min=int(cooldown_min),
+                window_hours=wh_test,
+            )
+            tp = int(blk["test_operational_simulated_true_positives"])
+            fp = int(blk["test_operational_simulated_false_positives"])
+            rows[f"{rate:g}_per_hr"] = {
+                "val_budget_alerts": int(budget),
+                "val_threshold": pick.threshold,
+                "val_precision": pick.precision,
+                "test_alerts": int(blk["test_operational_simulated_alerts"]),
+                "test_alerts_per_hour": blk["test_operational_simulated_alerts_per_hour"],
+                "test_tp": tp,
+                "test_fp": fp,
+                "test_precision": tp / max(tp + fp, 1),
+            }
+        results["models"][key] = rows
+        print(f"[ceiling] {key} done in {time.perf_counter() - t0:.0f}s", flush=True)
+        (OUT_ROOT / "ceiling_report.json").write_text(
+            json.dumps(results, indent=2, default=str),
+            encoding="utf-8",
+        )
+    return results
+
+
 def run_controlled_optuna(*, arm: str, seed: int, timeout_sec: float) -> dict[str, Any]:
     """Time-boxed Optuna on one arm with the guarded default search space."""
 
@@ -721,6 +794,9 @@ def main() -> None:
     p_opt.add_argument("--arm", default="add_txn")
     p_opt.add_argument("--seed", type=int, default=42)
     p_opt.add_argument("--timeout-sec", type=float, default=2700.0)
+    p_ceil = sub.add_parser("ceiling", help="precision vs alert-budget curve")
+    p_ceil.add_argument("--model-dirs", type=Path, nargs="+", required=True)
+    p_ceil.add_argument("--cooldown-min", type=int, default=120)
     args = parser.parse_args()
     if args.cmd == "prep":
         out = run_prep(with_txn=bool(args.with_txn))
@@ -730,6 +806,11 @@ def main() -> None:
         out = run_episode_study(model_dirs=tuple(args.model_dirs))
     elif args.cmd == "dq":
         out = run_dq_audit(partitions=tuple(args.partitions))
+    elif args.cmd == "ceiling":
+        out = run_ceiling(
+            model_dirs=tuple(args.model_dirs),
+            cooldown_min=int(args.cooldown_min),
+        )
     elif args.cmd == "optuna":
         out = run_controlled_optuna(
             arm=str(args.arm),

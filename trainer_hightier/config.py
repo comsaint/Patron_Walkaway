@@ -186,7 +186,9 @@ CASINO_PLAYER_ID_CLEAN_SQL: Final[str] = (
 WALKAWAY_GAP_MIN: Final[int] = 30
 ALERT_HORIZON_MIN: Final[int] = 15
 #: Offline train/eval player-level alert cooldown (Step 5 operational simulation).
-PLAYER_ALERT_COOLDOWN_MIN: Final[int] = 60
+#: 120m chosen from the 2026-06-12 episode policy study: cooldowns >=120m and the
+#: episode-cap policy tie within seed noise, all beat 60m; 120m is the simplest.
+PLAYER_ALERT_COOLDOWN_MIN: Final[int] = 120
 LABELS_CANONICAL_SHARD_COUNT: Final[int] = 32
 DEFAULT_USE_SHARDED_LABELS_CACHE: Final[bool] = False
 LABEL_LOOKAHEAD_MIN: Final[int] = 45
