@@ -824,6 +824,117 @@ def run_bankroll(*, seeds: tuple[int, ...]) -> dict[str, Any]:
     return results
 
 
+MOMENTUM_COLS: Final[tuple[str, ...]] = (
+    "fe__lossmom__casino_win_sum__w15m",
+    "fe__lossmom__casino_win_sum__w1h",
+    "fe__lossmom__loss_over_theo__w1h",
+    "fe__lossmom__loss_frac__w1h",
+    "fe__decel__bets_w15m_share_w1h",
+)
+MOMENTUM_SPLITS: Final[Path] = OUT_ROOT / "splits_momentum"
+
+
+def _momentum_copy_sql(src_parquet: Path) -> str:
+    """Augment a matrix split with recent loss-momentum + deceleration columns.
+
+    All windows are PIT and exclude the current bet (inclusive RANGE over
+    ``canonical_id`` real-time, then current-row value subtracted out).
+    """
+
+    src = str(Path(src_parquet).resolve()).replace("\\", "/")
+
+    def _rng(minutes: int) -> str:
+        return (
+            "PARTITION BY canonical_id ORDER BY _ts "
+            f"RANGE BETWEEN INTERVAL {minutes} MINUTE PRECEDING AND CURRENT ROW"
+        )
+
+    return f"""
+    WITH base AS (
+      SELECT *, CAST(payout_complete_dtm AS TIMESTAMP) AS _ts
+      FROM read_parquet('{src}')
+    ),
+    w AS (
+      SELECT *,
+        SUM(casino_win) OVER ({_rng(15)}) AS _cw15,
+        SUM(casino_win) OVER ({_rng(60)}) AS _cw60,
+        SUM(theo_win) OVER ({_rng(60)}) AS _th60,
+        COUNT(*) OVER ({_rng(15)}) AS _n15,
+        COUNT(*) OVER ({_rng(60)}) AS _n60,
+        SUM(CASE WHEN casino_win > 0 THEN 1 ELSE 0 END) OVER ({_rng(60)}) AS _ln60
+      FROM base
+    )
+    SELECT * EXCLUDE (_ts, _cw15, _cw60, _th60, _n15, _n60, _ln60),
+      (_cw15 - casino_win) AS fe__lossmom__casino_win_sum__w15m,
+      (_cw60 - casino_win) AS fe__lossmom__casino_win_sum__w1h,
+      CASE WHEN (_th60 - theo_win) > 0
+           THEN (_cw60 - casino_win) / (_th60 - theo_win) END
+        AS fe__lossmom__loss_over_theo__w1h,
+      CASE WHEN (_n60 - 1) > 0
+           THEN (_ln60 - CASE WHEN casino_win > 0 THEN 1 ELSE 0 END) * 1.0 / (_n60 - 1) END
+        AS fe__lossmom__loss_frac__w1h,
+      CASE WHEN (_n60 - 1) > 0 THEN (_n15 - 1) * 1.0 / (_n60 - 1) END
+        AS fe__decel__bets_w15m_share_w1h
+    FROM w
+    """.strip()
+
+
+def run_momentum(*, seeds: tuple[int, ...]) -> dict[str, Any]:
+    """Materialize momentum-augmented splits, then train add_txn vs add_txn+momentum."""
+
+    duck, _, _ = configs_from_run_profile(get_run_profile("default"))
+    MOMENTUM_SPLITS.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(database=":memory:")
+    con.execute("PRAGMA threads=8")
+    try:
+        for split in _SPLIT_NAMES:
+            out_p = MOMENTUM_SPLITS / f"{split}.parquet"
+            if out_p.is_file():
+                print(f"[momentum] {split} already materialized; skip", flush=True)
+                continue
+            sql = _momentum_copy_sql(MATRIX_SPLITS / f"{split}.parquet")
+            dst = str(out_p.resolve()).replace("\\", "/")
+            con.execute(f"COPY ({sql}) TO '{dst}' (FORMAT PARQUET, COMPRESSION SNAPPY)")
+            print(f"[momentum] materialized {split}", flush=True)
+    finally:
+        con.close()
+
+    base_txn = tuple(dict.fromkeys(tuple(MODEL_FEATURE_COLUMNS) + TXN_COLS))
+    arms = {
+        "add_txn": base_txn,
+        "add_txn_momentum": tuple(dict.fromkeys(base_txn + MOMENTUM_COLS)),
+    }
+    min_prec = HighTierObjectiveConfig().min_precision
+    report_path = OUT_ROOT / "momentum_report.json"
+    results: dict[str, Any] = (
+        json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {}
+    )
+    for arm, cols in arms.items():
+        for seed in seeds:
+            key = f"{arm}_seed{seed}"
+            if key in results:
+                print(f"[momentum] {key} already done; skip", flush=True)
+                continue
+            t0 = time.perf_counter()
+            print(f"[momentum] start {key} n_features={len(cols)}", flush=True)
+            res = _b5.train_lgbm_from_splits(
+                splits_dir=MOMENTUM_SPLITS,
+                duckdb_runtime=duck,
+                objective_min_precision=min_prec,
+                random_seed=int(seed),
+                step5=Step5TrainConfig(run_step5=True, skip_optuna=True),
+                output_dir=OUT_ROOT / f"momentum_{key}",
+                feature_columns=cols,
+            )
+            row = _metric_slice(dict(res.report))
+            row["elapsed_sec"] = round(time.perf_counter() - t0, 1)
+            row["n_features"] = len(cols)
+            results[key] = row
+            report_path.write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
+            print(f"[momentum] done {key} in {row['elapsed_sec']}s", flush=True)
+    return results
+
+
 _FP_CREDIT_HORIZONS_MIN: Final[tuple[int, ...]] = (15, 30, 45, 60, 90, 120, 180)
 
 
@@ -1067,6 +1178,8 @@ def main() -> None:
     p_fp.add_argument("--rate", type=float, default=1.0)
     p_bank = sub.add_parser("bankroll", help="train add_txn vs add_txn+bankroll")
     p_bank.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
+    p_mom = sub.add_parser("momentum", help="train add_txn vs add_txn+momentum")
+    p_mom.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
     args = parser.parse_args()
     if args.cmd == "prep":
         out = run_prep(with_txn=bool(args.with_txn))
@@ -1088,6 +1201,8 @@ def main() -> None:
         )
     elif args.cmd == "bankroll":
         out = run_bankroll(seeds=tuple(args.seeds))
+    elif args.cmd == "momentum":
+        out = run_momentum(seeds=tuple(args.seeds))
     elif args.cmd == "optuna":
         out = run_controlled_optuna(
             arm=str(args.arm),
