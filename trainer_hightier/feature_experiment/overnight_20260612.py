@@ -33,8 +33,10 @@ from trainer_hightier.feature_experiment.hall_probe_smoke import (
     select_top_hall_dummy_columns,
 )
 from trainer_hightier.feature_experiment.materialize_txn_lite import (
+    _txn_valid_cte,
     default_cleaned_casino_txn_root,
     materialize_txn_lite_parquet,
+    resolve_cleaned_casino_txn_read_sql,
 )
 
 _b5 = importlib.import_module("trainer_hightier.05_lgbm_train")
@@ -824,6 +826,123 @@ def run_bankroll(*, seeds: tuple[int, ...]) -> dict[str, Any]:
     return results
 
 
+CASHTIMING_COLS: Final[tuple[str, ...]] = (
+    "txn__min_since_last_cashout",
+    "txn__net_cash_flow__w30m",
+)
+CASHTIMING_SPLITS: Final[Path] = OUT_ROOT / "splits_cashtiming"
+_CASHTIMING_LOOKBACK_H: Final[int] = 6
+
+
+def _cashtiming_feature_sql(*, split_parquet: Path, cleaned_read: str) -> str:
+    """PIT bet-grain cash-out timing features (event_ts < pcd, available_ts <= pcd)."""
+
+    src = str(Path(split_parquet).resolve()).replace("\\", "/")
+    return f"""
+    WITH {_txn_valid_cte(cleaned_read)},
+    train_rows AS (
+      SELECT TRY_CAST(bet_id AS DOUBLE) AS bet_id,
+             TRY_CAST(player_id AS BIGINT) AS player_id,
+             CAST(payout_complete_dtm AS TIMESTAMPTZ) AS pcd
+      FROM read_parquet('{src}')
+      WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
+        AND TRY_CAST(player_id AS BIGINT) IS NOT NULL
+        AND payout_complete_dtm IS NOT NULL
+    ),
+    joined AS (
+      SELECT tr.bet_id, tr.pcd, txn.type, txn.sub_type, txn.txn_value, txn.event_ts
+      FROM train_rows AS tr
+      LEFT JOIN txn_valid AS txn
+        ON tr.player_id = txn.player_id
+       AND txn.event_ts < tr.pcd
+       AND txn.available_ts <= tr.pcd
+       AND txn.event_ts >= tr.pcd - INTERVAL {_CASHTIMING_LOOKBACK_H} HOUR
+    )
+    SELECT bet_id,
+      MIN(CASE WHEN type = 'CASHOUT'
+          THEN date_diff('second', event_ts, pcd) END) / 60.0
+        AS txn__min_since_last_cashout,
+      CAST(
+        SUM(CASE WHEN type = 'CASHOUT' AND event_ts >= pcd - INTERVAL 30 MINUTE
+                 THEN txn_value ELSE 0 END)
+        - SUM(CASE WHEN type = 'BUYIN' AND sub_type = 'CASH'
+                   AND event_ts >= pcd - INTERVAL 30 MINUTE THEN txn_value ELSE 0 END)
+      AS DOUBLE) AS txn__net_cash_flow__w30m
+    FROM joined
+    GROUP BY bet_id
+    """.strip()
+
+
+def run_cashtiming(*, seeds: tuple[int, ...]) -> dict[str, Any]:
+    """Materialize cash-out timing onto momentum splits; train add_txn_momentum +/- cashtiming."""
+
+    duck, _, _ = configs_from_run_profile(get_run_profile("default"))
+    cleaned_read, _, _ = resolve_cleaned_casino_txn_read_sql(default_cleaned_casino_txn_root())
+    CASHTIMING_SPLITS.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(database=":memory:")
+    con.execute("PRAGMA threads=8")
+    try:
+        for split in _SPLIT_NAMES:
+            out_p = CASHTIMING_SPLITS / f"{split}.parquet"
+            if out_p.is_file():
+                print(f"[cashtiming] {split} already materialized; skip", flush=True)
+                continue
+            feat_sql = _cashtiming_feature_sql(
+                split_parquet=MOMENTUM_SPLITS / f"{split}.parquet",
+                cleaned_read=cleaned_read,
+            )
+            mom = str((MOMENTUM_SPLITS / f"{split}.parquet").resolve()).replace("\\", "/")
+            dst = str(out_p.resolve()).replace("\\", "/")
+            sel = ", ".join(f'COALESCE(c."{x}", NULL) AS "{x}"' for x in CASHTIMING_COLS)
+            con.execute(
+                f"""
+                COPY (
+                  SELECT m.*, {sel}
+                  FROM read_parquet('{mom}') AS m
+                  LEFT JOIN ({feat_sql}) AS c ON TRY_CAST(m.bet_id AS DOUBLE) = c.bet_id
+                ) TO '{dst}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+                """,
+            )
+            print(f"[cashtiming] materialized {split}", flush=True)
+    finally:
+        con.close()
+
+    base = tuple(dict.fromkeys(tuple(MODEL_FEATURE_COLUMNS) + TXN_COLS + MOMENTUM_COLS))
+    arms = {
+        "add_txn_momentum": base,
+        "add_txn_momentum_cashtiming": tuple(dict.fromkeys(base + CASHTIMING_COLS)),
+    }
+    min_prec = HighTierObjectiveConfig().min_precision
+    report_path = OUT_ROOT / "cashtiming_report.json"
+    results: dict[str, Any] = (
+        json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {}
+    )
+    for arm, cols in arms.items():
+        for seed in seeds:
+            key = f"{arm}_seed{seed}"
+            if key in results:
+                print(f"[cashtiming] {key} already done; skip", flush=True)
+                continue
+            t0 = time.perf_counter()
+            print(f"[cashtiming] start {key} n_features={len(cols)}", flush=True)
+            res = _b5.train_lgbm_from_splits(
+                splits_dir=CASHTIMING_SPLITS,
+                duckdb_runtime=duck,
+                objective_min_precision=min_prec,
+                random_seed=int(seed),
+                step5=Step5TrainConfig(run_step5=True, skip_optuna=True),
+                output_dir=OUT_ROOT / f"cashtiming_{key}",
+                feature_columns=cols,
+            )
+            row = _metric_slice(dict(res.report))
+            row["elapsed_sec"] = round(time.perf_counter() - t0, 1)
+            row["n_features"] = len(cols)
+            results[key] = row
+            report_path.write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
+            print(f"[cashtiming] done {key} in {row['elapsed_sec']}s", flush=True)
+    return results
+
+
 MOMENTUM_COLS: Final[tuple[str, ...]] = (
     "fe__lossmom__casino_win_sum__w15m",
     "fe__lossmom__casino_win_sum__w1h",
@@ -1180,6 +1299,8 @@ def main() -> None:
     p_bank.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
     p_mom = sub.add_parser("momentum", help="train add_txn vs add_txn+momentum")
     p_mom.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
+    p_ct = sub.add_parser("cashtiming", help="train add_txn_momentum +/- cash-out timing")
+    p_ct.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
     args = parser.parse_args()
     if args.cmd == "prep":
         out = run_prep(with_txn=bool(args.with_txn))
@@ -1203,6 +1324,8 @@ def main() -> None:
         out = run_bankroll(seeds=tuple(args.seeds))
     elif args.cmd == "momentum":
         out = run_momentum(seeds=tuple(args.seeds))
+    elif args.cmd == "cashtiming":
+        out = run_cashtiming(seeds=tuple(args.seeds))
     elif args.cmd == "optuna":
         out = run_controlled_optuna(
             arm=str(args.arm),
