@@ -1054,6 +1054,112 @@ def run_momentum(*, seeds: tuple[int, ...]) -> dict[str, Any]:
     return results
 
 
+PROD3_COLS: Final[tuple[str, ...]] = (
+    "fe__outcome__casino_win_sum__w15m",
+    "fe__outcome__casino_win_sum__w1h",
+    "fe__outcome__casino_win_to_theo_ratio__w1h",
+)
+PRODMOM_SPLITS: Final[Path] = OUT_ROOT / "splits_prodmom"
+
+
+def _prodmom_copy_sql(src_parquet: Path) -> str:
+    """Augment a matrix split with the 3 PROMOTED fe__outcome__ features using the
+    EXACT production materialize_fe_derived semantics: ``PARTITION BY canonical_id``,
+    ``RANGE ... PRECEDING AND CURRENT ROW`` minus the scored bet (peer-inclusive semantics).
+    """
+
+    src = str(Path(src_parquet).resolve()).replace("\\", "/")
+
+    def _rng(minutes: int) -> str:
+        return (
+            "PARTITION BY canonical_id ORDER BY _ts "
+            f"RANGE BETWEEN INTERVAL {minutes} MINUTE PRECEDING AND CURRENT ROW"
+        )
+
+    return f"""
+    WITH base AS (
+      SELECT *, CAST(payout_complete_dtm AS TIMESTAMP) AS _ts
+      FROM read_parquet('{src}')
+    ),
+    w AS (
+      SELECT *,
+        SUM(casino_win) OVER ({_rng(15)}) AS _cw15,
+        SUM(casino_win) OVER ({_rng(60)}) AS _cw60,
+        SUM(theo_win) OVER ({_rng(60)}) AS _th60
+      FROM base
+    )
+    SELECT * EXCLUDE (_ts, _cw15, _cw60, _th60),
+      CAST(_cw15 - casino_win AS DOUBLE) AS fe__outcome__casino_win_sum__w15m,
+      CAST(_cw60 - casino_win AS DOUBLE) AS fe__outcome__casino_win_sum__w1h,
+      CASE WHEN (_th60 - theo_win) > 1e-9
+           THEN CAST((_cw60 - casino_win) / (_th60 - theo_win) AS DOUBLE) END
+        AS fe__outcome__casino_win_to_theo_ratio__w1h
+    FROM w
+    """.strip()
+
+
+def run_prodmom(*, seeds: tuple[int, ...]) -> dict[str, Any]:
+    """Validate the PROMOTED strict-PIT fe__outcome__ trio (same-pcd peers excluded) vs
+    the leakier experiment momentum feature that produced +3.4pp.
+
+    Arm A = base + txn (promotion-free baseline). Arm B = arm A + the 3 strict features.
+    Reports test operational P@1hr to measure the true production gain.
+    """
+
+    duck, _, _ = configs_from_run_profile(get_run_profile("default"))
+    PRODMOM_SPLITS.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(database=":memory:")
+    con.execute("PRAGMA threads=8")
+    try:
+        for split in _SPLIT_NAMES:
+            dst = PRODMOM_SPLITS / f"{split}.parquet"
+            if dst.is_file():
+                print(f"[prodmom] {split} already materialized; skip", flush=True)
+                continue
+            sql = _prodmom_copy_sql(MATRIX_SPLITS / f"{split}.parquet")
+            dst_s = str(dst.resolve()).replace("\\", "/")
+            con.execute(f"COPY ({sql}) TO '{dst_s}' (FORMAT PARQUET, COMPRESSION SNAPPY)")
+            print(f"[prodmom] materialized {split}", flush=True)
+    finally:
+        con.close()
+
+    base32 = tuple(c for c in MODEL_FEATURE_COLUMNS if c not in PROD3_COLS)
+    base_txn = tuple(dict.fromkeys(base32 + TXN_COLS))
+    arms = {
+        "base_txn": base_txn,
+        "base_txn_prodmom3": tuple(dict.fromkeys(base_txn + PROD3_COLS)),
+    }
+    min_prec = HighTierObjectiveConfig().min_precision
+    report_path = OUT_ROOT / "prodmom_report.json"
+    results: dict[str, Any] = (
+        json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {}
+    )
+    for arm, cols in arms.items():
+        for seed in seeds:
+            key = f"{arm}_seed{seed}"
+            if key in results:
+                print(f"[prodmom] {key} already done; skip", flush=True)
+                continue
+            t0 = time.perf_counter()
+            print(f"[prodmom] start {key} n_features={len(cols)}", flush=True)
+            res = _b5.train_lgbm_from_splits(
+                splits_dir=PRODMOM_SPLITS,
+                duckdb_runtime=duck,
+                objective_min_precision=min_prec,
+                random_seed=int(seed),
+                step5=Step5TrainConfig(run_step5=True, skip_optuna=True),
+                output_dir=OUT_ROOT / f"prodmom_{key}",
+                feature_columns=cols,
+            )
+            row = _metric_slice(dict(res.report))
+            row["elapsed_sec"] = round(time.perf_counter() - t0, 1)
+            row["n_features"] = len(cols)
+            results[key] = row
+            report_path.write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
+            print(f"[prodmom] done {key} in {row['elapsed_sec']}s", flush=True)
+    return results
+
+
 _FP_CREDIT_HORIZONS_MIN: Final[tuple[int, ...]] = (15, 30, 45, 60, 90, 120, 180)
 
 
@@ -1301,6 +1407,8 @@ def main() -> None:
     p_mom.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
     p_ct = sub.add_parser("cashtiming", help="train add_txn_momentum +/- cash-out timing")
     p_ct.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
+    p_pm = sub.add_parser("prodmom", help="validate promoted strict-PIT fe__outcome trio")
+    p_pm.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
     args = parser.parse_args()
     if args.cmd == "prep":
         out = run_prep(with_txn=bool(args.with_txn))
@@ -1326,6 +1434,8 @@ def main() -> None:
         out = run_momentum(seeds=tuple(args.seeds))
     elif args.cmd == "cashtiming":
         out = run_cashtiming(seeds=tuple(args.seeds))
+    elif args.cmd == "prodmom":
+        out = run_prodmom(seeds=tuple(args.seeds))
     elif args.cmd == "optuna":
         out = run_controlled_optuna(
             arm=str(args.arm),
