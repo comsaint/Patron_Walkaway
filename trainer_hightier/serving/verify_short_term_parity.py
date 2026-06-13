@@ -165,17 +165,22 @@ def _expand_pool_canonical_aliases(
     pool_end = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce").max().to_pydatetime()
     conn = _ddb.connect()
     try:
+        from trainer_hightier.serving.feature_builder import cleaned_bet_sql_etl_insert_column
+
         conn.execute(
             "CREATE TEMP TABLE allow_pids AS SELECT * FROM (SELECT UNNEST(?) AS player_id)",
             [all_pids],
         )
+        bet_from = f"read_parquet('{glob_path}', hive_partitioning=true)"
+        etl_col = cleaned_bet_sql_etl_insert_column(conn, bet_from)
         q = f"""
             SELECT
                 b.bet_id, b.player_id, b.payout_complete_dtm,
+                {etl_col},
                 CAST(b.gaming_day_event AS TIMESTAMP) AS gaming_day_event,
                 b.session_id, b.table_id, b.wager, b.casino_win, b.payout_odds,
                 b.is_back_bet, b.bet_type, b.type_of_bet
-            FROM read_parquet('{glob_path}', hive_partitioning=true) AS b
+            FROM {bet_from} AS b
             INNER JOIN allow_pids AS p ON b.player_id = p.player_id
             WHERE b.payout_complete_dtm >= ?
               AND b.payout_complete_dtm <= ?
@@ -185,13 +190,15 @@ def _expand_pool_canonical_aliases(
         conn.close()
     if wide.empty:
         return pool
-    wide["__etl_insert_Dtm"] = wide["payout_complete_dtm"]
     from trainer_hightier.serving.scorer import (
         _postprocess_incremental_bets_timestamps,
     )
     from trainer_hightier.serving.feature_builder import (
         attach_synthetic_etl_and_prediction_visible,
+        ensure_etl_observed_at_for_pit,
     )
+
+    wide = ensure_etl_observed_at_for_pit(wide)
 
     _postprocess_incremental_bets_timestamps(wide)
     return attach_synthetic_etl_and_prediction_visible(wide)

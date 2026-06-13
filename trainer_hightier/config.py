@@ -89,6 +89,7 @@ FE_SHORT_TERM_DEPLOY_PARQUET_BASENAME: Final[str] = "fe_short_term_features.parq
 SHORT_TERM_PIT_CACHE_DEPLOY_BASENAME: Final[str] = FE_SHORT_TERM_DEPLOY_PARQUET_BASENAME
 # Step 3.5 training artifact: per-row PIT values for training ``bet_id`` only.
 TRAINING_SHORT_TERM_PIT_CACHE_BASENAME: Final[str] = "_main_trainer_fe_short_term.parquet"
+TRAINING_TXN_LITE_CACHE_BASENAME: Final[str] = "_main_trainer_txn_lite.parquet"
 # L0 ``t_casino_txn`` source integration (see Data pipeline SSOT §5.2).
 TXN_L0_RAW_ROOT: Final[Path] = _REPO_ROOT / "data" / "t_casino_txn"
 TXN_L0_CLEANED_ROOT: Final[Path] = (
@@ -192,7 +193,10 @@ PLAYER_ALERT_COOLDOWN_MIN: Final[int] = 120
 LABELS_CANONICAL_SHARD_COUNT: Final[int] = 32
 DEFAULT_USE_SHARDED_LABELS_CACHE: Final[bool] = False
 LABEL_LOOKAHEAD_MIN: Final[int] = 45
-BET_AVAIL_DELAY_MIN: Final[int] = 1
+#: Bet availability delay before scoring (minutes). Keep >= ingest_delay_cap_sec (122s)
+#: from preprocess_l0_data_contract_registry so ``prediction_visible_ts_cf`` guarantees
+#: synthetic observed-at visibility at score time.
+BET_AVAIL_DELAY_MIN: Final[int] = 2
 SCORER_POLL_INTERVAL_SECONDS: Final[int] = 45
 #: Hard-fail scoring cycle when Feast entity row missing rate exceeds this fraction.
 SCORER_FEAST_ENTITY_MISSING_FAIL_FRACTION: Final[float] = 0.10
@@ -1037,7 +1041,7 @@ class HightierServingConfig:
     prediction_validation_cycle_budget_seconds: float = 20.0
     prediction_validation_retention_days: int = 180
     scorer_state_retention_hours: int = 24
-    bet_avail_delay_min: int = 1
+    bet_avail_delay_min: int = BET_AVAIL_DELAY_MIN
     session_avail_delay_min: int = 15
     scorer_poll_interval_seconds: float = 30.0
     scorer_feast_lookup_latency_warn_ms: float = SCORER_FEAST_LOOKUP_LATENCY_WARN_MS

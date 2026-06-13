@@ -135,3 +135,21 @@ def test_compute_fe_derived_from_pool_schema_max_payout_odds() -> None:
     assert not got.empty
     ratio = float(got.iloc[0]["fe__odds__payout_odds_to_recent_max_ratio__w1h"])
     assert ratio == pytest.approx(50.0)
+
+def test_ensure_etl_observed_at_for_pit_preserves_real_etl() -> None:
+    """Offline staging must not overwrite populated ``__etl_insert_Dtm`` with payout time."""
+    from trainer_hightier.serving.feature_builder import ensure_etl_observed_at_for_pit
+
+    hk = "Asia/Hong_Kong"
+    pcd = pd.Timestamp("2025-06-01 10:00:00", tz=hk)
+    etl = pcd + pd.Timedelta(minutes=5)
+    bets = pd.DataFrame(
+        {
+            "bet_id": [1.0],
+            "payout_complete_dtm": [pcd],
+            "__etl_insert_Dtm": [etl],
+        }
+    )
+    got = ensure_etl_observed_at_for_pit(bets)
+    assert pd.Timestamp(got.iloc[0]["__etl_insert_Dtm"]).tz_convert(hk) == etl
+

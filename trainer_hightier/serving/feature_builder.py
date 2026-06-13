@@ -42,6 +42,55 @@ SCORER_V2_SHORT_TERM_PIT_SUPPORTED: Final[frozenset[str]] = (
 )
 
 
+def cleaned_bet_sql_etl_insert_column(
+    conn: duckdb.DuckDBPyConnection,
+    bet_from: str,
+    *,
+    table_alias: str = "b",
+) -> str:
+    """SQL fragment for ``__etl_insert_Dtm`` when reading cleaned/raw bet parquet.
+
+    Falls back to ``payout_complete_dtm`` when the ETL column is absent (minimal
+    test fixtures). Real cleaned parquet and ClickHouse paths preserve raw ETL.
+    """
+    cols = {
+        str(row[0])
+        for row in conn.execute(f"DESCRIBE SELECT * FROM {bet_from} LIMIT 0").fetchall()
+    }
+    pcd = f"CAST({table_alias}.payout_complete_dtm AS TIMESTAMPTZ)"
+    if "__etl_insert_Dtm" in cols:
+        etl = f"CAST({table_alias}.__etl_insert_Dtm AS TIMESTAMPTZ)"
+        return f"COALESCE({etl}, {pcd}) AS __etl_insert_Dtm"
+    return f"{pcd} AS __etl_insert_Dtm"
+
+
+def ensure_etl_observed_at_for_pit(bets: pd.DataFrame) -> pd.DataFrame:
+    """Ensure ``__etl_insert_Dtm`` for PIT staging without overwriting real ETL timestamps.
+
+    Offline parity and backtest paths that lack ETL columns may fall back to
+    ``payout_complete_dtm``. When ETL is already present (cleaned parquet / CH),
+    preserve it so slow-ingest sources are not masked.
+    """
+    if bets.empty:
+        return bets
+    if "payout_complete_dtm" not in bets.columns:
+        raise ValueError(
+            f"bets missing payout_complete_dtm; columns={list(bets.columns)}",
+        )
+    out = bets.copy()
+    pcd = pd.to_datetime(out["payout_complete_dtm"], errors="coerce", utc=True)
+    if "__etl_insert_Dtm" not in out.columns:
+        out["__etl_insert_Dtm"] = pcd
+        return out
+    etl = pd.to_datetime(out["__etl_insert_Dtm"], errors="coerce", utc=True)
+    if etl.notna().any():
+        if etl.isna().any():
+            out["__etl_insert_Dtm"] = etl.fillna(pcd)
+        return out
+    out["__etl_insert_Dtm"] = pcd
+    return out
+
+
 def attach_synthetic_etl_and_prediction_visible(bets: pd.DataFrame) -> pd.DataFrame:
     """Add ``__etl_insert_Dtm_synthetic`` and ``prediction_visible_ts_cf`` like L0 preprocess.
 
@@ -892,6 +941,38 @@ def prepare_lgbm_feature_matrix(
                 out[c] = pd.Categorical(out[c], categories=list(cats))
         else:
             out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out
+
+
+def attach_txn_lite_features(
+    bets: pd.DataFrame,
+    *,
+    txn_columns: tuple[str, ...],
+    cleaned_casino_txn_root: Path | None = None,
+    duckdb_runtime: DuckDbRuntimeConfig | None = None,
+) -> pd.DataFrame:
+    """Left-join live ``txn__*`` cashflow features onto a scoring batch."""
+
+    if not txn_columns or bets.empty:
+        return bets
+    from trainer_hightier.feature_experiment.materialize_txn_lite import (
+        compute_txn_lite_features_for_bets,
+        default_cleaned_casino_txn_root,
+    )
+
+    root = Path(cleaned_casino_txn_root or default_cleaned_casino_txn_root()).resolve()
+    runtime = duckdb_runtime or DuckDbRuntimeConfig()
+    txn_df = compute_txn_lite_features_for_bets(
+        bets,
+        cleaned_casino_txn_root=root,
+        duckdb_runtime=runtime,
+    )
+    if txn_df.empty:
+        raise ValueError("attach_txn_lite_features: txn_lite query returned no rows")
+    out = bets.merge(txn_df, on="bet_id", how="left", suffixes=("", "_txn_dup"))
+    dup_cols = [c for c in out.columns if c.endswith("_txn_dup")]
+    if dup_cols:
+        out = out.drop(columns=dup_cols)
     return out
 
 

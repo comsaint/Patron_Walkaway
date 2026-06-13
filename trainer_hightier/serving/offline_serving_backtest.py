@@ -528,6 +528,10 @@ def load_bets_from_cleaned_parquet(
             "CREATE TEMP TABLE allowlist AS SELECT * FROM (SELECT UNNEST(?) AS player_id)",
             [allow],
         )
+        from trainer_hightier.serving.feature_builder import cleaned_bet_sql_etl_insert_column
+
+        bet_from = f"read_parquet('{glob_path}', hive_partitioning=true)"
+        etl_col = cleaned_bet_sql_etl_insert_column(conn, bet_from)
         q = f"""
             SELECT
                 b.bet_id,
@@ -535,6 +539,7 @@ def load_bets_from_cleaned_parquet(
                 b.bet_type,
                 b.type_of_bet,
                 b.payout_complete_dtm,
+                {etl_col},
                 CAST(b.gaming_day_event AS TIMESTAMP) AS gaming_day_event,
                 b.session_id,
                 b.player_id,
@@ -542,7 +547,7 @@ def load_bets_from_cleaned_parquet(
                 b.wager,
                 b.casino_win,
                 b.payout_odds
-            FROM read_parquet('{glob_path}', hive_partitioning=true) AS b
+            FROM {bet_from} AS b
             INNER JOIN allowlist AS a ON b.player_id = a.player_id
             WHERE CAST(b.gaming_day_event AS DATE) >= CAST(? AS DATE)
               AND CAST(b.gaming_day_event AS DATE) <= CAST(? AS DATE)
@@ -559,7 +564,9 @@ def load_bets_from_cleaned_parquet(
         conn.close()
     if bets.empty:
         return bets
-    bets["__etl_insert_Dtm"] = bets["payout_complete_dtm"]
+    from trainer_hightier.serving.feature_builder import ensure_etl_observed_at_for_pit
+
+    bets = ensure_etl_observed_at_for_pit(bets)
     if "casino_player_id" not in bets.columns:
         bets["casino_player_id"] = None
     if "position_idx" not in bets.columns:
@@ -674,11 +681,16 @@ def _bets_frame_from_test_batch(batch: pd.DataFrame) -> pd.DataFrame:
     miss = [c for c in _TEST_BET_COLUMNS if c not in batch.columns]
     if miss:
         raise ValueError(f"test split missing bet columns {miss}")
-    bets = batch[list(_TEST_BET_COLUMNS)].copy()
+    cols = list(_TEST_BET_COLUMNS)
+    if "__etl_insert_Dtm" in batch.columns:
+        cols.append("__etl_insert_Dtm")
+    bets = batch[cols].copy()
     bets["payout_complete_dtm"] = pandas_ts_series_to_hk_l0_contract(
         bets["payout_complete_dtm"],
     )
-    bets["__etl_insert_Dtm"] = bets["payout_complete_dtm"]
+    from trainer_hightier.serving.feature_builder import ensure_etl_observed_at_for_pit
+
+    bets = ensure_etl_observed_at_for_pit(bets)
     if "casino_player_id" not in bets.columns:
         bets["casino_player_id"] = None
     return bets
@@ -785,10 +797,13 @@ def build_pool_from_cleaned_parquet(
         )
     try:
         conn.execute("DROP TABLE IF EXISTS allow_pids")
+        from trainer_hightier.serving.feature_builder import cleaned_bet_sql_etl_insert_column
+
         conn.execute(
             "CREATE TEMP TABLE allow_pids AS SELECT * FROM (SELECT UNNEST(?) AS player_id)",
             [pids],
         )
+        etl_col = cleaned_bet_sql_etl_insert_column(conn, bet_from)
         q = f"""
             SELECT
                 b.bet_id,
@@ -796,6 +811,7 @@ def build_pool_from_cleaned_parquet(
                 b.bet_type,
                 b.type_of_bet,
                 b.payout_complete_dtm,
+                {etl_col},
                 CAST(b.gaming_day_event AS TIMESTAMP) AS gaming_day_event,
                 b.session_id,
                 b.player_id,
@@ -818,7 +834,9 @@ def build_pool_from_cleaned_parquet(
         raise ValueError(
             "[offline_backtest] cleaned bet pool empty; check --local-cleaned-bet path and dates"
         )
-    pool["__etl_insert_Dtm"] = pool["payout_complete_dtm"]
+    from trainer_hightier.serving.feature_builder import ensure_etl_observed_at_for_pit
+
+    pool = ensure_etl_observed_at_for_pit(pool)
     _postprocess_cleaned_l0_bets_timestamps(pool)
     return attach_synthetic_etl_and_prediction_visible(pool)
 

@@ -296,6 +296,10 @@ def build_pool_from_raw_partitions(
     glob_path = _raw_t_bet_partition_glob(raw_partition_dir)
     conn = duckdb.connect()
     try:
+        from trainer_hightier.serving.feature_builder import cleaned_bet_sql_etl_insert_column
+
+        bet_from = f"read_parquet('{glob_path}')"
+        etl_col = cleaned_bet_sql_etl_insert_column(conn, bet_from)
         conn.execute(
             "CREATE TEMP TABLE allow_pids AS SELECT * FROM (SELECT UNNEST(?) AS player_id)",
             [pids],
@@ -307,6 +311,7 @@ def build_pool_from_raw_partitions(
                 CAST(b.bet_type AS VARCHAR) AS bet_type,
                 CAST(b.type_of_bet AS VARCHAR) AS type_of_bet,
                 CAST(b.payout_complete_dtm AS TIMESTAMPTZ) AS payout_complete_dtm,
+                {etl_col},
                 CAST(b.gaming_day AS DATE) AS gaming_day_event,
                 TRY_CAST(CAST(b.session_id AS VARCHAR) AS DOUBLE) AS session_id,
                 TRY_CAST(CAST(b.player_id AS VARCHAR) AS BIGINT) AS player_id,
@@ -316,7 +321,7 @@ def build_pool_from_raw_partitions(
                 TRY_CAST(CAST(b.payout_odds AS VARCHAR) AS DOUBLE) AS payout_odds,
                 TRY_CAST(CAST(b.theo_win AS VARCHAR) AS DOUBLE) AS theo_win,
                 TRY_CAST(CAST(b.base_ha AS VARCHAR) AS DOUBLE) AS base_ha
-            FROM read_parquet('{glob_path}') AS b
+            FROM {bet_from} AS b
             INNER JOIN allow_pids AS p
               ON TRY_CAST(CAST(b.player_id AS VARCHAR) AS BIGINT) = p.player_id
             WHERE CAST(b.payout_complete_dtm AS TIMESTAMPTZ) >= ?
@@ -331,9 +336,12 @@ def build_pool_from_raw_partitions(
             "[raw_source_sanity] raw partition pool empty; check raw_partition_dir and dates",
         )
     pool = pool.drop_duplicates(subset=["bet_id"], keep="last")
-    pool["__etl_insert_Dtm"] = pool["payout_complete_dtm"]
-    from trainer_hightier.serving.feature_builder import attach_synthetic_etl_and_prediction_visible
+    from trainer_hightier.serving.feature_builder import (
+        attach_synthetic_etl_and_prediction_visible,
+        ensure_etl_observed_at_for_pit,
+    )
 
+    pool = ensure_etl_observed_at_for_pit(pool)
     return attach_synthetic_etl_and_prediction_visible(pool)
 
 
@@ -411,8 +419,9 @@ def run_raw_source_w1h_sanity_check(
             "issues": issues,
             "n_rows_compared": 0,
         }
-    staged = sort_bets_for_scoring_batch(work)
-    staged["__etl_insert_Dtm"] = pd.to_datetime(staged["payout_complete_dtm"], errors="coerce", utc=True)
+    from trainer_hightier.serving.feature_builder import ensure_etl_observed_at_for_pit
+
+    staged = ensure_etl_observed_at_for_pit(sort_bets_for_scoring_batch(work))
     pool = build_pool_from_raw_partitions(
         staged,
         raw_partition_dir=raw_dir,

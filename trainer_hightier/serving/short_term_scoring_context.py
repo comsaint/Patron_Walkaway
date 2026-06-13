@@ -131,8 +131,9 @@ def build_short_term_features_for_batch(
 
     if bets_batch.empty:
         return pd.DataFrame(columns=["bet_id", *trial_columns, *fe_columns])
-    work = sort_bets_for_scoring_batch(bets_batch)
-    work["__etl_insert_Dtm"] = pd.to_datetime(work["payout_complete_dtm"], errors="coerce", utc=True)
+    from trainer_hightier.serving.feature_builder import ensure_etl_observed_at_for_pit
+
+    work = ensure_etl_observed_at_for_pit(sort_bets_for_scoring_batch(bets_batch))
     pool = build_pool_from_cleaned_bets(
         work,
         cleaned_bet_parquet=cleaned_bet_parquet,
