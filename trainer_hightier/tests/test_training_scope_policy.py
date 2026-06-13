@@ -414,3 +414,64 @@ def test_training_manifest_includes_target_scope_audit_block() -> None:
     )
     assert "target_scope" in blob
     assert blob["target_scope"]["target_months"] == list(resolved.target_months)
+
+
+def test_join_labels_to_features_uses_deterministic_bet_dedup(tmp_path: Path) -> None:
+    """Duplicate cleaned-bet rows must resolve via keep-last ordering, not ANY_VALUE."""
+
+    features_p = tmp_path / "features.parquet"
+    labels_p = tmp_path / "labels.parquet"
+    cleaned_p = tmp_path / "cleaned_bet.parquet"
+    out_p = tmp_path / "training_set.parquet"
+
+    pq.write_table(
+        pa.table({"bet_id": [100.0], "feat_a": [1.0]}),
+        features_p,
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "bet_id": [100.0],
+                "label": [1],
+                "censored": [False],
+                "canonical_id": ["c1"],
+            }
+        ),
+        labels_p,
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "bet_id": [100.0, 100.0],
+                "gaming_day_event": ["2026-05-01", "2026-05-02"],
+                "player_id": [111, 222],
+                "game_id": [10, 20],
+                "payout_complete_dtm": [
+                    "2026-05-01T10:00:00+08:00",
+                    "2026-05-02T11:00:00+08:00",
+                ],
+                "__etl_insert_Dtm_synthetic": [
+                    "2026-05-01T09:00:00+08:00",
+                    "2026-05-02T12:00:00+08:00",
+                ],
+                "__etl_insert_Dtm": [
+                    "2026-05-01T09:00:00+08:00",
+                    "2026-05-02T12:00:00+08:00",
+                ],
+                "__ts_ms": [1, 2],
+            }
+        ),
+        cleaned_p,
+    )
+
+    _bt3._join_labels_to_features(
+        features_parquet=features_p,
+        labels_parquet=labels_p,
+        cleaned_bet_parquet=cleaned_p,
+        output_parquet=out_p,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+    )
+    row = duckdb.connect(database=":memory:").execute(
+        f"SELECT player_id, game_id, gaming_day_event FROM read_parquet('{out_p.as_posix()}')"
+    ).fetchone()
+    assert row == (222, 20, date(2026, 5, 2))

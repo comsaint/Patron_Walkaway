@@ -867,13 +867,28 @@ COPY (
   ) y ON TRY_CAST(h.bet_id AS DOUBLE) = y.bet_id
   LEFT JOIN (
     SELECT
-      TRY_CAST(bet_id AS DOUBLE) AS bet_id,
-      MIN(CAST(gaming_day_event AS DATE)) AS gaming_day_event,
-      ANY_VALUE(TRY_CAST(player_id AS BIGINT)) AS player_id,
-      ANY_VALUE(TRY_CAST(game_id AS BIGINT)) AS game_id
-    FROM {bet_from} AS _cbd
-    WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
-    GROUP BY 1
+      bet_id,
+      gaming_day_event,
+      player_id,
+      game_id
+    FROM (
+      SELECT
+        TRY_CAST(bet_id AS DOUBLE) AS bet_id,
+        CAST(gaming_day_event AS DATE) AS gaming_day_event,
+        TRY_CAST(player_id AS BIGINT) AS player_id,
+        TRY_CAST(game_id AS BIGINT) AS game_id,
+        ROW_NUMBER() OVER (
+          PARTITION BY TRY_CAST(bet_id AS DOUBLE)
+          ORDER BY
+            __etl_insert_Dtm_synthetic DESC NULLS LAST,
+            TRY_CAST(payout_complete_dtm AS TIMESTAMP) DESC NULLS LAST,
+            TRY_CAST(__etl_insert_Dtm AS TIMESTAMP) DESC NULLS LAST,
+            TRY_CAST(__ts_ms AS BIGINT) DESC NULLS LAST
+        ) AS _rn
+      FROM {bet_from} AS _cbd
+      WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
+    ) ranked
+    WHERE _rn = 1
   ) b ON TRY_CAST(h.bet_id AS DOUBLE) = b.bet_id
 ) TO '{o_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)
 """.strip()
