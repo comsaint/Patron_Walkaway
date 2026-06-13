@@ -547,12 +547,15 @@ features:
   semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
   status: experimental
   enabled_for:
+  - baseline
   - candidate
   - ablation
   drop_reason_code: null
-  last_updated_experiment: run_20260515T175157Z
-  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP -0.0002,
-    ΔRecall +0.0042 (mixed_leave_one_out_signals).'
+  last_updated_experiment: run_20260612_momentum_promote
+  note: 'PROMOTED (run_20260612_momentum_promote): recent loss-momentum arm gave +3.4pp
+    operational P@1hr across 3 seeds vs add_txn base. Supersedes the 20260515 add-one
+    AP-neutral verdict (different KPI: operational P@1hr vs global AP, and base lacked
+    outcome features).'
   time_horizon: short_term
   max_lookback: PT15M
 - feature_id: fe__outcome__casino_win_sum__w1h
@@ -561,12 +564,15 @@ features:
   semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
   status: experimental
   enabled_for:
+  - baseline
   - candidate
   - ablation
   drop_reason_code: null
-  last_updated_experiment: run_20260515T175157Z
-  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP -0.0002,
-    ΔRecall +0.0042 (mixed_leave_one_out_signals).'
+  last_updated_experiment: run_20260612_momentum_promote
+  note: 'PROMOTED (run_20260612_momentum_promote): recent loss-momentum arm gave +3.4pp
+    operational P@1hr across 3 seeds vs add_txn base. Supersedes the 20260515 add-one
+    AP-neutral verdict (different KPI: operational P@1hr vs global AP, and base lacked
+    outcome features).'
   time_horizon: short_term
   max_lookback: PT1H
 - feature_id: fe__outcome__loss_rate__w1h
@@ -595,6 +601,23 @@ features:
   last_updated_experiment: run_20260515T175157Z
   note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP -0.0002,
     ΔRecall +0.0042 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__outcome__casino_win_to_theo_ratio__w1h
+  group_id: group_m_outcome_state
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260612_momentum_promote
+  note: 'PROMOTED (run_20260612_momentum_promote): loss-over-theo (recent actual loss
+    / theoretical loss over 1h, PIT-exclusive). Part of the recent loss-momentum arm
+    (+3.4pp operational P@1hr across 3 seeds vs add_txn base). Requires theo_win in
+    the fe_derived pool (offline + online scorer fetch).'
   time_horizon: short_term
   max_lookback: PT1H
 - feature_id: fe__outcome__last_3_bets_loss_count
@@ -1072,6 +1095,7 @@ features:
   semantic_owner: trainer_hightier/feature_experiment/materialize_txn_lite.py
   status: experimental
   enabled_for:
+  - baseline
   - candidate
   - ablation
   drop_reason_code: null
@@ -1085,6 +1109,7 @@ features:
   semantic_owner: trainer_hightier/feature_experiment/materialize_txn_lite.py
   status: experimental
   enabled_for:
+  - baseline
   - candidate
   - ablation
   drop_reason_code: null
@@ -1098,6 +1123,7 @@ features:
   semantic_owner: trainer_hightier/feature_experiment/materialize_txn_lite.py
   status: experimental
   enabled_for:
+  - baseline
   - candidate
   - ablation
   drop_reason_code: null
@@ -1111,6 +1137,7 @@ features:
   semantic_owner: trainer_hightier/feature_experiment/materialize_txn_lite.py
   status: experimental
   enabled_for:
+  - baseline
   - candidate
   - ablation
   drop_reason_code: null
@@ -1124,6 +1151,7 @@ features:
   semantic_owner: trainer_hightier/feature_experiment/materialize_txn_lite.py
   status: experimental
   enabled_for:
+  - baseline
   - candidate
   - ablation
   drop_reason_code: null
@@ -1137,6 +1165,7 @@ features:
   semantic_owner: trainer_hightier/feature_experiment/materialize_txn_lite.py
   status: experimental
   enabled_for:
+  - baseline
   - candidate
   - ablation
   drop_reason_code: null
@@ -1150,6 +1179,7 @@ features:
   semantic_owner: trainer_hightier/feature_experiment/materialize_txn_lite.py
   status: experimental
   enabled_for:
+  - baseline
   - candidate
   - ablation
   drop_reason_code: null
