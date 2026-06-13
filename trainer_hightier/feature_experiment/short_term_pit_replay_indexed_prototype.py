@@ -95,6 +95,12 @@ WP_9_6_TODAY_COLUMNS: Final[tuple[str, ...]] = (
     "fe__canonical__elapsed_sec_since_first_bet__today",
 )
 
+OUTCOME_PEER_INCLUSIVE_COLUMNS: Final[tuple[str, ...]] = (
+    "fe__outcome__casino_win_sum__w15m",
+    "fe__outcome__casino_win_sum__w1h",
+    "fe__outcome__casino_win_to_theo_ratio__w1h",
+)
+
 INDEXED_PROTOTYPE_OUTPUT_COLUMNS: Final[tuple[str, ...]] = (
     *PROTOTYPE_OUTPUT_COLUMNS,
     "bet__wager_sum__w1h",
@@ -105,9 +111,10 @@ INDEXED_PROTOTYPE_OUTPUT_COLUMNS: Final[tuple[str, ...]] = (
     *WP_9_4_MAX_RATIO_COLUMNS,
     *WP_9_5_INTERARRIVAL_COLUMNS,
     *WP_9_6_TODAY_COLUMNS,
+    *OUTCOME_PEER_INCLUSIVE_COLUMNS,
 )
 
-# Prototype go/no-go excludes these production gate columns (low model importance / edge parity).
+# Prototype go/no-go excludes low-importance production gate columns only.
 PROTOTYPE_GATE_IGNORE_COLUMNS: Final[tuple[str, ...]] = (
     "fe__odds__payout_odds_z__w1h",
 )
@@ -175,6 +182,10 @@ class _EntityArrays:
     iv_sumsq_prefix: np.ndarray
     iv_cnt_prefix: np.ndarray
     gaming_day_ord: np.ndarray
+    casino_win: np.ndarray
+    theo_win: np.ndarray
+    casino_win_sum_prefix: np.ndarray
+    theo_win_sum_prefix: np.ndarray
 
 
 def _cumsum_prefix(values: np.ndarray) -> np.ndarray:
@@ -333,9 +344,13 @@ def _entity_arrays_from_sorted_rows(
     odds: np.ndarray,
     wager: np.ndarray,
     gday: np.ndarray,
+    casino_win: np.ndarray,
+    theo_win: np.ndarray,
 ) -> _EntityArrays:
     """Build prefix arrays from lex-sorted entity rows."""
     wager_sum_p, wager_sumsq_p, wager_cnt_p = _finite_value_prefixes(wager)
+    casino_win_sum_p, _, _ = _finite_value_prefixes(casino_win)
+    theo_win_sum_p, _, _ = _finite_value_prefixes(theo_win)
     finite_wager = np.isfinite(wager)
     abs_wager_sum_p = _cumsum_prefix(np.where(finite_wager, np.abs(wager), 0.0))
     abs_wager_cnt_p = _cumsum_prefix(finite_wager.astype(np.float64))
@@ -362,6 +377,10 @@ def _entity_arrays_from_sorted_rows(
         iv_sumsq_prefix=iv_sumsq_p,
         iv_cnt_prefix=iv_cnt_p,
         gaming_day_ord=gday,
+        casino_win=casino_win,
+        theo_win=theo_win,
+        casino_win_sum_prefix=casino_win_sum_p,
+        theo_win_sum_prefix=theo_win_sum_p,
     )
 
 
@@ -376,6 +395,14 @@ def _prepare_entity_event_frame(
     work["player_id"] = pd.to_numeric(work["player_id"], errors="coerce")
     work["bet_id"] = pd.to_numeric(work["bet_id"], errors="coerce")
     work["wager"] = pd.to_numeric(work["wager"], errors="coerce")
+    if "casino_win" in work.columns:
+        work["casino_win"] = pd.to_numeric(work["casino_win"], errors="coerce")
+    else:
+        work["casino_win"] = np.nan
+    if "theo_win" in work.columns:
+        work["theo_win"] = pd.to_numeric(work["theo_win"], errors="coerce")
+    else:
+        work["theo_win"] = np.nan
     work["payout_odds"] = pd.to_numeric(work["payout_odds"], errors="coerce")
     work["pcd_ns"] = _series_to_ns(work["payout_complete_dtm"])
     gde_series = work["gaming_day_event"] if "gaming_day_event" in work.columns else None
@@ -407,6 +434,8 @@ def _build_entity_arrays(
         bid = grp["bet_id"].to_numpy(dtype=np.float64, copy=False)
         odds = grp["payout_odds"].to_numpy(dtype=np.float64, copy=False)
         wager = grp["wager"].to_numpy(dtype=np.float64, copy=False)
+        casino_win = grp["casino_win"].to_numpy(dtype=np.float64, copy=False)
+        theo_win = grp["theo_win"].to_numpy(dtype=np.float64, copy=False)
         gday = grp["gaming_day_ord"].to_numpy(dtype=np.int64, copy=False)
         order = np.lexsort((bid, pcd))
         arrays = _entity_arrays_from_sorted_rows(
@@ -415,6 +444,8 @@ def _build_entity_arrays(
             odds[order],
             wager[order],
             gday[order],
+            casino_win[order],
+            theo_win[order],
         )
         entity_arrays[(str(cid).strip(), int(pid))] = arrays
         max_len = max(max_len, len(arrays.pcd_ns))
@@ -1163,6 +1194,62 @@ def _batch_uncapped_window_bounds(
     return left.astype(np.int64, copy=False), right.astype(np.int64, copy=False)
 
 
+def _batch_peer_inclusive_window_bounds(
+    pcd_ns: np.ndarray,
+    pool_start_ns: np.ndarray,
+    scoring_pcd_ns: np.ndarray,
+    window_ns: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return slice bounds for peer-inclusive windows (``CURRENT ROW`` at ``scoring_pcd``)."""
+    window_start = np.maximum(pool_start_ns, scoring_pcd_ns - int(window_ns))
+    left = np.searchsorted(pcd_ns, window_start, side="left")
+    right = np.searchsorted(pcd_ns, scoring_pcd_ns, side="right")
+    return left.astype(np.int64, copy=False), right.astype(np.int64, copy=False)
+
+
+def _batch_emit_outcome_peer_features(
+    col_arrays: dict[str, np.ndarray],
+    out_indices: np.ndarray,
+    arrays: _EntityArrays,
+    target_idx_arr: np.ndarray,
+    pool_start_ns: np.ndarray,
+    scoring_pcd_ns: np.ndarray,
+) -> None:
+    """Emit inclusive-minus-self outcome momentum columns for one entity batch."""
+    left15, right15 = _batch_peer_inclusive_window_bounds(
+        arrays.pcd_ns,
+        pool_start_ns,
+        scoring_pcd_ns,
+        _W15_NS,
+    )
+    left1h, right1h = _batch_peer_inclusive_window_bounds(
+        arrays.pcd_ns,
+        pool_start_ns,
+        scoring_pcd_ns,
+        _W1H_NS,
+    )
+    cw15 = arrays.casino_win_sum_prefix[right15] - arrays.casino_win_sum_prefix[left15]
+    cw1h = arrays.casino_win_sum_prefix[right1h] - arrays.casino_win_sum_prefix[left1h]
+    th1h = arrays.theo_win_sum_prefix[right1h] - arrays.theo_win_sum_prefix[left1h]
+    valid = target_idx_arr >= 0
+    self_cw = np.zeros(len(target_idx_arr), dtype=np.float64)
+    self_th = np.zeros(len(target_idx_arr), dtype=np.float64)
+    if np.any(valid):
+        idx = target_idx_arr[valid]
+        cw_vals = arrays.casino_win[idx]
+        th_vals = arrays.theo_win[idx]
+        self_cw[valid] = np.where(np.isfinite(cw_vals), cw_vals, 0.0)
+        self_th[valid] = np.where(np.isfinite(th_vals), th_vals, 0.0)
+    peer_cw15 = cw15 - self_cw
+    peer_cw1h = cw1h - self_cw
+    peer_th1h = th1h - self_th
+    ratio = np.full(len(target_idx_arr), np.nan, dtype=np.float64)
+    np.divide(peer_cw1h, peer_th1h, out=ratio, where=peer_th1h > 1e-9)
+    col_arrays["fe__outcome__casino_win_sum__w15m"][out_indices] = peer_cw15
+    col_arrays["fe__outcome__casino_win_sum__w1h"][out_indices] = peer_cw1h
+    col_arrays["fe__outcome__casino_win_to_theo_ratio__w1h"][out_indices] = ratio
+
+
 def _batch_entity_window_slices(
     arrays: _EntityArrays,
     pool_start_ns: np.ndarray,
@@ -1856,6 +1943,14 @@ def _indexed_replay_features(
                 group_pool_start,
                 group_scoring_pcd,
                 group_bet_ids,
+            )
+            _batch_emit_outcome_peer_features(
+                col_arrays,
+                out_indices,
+                arrays,
+                target_idx_arr,
+                group_pool_start,
+                group_scoring_pcd,
             )
             canon_bounds_list: list[tuple[int, int] | None]
             if canon_arrays is not None:

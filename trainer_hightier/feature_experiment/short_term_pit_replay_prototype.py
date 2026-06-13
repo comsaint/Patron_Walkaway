@@ -179,6 +179,8 @@ def _load_replay_events(
                 "player_id",
                 "payout_complete_dtm",
                 "wager",
+                "casino_win",
+                "theo_win",
                 "is_back_bet",
                 "payout_odds",
             ],
@@ -200,6 +202,8 @@ def _load_replay_events(
               CAST(payout_complete_dtm AS TIMESTAMPTZ) AS payout_complete_dtm,
               CAST(gaming_day_event AS TIMESTAMP) AS gaming_day_event,
               TRY_CAST(wager AS DOUBLE) AS wager,
+              TRY_CAST(casino_win AS DOUBLE) AS casino_win,
+              TRY_CAST(theo_win AS DOUBLE) AS theo_win,
               TRY_CAST(is_back_bet AS INTEGER) AS is_back_bet,
               TRY_CAST(payout_odds AS DOUBLE) AS payout_odds
             FROM {session.table_name}

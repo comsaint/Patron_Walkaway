@@ -47,6 +47,9 @@ DEFAULT_MODEL_FE_DERIVED_COLUMNS: tuple[str, ...] = (
     "fe__odds__payout_odds_z__w1h",
     "fe__odds__payout_odds_to_recent_max_ratio__w1h",
     "fe__odds__payout_odds_step_ratio",
+    "fe__outcome__casino_win_sum__w15m",
+    "fe__outcome__casino_win_sum__w1h",
+    "fe__outcome__casino_win_to_theo_ratio__w1h",
 )
 
 DEFAULT_MODEL_SLOW_PATRON_COLUMNS: tuple[str, ...] = (

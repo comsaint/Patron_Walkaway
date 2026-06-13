@@ -18,6 +18,7 @@ from trainer_hightier.config import default_hightier_serving_config
 # Bare CAST(... AS Float64) fails on NULL; toFloat64OrNull only accepts String.
 CH_TBET_WAGER_SELECT: Final[str] = "CAST(wager AS Nullable(Float64)) AS wager"
 CH_TBET_CASINO_WIN_SELECT: Final[str] = "CAST(casino_win AS Nullable(Float64)) AS casino_win"
+CH_TBET_THEO_WIN_SELECT: Final[str] = "CAST(theo_win AS Nullable(Float64)) AS theo_win"
 CH_TBET_PAYOUT_ODDS_SELECT: Final[str] = "CAST(payout_odds AS Nullable(Float64)) AS payout_odds"
 CH_TBET_WAGER_POSITIVE_PRED: Final[str] = (
     "wager IS NOT NULL AND CAST(wager AS Nullable(Float64)) > 0"

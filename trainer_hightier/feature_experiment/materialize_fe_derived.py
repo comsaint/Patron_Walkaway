@@ -1,10 +1,14 @@
 """Materialize ``fe__*`` window features from cleaned bet (DuckDB, read-only ingest).
 
-Windows mirror :mod:`trainer_hightier.utils.trial_bet_behavior_1h`:
-``RANGE ... PRECEDING`` excludes the current row. Patron-level windows partition
-by ``canonical_id`` (aligned with walkaway labels). The scan universe is all
-``player_id`` rows that map to any ``canonical_id`` seen on training ``bet_id``
-rows (so multi-card patrons include history under every linked ``player_id``).
+Windows mirror :mod:`trainer_hightier.utils.trial_bet_behavior_1h` for most
+features: ``RANGE ... PRECEDING`` excludes the current row. Outcome momentum
+columns ``fe__outcome__casino_win_sum__*`` and ``fe__outcome__casino_win_to_theo_ratio__w1h``
+use a peer-inclusive window (``CURRENT ROW``) minus the scored bet so same-``pcd``
+siblings contribute (PIT-safe when ETL is visible at score time). Patron-level
+windows partition by ``canonical_id`` (aligned with walkaway labels). The scan
+universe is all ``player_id`` rows that map to any ``canonical_id`` seen on
+training ``bet_id`` rows (so multi-card patrons include history under every
+linked ``player_id``).
 
 Time-zone convention (verified against cleaned bet Parquet):
 - ``payout_complete_dtm`` is stored as ``timestamp[us, tz=UTC]``; window arithmetic
@@ -42,7 +46,7 @@ from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
 
 logger = logging.getLogger(__name__)
 
-BOUNDED_SHORT_TERM_MATERIALIZER_VERSION: Final[str] = "bounded_hot_pool_v1"
+BOUNDED_SHORT_TERM_MATERIALIZER_VERSION: Final[str] = "bounded_hot_pool_v2_peer_inclusive"
 
 _TRAINING_BET_STAGING_COLUMNS: Final[tuple[str, ...]] = (
     "bet_id",
@@ -218,10 +222,13 @@ ordered AS (
     COUNT(*) OVER w15 AS fe__bets_cnt__w15m_raw,
     COALESCE(SUM(wager) OVER w15, 0.0) AS fe__wager_sum__w15m_raw,
     COALESCE(SUM(casino_win) OVER w15, 0.0) AS cw_sum_w15m,
+    COALESCE(SUM(casino_win) OVER w15_peer, 0.0) AS cw_sum_w15m_peer,
     COUNT(*) OVER w1h AS cnt_w1h,
     COALESCE(SUM(wager) OVER w1h, 0.0) AS wager_sum_w1h,
     COALESCE(SUM(casino_win) OVER w1h, 0.0) AS cw_sum_w1h,
+    COALESCE(SUM(casino_win) OVER w1h_peer, 0.0) AS cw_sum_w1h_peer,
     COALESCE(SUM(theo_win) OVER w1h, 0.0) AS tw_sum_w1h,
+    COALESCE(SUM(theo_win) OVER w1h_peer, 0.0) AS tw_sum_w1h_peer,
     COALESCE(SUM(CASE WHEN casino_win > 0 THEN 1 ELSE 0 END) OVER w1h, 0) AS loss_cnt_w1h,
     AVG(payout_odds) OVER w1h AS payout_odds_avg_w1h,
     STDDEV_POP(payout_odds) OVER w1h AS payout_odds_std_w1h,
@@ -260,9 +267,17 @@ ordered AS (
       PARTITION BY canonical_id ORDER BY pcd
       RANGE BETWEEN INTERVAL '15 MINUTE' PRECEDING AND INTERVAL '1 MICROSECOND' PRECEDING
     ),
+    w15_peer AS (
+      PARTITION BY canonical_id ORDER BY pcd
+      RANGE BETWEEN INTERVAL '15 MINUTE' PRECEDING AND CURRENT ROW
+    ),
     w1h AS (
       PARTITION BY canonical_id ORDER BY pcd
       RANGE BETWEEN INTERVAL '1 HOUR' PRECEDING AND INTERVAL '1 MICROSECOND' PRECEDING
+    ),
+    w1h_peer AS (
+      PARTITION BY canonical_id ORDER BY pcd
+      RANGE BETWEEN INTERVAL '1 HOUR' PRECEDING AND CURRENT ROW
     ),
     w1d AS (
       PARTITION BY canonical_id ORDER BY pcd
@@ -346,8 +361,8 @@ SELECT
   END AS fe__clock__is_late_night,
 
   -- Group M: outcome_state (casino_win > 0 = player lost; bet-table only, PIT-safe)
-  CAST(cw_sum_w15m AS DOUBLE) AS fe__outcome__casino_win_sum__w15m,
-  CAST(cw_sum_w1h AS DOUBLE) AS fe__outcome__casino_win_sum__w1h,
+  CAST(cw_sum_w15m_peer - COALESCE(casino_win, 0.0) AS DOUBLE) AS fe__outcome__casino_win_sum__w15m,
+  CAST(cw_sum_w1h_peer - COALESCE(casino_win, 0.0) AS DOUBLE) AS fe__outcome__casino_win_sum__w1h,
   CASE
     WHEN cnt_w1h > 0 THEN CAST(loss_cnt_w1h * 1.0 / cnt_w1h AS DOUBLE)
     ELSE CAST(NULL AS DOUBLE)
@@ -356,6 +371,14 @@ SELECT
     WHEN wager_sum_w1h > 1e-9 THEN CAST(cw_sum_w1h / wager_sum_w1h AS DOUBLE)
     ELSE CAST(NULL AS DOUBLE)
   END AS fe__outcome__net_pnl_to_wager_ratio__w1h,
+  CASE
+    WHEN (tw_sum_w1h_peer - COALESCE(theo_win, 0.0)) > 1e-9
+    THEN CAST(
+      (cw_sum_w1h_peer - COALESCE(casino_win, 0.0))
+      / (tw_sum_w1h_peer - COALESCE(theo_win, 0.0))
+      AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__outcome__casino_win_to_theo_ratio__w1h,
   CAST(
     CASE WHEN lag1_casino_win IS NOT NULL AND lag1_casino_win > 0 THEN 1 ELSE 0 END
     + CASE WHEN lag2_casino_win IS NOT NULL AND lag2_casino_win > 0 THEN 1 ELSE 0 END
@@ -955,6 +978,12 @@ ordered AS (
     COUNT(*) OVER w5m AS cnt_w5m,
     COUNT(*) OVER w15 AS fe__bets_cnt__w15m_raw,
     COALESCE(SUM(wager) OVER w15, 0.0) AS fe__wager_sum__w15m_raw,
+    COALESCE(SUM(casino_win) OVER w15, 0.0) AS cw_sum_w15m,
+    COALESCE(SUM(casino_win) OVER w15_peer, 0.0) AS cw_sum_w15m_peer,
+    COALESCE(SUM(casino_win) OVER w1h, 0.0) AS cw_sum_w1h,
+    COALESCE(SUM(casino_win) OVER w1h_peer, 0.0) AS cw_sum_w1h_peer,
+    COALESCE(SUM(theo_win) OVER w1h, 0.0) AS tw_sum_w1h,
+    COALESCE(SUM(theo_win) OVER w1h_peer, 0.0) AS tw_sum_w1h_peer,
     COUNT(*) OVER w1h AS cnt_w1h,
     COUNT(*) OVER w1d AS fe__bets_cnt__w1d_raw,
     COALESCE(SUM(wager) OVER w1d, 0.0) AS fe__wager_sum__w1d_raw,
@@ -990,9 +1019,17 @@ ordered AS (
       PARTITION BY target_bet_id ORDER BY pcd
       RANGE BETWEEN INTERVAL '15 MINUTE' PRECEDING AND INTERVAL '1 MICROSECOND' PRECEDING
     ),
+    w15_peer AS (
+      PARTITION BY target_bet_id ORDER BY pcd
+      RANGE BETWEEN INTERVAL '15 MINUTE' PRECEDING AND CURRENT ROW
+    ),
     w1h AS (
       PARTITION BY target_bet_id ORDER BY pcd
       RANGE BETWEEN INTERVAL '1 HOUR' PRECEDING AND INTERVAL '1 MICROSECOND' PRECEDING
+    ),
+    w1h_peer AS (
+      PARTITION BY target_bet_id ORDER BY pcd
+      RANGE BETWEEN INTERVAL '1 HOUR' PRECEDING AND CURRENT ROW
     ),
     w1d AS (
       PARTITION BY target_bet_id ORDER BY pcd
@@ -1019,6 +1056,16 @@ SELECT
   CAST(fe__wager_sum__w7d_raw AS DOUBLE) AS fe__wager_sum__w7d,
   CAST(fe__bets_cnt__w30d_raw AS DOUBLE) AS fe__bets_cnt__w30d,
   CAST(fe__wager_sum__w30d_raw AS DOUBLE) AS fe__wager_sum__w30d,
+  CAST(cw_sum_w15m_peer - COALESCE(casino_win, 0.0) AS DOUBLE) AS fe__outcome__casino_win_sum__w15m,
+  CAST(cw_sum_w1h_peer - COALESCE(casino_win, 0.0) AS DOUBLE) AS fe__outcome__casino_win_sum__w1h,
+  CASE
+    WHEN (tw_sum_w1h_peer - COALESCE(theo_win, 0.0)) > 1e-9
+    THEN CAST(
+      (cw_sum_w1h_peer - COALESCE(casino_win, 0.0))
+      / (tw_sum_w1h_peer - COALESCE(theo_win, 0.0))
+      AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__outcome__casino_win_to_theo_ratio__w1h,
   CASE
     WHEN fe__wager_sum__w1d_raw > 1e-9
     THEN CAST(fe__wager_sum__w15m_raw / fe__wager_sum__w1d_raw AS DOUBLE)

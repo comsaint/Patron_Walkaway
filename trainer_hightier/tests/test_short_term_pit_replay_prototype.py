@@ -916,8 +916,8 @@ def test_scorer_gate_columns_subset_of_indexed_output() -> None:
     production = resolve_production_scorer_short_pit_gate_columns()
     missing = [c for c in gate if c not in indexed]
     assert not missing, missing
-    assert len(production) == 17
-    assert len(gate) == 16
+    assert len(production) == 20
+    assert len(gate) == 19
     for ignored in PROTOTYPE_GATE_IGNORE_COLUMNS:
         assert ignored in production
         assert ignored not in gate

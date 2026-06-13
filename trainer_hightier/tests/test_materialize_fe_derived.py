@@ -136,6 +136,33 @@ def test_compute_fe_derived_from_pool_schema_max_payout_odds() -> None:
     ratio = float(got.iloc[0]["fe__odds__payout_odds_to_recent_max_ratio__w1h"])
     assert ratio == pytest.approx(50.0)
 
+
+def test_compute_fe_derived_same_pcd_peer_casino_win_inclusive_minus_self() -> None:
+    """Same-pcd siblings contribute to outcome momentum (inclusive window minus scored bet)."""
+    hk = "Asia/Hong_Kong"
+    t0 = pd.Timestamp("2025-06-01 10:00:00", tz=hk)
+    pool = pd.DataFrame(
+        {
+            "bet_id": [100.0, 200.0],
+            "player_id": [10, 10],
+            "canonical_id": ["c10", "c10"],
+            "session_id": [1, 1],
+            "table_id": [1, 1],
+            "gaming_day_event": pd.to_datetime(["2025-06-01", "2025-06-01"]),
+            "payout_complete_dtm": [t0, t0],
+            "wager": [10.0, 20.0],
+            "payout_odds": [2.0, 2.0],
+            "casino_win": [10.0, 20.0],
+            "theo_win": [5.0, 8.0],
+        }
+    )
+    got = compute_fe_derived_features_from_pool(pool, pd.Series([200.0]))
+    row = got.iloc[0]
+    assert float(row["fe__outcome__casino_win_sum__w15m"]) == pytest.approx(10.0)
+    assert float(row["fe__outcome__casino_win_sum__w1h"]) == pytest.approx(10.0)
+    assert float(row["fe__outcome__casino_win_to_theo_ratio__w1h"]) == pytest.approx(2.0)
+
+
 def test_ensure_etl_observed_at_for_pit_preserves_real_etl() -> None:
     """Offline staging must not overwrite populated ``__etl_insert_Dtm`` with payout time."""
     from trainer_hightier.serving.feature_builder import ensure_etl_observed_at_for_pit
@@ -152,4 +179,3 @@ def test_ensure_etl_observed_at_for_pit_preserves_real_etl() -> None:
     )
     got = ensure_etl_observed_at_for_pit(bets)
     assert pd.Timestamp(got.iloc[0]["__etl_insert_Dtm"]).tz_convert(hk) == etl
-
