@@ -50,6 +50,7 @@ from trainer_hightier.config import (
     DEFAULT_STEP35_MISS_PATH,
     SHORT_TERM_TRIAL_BET_COLUMNS,
     TRAINING_SHORT_TERM_PIT_CACHE_BASENAME,
+    TRAINING_TXN_LITE_CACHE_BASENAME,
     DuckDbRuntimeConfig,
     HighTierObjectiveConfig,
     MLFLOW_EXPERIMENT_TRAIN_HIGHTIER,
@@ -1454,8 +1455,9 @@ def _ensure_fe_enriched_training_parquet_for_step4(
     snap = load_candidate_registry(reg_p)
     baseline = baseline_features_for_main_trainer(snap)
     fe_baseline = tuple(c for c in baseline if str(c).startswith("fe__"))
+    txn_baseline = tuple(c for c in baseline if str(c).startswith("txn__"))
     trial_baseline = tuple(c for c in SHORT_TERM_TRIAL_BET_COLUMNS if c in baseline)
-    if not fe_baseline and not trial_baseline:
+    if not fe_baseline and not trial_baseline and not txn_baseline:
         return base_training_parquet
 
     raw_rows = load_registry_raw_feature_dicts(reg_p)
@@ -1480,6 +1482,7 @@ def _ensure_fe_enriched_training_parquet_for_step4(
     audit_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
 
     fe_short_out = out_dir / TRAINING_SHORT_TERM_PIT_CACHE_BASENAME
+    txn_out = out_dir / TRAINING_TXN_LITE_CACHE_BASENAME
     mid_snap_out = out_dir / "_main_trainer_mid_term_daily_snapshot.parquet"
     enriched = out_dir / "training_set_fe_enriched.parquet"
 
@@ -1504,7 +1507,12 @@ def _ensure_fe_enriched_training_parquet_for_step4(
     enrich_fp = enrich_module_fingerprint_sha256_hex()
     assembly_manifest_p = assembly_manifest_path(enriched)
 
-    def _assembly_policy_fp(*, short_fp: str | None, mid_fp: str | None) -> str:
+    def _assembly_policy_fp(
+        *,
+        short_fp: str | None,
+        mid_fp: str | None,
+        txn_fp: str | None = None,
+    ) -> str:
         if not entity_fp_for_assembly:
             raise ValueError("entity_set_policy_fingerprint_sha256_hex required for assembly policy")
         return assembly_policy_fingerprint_sha256_hex(
@@ -1514,6 +1522,7 @@ def _ensure_fe_enriched_training_parquet_for_step4(
             enrich_module_fingerprint_sha256_hex=enrich_fp,
             short_term_parquet_fingerprint_sha256_hex=short_fp,
             mid_term_snapshot_fingerprint_sha256_hex=mid_fp,
+            txn_lite_parquet_fingerprint_sha256_hex=txn_fp,
         )
 
     if (
@@ -1524,6 +1533,7 @@ def _ensure_fe_enriched_training_parquet_for_step4(
         probe_fp = _assembly_policy_fp(
             short_fp=parquet_content_fingerprint(fe_short_out if short_cols else None),
             mid_fp=parquet_content_fingerprint(mid_snap_out if mid_cols else None),
+            txn_fp=parquet_content_fingerprint(txn_out if txn_baseline else None),
         )
         if assembly_cache_is_hit(
             manifest_path=assembly_manifest_p,
@@ -1664,12 +1674,37 @@ def _ensure_fe_enriched_training_parquet_for_step4(
     )
     enr_sec = round(time.perf_counter() - t_e0, 3)
 
+    mat_txn_sec = 0.0
+    if txn_baseline:
+        txn_mod = importlib.import_module("trainer_hightier.feature_experiment.materialize_txn_lite")
+        t_txn0 = time.perf_counter()
+        force_txn = bool(args.ignore_caches) or bool(args.force_refresh_short_term_pit)
+        if force_txn or not txn_out.is_file():
+            txn_mod.materialize_txn_lite_parquet(
+                cleaned_casino_txn_root=txn_mod.default_cleaned_casino_txn_root(),
+                training_parquet_for_bet_ids=base_training_parquet,
+                out_parquet=txn_out,
+                duckdb_runtime=args.duckdb_runtime,
+            )
+        txn_join_tmp = out_dir / "_training_set_fe_enriched_txn_join.parquet"
+        en_mod.join_txn_lite_onto_parquet(
+            base_parquet=enriched,
+            txn_lite_parquet=txn_out,
+            out_parquet=txn_join_tmp,
+            duckdb_runtime=args.duckdb_runtime,
+            txn_feature_columns=txn_baseline,
+        )
+        txn_join_tmp.replace(enriched)
+        mat_txn_sec = round(time.perf_counter() - t_txn0, 3)
+
     if metrics is not None:
         metrics["main_trainer_fe_materialize_short_sec"] = mat_short_sec
         metrics["main_trainer_fe_materialize_mid_sec"] = mat_mid_sec
+        metrics["main_trainer_fe_materialize_txn_sec"] = mat_txn_sec
         metrics["main_trainer_fe_enrich_sec"] = enr_sec
         metrics["main_trainer_training_parquet_for_step4"] = str(enriched.resolve())
         metrics["main_trainer_fe_short_term_parquet"] = str(fe_short_out.resolve()) if short_cols else None
+        metrics["main_trainer_txn_lite_parquet"] = str(txn_out.resolve()) if txn_baseline else None
         if short_cache_meta:
             metrics["main_trainer_fe_short_term_cache"] = short_cache_meta
             metrics["short_term_pit_primitive_hit_ratio"] = short_cache_meta.get(
@@ -1742,6 +1777,7 @@ def _ensure_fe_enriched_training_parquet_for_step4(
             final_fp = _assembly_policy_fp(
                 short_fp=parquet_content_fingerprint(fe_short_out if short_cols else None),
                 mid_fp=parquet_content_fingerprint(mid_snap_out if mid_cols else None),
+                txn_fp=parquet_content_fingerprint(txn_out if txn_baseline else None),
             )
             write_assembly_manifest(
                 manifest_path=assembly_manifest_p,

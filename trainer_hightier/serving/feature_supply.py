@@ -137,6 +137,7 @@ _KNOWN_SOURCES: frozenset[str] = frozenset(
         "feast_trial_1h",
         "feast_slow_180d",
         "fe_derived",
+        "t_casino_txn",
     }
 )
 
@@ -281,6 +282,8 @@ def audit_feature_supplier_routes(
                 supplier = "legacy_fe_derived_parquet"
             else:
                 supplier = "missing"
+        elif src == "t_casino_txn":
+            supplier = "txn_lite_builder"
         else:
             supplier = "unknown"
         rows.append(
@@ -477,6 +480,8 @@ def build_feature_supplier_summary(
             supplier = "bundled_slow_parquet"
         elif src == "fe_derived":
             supplier = "bundled_fe_derived_parquet" if fe_bundled else "missing"
+        elif src == "t_casino_txn":
+            supplier = "txn_lite_builder"
         else:
             supplier = "unknown"
         rows.append({"feature_id": feat, "source": src, "supplier": supplier})
@@ -530,6 +535,20 @@ def assert_feature_supplyability_or_raise(
             # Production primary supplier is online attach_trial_bet_behavior_1h; optional trial parquet
             # is not a substitute for readiness.
             pass
+        elif src == "t_casino_txn":
+            if require_runtime_artifacts:
+                from trainer_hightier.feature_experiment.materialize_txn_lite import (
+                    default_cleaned_casino_txn_root,
+                    discover_cleaned_txn_partitions,
+                )
+
+                txn_root = default_cleaned_casino_txn_root()
+                paths, _, _ = discover_cleaned_txn_partitions(txn_root, exclude_partial=True)
+                if not paths:
+                    raise FileNotFoundError(
+                        f"[feature-supply] model expects txn__* but no eligible cleaned txn partitions "
+                        f"under {txn_root}",
+                    )
 
     if unknown:
         raise ValueError(
@@ -715,6 +734,7 @@ class RuntimeDependencyClosure:
     mid_composite_cols: tuple[str, ...]
     dependency_only_cols: tuple[str, ...]
     unknown_cols: tuple[str, ...]
+    txn_cols: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -729,6 +749,7 @@ class ScorerSupplierPlan:
     short_term_cols: tuple[str, ...]
     unknown_cols: tuple[str, ...]
     dependency_only_cols: tuple[str, ...] = ()
+    txn_cols: tuple[str, ...] = ()
 
 
 def _infer_runtime_supplier(
@@ -746,11 +767,14 @@ def _infer_runtime_supplier(
         from trainer_hightier.feature_experiment.feature_cadence import (
             SUPPLIER_MID_TERM_DAILY,
             SUPPLIER_SHORT_TERM_PIT,
+            SUPPLIER_TXN_LITE,
         )
 
         ats = str(row.allowed_training_supplier or "").strip()
         if ats == SUPPLIER_SHORT_TERM_PIT:
             return "short_term_pit_builder"
+        if ats == SUPPLIER_TXN_LITE:
+            return "txn_lite_builder"
         if ats == SUPPLIER_MID_TERM_DAILY:
             if feature_id in MID_TERM_COMPOSITE_FEATURE_COLUMNS:
                 return "composite"
@@ -765,6 +789,8 @@ def _infer_runtime_supplier(
     src = row.source
     if src == "baseline_model":
         return "clickhouse_raw"
+    if src == "t_casino_txn":
+        return "txn_lite_builder"
     if src == "feast_trial_1h":
         return "short_term_pit_builder"
     if src == "feast_slow_180d" or feature_id in DEFAULT_MODEL_SLOW_PATRON_COLUMNS:
@@ -841,6 +867,7 @@ def build_runtime_dependency_closure(
     mid_comp: list[str] = []
     slow: list[str] = []
     short: list[str] = []
+    txn: list[str] = []
     unknown: list[str] = list(unknown_from_closure)
 
     def _append_unique(bucket: list[str], fid: str) -> None:
@@ -878,6 +905,8 @@ def build_runtime_dependency_closure(
                 elif sup_key == "short_term_pit_builder":
                     for dep in deps:
                         _append_unique(short, dep)
+        elif supplier == "txn_lite_builder" and is_model_output:
+            _append_unique(txn, fid)
 
     for fid in model_feats:
         _classify_into_buckets(fid, is_model_output=True)
@@ -905,6 +934,7 @@ def build_runtime_dependency_closure(
         mid_composite_cols=tuple(dict.fromkeys(mid_comp)),
         dependency_only_cols=dep_only_out,
         unknown_cols=unknown_out,
+        txn_cols=tuple(dict.fromkeys(txn)),
     )
 
 
@@ -923,6 +953,7 @@ def build_scorer_supplier_plan(
         short_term_cols=closure.short_term_cols,
         unknown_cols=closure.unknown_cols,
         dependency_only_cols=closure.dependency_only_cols,
+        txn_cols=closure.txn_cols,
     )
 
 
@@ -981,4 +1012,5 @@ def scorer_supplier_route_counts(plan: ScorerSupplierPlan) -> dict[str, int]:
         "mid_term_composite": len(plan.mid_composite_cols),
         "feast_online_slow": len(plan.feast_slow_cols),
         "short_term_pit_builder": len(plan.short_term_cols),
+        "txn_lite_builder": len(plan.txn_cols),
     }

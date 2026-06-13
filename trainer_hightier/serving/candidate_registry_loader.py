@@ -24,6 +24,7 @@ _RUNTIME_INPUT_SUPPLIERS: Final[frozenset[str]] = frozenset(
         "short_term_pit_builder",
         "clickhouse_raw",
         "feast_trial_1h",
+        "txn_lite_builder",
     }
 )
 _RUNTIME_SUPPLIERS: Final[frozenset[str]] = _RUNTIME_INPUT_SUPPLIERS | frozenset({"composite"})

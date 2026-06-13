@@ -30,6 +30,7 @@ from trainer_hightier.serving.ch_adapter import (
     CH_TBET_GAMING_DAY_EVENT_NOT_NULL_PRED,
     CH_TBET_GAMING_DAY_EVENT_SELECT,
     CH_TBET_PAYOUT_ODDS_SELECT,
+    CH_TBET_THEO_WIN_SELECT,
     CH_TBET_WAGER_SELECT,
     ch_tbet_gaming_day_event_sql,
     get_clickhouse_client,
@@ -56,6 +57,7 @@ from trainer_hightier.serving.feature_builder import (
     attach_mid_term_composite_columns,
     attach_short_term_pit_features,
     attach_synthetic_etl_and_prediction_visible,
+    attach_txn_lite_features,
     attach_trial_bet_behavior_1h,
     prepare_lgbm_feature_matrix,
 )
@@ -304,6 +306,7 @@ def _effective_etl_cursor(bets: pd.DataFrame) -> pd.Series:
 _TBET_CASINO_PLAYER_ID_SELECT = "CAST(NULL AS Nullable(String)) AS casino_player_id"
 _TBET_WAGER_SELECT = CH_TBET_WAGER_SELECT
 _TBET_CASINO_WIN_SELECT = CH_TBET_CASINO_WIN_SELECT
+_TBET_THEO_WIN_SELECT = CH_TBET_THEO_WIN_SELECT
 _TBET_PAYOUT_ODDS_SELECT = CH_TBET_PAYOUT_ODDS_SELECT
 
 
@@ -438,6 +441,7 @@ def _incremental_bet_select_list(*, casino_player_id_select: str) -> str:
                 position_idx,
                 {_TBET_WAGER_SELECT},
                 {_TBET_CASINO_WIN_SELECT},
+                {_TBET_THEO_WIN_SELECT},
                 {_TBET_PAYOUT_ODDS_SELECT},
                 status,
                 {casino_player_id_select}
@@ -712,6 +716,7 @@ def fetch_bet_pool_window(
                 position_idx,
                 {_TBET_WAGER_SELECT},
                 {_TBET_CASINO_WIN_SELECT},
+                {_TBET_THEO_WIN_SELECT},
                 {_TBET_PAYOUT_ODDS_SELECT},
                 status,
                 {cid_sel}
@@ -973,7 +978,10 @@ def _build_staged_features(
         supplier_plan.short_term_cols,
         mid_term_for_deps,
     )
-    return attach_live_short_term_pit(staged, pool, short_columns=short_cols)
+    staged = attach_live_short_term_pit(staged, pool, short_columns=short_cols)
+    if supplier_plan.txn_cols:
+        staged = attach_txn_lite_features(staged, txn_columns=supplier_plan.txn_cols)
+    return staged
 
 
 def _log_scorer_readiness_summary(

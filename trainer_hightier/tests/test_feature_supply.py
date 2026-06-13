@@ -326,3 +326,23 @@ def test_default_registry_feast_schema_supports_payout_odds_w7d_composite() -> N
     assert plan.mid_composite_cols == ("fe__odds__payout_odds_z__w7d",)
     assert_scorer_supplier_plan_or_raise(plan)
     assert_feast_plan_schema_support_or_raise(plan)
+
+
+def test_build_scorer_supplier_plan_routes_txn_lite_columns() -> None:
+    """txn__* registry rows route to txn_lite_builder without unknown_cols."""
+
+    from trainer_hightier.serving.feature_supply import (
+        assert_scorer_supplier_plan_or_raise,
+        build_scorer_supplier_plan,
+        scorer_supplier_route_counts,
+    )
+
+    snap = load_candidate_registry(None)
+    txn_cols = tuple(c for c in snap.model_feature_columns if c.startswith("txn__"))
+    assert len(txn_cols) == 7
+    plan = build_scorer_supplier_plan(snap, txn_cols)
+    assert plan.txn_cols == txn_cols
+    assert plan.unknown_cols == ()
+    assert_scorer_supplier_plan_or_raise(plan)
+    routes = scorer_supplier_route_counts(plan)
+    assert routes["txn_lite_builder"] == 7

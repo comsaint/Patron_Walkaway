@@ -39,6 +39,7 @@ def assembly_policy_fingerprint_sha256_hex(
     enrich_module_fingerprint_sha256_hex: str,
     short_term_parquet_fingerprint_sha256_hex: str | None = None,
     mid_term_snapshot_fingerprint_sha256_hex: str | None = None,
+    txn_lite_parquet_fingerprint_sha256_hex: str | None = None,
 ) -> str:
     """Stable fingerprint for ``training_set_fe_enriched.parquet`` assembly policy."""
     return _policy_blob_sha256(
@@ -50,6 +51,7 @@ def assembly_policy_fingerprint_sha256_hex(
             "enrich_module_fingerprint": str(enrich_module_fingerprint_sha256_hex).strip(),
             "short_term_parquet_fingerprint": str(short_term_parquet_fingerprint_sha256_hex or "").strip(),
             "mid_term_snapshot_fingerprint": str(mid_term_snapshot_fingerprint_sha256_hex or "").strip(),
+            "txn_lite_parquet_fingerprint": str(txn_lite_parquet_fingerprint_sha256_hex or "").strip(),
         },
     )
 

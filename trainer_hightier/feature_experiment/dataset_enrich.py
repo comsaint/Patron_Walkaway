@@ -306,3 +306,43 @@ SELECT
     finally:
         con.close()
     return out
+
+
+def join_txn_lite_onto_parquet(
+    *,
+    base_parquet: Path,
+    txn_lite_parquet: Path,
+    out_parquet: Path,
+    duckdb_runtime: DuckDbRuntimeConfig,
+    txn_feature_columns: Sequence[str] | None = None,
+) -> Path:
+    """Left-join bet-grain ``txn__*`` columns onto a training parquet by ``bet_id``."""
+
+    from trainer_hightier.config import TXN_LITE_FEATURE_COLUMNS
+
+    bq = _esc(base_parquet)
+    tq = _esc(txn_lite_parquet)
+    out = Path(out_parquet).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    oq = _esc(out)
+    txn_col_list = (
+        list(txn_feature_columns)
+        if txn_feature_columns is not None
+        else list(TXN_LITE_FEATURE_COLUMNS)
+    )
+    txn_select = ",\n  ".join(f't."{c}" AS "{c}"' for c in txn_col_list)
+    inner = f"""
+SELECT
+  b.*,
+  {txn_select}
+FROM read_parquet('{bq}') AS b
+LEFT JOIN read_parquet('{tq}') AS t
+  ON TRY_CAST(b.bet_id AS DOUBLE) = t.bet_id
+""".strip()
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        con.execute(f"COPY ({inner}) TO '{oq}' (FORMAT PARQUET, COMPRESSION SNAPPY)")
+    finally:
+        con.close()
+    return out

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Final
 
 import duckdb
+import pandas as pd
 
 from trainer_hightier.config import (
     DEFAULT_T_CASINO_TXN_CLEANED_ROOT,
@@ -160,11 +161,16 @@ def _buyin_cash_sum_sql(hours: int) -> str:
 
 def _build_materialize_copy_sql(
     *,
-    train_esc: str,
+    train_source: str,
     cleaned_read: str,
     extra_window_hours: tuple[int, ...],
 ) -> str:
-    """Build DuckDB COPY SQL for bet-grain txn_lite features."""
+    """Build DuckDB SQL for bet-grain txn_lite features.
+
+    Args:
+        train_source: DuckDB table expression for training/scoring bets
+            (e.g. ``read_parquet('path')`` or registered ``scoring_bets``).
+    """
 
     lookback_h = _join_lookback_hours(extra_window_hours)
     extra_hours = tuple(h for h in extra_window_hours if h > 1)
@@ -183,7 +189,7 @@ train_rows AS (
     TRY_CAST(bet_id AS DOUBLE) AS bet_id,
     TRY_CAST(player_id AS BIGINT) AS player_id,
     CAST(payout_complete_dtm AS TIMESTAMPTZ) AS pcd
-  FROM read_parquet('{train_esc}') AS b
+  FROM {train_source} AS b
   WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
     AND TRY_CAST(player_id AS BIGINT) IS NOT NULL
     AND b.payout_complete_dtm IS NOT NULL
@@ -323,8 +329,9 @@ def materialize_txn_lite_parquet(
     out.parent.mkdir(parents=True, exist_ok=True)
 
     tq, oq = _path_esc(train), _path_esc(out)
+    train_source = f"read_parquet('{tq}')"
     copy_sql = _build_materialize_copy_sql(
-        train_esc=tq,
+        train_source=train_source,
         cleaned_read=cleaned_read,
         extra_window_hours=extra_window_hours,
     )
@@ -383,6 +390,46 @@ def materialize_txn_lite_parquet(
         out,
     )
     return meta
+
+
+def compute_txn_lite_features_for_bets(
+    bets: pd.DataFrame,
+    *,
+    cleaned_casino_txn_root: Path,
+    duckdb_runtime: DuckDbRuntimeConfig,
+    extra_window_hours: tuple[int, ...] = (),
+) -> pd.DataFrame:
+    """Compute bet-grain ``txn__*`` columns for in-memory scoring bets."""
+
+    out_feature_cols = txn_lite_feature_columns(extra_window_hours=extra_window_hours)
+    if bets.empty:
+        return pd.DataFrame(columns=["bet_id", *out_feature_cols])
+    required = frozenset({"bet_id", "player_id", "payout_complete_dtm"})
+    missing = required - frozenset(bets.columns)
+    if missing:
+        raise ValueError(
+            f"compute_txn_lite_features_for_bets missing columns {sorted(missing)}; "
+            f"got {list(bets.columns)!r}",
+        )
+    cleaned_root = Path(cleaned_casino_txn_root).resolve()
+    cleaned_read, _, _ = resolve_cleaned_casino_txn_read_sql(
+        cleaned_root,
+        exclude_partial=True,
+    )
+    copy_sql = _build_materialize_copy_sql(
+        train_source="scoring_bets",
+        cleaned_read=cleaned_read,
+        extra_window_hours=extra_window_hours,
+    )
+    work = bets[list(required)].copy()
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        con.register("scoring_bets", work)
+        out = con.execute(copy_sql).df()
+    finally:
+        con.close()
+    return out
 
 
 def default_cleaned_casino_txn_root() -> Path:
