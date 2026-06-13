@@ -398,3 +398,19 @@ def test_global_manifest_written(short_cache_fixture: dict[str, Path]) -> None:
     assert payload.get("shard_months") == ["202406"]
     assert payload.get("schema_version") == 2
     assert payload.get("supplier_family") == "short_term:w1h"
+
+
+def test_materialize_rejects_invalid_step35_miss_path(short_cache_fixture: dict[str, Path]) -> None:
+    """Step 3.5 miss-path must be one of the supported materializer engines."""
+    with pytest.raises(ValueError, match="step35_miss_path must be"):
+        materialize_fe_derived_short_term_parquet_with_cache(
+            cleaned_bet_parquet=short_cache_fixture["cleaned"],
+            training_parquet_for_bet_ids=short_cache_fixture["training"],
+            out_parquet=short_cache_fixture["out"],
+            duckdb_runtime=DuckDbRuntimeConfig(),
+            canonical_mapping_parquet=short_cache_fixture["mapping"],
+            short_term_columns=("fe__bets_cnt__w15m",),
+            trial_columns=tuple(SHORT_TERM_TRIAL_BET_COLUMNS[:1]),
+            batch_size=2000,
+            step35_miss_path="legacy_sql",
+        )
