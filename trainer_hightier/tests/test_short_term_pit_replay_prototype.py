@@ -8,6 +8,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import duckdb
 
 from trainer_hightier.config import DuckDbRuntimeConfig
 from trainer_hightier.feature_experiment.materialize_fe_derived import (
@@ -1007,3 +1008,110 @@ def test_apply_parity_waiver_governance_rejects_excessive_bet_mismatch() -> None
     parity = _synthetic_parity_report(bet_waiver_mismatch_count=50_000, compared_rows=500_000)
     assert parity["hard_parity_passed"] is True
     assert parity["waiver_accepted"] is False
+
+
+def test_unique_int_player_ids_deduplicates_and_sorts() -> None:
+    """Player id normalization returns deterministic unique integers."""
+    from trainer_hightier.feature_experiment.short_term_pit_replay_prototype import (
+        unique_int_player_ids,
+    )
+
+    got = unique_int_player_ids(pd.Series([3, 1, 3, None, "2", 1.0]))
+    assert got == (1, 2, 3)
+
+
+def test_load_replay_events_deduplicates_restrict_player_ids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Indexed replay pool load passes unique player ids to hot-pool session."""
+    from trainer_hightier.utils import cleaned_bet_pool_read as pool_read
+
+    captured: dict[str, tuple[int, ...]] = {}
+
+    class _FakeSession:
+        conn = duckdb.connect(database=":memory:")
+        table_name = pool_read.MONTH_HOT_POOL_TABLE
+
+        def close(self) -> None:
+            self.conn.close()
+
+    def _fake_open_month_hot_pool_session(
+        cleaned_root: Path,
+        *,
+        payout_yyyymm: str,
+        duckdb_runtime: DuckDbRuntimeConfig,
+        hk_tz: str,
+        restrict_player_ids: tuple[int, ...] | None = None,
+        table_name: str = pool_read.MONTH_HOT_POOL_TABLE,
+    ) -> _FakeSession:
+        del cleaned_root, payout_yyyymm, duckdb_runtime, hk_tz, table_name
+        captured["restrict_player_ids"] = tuple(restrict_player_ids or ())
+        session = _FakeSession()
+        session.conn.execute(
+            f"CREATE TEMP TABLE {session.table_name} AS "
+            "SELECT 1::DOUBLE AS bet_id, 10::BIGINT AS player_id, "
+            "TIMESTAMP '2024-06-01 00:00:00' AS payout_complete_dtm, "
+            "TIMESTAMP '2024-06-01' AS gaming_day_event, "
+            "1.0::DOUBLE AS wager, 0.0::DOUBLE AS casino_win, 0.0::DOUBLE AS theo_win, "
+            "0::INTEGER AS is_back_bet, 1.5::DOUBLE AS payout_odds "
+            "WHERE FALSE",
+        )
+        return session
+
+    monkeypatch.setattr(
+        pool_read,
+        "open_month_hot_pool_session",
+        _fake_open_month_hot_pool_session,
+    )
+    from trainer_hightier.feature_experiment.short_term_pit_replay_prototype import (
+        _load_replay_events,
+    )
+
+    _load_replay_events(
+        tmp_path,
+        payout_yyyymm="202406",
+        player_ids=(10, 20, 10, 20, 10),
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        hk_tz="Asia/Hong_Kong",
+    )
+    assert captured["restrict_player_ids"] == (10, 20)
+
+
+def test_indexed_replay_whale_benchmark_reports_phase_timings(tmp_path: Path) -> None:
+    """Synthetic whale fixture exposes emit phase metrics for benchmarking."""
+    from trainer_hightier.feature_experiment.short_term_pit_replay_indexed_prototype import (
+        materialize_short_term_replay_indexed_prototype,
+    )
+
+    t0 = pd.Timestamp("2024-06-01 06:00:00", tz="UTC")
+    rows = [
+        _base_row(
+            bet_id=float(i),
+            player_id=10,
+            pcd=t0 + pd.Timedelta(seconds=i),
+            wager=10.0 + float(i % 7),
+            payout_odds=1.5 + float(i % 3) * 0.1,
+        )
+        for i in range(1, 1201)
+    ]
+    cleaned, cmap, train, ym = _write_fixture(
+        tmp_path,
+        rows,
+        target_bet_ids=tuple(float(i) for i in range(1, 1201)),
+    )
+    out = tmp_path / "whale_replay.parquet"
+    _, metrics = materialize_short_term_replay_indexed_prototype(
+        cleaned_bet_parquet=cleaned,
+        training_parquet_for_bet_ids=train,
+        out_parquet=out,
+        payout_yyyymm=ym,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        canonical_mapping_parquet=cmap,
+    )
+    assert metrics["max_entity_target_rows"] == 1200
+    assert metrics["unique_target_player_ids"] == 1
+    assert metrics["target_player_id_rows"] == 1200
+    assert metrics["emit_entity_count"] == 1
+    assert "phase_timings" in metrics
+    assert metrics["phase_timings"]["emit_s"] >= 0.0

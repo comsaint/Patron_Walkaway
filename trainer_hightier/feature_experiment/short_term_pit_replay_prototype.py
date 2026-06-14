@@ -72,6 +72,15 @@ def _path_esc(path: Path) -> str:
     return str(Path(path).resolve()).replace("\\", "/")
 
 
+def unique_int_player_ids(values: pd.Series | np.ndarray | list[object]) -> tuple[int, ...]:
+    """Return sorted unique player ids from mixed numeric input."""
+    if isinstance(values, pd.Series):
+        nums = pd.to_numeric(values, errors="coerce")
+    else:
+        nums = pd.to_numeric(pd.Series(list(values)), errors="coerce")
+    return tuple(sorted({int(pid) for pid in nums.dropna().astype(int).tolist()}))
+
+
 def _entity_key(canonical_id: str, player_id: int) -> tuple[str, int]:
     return str(canonical_id).strip(), int(player_id)
 
@@ -172,7 +181,8 @@ def _load_replay_events(
     """Load partition-pruned cleaned bet rows for replay."""
     from trainer_hightier.utils.cleaned_bet_pool_read import open_month_hot_pool_session
 
-    if not player_ids:
+    unique_ids = unique_int_player_ids(player_ids)
+    if not unique_ids:
         return pd.DataFrame(
             columns=[
                 "bet_id",
@@ -190,10 +200,10 @@ def _load_replay_events(
         payout_yyyymm=str(payout_yyyymm),
         duckdb_runtime=duckdb_runtime,
         hk_tz=hk_tz,
-        restrict_player_ids=player_ids,
+        restrict_player_ids=unique_ids,
     )
     try:
-        ids_sql = ",".join(str(int(pid)) for pid in player_ids)
+        ids_sql = ",".join(str(int(pid)) for pid in unique_ids)
         return session.conn.execute(
             f"""
             SELECT

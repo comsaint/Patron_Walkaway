@@ -20,6 +20,7 @@ import duckdb
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+from numba import njit
 
 from trainer_hightier.config import (
     DuckDbRuntimeConfig,
@@ -37,11 +38,18 @@ from trainer_hightier.feature_experiment.short_term_pit_replay_prototype import 
     _path_esc,
     compare_replay_to_oracle,
     evaluate_replay_go_no_go,
+    unique_int_player_ids,
 )
 from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_parquet_path
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
 
 logger = logging.getLogger(__name__)
+
+_INDEXED_REPLAY_EMIT_PROGRESS_EVERY_ENTITIES: Final[int] = 100
+_INDEXED_REPLAY_EMIT_WHALE_TARGET_ROWS: Final[int] = 50_000
+_INDEXED_REPLAY_EMIT_WHALE_PROGRESS_EVERY: Final[int] = 50_000
+_INDEXED_REPLAY_EMIT_ENTITY_CHUNK_SIZE: Final[int] = 50_000
+_INDEXED_REPLAY_EMIT_TOP_ENTITY_SIZES: Final[int] = 5
 
 _US_NS: Final[int] = 1_000
 _W5M_NS: Final[int] = 5 * 60 * 1_000_000_000
@@ -1282,11 +1290,20 @@ def _batch_target_row_indices(
     bid = arrays.bet_id
     same_start = np.searchsorted(pcd, scoring_pcd_ns, side="left")
     same_end = np.searchsorted(pcd, scoring_pcd_ns, side="right")
-    for i in range(n):
+    span = same_end - same_start
+    valid_span = span > 0
+    single = valid_span & (span == 1)
+    if np.any(single):
+        idx_single = same_start[single]
+        ok = (
+            (bid[idx_single] == target_bet_ids[single])
+            & (pcd[idx_single] >= pool_start_ns[single])
+        )
+        out[np.where(single)[0][ok]] = idx_single[ok]
+    multi_idx = np.where(valid_span & (span > 1))[0]
+    for i in multi_idx:
         start = int(same_start[i])
         end = int(same_end[i])
-        if end <= start:
-            continue
         local = int(np.searchsorted(bid[start:end], target_bet_ids[i], side="left"))
         idx = start + local
         if local >= end - start or bid[idx] != target_bet_ids[i]:
@@ -1297,12 +1314,12 @@ def _batch_target_row_indices(
     return out
 
 
-def _batch_canonical_bounds_1h(
+def _batch_canonical_bounds_1h_arrays(
     arrays: _CanonicalArrays,
     trial_pool_start_ns: int,
     scoring_pcd_ns: np.ndarray,
-) -> list[tuple[int, int] | None]:
-    """Return per-target canonical 1h bounds for a target batch."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return vectorized canonical 1h slice bounds for a target batch."""
     pool_start = np.full(len(scoring_pcd_ns), int(trial_pool_start_ns), dtype=np.int64)
     left, right = _batch_uncapped_window_bounds(
         arrays.pcd_ns,
@@ -1310,12 +1327,501 @@ def _batch_canonical_bounds_1h(
         scoring_pcd_ns,
         _W1H_NS,
     )
+    valid = right > left
+    return left.astype(np.int64, copy=False), right.astype(np.int64, copy=False), valid
+
+
+def _batch_canonical_bounds_1h(
+    arrays: _CanonicalArrays,
+    trial_pool_start_ns: int,
+    scoring_pcd_ns: np.ndarray,
+) -> list[tuple[int, int] | None]:
+    """Return per-target canonical 1h bounds for a target batch."""
+    left, right, valid = _batch_canonical_bounds_1h_arrays(
+        arrays,
+        trial_pool_start_ns,
+        scoring_pcd_ns,
+    )
     bounds: list[tuple[int, int] | None] = []
     for idx in range(len(scoring_pcd_ns)):
-        left_i = int(left[idx])
-        right_i = int(right[idx])
-        bounds.append((left_i, right_i) if right_i > left_i else None)
+        if not bool(valid[idx]):
+            bounds.append(None)
+        else:
+            bounds.append((int(left[idx]), int(right[idx])))
     return bounds
+
+
+def _canon_bounds_tuple_at(
+    left: np.ndarray,
+    right: np.ndarray,
+    valid: np.ndarray,
+    idx: int,
+) -> tuple[int, int] | None:
+    """Return one canonical bounds tuple from vectorized bounds arrays."""
+    if not bool(valid[idx]):
+        return None
+    return int(left[idx]), int(right[idx])
+
+
+def _z_score_vectorized(
+    values: np.ndarray,
+    mean: np.ndarray,
+    std: np.ndarray,
+    *,
+    std_min: float,
+) -> np.ndarray:
+    """Compute guarded z-scores for aligned vector inputs."""
+    out = np.full(len(values), np.nan, dtype=np.float64)
+    ok = (
+        np.isfinite(mean)
+        & np.isfinite(std)
+        & (np.abs(std) > std_min)
+        & np.isfinite(values)
+    )
+    out[ok] = (values[ok] - mean[ok]) / std[ok]
+    return out
+
+
+def _batch_abs_wager_mean_from_bounds(
+    arrays: _EntityArrays,
+    left: np.ndarray,
+    right: np.ndarray,
+) -> np.ndarray:
+    """Return row-wise ``AVG(ABS(wager))`` for precomputed slice bounds."""
+    n = int(len(left))
+    out = np.full(n, np.nan, dtype=np.float64)
+    for i in range(n):
+        l_i = int(left[i])
+        r_i = int(right[i])
+        bounds = (l_i, r_i) if r_i > l_i else None
+        abs_mean, _ = _abs_wager_mean_from_bounds(arrays, bounds)
+        out[i] = abs_mean
+    return out
+
+
+def _batch_capped_window_right(
+    left: np.ndarray,
+    right: np.ndarray,
+    target_idx_arr: np.ndarray,
+) -> np.ndarray:
+    """Cap window right bounds at each target row index when present."""
+    capped = right.copy()
+    valid_target = target_idx_arr >= 0
+    capped[valid_target] = np.minimum(capped[valid_target], target_idx_arr[valid_target])
+    capped = np.maximum(capped, left)
+    return capped.astype(np.int64, copy=False)
+
+
+def _batch_range_slice_max_from_bounds(
+    values: np.ndarray,
+    left: np.ndarray,
+    right: np.ndarray,
+) -> np.ndarray:
+    """Return row-wise ``MAX(values[left:right])`` ignoring non-finite values."""
+    return _range_slice_max_numba(
+        values.astype(np.float64, copy=False),
+        left.astype(np.int64, copy=False),
+        right.astype(np.int64, copy=False),
+    )
+
+
+@njit(cache=True)
+def _range_slice_max_numba(
+    values: np.ndarray,
+    left: np.ndarray,
+    right: np.ndarray,
+) -> np.ndarray:
+    """Numba row-wise max over sorted slice bounds."""
+    n = int(len(left))
+    out = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        l_i = int(left[i])
+        r_i = int(right[i])
+        if r_i <= l_i:
+            out[i] = np.nan
+            continue
+        max_val = -np.inf
+        has_finite = False
+        for j in range(l_i, r_i):
+            val = values[j]
+            if np.isfinite(val):
+                has_finite = True
+                if val > max_val:
+                    max_val = val
+        out[i] = max_val if has_finite else np.nan
+    return out
+
+
+def _prefix_mean_std_from_bounds(
+    sum_prefix: np.ndarray,
+    sumsq_prefix: np.ndarray,
+    cnt_prefix: np.ndarray,
+    left: np.ndarray,
+    right: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return vectorized population mean/std over prefix slice bounds."""
+    n = int(len(left))
+    mean = np.full(n, np.nan, dtype=np.float64)
+    std = np.full(n, np.nan, dtype=np.float64)
+    for i in range(n):
+        l_i = int(left[i])
+        r_i = int(right[i])
+        m, s = _pop_mean_std(sum_prefix, sumsq_prefix, cnt_prefix, l_i, r_i)
+        mean[i] = m
+        std[i] = s
+    return mean, std
+
+
+def _build_pool_safe_iv_prefixes(
+    arrays: _EntityArrays,
+    pool_start_ns: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build prefix sums for pool-safe interarrival gaps at one pool start."""
+    n_arr = int(len(arrays.pcd_ns))
+    safe = np.zeros(n_arr, dtype=np.float64)
+    safe_cnt = np.zeros(n_arr, dtype=np.float64)
+    if n_arr > 1:
+        prior_in_pool = arrays.pcd_ns[:-1] >= int(pool_start_ns)
+        finite_iv = np.isfinite(arrays.iv_sec[1:])
+        mask = prior_in_pool & finite_iv
+        safe[1:] = np.where(mask, arrays.iv_sec[1:], 0.0)
+        safe_cnt[1:] = mask.astype(np.float64)
+    sum_p = _cumsum_prefix(safe)
+    sumsq_p = _cumsum_prefix(safe * safe)
+    cnt_p = _cumsum_prefix(safe_cnt)
+    return sum_p, sumsq_p, cnt_p
+
+
+def _batch_interarrival_mean_std(
+    arrays: _EntityArrays,
+    pool_start_ns_arr: np.ndarray,
+    left: np.ndarray,
+    right: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return row-wise interarrival gap mean/std for capped window bounds."""
+    n = int(len(left))
+    mean = np.full(n, np.nan, dtype=np.float64)
+    std = np.full(n, np.nan, dtype=np.float64)
+    if n == 0:
+        return mean, std
+    keys = np.unique(pool_start_ns_arr)
+    for pool_start in keys:
+        mask = pool_start_ns_arr == pool_start
+        sum_p, sumsq_p, cnt_p = _build_pool_safe_iv_prefixes(arrays, int(pool_start))
+        sub_left = left[mask]
+        sub_right = right[mask]
+        sub_mean, sub_std = _prefix_mean_std_from_bounds(
+            sum_p,
+            sumsq_p,
+            cnt_p,
+            sub_left,
+            sub_right,
+        )
+        mean[mask] = sub_mean
+        std[mask] = sub_std
+    return mean, std
+
+
+def _batch_today_features(
+    arrays: _EntityArrays,
+    *,
+    target_idx_arr: np.ndarray,
+    pool_start_ns_arr: np.ndarray,
+    scoring_pcd_ns_arr: np.ndarray,
+    target_gaming_day_ord_arr: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Compute WP-9.6 today columns for one entity target batch."""
+    n = int(len(target_idx_arr))
+    bets_cnt = np.zeros(n, dtype=np.float64)
+    wager_sum = np.zeros(n, dtype=np.float64)
+    avg_wager = np.full(n, np.nan, dtype=np.float64)
+    elapsed = np.full(n, np.nan, dtype=np.float64)
+    if n == 0:
+        return {
+            "fe__canonical__bets_cnt__today": bets_cnt,
+            "fe__canonical__wager_sum__today": wager_sum,
+            "fe__canonical__avg_wager__today": avg_wager,
+            "fe__canonical__elapsed_sec_since_first_bet__today": elapsed,
+        }
+    n_arr = int(len(arrays.pcd_ns))
+    pcd = arrays.pcd_ns
+    gday = arrays.gaming_day_ord
+    wager = arrays.wager
+    keys = np.stack([pool_start_ns_arr, target_gaming_day_ord_arr], axis=1)
+    unique_keys = np.unique(keys, axis=0)
+    for key in unique_keys:
+        pool_start = int(key[0])
+        gday_ord = int(key[1])
+        mask = np.all(keys == key, axis=1)
+        eligible = (pcd >= pool_start) & (gday == gday_ord)
+        prefix_cnt = np.empty(n_arr + 1, dtype=np.float64)
+        prefix_cnt[0] = 0.0
+        prefix_cnt[1:] = np.cumsum(eligible.astype(np.float64))
+        prefix_wager = np.empty(n_arr + 1, dtype=np.float64)
+        prefix_wager[0] = 0.0
+        wager_contrib = np.where(eligible & np.isfinite(wager), wager, 0.0)
+        prefix_wager[1:] = np.cumsum(wager_contrib)
+        min_up_to = np.full(n_arr, np.iinfo(np.int64).max, dtype=np.int64)
+        running_min = np.iinfo(np.int64).max
+        for i in range(n_arr):
+            if bool(eligible[i]):
+                running_min = min(running_min, int(pcd[i]))
+            min_up_to[i] = running_min
+        tidx = target_idx_arr[mask]
+        pos = np.flatnonzero(mask)
+        valid = tidx >= 0
+        if not np.any(valid):
+            continue
+        tidx_valid = tidx[valid]
+        pos_valid = pos[valid]
+        bets_cnt[pos_valid] = prefix_cnt[tidx_valid]
+        wager_sum[pos_valid] = prefix_wager[tidx_valid]
+        avg_wager[pos_valid] = np.where(
+            prefix_cnt[tidx_valid] > 0.0,
+            prefix_wager[tidx_valid] / prefix_cnt[tidx_valid],
+            np.nan,
+        )
+        min_at = min_up_to[tidx_valid]
+        has_day = min_at < np.iinfo(np.int64).max
+        elapsed[pos_valid[has_day]] = (
+            scoring_pcd_ns_arr[pos_valid[has_day]] - min_at[has_day]
+        ) / 1_000_000_000.0
+    invalid = target_idx_arr < 0
+    if np.any(invalid):
+        avg_wager[invalid] = np.nan
+        elapsed[invalid] = np.nan
+    return {
+        "fe__canonical__bets_cnt__today": bets_cnt,
+        "fe__canonical__wager_sum__today": wager_sum,
+        "fe__canonical__avg_wager__today": avg_wager,
+        "fe__canonical__elapsed_sec_since_first_bet__today": elapsed,
+    }
+
+
+def _batch_emit_entity_non_range(
+    col_arrays: dict[str, np.ndarray],
+    out_indices: np.ndarray,
+    arrays: _EntityArrays,
+    canonical_arrays: _CanonicalArrays | None,
+    *,
+    window_slices: dict[str, tuple[np.ndarray, np.ndarray]],
+    target_idx_arr: np.ndarray,
+    canon_left: np.ndarray | None,
+    canon_right: np.ndarray | None,
+    canon_valid: np.ndarray | None,
+    pool_start_ns_arr: np.ndarray,
+    scoring_pcd_ns_arr: np.ndarray,
+    payout_odds: np.ndarray,
+    wagers: np.ndarray,
+    target_gday_ord: np.ndarray,
+) -> None:
+    """Write non-RANGE prototype columns for one entity target batch."""
+    n = int(len(out_indices))
+    if n == 0:
+        return
+    if canonical_arrays is not None and canon_left is not None and canon_valid is not None:
+        cnt = (canon_right - canon_left).astype(np.float64)
+        wsum = canonical_arrays.wager_prefix[canon_right] - canonical_arrays.wager_prefix[canon_left]
+        back_sum = canonical_arrays.back_prefix[canon_right] - canonical_arrays.back_prefix[canon_left]
+        odds_cnt = canonical_arrays.odds_cnt_prefix[canon_right] - canonical_arrays.odds_cnt_prefix[canon_left]
+        odds_sum = canonical_arrays.odds_sum_prefix[canon_right] - canonical_arrays.odds_sum_prefix[canon_left]
+        odds_avg = np.divide(
+            odds_sum,
+            odds_cnt,
+            out=np.zeros(n, dtype=np.float64),
+            where=odds_cnt > 0.0,
+        )
+        back_ratio = np.divide(
+            back_sum,
+            cnt,
+            out=np.zeros(n, dtype=np.float64),
+            where=cnt > 0.0,
+        )
+        invalid_canon = ~canon_valid
+        cnt = np.where(invalid_canon, 0.0, cnt)
+        wsum = np.where(invalid_canon, 0.0, wsum)
+        back_ratio = np.where(invalid_canon, 0.0, back_ratio)
+        odds_avg = np.where(invalid_canon, 0.0, odds_avg)
+        col_arrays["bet__bets_cnt__w1h"][out_indices] = cnt
+        col_arrays["bet__wager_sum__w1h"][out_indices] = wsum
+        col_arrays["bet__back_bet_ratio__w1h"][out_indices] = back_ratio
+        col_arrays["bet__payout_odds_avg__w1h"][out_indices] = odds_avg
+    left1h, right1h = window_slices["1h"]
+    left7d, right7d = window_slices["7d"]
+    left30d, right30d = window_slices["30d"]
+    valid_target = target_idx_arr >= 0
+    right1h_capped = _batch_capped_window_right(left1h, right1h, target_idx_arr)
+    right7d_capped = _batch_capped_window_right(left7d, right7d, target_idx_arr)
+    w_mean_1h, w_std_1h = _prefix_mean_std_from_bounds(
+        arrays.wager_sum_prefix,
+        arrays.wager_sumsq_prefix,
+        arrays.wager_cnt_prefix,
+        left1h,
+        right1h_capped,
+    )
+    o_mean_1h, o_std_1h = _prefix_mean_std_from_bounds(
+        arrays.odds_sum_prefix,
+        arrays.odds_sumsq_prefix,
+        arrays.odds_cnt_prefix,
+        left1h,
+        right1h_capped,
+    )
+    odds_cnt_1h = (
+        arrays.odds_cnt_prefix[right1h_capped] - arrays.odds_cnt_prefix[left1h]
+    )
+    w_mean_7d, w_std_7d = _prefix_mean_std_from_bounds(
+        arrays.wager_sum_prefix,
+        arrays.wager_sumsq_prefix,
+        arrays.wager_cnt_prefix,
+        left7d,
+        right7d,
+    )
+    o_mean_7d, o_std_7d = _prefix_mean_std_from_bounds(
+        arrays.odds_sum_prefix,
+        arrays.odds_sumsq_prefix,
+        arrays.odds_cnt_prefix,
+        left7d,
+        right7d,
+    )
+    abs_mean_7d = _batch_abs_wager_mean_from_bounds(arrays, left7d, right7d)
+    prior_w_mean_30, prior_w_std_30 = _prefix_mean_std_from_bounds(
+        arrays.wager_sum_prefix,
+        arrays.wager_sumsq_prefix,
+        arrays.wager_cnt_prefix,
+        left30d,
+        right30d,
+    )
+    prior_o_mean_30, prior_o_std_30 = _prefix_mean_std_from_bounds(
+        arrays.odds_sum_prefix,
+        arrays.odds_sumsq_prefix,
+        arrays.odds_cnt_prefix,
+        left30d,
+        right30d,
+    )
+    odds_for_z = payout_odds.copy()
+    if np.any(valid_target):
+        odds_for_z[valid_target] = arrays.payout_odds[target_idx_arr[valid_target]]
+    z_odds_1h = _z_score_vectorized(odds_for_z, o_mean_1h, o_std_1h, std_min=1e-12)
+    z_odds_1h = np.where(odds_cnt_1h >= 2.0, z_odds_1h, np.nan)
+    z_odds_7d = _z_score_vectorized(odds_for_z, o_mean_7d, o_std_7d, std_min=1e-12)
+    z_wager_1h = _z_score_vectorized(wagers, w_mean_1h, w_std_1h, std_min=1e-12)
+    stake_cv_1h = np.divide(
+        w_std_1h,
+        w_mean_1h,
+        out=np.full(n, np.nan, dtype=np.float64),
+        where=(np.isfinite(w_mean_1h) & (w_mean_1h > 1e-12) & np.isfinite(w_std_1h)),
+    )
+    wager_cv_7d = np.divide(
+        w_std_7d,
+        abs_mean_7d,
+        out=np.full(n, np.nan, dtype=np.float64),
+        where=(np.isfinite(abs_mean_7d) & (abs_mean_7d > 1e-12) & np.isfinite(w_std_7d)),
+    )
+    z_wager_30 = _z_score_vectorized(wagers, prior_w_mean_30, prior_w_std_30, std_min=1e-12)
+    z_odds_30 = _z_score_vectorized(payout_odds, prior_o_mean_30, prior_o_std_30, std_min=1e-12)
+    max_odds = _batch_range_slice_max_from_bounds(arrays.payout_odds, left1h, right1h)
+    max_wager = _batch_range_slice_max_from_bounds(arrays.wager, left1h, right1h)
+    max_odds_ratio = np.divide(
+        payout_odds,
+        max_odds,
+        out=np.full(n, np.nan, dtype=np.float64),
+        where=(np.isfinite(max_odds) & (max_odds > 1e-9) & np.isfinite(payout_odds)),
+    )
+    max_wager_ratio = np.divide(
+        wagers,
+        max_wager,
+        out=np.full(n, np.nan, dtype=np.float64),
+        where=(np.isfinite(max_wager) & (max_wager > 1e-9) & np.isfinite(wagers)),
+    )
+    prior = target_idx_arr - 1
+    valid_prior = target_idx_arr > 0
+    if np.any(valid_prior):
+        valid_prior = valid_prior.copy()
+        valid_prior[valid_prior] = (
+            arrays.pcd_ns[prior[valid_prior]] >= pool_start_ns_arr[valid_prior]
+        )
+    gap = np.full(n, np.nan, dtype=np.float64)
+    gap[valid_prior] = (
+        scoring_pcd_ns_arr[valid_prior] - arrays.pcd_ns[prior[valid_prior]]
+    ) / 1_000_000_000.0
+    lag2 = np.full(n, np.nan, dtype=np.float64)
+    lag2_prior = prior - 1
+    valid_lag2 = np.zeros(n, dtype=bool)
+    lag2_ok = valid_prior & (lag2_prior >= 0)
+    if np.any(lag2_ok):
+        valid_lag2[lag2_ok] = (
+            arrays.pcd_ns[lag2_prior[lag2_ok]] >= pool_start_ns_arr[lag2_ok]
+        )
+    if np.any(valid_lag2):
+        lag2[valid_lag2] = np.where(
+            np.isfinite(arrays.iv_sec[prior[valid_lag2]]),
+            arrays.iv_sec[prior[valid_lag2]],
+            np.nan,
+        )
+    iv_mean_1h, iv_std_1h = _batch_interarrival_mean_std(
+        arrays,
+        pool_start_ns_arr,
+        left1h,
+        right1h_capped,
+    )
+    iv_mean_7d, iv_std_7d = _batch_interarrival_mean_std(
+        arrays,
+        pool_start_ns_arr,
+        left7d,
+        right7d_capped,
+    )
+    ratio_1h = np.divide(
+        gap,
+        iv_mean_1h,
+        out=np.full(n, np.nan, dtype=np.float64),
+        where=(np.isfinite(gap) & np.isfinite(iv_mean_1h) & (iv_mean_1h > 1e-9)),
+    )
+    cv_1h = np.divide(
+        iv_std_1h,
+        iv_mean_1h,
+        out=np.full(n, np.nan, dtype=np.float64),
+        where=(np.isfinite(iv_mean_1h) & (iv_mean_1h > 1e-9) & np.isfinite(iv_std_1h)),
+    )
+    gap_z_7d = _z_score_vectorized(gap, iv_mean_7d, iv_std_7d, std_min=1e-9)
+    today = _batch_today_features(
+        arrays,
+        target_idx_arr=target_idx_arr,
+        pool_start_ns_arr=pool_start_ns_arr,
+        scoring_pcd_ns_arr=scoring_pcd_ns_arr,
+        target_gaming_day_ord_arr=target_gday_ord,
+    )
+    step_ratio = np.full(n, np.nan, dtype=np.float64)
+    if np.any(valid_prior):
+        lag_odds = arrays.payout_odds[prior[valid_prior]]
+        step_ratio[valid_prior] = np.divide(
+            payout_odds[valid_prior],
+            lag_odds,
+            out=np.full(int(np.sum(valid_prior)), np.nan, dtype=np.float64),
+            where=(np.isfinite(lag_odds) & (lag_odds > 1e-9) & np.isfinite(payout_odds[valid_prior])),
+        )
+    invalid_target = target_idx_arr < 0
+    gap[invalid_target] = np.nan
+    lag2[invalid_target] = np.nan
+    ratio_1h[invalid_target] = np.nan
+    cv_1h[invalid_target] = np.nan
+    gap_z_7d[invalid_target] = np.nan
+    col_arrays["fe__odds__payout_odds_step_ratio"][out_indices] = step_ratio
+    col_arrays["fe__time_since_last_bet_sec"][out_indices] = gap
+    col_arrays["fe__interarrival__lag2_sec"][out_indices] = lag2
+    col_arrays["fe__interarrival__last_gap_to_recent_mean_ratio__w1h"][out_indices] = ratio_1h
+    col_arrays["fe__interarrival__cv__w1h"][out_indices] = cv_1h
+    col_arrays["fe__interarrival__last_gap_z__w7d"][out_indices] = gap_z_7d
+    col_arrays["fe__odds__payout_odds_z__w1h"][out_indices] = z_odds_1h
+    col_arrays["fe__odds__payout_odds_z__w7d"][out_indices] = z_odds_7d
+    col_arrays["fe__stake__wager_z__w1h"][out_indices] = z_wager_1h
+    col_arrays["fe__stake__wager_cv__w1h"][out_indices] = stake_cv_1h
+    col_arrays["fe__wager_cv_w7d"][out_indices] = wager_cv_7d
+    col_arrays["fe__wager_z_prior_w30d"][out_indices] = z_wager_30
+    col_arrays["fe__payout_odds_z_prior_w30d"][out_indices] = z_odds_30
+    col_arrays["fe__odds__payout_odds_to_recent_max_ratio__w1h"][out_indices] = max_odds_ratio
+    col_arrays["fe__stake__wager_to_recent_max_ratio__w1h"][out_indices] = max_wager_ratio
+    for col in today:
+        col_arrays[col][out_indices] = today[col]
 
 
 def _optional_slice_bounds(left: int, right: int) -> tuple[int, int] | None:
@@ -1795,11 +2301,12 @@ def _emit_target_into(
         )
         canon_bounds: tuple[int, int] | None = None
         if canonical_arrays is not None:
-            canon_bounds = _batch_canonical_bounds_1h(
+            canon_left, canon_right, canon_valid = _batch_canonical_bounds_1h_arrays(
                 canonical_arrays,
                 trial_pool_start_ns,
                 scoring_arr,
-            )[0]
+            )
+            canon_bounds = _canon_bounds_tuple_at(canon_left, canon_right, canon_valid, 0)
         emit_ctx = _emit_context_from_batch_slices(
             target_idx,
             row_slices,
@@ -1860,6 +2367,129 @@ def _emit_target_row(
     return {col: float(col_arrays[col][0]) for col in INDEXED_PROTOTYPE_OUTPUT_COLUMNS}
 
 
+def _emit_entity_group_members(
+    col_arrays: dict[str, np.ndarray],
+    *,
+    key: tuple[str, int],
+    members: list[tuple[int, int]],
+    entity_arrays: dict[tuple[str, int], _EntityArrays],
+    canonical_arrays: dict[str, _CanonicalArrays],
+    trial_pool_start_ns: int,
+    bet_ids: np.ndarray,
+    pool_start_ns_arr: np.ndarray,
+    scoring_pcd_ns_arr: np.ndarray,
+    payout_odds: np.ndarray,
+    wagers: np.ndarray,
+    target_gday_ord: np.ndarray,
+    payout_yyyymm: str,
+    entity_idx: int,
+    entity_count: int,
+) -> int:
+    """Emit indexed replay features for one entity group."""
+    arrays = entity_arrays[key]
+    canon_arrays = canonical_arrays.get(key[0])
+    out_indices = np.fromiter((m[0] for m in members), dtype=np.int64, count=len(members))
+    src_indices = np.fromiter((m[1] for m in members), dtype=np.int64, count=len(members))
+    group_pool_start = pool_start_ns_arr[src_indices]
+    group_scoring_pcd = scoring_pcd_ns_arr[src_indices]
+    group_bet_ids = bet_ids[src_indices]
+    group_payout_odds = payout_odds[src_indices]
+    group_wagers = wagers[src_indices]
+    group_gday_ord = target_gday_ord[src_indices]
+    col_arrays["bet_id"][out_indices] = group_bet_ids
+    member_count = int(len(members))
+    is_whale = member_count >= _INDEXED_REPLAY_EMIT_WHALE_TARGET_ROWS
+    if is_whale:
+        logger.info(
+            "[indexed_replay_emit] whale_start yyyymm=%s entity_idx=%d/%d "
+            "canonical_id=%s player_id=%d targets=%d events=%d",
+            payout_yyyymm,
+            entity_idx,
+            entity_count,
+            key[0],
+            key[1],
+            member_count,
+            int(len(arrays.pcd_ns)),
+        )
+    chunk_size = (
+        _INDEXED_REPLAY_EMIT_ENTITY_CHUNK_SIZE if is_whale else member_count
+    )
+    t_group = time.perf_counter()
+    for chunk_start in range(0, member_count, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, member_count)
+        chunk_out = out_indices[chunk_start:chunk_end]
+        chunk_pool_start = group_pool_start[chunk_start:chunk_end]
+        chunk_scoring_pcd = group_scoring_pcd[chunk_start:chunk_end]
+        chunk_bet_ids = group_bet_ids[chunk_start:chunk_end]
+        chunk_payout_odds = group_payout_odds[chunk_start:chunk_end]
+        chunk_wagers = group_wagers[chunk_start:chunk_end]
+        chunk_gday_ord = group_gday_ord[chunk_start:chunk_end]
+        window_slices = _batch_entity_window_slices(
+            arrays,
+            chunk_pool_start,
+            chunk_scoring_pcd,
+        )
+        _batch_emit_entity_range_features(
+            col_arrays,
+            chunk_out,
+            arrays,
+            window_slices,
+        )
+        target_idx_arr = _batch_target_row_indices(
+            arrays,
+            chunk_pool_start,
+            chunk_scoring_pcd,
+            chunk_bet_ids,
+        )
+        _batch_emit_outcome_peer_features(
+            col_arrays,
+            chunk_out,
+            arrays,
+            target_idx_arr,
+            chunk_pool_start,
+            chunk_scoring_pcd,
+        )
+        canon_left: np.ndarray | None = None
+        canon_right: np.ndarray | None = None
+        canon_valid: np.ndarray | None = None
+        if canon_arrays is not None:
+            canon_left, canon_right, canon_valid = _batch_canonical_bounds_1h_arrays(
+                canon_arrays,
+                trial_pool_start_ns,
+                chunk_scoring_pcd,
+            )
+        _batch_emit_entity_non_range(
+            col_arrays,
+            chunk_out,
+            arrays,
+            canon_arrays,
+            window_slices=window_slices,
+            target_idx_arr=target_idx_arr,
+            canon_left=canon_left,
+            canon_right=canon_right,
+            canon_valid=canon_valid,
+            pool_start_ns_arr=chunk_pool_start,
+            scoring_pcd_ns_arr=chunk_scoring_pcd,
+            payout_odds=chunk_payout_odds,
+            wagers=chunk_wagers,
+            target_gday_ord=chunk_gday_ord,
+        )
+        if is_whale and (
+            chunk_end % _INDEXED_REPLAY_EMIT_WHALE_PROGRESS_EVERY == 0
+            or chunk_end == member_count
+        ):
+            logger.info(
+                "[indexed_replay_emit] whale_progress yyyymm=%s player_id=%d "
+                "emitted=%d/%d elapsed=%.1fs",
+                payout_yyyymm,
+                key[1],
+                chunk_end,
+                member_count,
+                time.perf_counter() - t_group,
+            )
+    return member_count
+
+
 def _indexed_replay_features(
     events_df: pd.DataFrame,
     targets: pd.DataFrame,
@@ -1867,6 +2497,7 @@ def _indexed_replay_features(
     *,
     canonical_by_player: dict[int, str],
     hk_tz: str = "Asia/Hong_Kong",
+    payout_yyyymm: str = "",
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Emit indexed replay features grouped by entity."""
     bounds_ns = _bounds_with_ns(bounds)
@@ -1895,6 +2526,15 @@ def _indexed_replay_features(
         hk_tz=hk_tz,
     )
     n_targets = int(len(work_targets))
+    target_player_id_rows = int(len(work_targets))
+    unique_target_player_ids = int(work_targets["player_id"].nunique())
+    pool_event_rows = int(len(events_df))
+    unique_pool_player_ids = int(
+        pd.to_numeric(events_df.get("player_id"), errors="coerce").nunique(),
+    )
+    max_entity_target_rows = 0
+    max_entity_event_rows = 0
+    emit_entity_count = 0
     if n_targets == 0:
         out = pd.DataFrame(columns=list(INDEXED_PROTOTYPE_OUTPUT_COLUMNS))
     else:
@@ -1918,69 +2558,50 @@ def _indexed_replay_features(
                 continue
             entity_groups[key].append((out_idx, i))
             out_idx += 1
-        for key, members in entity_groups.items():
-            arrays = entity_arrays[key]
-            canon_arrays = canonical_arrays.get(key[0])
-            out_indices = np.fromiter((m[0] for m in members), dtype=np.int64, count=len(members))
-            src_indices = np.fromiter((m[1] for m in members), dtype=np.int64, count=len(members))
-            group_pool_start = pool_start_ns_arr[src_indices]
-            group_scoring_pcd = scoring_pcd_ns_arr[src_indices]
-            group_bet_ids = bet_ids[src_indices]
-            col_arrays["bet_id"][out_indices] = group_bet_ids
-            window_slices = _batch_entity_window_slices(
-                arrays,
-                group_pool_start,
-                group_scoring_pcd,
-            )
-            _batch_emit_entity_range_features(
+        entity_sizes = sorted((len(v) for v in entity_groups.values()), reverse=True)
+        max_entity_target_rows = int(entity_sizes[0]) if entity_sizes else 0
+        for key, arrays in entity_arrays.items():
+            max_entity_event_rows = max(max_entity_event_rows, int(len(arrays.pcd_ns)))
+        emit_entity_count = int(len(entity_groups))
+        top_sizes = entity_sizes[:_INDEXED_REPLAY_EMIT_TOP_ENTITY_SIZES]
+        logger.info(
+            "[indexed_replay_emit] yyyymm=%s entities=%d target_rows=%d "
+            "max_entity_targets=%d top_entity_target_sizes=%s",
+            payout_yyyymm,
+            emit_entity_count,
+            out_idx,
+            max_entity_target_rows,
+            top_sizes,
+        )
+        for entity_idx, (key, members) in enumerate(entity_groups.items(), start=1):
+            group_size = _emit_entity_group_members(
                 col_arrays,
-                out_indices,
-                arrays,
-                window_slices,
+                key=key,
+                members=members,
+                entity_arrays=entity_arrays,
+                canonical_arrays=canonical_arrays,
+                trial_pool_start_ns=trial_pool_start_ns,
+                bet_ids=bet_ids,
+                pool_start_ns_arr=pool_start_ns_arr,
+                scoring_pcd_ns_arr=scoring_pcd_ns_arr,
+                payout_odds=payout_odds,
+                wagers=wagers,
+                target_gday_ord=target_gday_ord,
+                payout_yyyymm=payout_yyyymm,
+                entity_idx=entity_idx,
+                entity_count=emit_entity_count,
             )
-            target_idx_arr = _batch_target_row_indices(
-                arrays,
-                group_pool_start,
-                group_scoring_pcd,
-                group_bet_ids,
-            )
-            _batch_emit_outcome_peer_features(
-                col_arrays,
-                out_indices,
-                arrays,
-                target_idx_arr,
-                group_pool_start,
-                group_scoring_pcd,
-            )
-            canon_bounds_list: list[tuple[int, int] | None]
-            if canon_arrays is not None:
-                canon_bounds_list = _batch_canonical_bounds_1h(
-                    canon_arrays,
-                    trial_pool_start_ns,
-                    group_scoring_pcd,
-                )
-            else:
-                canon_bounds_list = [None] * len(out_indices)
-            for batch_idx, (out_row, src_row) in enumerate(
-                zip(out_indices, src_indices, strict=True),
+            if (
+                entity_idx % _INDEXED_REPLAY_EMIT_PROGRESS_EVERY_ENTITIES == 0
+                or entity_idx == emit_entity_count
             ):
-                emit_ctx = _emit_context_from_batch_slices(
-                    int(target_idx_arr[batch_idx]),
-                    window_slices,
-                    batch_idx,
-                    canon_bounds_list[batch_idx],
-                )
-                _emit_target_into_non_range(
-                    col_arrays,
-                    int(out_row),
-                    arrays,
-                    canon_arrays,
-                    emit_ctx,
-                    pool_start_ns=int(pool_start_ns_arr[src_row]),
-                    scoring_pcd_ns=int(scoring_pcd_ns_arr[src_row]),
-                    payout_odds=float(payout_odds[src_row]),
-                    target_wager=float(wagers[src_row]),
-                    target_gaming_day_ord=int(target_gday_ord[src_row]),
+                logger.info(
+                    "[indexed_replay_emit] progress yyyymm=%s entities=%d/%d "
+                    "last_entity_targets=%d",
+                    payout_yyyymm,
+                    entity_idx,
+                    emit_entity_count,
+                    group_size,
                 )
         if out_idx == 0:
             out = pd.DataFrame(columns=out_cols)
@@ -1991,6 +2612,13 @@ def _indexed_replay_features(
     metrics = {
         "input_event_rows": int(len(events_df)),
         "target_rows": int(len(targets)),
+        "target_player_id_rows": target_player_id_rows,
+        "unique_target_player_ids": unique_target_player_ids,
+        "pool_event_rows": pool_event_rows,
+        "unique_pool_player_ids": unique_pool_player_ids,
+        "max_entity_event_rows": max_entity_event_rows,
+        "max_entity_target_rows": max_entity_target_rows,
+        "emit_entity_count": emit_entity_count,
         "output_rows": int(len(out)),
         "max_state_keys": int(len(entity_arrays)),
         "max_canonical_keys": int(len(canonical_arrays)),
@@ -2037,10 +2665,7 @@ def materialize_short_term_replay_indexed_prototype(
     t1 = time.perf_counter()
     targets = _attach_canonical_id(targets, cmap)
     phase["attach_canonical_s"] = round(time.perf_counter() - t1, 6)
-    player_ids = tuple(
-        int(pid)
-        for pid in pd.to_numeric(targets["player_id"], errors="coerce").dropna().astype(int).tolist()
-    )
+    player_ids = unique_int_player_ids(targets["player_id"])
     t2 = time.perf_counter()
     events_df = _load_replay_events(
         Path(cleaned_bet_parquet).resolve(),
@@ -2054,10 +2679,7 @@ def materialize_short_term_replay_indexed_prototype(
 
     t3 = time.perf_counter()
     bounds = compute_scoring_bounds_for_bets(targets, cfg=cfg)
-    pool_player_ids = tuple(
-        int(pid)
-        for pid in pd.to_numeric(events_df["player_id"], errors="coerce").dropna().astype(int).tolist()
-    )
+    pool_player_ids = unique_int_player_ids(events_df["player_id"])
     from trainer_hightier.feature_experiment.short_term_pit_replay_prototype import _canonical_by_player
 
     canonical_by_player = _canonical_by_player(cmap, pool_player_ids)
@@ -2069,6 +2691,7 @@ def materialize_short_term_replay_indexed_prototype(
         bounds,
         canonical_by_player={int(k): str(v) for k, v in canonical_by_player.items()},
         hk_tz=cfg.hk_tz,
+        payout_yyyymm=str(payout_yyyymm),
     )
     phase["emit_s"] = round(time.perf_counter() - t4, 6)
     dst = Path(out_parquet).resolve()
