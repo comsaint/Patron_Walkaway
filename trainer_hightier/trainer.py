@@ -58,6 +58,7 @@ from trainer_hightier.config import (
     MID_TERM_SNAPSHOT_MAX_LOOKBACK_DAYS,
     MID_TERM_SNAPSHOT_SCOPE_TRAINING,
     PartitionIngressConfig,
+    PlayerDqConfig,
     PreTrainFeatureGateConfig,
     PreTrainFeatureGateConfig,
     Step5TrainConfig,
