@@ -179,3 +179,33 @@ def test_ensure_etl_observed_at_for_pit_preserves_real_etl() -> None:
     )
     got = ensure_etl_observed_at_for_pit(bets)
     assert pd.Timestamp(got.iloc[0]["__etl_insert_Dtm"]).tz_convert(hk) == etl
+
+
+def test_ensure_etl_observed_at_for_pit_falls_back_when_column_missing() -> None:
+    """Fixtures without ETL column should use payout time for PIT staging."""
+    from trainer_hightier.serving.feature_builder import ensure_etl_observed_at_for_pit
+
+    hk = "Asia/Hong_Kong"
+    pcd = pd.Timestamp("2025-06-01 10:00:00", tz=hk)
+    bets = pd.DataFrame({"bet_id": [1.0], "payout_complete_dtm": [pcd]})
+    got = ensure_etl_observed_at_for_pit(bets)
+    assert pd.Timestamp(got.iloc[0]["__etl_insert_Dtm"]).tz_convert(hk) == pcd
+
+
+def test_ensure_etl_observed_at_for_pit_fills_partial_null_etl() -> None:
+    """Null ETL cells may fall back to payout without overwriting populated ETL."""
+    from trainer_hightier.serving.feature_builder import ensure_etl_observed_at_for_pit
+
+    hk = "Asia/Hong_Kong"
+    pcd = pd.Timestamp("2025-06-01 10:00:00", tz=hk)
+    etl = pcd + pd.Timedelta(minutes=3)
+    bets = pd.DataFrame(
+        {
+            "bet_id": [1.0, 2.0],
+            "payout_complete_dtm": [pcd, pcd],
+            "__etl_insert_Dtm": [etl, pd.NaT],
+        }
+    )
+    got = ensure_etl_observed_at_for_pit(bets)
+    assert pd.Timestamp(got.iloc[0]["__etl_insert_Dtm"]).tz_convert(hk) == etl
+    assert pd.Timestamp(got.iloc[1]["__etl_insert_Dtm"]).tz_convert(hk) == pcd

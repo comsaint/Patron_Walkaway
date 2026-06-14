@@ -21,8 +21,10 @@ from trainer_hightier.utils.entity_set_v1 import (
     entity_set_policy_fingerprint_sha256_hex,
     materialize_entity_set_v1_cached,
 )
+from trainer_hightier.utils.bet_l0_preprocess import segment_cleaned_bet_from_base_parquet
 from trainer_hightier.utils.player_dq import (
     flags_policy_fingerprint_sha256_hex,
+    hard_exclude_anti_join_sql,
     hard_exclude_policy_fingerprint_sha256_hex,
     materialize_player_dq_cached,
 )
@@ -206,3 +208,154 @@ def test_entity_set_fingerprint_unchanged_when_disabled() -> None:
         hard_exclude_policy_fingerprint_sha256_hex="",
     )
     assert fp_old == fp_disabled
+
+
+def test_materialize_player_dq_disabled_skips_artifacts(tmp_path: Path) -> None:
+    """Disabled DQ must not write artifacts or change downstream fingerprints."""
+    t0 = pd.Timestamp("2025-05-27 09:00:00")
+    raw = tmp_path / "raw.parquet"
+    pq.write_table(
+        pa.Table.from_pandas(pd.DataFrame([_bet_row(bet_id=1, player_id=100, payout_complete_dtm=t0)])),
+        raw,
+    )
+    base = tmp_path / "base"
+    _preprocess_bets(raw, base)
+    cmap = tmp_path / "map.parquet"
+    pq.write_table(
+        pa.table({"player_id": [100], "canonical_id": ["c100"], "casino_player_id": ["vip"]}),
+        cmap,
+    )
+    meta = materialize_player_dq_cached(
+        bet_base_parquet=base,
+        canonical_mapping_parquet=cmap,
+        cfg=PlayerDqConfig(enabled=False, artifacts_dir=tmp_path / "dq"),
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        use_cache=False,
+    )
+    assert meta["player_dq_enabled"] is False
+    assert meta["player_dq_hard_exclude_parquet"] is None
+    assert meta["hard_exclude_policy_fingerprint_sha256_hex"] == ""
+
+
+def test_player_dq_cache_hit_on_repeat_materialize(tmp_path: Path) -> None:
+    """Second materialize with unchanged inputs must reuse cached DQ artifacts."""
+    t0 = pd.Timestamp("2025-05-27 09:00:00")
+    raw = tmp_path / "raw.parquet"
+    pq.write_table(
+        pa.Table.from_pandas(pd.DataFrame([_bet_row(bet_id=1, player_id=100, payout_complete_dtm=t0)])),
+        raw,
+    )
+    base = tmp_path / "base"
+    _preprocess_bets(raw, base)
+    cmap = tmp_path / "map.parquet"
+    pq.write_table(
+        pa.table({"player_id": [100], "canonical_id": ["c100"], "casino_player_id": ["vip"]}),
+        cmap,
+    )
+    dq_dir = tmp_path / "dq"
+    cfg = PlayerDqConfig(artifacts_dir=dq_dir)
+    first = materialize_player_dq_cached(
+        bet_base_parquet=base,
+        canonical_mapping_parquet=cmap,
+        cfg=cfg,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        use_cache=True,
+    )
+    second = materialize_player_dq_cached(
+        bet_base_parquet=base,
+        canonical_mapping_parquet=cmap,
+        cfg=cfg,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        use_cache=True,
+    )
+    assert first["player_dq_cache_hit"] is False
+    assert second["player_dq_cache_hit"] is True
+    assert second["player_dq_hard_player_count"] == first["player_dq_hard_player_count"]
+
+
+def test_player_dq_cache_miss_when_flags_policy_changes(tmp_path: Path) -> None:
+    """Review-threshold changes invalidate flags fingerprint and force recompute."""
+    t0 = pd.Timestamp("2025-05-27 09:00:00")
+    raw = tmp_path / "raw.parquet"
+    pq.write_table(
+        pa.Table.from_pandas(pd.DataFrame([_bet_row(bet_id=1, player_id=100, payout_complete_dtm=t0)])),
+        raw,
+    )
+    base = tmp_path / "base"
+    _preprocess_bets(raw, base)
+    cmap = tmp_path / "map.parquet"
+    pq.write_table(
+        pa.table({"player_id": [100], "canonical_id": ["c100"], "casino_player_id": ["vip"]}),
+        cmap,
+    )
+    dq_dir = tmp_path / "dq"
+    materialize_player_dq_cached(
+        bet_base_parquet=base,
+        canonical_mapping_parquet=cmap,
+        cfg=PlayerDqConfig(artifacts_dir=dq_dir, review_distinct_game_id_per_hour=120),
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        use_cache=True,
+    )
+    changed = materialize_player_dq_cached(
+        bet_base_parquet=base,
+        canonical_mapping_parquet=cmap,
+        cfg=PlayerDqConfig(artifacts_dir=dq_dir, review_distinct_game_id_per_hour=100),
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        use_cache=True,
+    )
+    assert changed["player_dq_cache_hit"] is False
+
+
+def test_hard_exclude_anti_join_sql_filters_player_ids() -> None:
+    """Anti-join fragment must reference hard-exclude parquet and player_id expr."""
+    sql = hard_exclude_anti_join_sql(
+        hard_exclude_parquet_esc="/tmp/hard.parquet",
+        player_id_expr="b.player_id",
+    )
+    assert "NOT IN" in sql
+    assert "read_parquet('/tmp/hard.parquet')" in sql
+    assert "b.player_id" in sql
+
+
+def test_segment_cleaned_bet_applies_hard_exclude(tmp_path: Path) -> None:
+    """Legacy segment projection must drop hard-DQ players when parquet is supplied."""
+    t0 = pd.Timestamp("2025-05-27 09:00:00")
+    rows = [
+        _bet_row(bet_id=1, player_id=100, payout_complete_dtm=t0),
+        _bet_row(bet_id=2, player_id=200, payout_complete_dtm=t0),
+    ]
+    raw = tmp_path / "raw.parquet"
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(rows)), raw)
+    base = tmp_path / "base"
+    _preprocess_bets(raw, base)
+    cmap = tmp_path / "map.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "player_id": [100, 200],
+                "canonical_id": ["c100", "c200"],
+                "casino_player_id": ["44440101", "vip"],
+            }
+        ),
+        cmap,
+    )
+    dq_dir = tmp_path / "dq"
+    dq_meta = materialize_player_dq_cached(
+        bet_base_parquet=base,
+        canonical_mapping_parquet=cmap,
+        cfg=PlayerDqConfig(artifacts_dir=dq_dir),
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        use_cache=False,
+    )
+    allowed = tmp_path / "allow.parquet"
+    pq.write_table(pa.table({"player_id": [100, 200]}), allowed)
+    seg = tmp_path / "seg"
+    segment_cleaned_bet_from_base_parquet(
+        base,
+        allowed,
+        seg,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        hard_exclude_parquet=Path(str(dq_meta["player_dq_hard_exclude_parquet"])),
+    )
+    got = read_cleaned_bet_dataset(seg)
+    assert set(got["player_id"].astype(int).tolist()) == {200}

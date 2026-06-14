@@ -6,6 +6,9 @@ import pandas as pd
 import pytest
 
 from trainer_hightier.evaluation.alert_band_objective import (
+    AlertBandEvaluation,
+    OperationalCapacityPoint,
+    alert_band_meta_dict,
     alert_band_scalar_score,
     evaluate_alert_band_on_candidates,
     target_alert_count,
@@ -101,3 +104,34 @@ def test_evaluate_alert_band_on_candidates_returns_scalar() -> None:
     assert len(band.points) == 2
     assert band.scalar_score > -1.0
     assert band.deployment_threshold == pytest.approx(band.points[0].threshold)
+
+
+def test_alert_band_meta_dict_serializes_points() -> None:
+    """Refactored metadata helper must round-trip band evaluation for reporting."""
+    pt = OperationalCapacityPoint(
+        target_alerts_per_hour=1.0,
+        target_alert_count=10,
+        threshold=0.42,
+        precision=0.55,
+        recall=0.12,
+        alerts=10,
+        alerts_per_hour=1.0,
+        true_positives=5,
+    )
+    band = AlertBandEvaluation(
+        scalar_score=57.0,
+        deployment_target_alerts_per_hour=1.0,
+        deployment_threshold=0.42,
+        points=(pt,),
+        min_precision=0.55,
+        mean_precision=0.55,
+    )
+    got = alert_band_meta_dict(
+        band,
+        deployment_target_alerts_per_hour=1.0,
+        target_alerts_per_hour=(1.0, 2.0),
+    )
+    assert got["scalar_score"] == pytest.approx(57.0)
+    assert got["target_alerts_per_hour"] == [1.0, 2.0]
+    assert got["points"][0]["precision"] == pytest.approx(0.55)
+    assert got["points"][0]["true_positives"] == 5
