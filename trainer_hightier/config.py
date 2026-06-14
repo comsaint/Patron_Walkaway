@@ -184,6 +184,12 @@ CASINO_PLAYER_ID_CLEAN_SQL: Final[str] = (
     "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') "
     "THEN NULL ELSE trim(casino_player_id) END"
 )
+# Player DQ v1: known test accounts + abnormal game pace (distinct game_id buckets).
+PLAYER_DQ_KNOWN_TEST_CASINO_PLAYER_ID_PREFIX: Final[str] = "4444"
+PLAYER_DQ_HARD_MAX_DISTINCT_GAME_ID_PER_HOUR: Final[int] = 240
+PLAYER_DQ_HARD_MAX_DISTINCT_GAME_ID_PER_DAY: Final[int] = 2880
+PLAYER_DQ_REVIEW_MAX_DISTINCT_GAME_ID_PER_HOUR: Final[int] = 120
+PLAYER_DQ_REVIEW_MAX_DISTINCT_GAME_ID_PER_DAY: Final[int] = 1440
 WALKAWAY_GAP_MIN: Final[int] = 30
 ALERT_HORIZON_MIN: Final[int] = 15
 #: Offline train/eval player-level alert cooldown (Step 5 operational simulation).
@@ -700,6 +706,25 @@ class CanonicalMappingConfig:
     compile_patron_session_metrics: bool = True
     # Rich per-canonical profile CSV under ``trainer_hightier/artifacts/profile/``.
     compile_patron_profile_csv: bool = True
+
+
+@dataclass(frozen=True)
+class PlayerDqConfig:
+    """Player-level DQ for training universe (hard exclude + review flags).
+
+    Hard exclude applies at entity-set / legacy segment projection only; bet base clean
+    cache is unchanged. Review flags are written to ``player_dq_flags.parquet`` only.
+    """
+
+    enabled: bool = True
+    known_test_casino_player_id_prefixes: tuple[str, ...] = (
+        PLAYER_DQ_KNOWN_TEST_CASINO_PLAYER_ID_PREFIX,
+    )
+    hard_distinct_game_id_per_hour: int = PLAYER_DQ_HARD_MAX_DISTINCT_GAME_ID_PER_HOUR
+    hard_distinct_game_id_per_day: int = PLAYER_DQ_HARD_MAX_DISTINCT_GAME_ID_PER_DAY
+    review_distinct_game_id_per_hour: int = PLAYER_DQ_REVIEW_MAX_DISTINCT_GAME_ID_PER_HOUR
+    review_distinct_game_id_per_day: int = PLAYER_DQ_REVIEW_MAX_DISTINCT_GAME_ID_PER_DAY
+    artifacts_dir: Path | None = None
 
 
 @dataclass(frozen=True)

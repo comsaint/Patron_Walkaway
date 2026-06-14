@@ -925,8 +925,11 @@ def segment_cleaned_bet_from_base_parquet(
     output_parquet: Path,
     *,
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
+    hard_exclude_parquet: Path | None = None,
 ) -> Path:
     """Project partitioned all-player bets onto ADT allowlist rows; rewritten as Hive partitioned output."""
+
+    from trainer_hightier.utils.player_dq import hard_exclude_anti_join_sql
 
     base = Path(base_cleaned_parquet).resolve()
     allow = Path(allowlist_parquet).resolve()
@@ -939,6 +942,10 @@ def segment_cleaned_bet_from_base_parquet(
     b_from = resolved_cleaned_bet_read_parquet_sql(base)
     a_esc = _path_posix(allow).replace("'", "''")
     o_esc = _path_posix(out).replace("'", "''")
+    hard_clause = ""
+    if hard_exclude_parquet is not None and Path(hard_exclude_parquet).is_file():
+        hard_esc = _path_posix(Path(hard_exclude_parquet)).replace("'", "''")
+        hard_clause = hard_exclude_anti_join_sql(hard_exclude_parquet_esc=hard_esc)
     partition_opts = (
         "FORMAT PARQUET, COMPRESSION SNAPPY, PARTITION_BY (gaming_month, gaming_day_key), OVERWRITE_OR_IGNORE TRUE"
     )
@@ -956,6 +963,7 @@ COPY (
       FROM read_parquet('{a_esc}')
       WHERE TRY_CAST(player_id AS BIGINT) IS NOT NULL
     ) AS a ON TRY_CAST(b.player_id AS BIGINT) = a.pid
+    WHERE TRUE{hard_clause}
   ) AS s
 ) TO '{o_esc}' ({partition_opts})
 """.strip()
@@ -1256,6 +1264,7 @@ def build_bet_clean_cache_record(
     bet_base_cleaned_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
     data_scope: L0PreprocessDataScopeConfig | None = None,
+    hard_exclude_policy_fingerprint_sha256_hex: str | None = None,
 ) -> dict[str, Any]:
     """Fingerprint for cleaned bet parquet cache (raw t_bet + registry + optional ADT allowlist).
 
@@ -1312,6 +1321,9 @@ def build_bet_clean_cache_record(
                 "adt_segment": seg,
             }
         )
+        hard_fp = str(hard_exclude_policy_fingerprint_sha256_hex or "").strip()
+        if hard_fp:
+            rec["hard_exclude_policy_fingerprint_sha256_hex"] = hard_fp
         return rec
 
     if len(merged_sources) > 1:
@@ -1353,6 +1365,7 @@ def bet_clean_cache_is_hit(
     bet_base_cleaned_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
     data_scope: L0PreprocessDataScopeConfig | None = None,
+    hard_exclude_policy_fingerprint_sha256_hex: str | None = None,
 ) -> bool:
     cleaned = Path(cleaned_parquet).resolve()
     reg = _resolve_preprocess_registry(preprocess_registry_yaml)
@@ -1384,6 +1397,7 @@ def bet_clean_cache_is_hit(
             bet_base_cleaned_parquet=bet_base_cleaned_parquet,
             partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
             data_scope=data_scope,
+            hard_exclude_policy_fingerprint_sha256_hex=hard_exclude_policy_fingerprint_sha256_hex,
         )
 
     try:
@@ -1411,6 +1425,7 @@ def write_bet_clean_cache_manifest(
     bet_base_cleaned_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
     data_scope: L0PreprocessDataScopeConfig | None = None,
+    hard_exclude_policy_fingerprint_sha256_hex: str | None = None,
 ) -> Path:
     reg = _resolve_preprocess_registry(preprocess_registry_yaml)
     rec = build_bet_clean_cache_record(
@@ -1426,6 +1441,7 @@ def write_bet_clean_cache_manifest(
         bet_base_cleaned_parquet=bet_base_cleaned_parquet,
         partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
         data_scope=data_scope,
+        hard_exclude_policy_fingerprint_sha256_hex=hard_exclude_policy_fingerprint_sha256_hex,
     )
     mp = bet_clean_cache_manifest_path(Path(cleaned_parquet))
     mp.parent.mkdir(parents=True, exist_ok=True)

@@ -199,6 +199,7 @@ class HighTierTrainArgs:
     bet_preprocess: BetPreprocessConfig = field(default_factory=BetPreprocessConfig)
     skip_bet_preprocess: bool = False
     canonical_mapping: CanonicalMappingConfig = field(default_factory=CanonicalMappingConfig)
+    player_dq: PlayerDqConfig = field(default_factory=PlayerDqConfig)
     # When True with ``objective.theo_train_quantile`` in (0,1), bet preprocess keeps only ADT-top patrons.
     filter_bets_by_adt_quantile: bool = True
     # After cleaned ``t_bet`` exists: join to mapping and write ``walkaway_labels.parquet`` (``trainer.labels`` parity).
@@ -810,6 +811,31 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 metrics["bet_base_clean_cache_hit"] = bool(base_hit)
                 metrics["bet_dedup_hash_buckets_effective"] = int(bet_dedup_eff)
 
+            hard_exclude_parquet: Path | None = None
+            hard_exclude_policy_fp = ""
+            if (
+                args.player_dq.enabled
+                and mapping_parquet_path.is_file()
+                and _hbet.cleaned_bet_dataset_has_any_parquet(base_bet_path)
+            ):
+                from trainer_hightier.utils.player_dq import materialize_player_dq_cached
+
+                dq_meta = materialize_player_dq_cached(
+                    bet_base_parquet=base_bet_path,
+                    canonical_mapping_parquet=mapping_parquet_path,
+                    cfg=args.player_dq,
+                    duckdb_runtime=args.duckdb_runtime,
+                    use_cache=use_preprocess_caches,
+                )
+                if metrics is not None:
+                    metrics.update(dq_meta)
+                hard_exclude_policy_fp = str(
+                    dq_meta.get("hard_exclude_policy_fingerprint_sha256_hex") or "",
+                ).strip()
+                hx_raw = dq_meta.get("player_dq_hard_exclude_parquet")
+                if hx_raw:
+                    hard_exclude_parquet = Path(str(hx_raw))
+
             if args.use_entity_set_v1:
                 if rank_meta is None or source_fp is None:
                     raise ValueError(
@@ -833,6 +859,8 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     duckdb_runtime=args.duckdb_runtime,
                     output_parquet=cleaned_bet_path,
                     use_cache=use_preprocess_caches,
+                    hard_exclude_parquet=hard_exclude_parquet,
+                    hard_exclude_policy_fingerprint_sha256_hex=hard_exclude_policy_fp,
                 )
                 entity_set_policy_fp = str(es_meta.get("entity_set_policy_fingerprint_sha256_hex") or "").strip() or None
                 if metrics is not None:
@@ -881,6 +909,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     bet_base_cleaned_parquet=base_bet_path,
                     partition_inventory_fingerprint_sha256_hex=inv_fp,
                     data_scope=effective_bet_cfg.data_scope,
+                    hard_exclude_policy_fingerprint_sha256_hex=hard_exclude_policy_fp or None,
                 )
                 if metrics is not None:
                     metrics["bet_segment_clean_cache_hit"] = bool(seg_hit)
@@ -897,6 +926,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                             allowed_players_pq,
                             cleaned_bet_path,
                             duckdb_runtime=args.duckdb_runtime,
+                            hard_exclude_parquet=hard_exclude_parquet,
                         )
                         _hbet.write_bet_clean_cache_manifest(
                             bet_cache_primary,
@@ -912,6 +942,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                             bet_base_cleaned_parquet=base_bet_path,
                             partition_inventory_fingerprint_sha256_hex=inv_fp,
                             data_scope=effective_bet_cfg.data_scope,
+                            hard_exclude_policy_fingerprint_sha256_hex=hard_exclude_policy_fp or None,
                         )
                     n_b = _hbet.partitioned_cleaned_bet_total_rows(cleaned_bet_path)
                     logger.info(
@@ -925,6 +956,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     training_scope_fingerprint_sha256_hex=training_scope_fingerprint(base_bet_cfg.data_scope),
                     partition_inventory_fingerprint_sha256_hex=inv_fp or "",
                     source_manifest_v2_fingerprint_sha256_hex=source_fp,
+                    hard_exclude_policy_fingerprint_sha256_hex=hard_exclude_policy_fp,
                 )
         else:
             bet_cache_ok = use_preprocess_caches and _hbet.bet_clean_cache_is_hit(

@@ -71,18 +71,21 @@ def entity_set_policy_fingerprint_sha256_hex(
     source_manifest_v2_fingerprint_sha256_hex: str,
     bet_base_fingerprint_sha256_hex: str,
     training_scope_fingerprint_sha256_hex: str,
+    hard_exclude_policy_fingerprint_sha256_hex: str = "",
 ) -> str:
     """Stable fingerprint for entity-set v1 universe used by labels / short PIT caches."""
-    return _policy_blob_sha256(
-        {
-            "kind": ENTITY_SET_KIND,
-            "selected_quantile": float(selected_quantile),
-            "selected_universe_fingerprint": str(selected_universe_fingerprint_sha256_hex).strip(),
-            "source_manifest_v2_fingerprint": str(source_manifest_v2_fingerprint_sha256_hex).strip(),
-            "bet_base_cleaned_fingerprint": str(bet_base_fingerprint_sha256_hex).strip(),
-            "training_scope_fingerprint": str(training_scope_fingerprint_sha256_hex).strip(),
-        },
-    )
+    payload: dict[str, Any] = {
+        "kind": ENTITY_SET_KIND,
+        "selected_quantile": float(selected_quantile),
+        "selected_universe_fingerprint": str(selected_universe_fingerprint_sha256_hex).strip(),
+        "source_manifest_v2_fingerprint": str(source_manifest_v2_fingerprint_sha256_hex).strip(),
+        "bet_base_cleaned_fingerprint": str(bet_base_fingerprint_sha256_hex).strip(),
+        "training_scope_fingerprint": str(training_scope_fingerprint_sha256_hex).strip(),
+    }
+    hard_fp = str(hard_exclude_policy_fingerprint_sha256_hex or "").strip()
+    if hard_fp:
+        payload["hard_exclude_policy_fingerprint"] = hard_fp
+    return _policy_blob_sha256(payload)
 
 
 def legacy_bet_segment_policy_fingerprint_sha256_hex(
@@ -92,18 +95,21 @@ def legacy_bet_segment_policy_fingerprint_sha256_hex(
     training_scope_fingerprint_sha256_hex: str,
     partition_inventory_fingerprint_sha256_hex: str,
     source_manifest_v2_fingerprint_sha256_hex: str | None,
+    hard_exclude_policy_fingerprint_sha256_hex: str = "",
 ) -> str:
     """Fingerprint for legacy ADT segment path (pre entity-set v1)."""
-    return _policy_blob_sha256(
-        {
-            "kind": "legacy_bet_segment_v1",
-            "selected_quantile": float(selected_quantile),
-            "bet_base_cleaned_fingerprint": str(bet_base_fingerprint_sha256_hex).strip(),
-            "training_scope_fingerprint": str(training_scope_fingerprint_sha256_hex).strip(),
-            "partition_inventory_fingerprint": str(partition_inventory_fingerprint_sha256_hex).strip(),
-            "source_manifest_v2_fingerprint": str(source_manifest_v2_fingerprint_sha256_hex or "").strip(),
-        },
-    )
+    payload: dict[str, Any] = {
+        "kind": "legacy_bet_segment_v1",
+        "selected_quantile": float(selected_quantile),
+        "bet_base_cleaned_fingerprint": str(bet_base_fingerprint_sha256_hex).strip(),
+        "training_scope_fingerprint": str(training_scope_fingerprint_sha256_hex).strip(),
+        "partition_inventory_fingerprint": str(partition_inventory_fingerprint_sha256_hex).strip(),
+        "source_manifest_v2_fingerprint": str(source_manifest_v2_fingerprint_sha256_hex or "").strip(),
+    }
+    hard_fp = str(hard_exclude_policy_fingerprint_sha256_hex or "").strip()
+    if hard_fp:
+        payload["hard_exclude_policy_fingerprint"] = hard_fp
+    return _policy_blob_sha256(payload)
 
 
 def bet_clean_policy_fingerprint_sha256_hex(
@@ -147,9 +153,15 @@ def _entity_projection_inner_sql(
     base_from: str,
     rank_esc: str,
     quantile: float,
+    hard_exclude_parquet_esc: str | None = None,
 ) -> str:
     """DuckDB SELECT filtering base bets through ADT rank universe."""
+    from trainer_hightier.utils.player_dq import hard_exclude_anti_join_sql
+
     qf = float(quantile)
+    hard_clause = ""
+    if hard_exclude_parquet_esc:
+        hard_clause = hard_exclude_anti_join_sql(hard_exclude_parquet_esc=hard_exclude_parquet_esc)
     return f"""
 SELECT DISTINCT b.*
 FROM {base_from} AS b
@@ -160,6 +172,7 @@ INNER JOIN (
     AND CAST(adt_percentile AS DOUBLE) >= {qf}
     AND has_slow_window_coverage
 ) AS u ON TRY_CAST(b.player_id AS BIGINT) = u.pid
+WHERE TRUE{hard_clause}
 """.strip()
 
 
@@ -341,6 +354,7 @@ def entity_set_cache_is_hit(
     source_manifest_v2_fingerprint_sha256_hex: str,
     bet_base_fingerprint_sha256_hex: str,
     training_scope_fingerprint_sha256_hex: str,
+    hard_exclude_policy_fingerprint_sha256_hex: str = "",
 ) -> bool:
     """Return True when cached entity set matches policy and output exists."""
     if not cleaned_bet_dataset_has_any_parquet(output_root):
@@ -348,6 +362,8 @@ def entity_set_cache_is_hit(
     prev = load_entity_set_manifest(manifest_path)
     if prev is None:
         return False
+    want_hard = str(hard_exclude_policy_fingerprint_sha256_hex or "").strip()
+    have_hard = str(prev.get("hard_exclude_policy_fingerprint") or "").strip()
     return (
         float(prev.get("selected_quantile", -1)) == float(selected_quantile)
         and _manifest_selected_universe_fingerprint(prev)
@@ -355,6 +371,7 @@ def entity_set_cache_is_hit(
         and str(prev.get("source_manifest_v2_fingerprint")) == str(source_manifest_v2_fingerprint_sha256_hex)
         and str(prev.get("bet_base_cleaned_fingerprint")) == str(bet_base_fingerprint_sha256_hex)
         and str(prev.get("training_scope_fingerprint")) == str(training_scope_fingerprint_sha256_hex)
+        and have_hard == want_hard
     )
 
 
@@ -387,6 +404,8 @@ def materialize_entity_set_v1_cached(
     cache_root: Path | None = None,
     output_parquet: Path | None = None,
     use_cache: bool = True,
+    hard_exclude_parquet: Path | None = None,
+    hard_exclude_policy_fingerprint_sha256_hex: str = "",
 ) -> dict[str, Any]:
     """Project cleaned bet base through rank universe; write Step 3-compatible output."""
     t0 = time.perf_counter()
@@ -408,6 +427,15 @@ def materialize_entity_set_v1_cached(
     )
     manifest_path = policy_dir / "manifest.json"
     partitions_dir = policy_dir / "partitions"
+    hard_fp = str(hard_exclude_policy_fingerprint_sha256_hex or "").strip()
+    hard_esc: str | None = None
+    if hard_fp:
+        if hard_exclude_parquet is None or not Path(hard_exclude_parquet).is_file():
+            raise FileNotFoundError(
+                "hard_exclude_policy_fingerprint set but hard_exclude_parquet missing: "
+                f"{hard_exclude_parquet!r}",
+            )
+        hard_esc = _path_posix(Path(hard_exclude_parquet)).replace("'", "''")
     cache_hit = use_cache and entity_set_cache_is_hit(
         manifest_path=manifest_path,
         output_root=out,
@@ -416,12 +444,14 @@ def materialize_entity_set_v1_cached(
         source_manifest_v2_fingerprint_sha256_hex=str(source_manifest_v2_fingerprint_sha256_hex),
         bet_base_fingerprint_sha256_hex=base_fp,
         training_scope_fingerprint_sha256_hex=scope_fp,
+        hard_exclude_policy_fingerprint_sha256_hex=hard_fp,
     )
     if not cache_hit:
         inner = _entity_projection_inner_sql(
             base_from=resolved_cleaned_bet_read_parquet_sql(base),
             rank_esc=_path_posix(rank_p).replace("'", "''"),
             quantile=float(selected_quantile),
+            hard_exclude_parquet_esc=hard_esc,
         )
         _copy_entity_set_to_output(
             inner_sql=inner,
@@ -444,6 +474,8 @@ def materialize_entity_set_v1_cached(
             "partitions_dir": str(partitions_dir.resolve()),
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         }
+        if hard_fp:
+            manifest["hard_exclude_policy_fingerprint"] = hard_fp
         write_json_atomic(manifest_path, manifest)
     else:
         prev = load_entity_set_manifest(manifest_path) or {}
@@ -456,6 +488,7 @@ def materialize_entity_set_v1_cached(
         source_manifest_v2_fingerprint_sha256_hex=str(source_manifest_v2_fingerprint_sha256_hex),
         bet_base_fingerprint_sha256_hex=base_fp,
         training_scope_fingerprint_sha256_hex=scope_fp,
+        hard_exclude_policy_fingerprint_sha256_hex=hard_fp,
     )
     delta_meta: dict[str, Any] = {}
     stricter = find_stricter_cached_entity_set_quantile(
