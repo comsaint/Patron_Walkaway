@@ -35,9 +35,10 @@ except ModuleNotFoundError:  # serving bundles omit the "training" extra; only n
 import pandas as pd
 import pyarrow.parquet as pq
 from trainer_hightier.evaluation.alert_band_objective import (
-    alert_band_metrics_block,
+    alert_band_meta_dict,
     evaluate_alert_band_on_candidates,
 )
+from trainer_hightier.reporting.writer import slim_training_metrics_body
 from trainer_hightier.evaluation.metrics_blocks import (
     metrics_at_threshold,
     split_metrics_block,
@@ -392,26 +393,11 @@ def _pick_validation_threshold(
         alert_count=int(deploy.alerts),
         n_samples=int(len(val_pg.y_true)),
     )
-    band_meta = {
-        "scalar_score": float(band.scalar_score),
-        "min_precision": float(band.min_precision),
-        "mean_precision": float(band.mean_precision),
-        "deployment_target_alerts_per_hour": float(objective_cfg.deployment_target_alerts_per_hour),
-        "target_alerts_per_hour": list(objective_cfg.target_alerts_per_hour),
-        "points": [
-            {
-                "target_alerts_per_hour": float(p.target_alerts_per_hour),
-                "target_alert_count": int(p.target_alert_count),
-                "threshold": float(p.threshold),
-                "precision": float(p.precision),
-                "recall": float(p.recall),
-                "alerts": int(p.alerts),
-                "alerts_per_hour": p.alerts_per_hour,
-                "true_positives": int(p.true_positives),
-            }
-            for p in band.points
-        ],
-    }
+    band_meta = alert_band_meta_dict(
+        band,
+        deployment_target_alerts_per_hour=float(objective_cfg.deployment_target_alerts_per_hour),
+        target_alerts_per_hour=tuple(objective_cfg.target_alerts_per_hour),
+    )
     return pick, float(band.scalar_score), band_meta
 
 
@@ -896,13 +882,13 @@ def train_lgbm_from_splits(
     pg_va = aggregate_bets_to_player_game(df_va, val_scores, split_name="val")
     pg_te = aggregate_bets_to_player_game(df_te, test_scores, split_name="test")
     block_tr_pg = split_metrics_block(
-        "train_player_game", pg_tr.y_true, pg_tr.scores, thr, window_hours=wh_train,
+        "train", pg_tr.y_true, pg_tr.scores, thr, window_hours=wh_train,
     )
     block_va_pg = split_metrics_block(
-        "val_player_game", pg_va.y_true, pg_va.scores, thr, window_hours=wh_val,
+        "val", pg_va.y_true, pg_va.scores, thr, window_hours=wh_val,
     )
     block_te_pg = split_metrics_block(
-        "test_player_game", pg_te.y_true, pg_te.scores, thr, window_hours=wh_test,
+        "test", pg_te.y_true, pg_te.scores, thr, window_hours=wh_test,
     )
     block_tr_bl = split_metrics_block(
         "train_bet_level", y_tr, train_scores, thr, window_hours=wh_train,
@@ -913,9 +899,21 @@ def train_lgbm_from_splits(
     block_te_bl = split_metrics_block(
         "test_bet_level", y_te, test_scores, thr, window_hours=wh_test,
     )
-    block_tr_main = split_metrics_block("train", pg_tr.y_true, pg_tr.scores, thr, window_hours=wh_train)
-    block_va_main = split_metrics_block("val", pg_va.y_true, pg_va.scores, thr, window_hours=wh_val)
-    block_te_main = split_metrics_block("test", pg_te.y_true, pg_te.scores, thr, window_hours=wh_test)
+    test_band_meta: dict[str, Any] | None = None
+    if objective_cfg.selection_policy == "alert_band_precision":
+        test_band = evaluate_alert_band_on_candidates(
+            pg_te.candidates,
+            window_hours=wh_test,
+            target_alerts_per_hour=tuple(objective_cfg.target_alerts_per_hour),
+            deployment_target_alerts_per_hour=float(objective_cfg.deployment_target_alerts_per_hour),
+            cooldown_min=cooldown_min,
+            split_prefix="test",
+        )
+        test_band_meta = alert_band_meta_dict(
+            test_band,
+            deployment_target_alerts_per_hour=float(objective_cfg.deployment_target_alerts_per_hour),
+            target_alerts_per_hour=tuple(objective_cfg.target_alerts_per_hour),
+        )
     block_tr_op = operational_simulated_metrics_block(
         "train",
         pg_tr.candidates,
@@ -937,34 +935,11 @@ def train_lgbm_from_splits(
         cooldown_min=cooldown_min,
         window_hours=wh_test,
     )
-    band_blocks: dict[str, Any] = {}
-    if objective_cfg.selection_policy == "alert_band_precision":
-        band_blocks.update(
-            alert_band_metrics_block(
-                "val",
-                pg_va.candidates,
-                window_hours=wh_val,
-                target_alerts_per_hour=tuple(objective_cfg.target_alerts_per_hour),
-                cooldown_min=cooldown_min,
-            )
-        )
-        band_blocks.update(
-            alert_band_metrics_block(
-                "test",
-                pg_te.candidates,
-                window_hours=wh_test,
-                target_alerts_per_hour=tuple(objective_cfg.target_alerts_per_hour),
-                cooldown_min=cooldown_min,
-            )
-        )
 
     elapsed = round(time.perf_counter() - t0, 3)
     policy_meta = build_player_alert_policy_metadata(cfg.player_alert_policy)
     report: dict[str, Any] = {
         "evaluation_grain": EVALUATION_GRAIN_PLAYER_GAME,
-        "player_cooldown_simulated": True,
-        "player_cooldown_simulated_min": cooldown_min,
-        "player_cooldown_alert_ts_source": PAYOUT_TS_COLUMN,
         "player_game_group_key": [PLAYER_ID_COLUMN, GAME_ID_COLUMN],
         "score_aggregation": PLAYER_GAME_SCORE_AGGREGATION,
         "label_aggregation": "max",
@@ -989,9 +964,6 @@ def train_lgbm_from_splits(
         "train_player_game_count": pg_tr.player_game_count,
         "val_player_game_count": pg_va.player_game_count,
         "test_player_game_count": pg_te.player_game_count,
-        **block_tr_main,
-        **block_va_main,
-        **block_te_main,
         **block_tr_pg,
         **block_va_pg,
         **block_te_pg,
@@ -1001,16 +973,15 @@ def train_lgbm_from_splits(
         **block_tr_op,
         **block_va_op,
         **block_te_op,
-        **band_blocks,
         **policy_meta,
     }
+    if test_band_meta is not None:
+        report["step5_test_alert_band"] = test_band_meta
     report.update(study_summary)
     if val_band_meta is not None:
         report["step5_val_alert_band"] = val_band_meta
-        report["step5_alert_band_scalar_score"] = val_band_meta.get("scalar_score")
     if isinstance(sample_policy_meta, dict) and sample_policy_meta:
         report["sample_policy"] = dict(sample_policy_meta)
-        report["sample_policy_fingerprint"] = sample_policy_meta.get("sample_policy_fingerprint")
         report["val_test_evaluation_unsampled"] = bool(
             sample_policy_meta.get("val_test_evaluation_unsampled", True),
         )
@@ -1066,7 +1037,10 @@ def train_lgbm_from_splits(
     report["training_metrics_path"] = str(metrics_path)
     report["step5_training_metrics_path"] = str(metrics_path)
     if persist_training_metrics:
-        metrics_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+        metrics_path.write_text(
+            json.dumps(slim_training_metrics_body(report), indent=2, default=str),
+            encoding="utf-8",
+        )
 
     logger.info(
         "Step 5 trained LightGBM in %.3fs; threshold=%.6f feasible=%s val recall=%.4f prec=%.4f refit_train_plus_val=%s → %s",

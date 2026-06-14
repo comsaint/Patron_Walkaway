@@ -430,7 +430,7 @@ class TrainingScopePolicy:
     rows within ``TrainingDataScopeConfig``).
     """
 
-    recent_full_months: int | None = 6  # experiment: recent 6 full months (was 3)
+    recent_full_months: int | None = None  # experiment: recent 6 full months (was 3)
     include_current_partial_month: bool = True  # ... and include current partial month
     as_of_date: date | None = None
     data_completeness_mode: DataCompletenessMode = DATA_COMPLETENESS_MODE_WARN

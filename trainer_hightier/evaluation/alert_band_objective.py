@@ -48,6 +48,36 @@ class AlertBandEvaluation:
     mean_precision: float
 
 
+def alert_band_meta_dict(
+    band: AlertBandEvaluation,
+    *,
+    deployment_target_alerts_per_hour: float,
+    target_alerts_per_hour: tuple[float, ...] | list[float],
+) -> dict[str, Any]:
+    """Nested alert-band block for ``training_metrics.json`` / run reports."""
+
+    return {
+        "scalar_score": float(band.scalar_score),
+        "min_precision": float(band.min_precision),
+        "mean_precision": float(band.mean_precision),
+        "deployment_target_alerts_per_hour": float(deployment_target_alerts_per_hour),
+        "target_alerts_per_hour": [float(r) for r in target_alerts_per_hour],
+        "points": [
+            {
+                "target_alerts_per_hour": float(p.target_alerts_per_hour),
+                "target_alert_count": int(p.target_alert_count),
+                "threshold": float(p.threshold),
+                "precision": float(p.precision),
+                "recall": float(p.recall),
+                "alerts": int(p.alerts),
+                "alerts_per_hour": p.alerts_per_hour,
+                "true_positives": int(p.true_positives),
+            }
+            for p in band.points
+        ],
+    }
+
+
 def target_alert_count(window_hours: float | None, alerts_per_hour: float) -> int:
     """Convert target alerts/hour to integer alert budget for a split window."""
 

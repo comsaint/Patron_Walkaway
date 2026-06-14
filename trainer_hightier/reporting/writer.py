@@ -9,7 +9,7 @@ import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Mapping
 
 from trainer_hightier.core.model_bundle_paths import (
     RUN_REPORT_FILENAME,
@@ -19,6 +19,87 @@ from trainer_hightier.core.model_bundle_paths import (
 )
 
 logger = logging.getLogger(__name__)
+
+_PLAYER_GAME_METRIC_SUFFIXES: Final[tuple[str, ...]] = (
+    "ap",
+    "precision",
+    "recall",
+    "f1",
+    "samples",
+    "positives",
+    "alerts",
+    "window_hours",
+    "alerts_per_hour",
+    "true_labels_per_hour",
+)
+
+
+def slim_training_metrics_body(body: dict[str, Any]) -> dict[str, Any]:
+    """Remove redundant flat keys before persisting ``training_metrics.json``."""
+
+    out = dict(body)
+
+    for split in ("train", "val", "test"):
+        for suffix in _PLAYER_GAME_METRIC_SUFFIXES:
+            out.pop(f"{split}_player_game_{suffix}", None)
+
+    for key in list(out):
+        if key.startswith("player_cooldown_"):
+            out.pop(key, None)
+
+    for split in ("val", "test"):
+        for key in list(out):
+            if key.startswith(f"{split}_op_") or key.startswith(f"{split}_alert_band_"):
+                out.pop(key, None)
+
+    out.pop("step5_model_path", None)
+    out.pop("step5_training_metrics_path", None)
+    out.pop("step5_alert_band_scalar_score", None)
+
+    sample_policy = out.get("sample_policy")
+    if isinstance(sample_policy, dict) and sample_policy.get("sample_policy_fingerprint") is not None:
+        out.pop("sample_policy_fingerprint", None)
+
+    feat_cols = out.get("step5_feature_columns")
+    feature_screening = out.get("feature_screening")
+    if isinstance(feat_cols, list) and isinstance(feature_screening, dict):
+        selected = feature_screening.get("selected_features")
+        if isinstance(selected, list) and selected == feat_cols:
+            trimmed = dict(feature_screening)
+            trimmed.pop("selected_features", None)
+            out["feature_screening"] = trimmed
+
+    if isinstance(out.get("feature_screening"), dict):
+        nested = out["feature_screening"]
+        if nested.get("feature_selection_policy_fingerprint") == out.get("feature_selection_policy_fingerprint"):
+            out.pop("feature_selection_policy_fingerprint", None)
+        if nested.get("feature_selection_manifest_fingerprint") == out.get(
+            "feature_selection_manifest_fingerprint",
+        ):
+            out.pop("feature_selection_manifest_fingerprint", None)
+
+    return out
+
+
+def _alert_band_nested_key(split_prefix: str) -> str:
+    """Return nested alert-band key for a split prefix."""
+
+    return f"step5_{split_prefix}_alert_band"
+
+
+def _alert_band_point(band: Mapping[str, Any], rate: float) -> dict[str, Any] | None:
+    """Return the alert-band point at ``rate`` alerts/hour when present."""
+
+    points = band.get("points")
+    if not isinstance(points, list):
+        return None
+    for raw in points:
+        if not isinstance(raw, dict):
+            continue
+        target = raw.get("target_alerts_per_hour")
+        if isinstance(target, (int, float)) and float(target) == float(rate):
+            return raw
+    return None
 
 
 def _repo_root() -> Path:
@@ -98,7 +179,7 @@ def build_training_metrics_document(
 ) -> dict[str, Any]:
     """Assemble ``training_metrics.json`` body from Step 5 report dict."""
 
-    body = dict(step5_report)
+    body = slim_training_metrics_body(dict(step5_report))
     body["schema"] = TRAINING_METRICS_SCHEMA
     if patches:
         body.update(patches)
@@ -112,6 +193,17 @@ def _build_thresholding_block(metrics: dict[str, Any], args: Any) -> dict[str, A
     selected = float(thr) if isinstance(thr, (int, float)) else None
     policy = str(metrics.get("step5_selection_policy") or "min_precision")
     if policy == "alert_band_precision":
+        val_band = metrics.get(_alert_band_nested_key("val"))
+        test_band = metrics.get(_alert_band_nested_key("test"))
+        val_p1 = _alert_band_point(val_band, 1.0) if isinstance(val_band, Mapping) else None
+        val_p2 = _alert_band_point(val_band, 2.0) if isinstance(val_band, Mapping) else None
+        test_p1 = _alert_band_point(test_band, 1.0) if isinstance(test_band, Mapping) else None
+        test_p2 = _alert_band_point(test_band, 2.0) if isinstance(test_band, Mapping) else None
+        scalar = None
+        if isinstance(val_band, Mapping):
+            scalar = val_band.get("scalar_score")
+        if scalar is None:
+            scalar = metrics.get("step5_alert_band_scalar_score")
         return {
             "policy": policy,
             "policy_param": {
@@ -121,18 +213,18 @@ def _build_thresholding_block(metrics: dict[str, Any], args: Any) -> dict[str, A
                 ),
             },
             "selected_threshold": selected,
-            "alert_band_scalar_score": metrics.get("step5_alert_band_scalar_score"),
-            "val_op_precision_at_1_alerts_per_hour": metrics.get(
-                "val_op_precision_at_1_alerts_per_hour",
+            "alert_band_scalar_score": scalar,
+            "val_op_precision_at_1_alerts_per_hour": (
+                val_p1.get("precision") if val_p1 else metrics.get("val_op_precision_at_1_alerts_per_hour")
             ),
-            "val_op_precision_at_2_alerts_per_hour": metrics.get(
-                "val_op_precision_at_2_alerts_per_hour",
+            "val_op_precision_at_2_alerts_per_hour": (
+                val_p2.get("precision") if val_p2 else metrics.get("val_op_precision_at_2_alerts_per_hour")
             ),
-            "test_op_precision_at_1_alerts_per_hour": metrics.get(
-                "test_op_precision_at_1_alerts_per_hour",
+            "test_op_precision_at_1_alerts_per_hour": (
+                test_p1.get("precision") if test_p1 else metrics.get("test_op_precision_at_1_alerts_per_hour")
             ),
-            "test_op_precision_at_2_alerts_per_hour": metrics.get(
-                "test_op_precision_at_2_alerts_per_hour",
+            "test_op_precision_at_2_alerts_per_hour": (
+                test_p2.get("precision") if test_p2 else metrics.get("test_op_precision_at_2_alerts_per_hour")
             ),
         }
     return {
@@ -150,6 +242,19 @@ def _build_alert_band_analysis(metrics: dict[str, Any]) -> dict[str, Any] | None
         return None
 
     def _split_band(prefix: str) -> dict[str, Any]:
+        nested = metrics.get(_alert_band_nested_key(prefix))
+        if isinstance(nested, Mapping):
+            p1 = _alert_band_point(nested, 1.0)
+            p2 = _alert_band_point(nested, 2.0)
+            return {
+                "scalar_score": nested.get("scalar_score"),
+                "min_precision": nested.get("min_precision"),
+                "mean_precision": nested.get("mean_precision"),
+                "precision_at_1_alerts_per_hour": p1.get("precision") if p1 else None,
+                "precision_at_2_alerts_per_hour": p2.get("precision") if p2 else None,
+                "recall_at_1_alerts_per_hour": p1.get("recall") if p1 else None,
+                "recall_at_2_alerts_per_hour": p2.get("recall") if p2 else None,
+            }
         return {
             "scalar_score": metrics.get(f"{prefix}_alert_band_scalar_score"),
             "min_precision": metrics.get(f"{prefix}_alert_band_min_precision"),
@@ -266,13 +371,17 @@ def build_metrics_detailed(metrics: dict[str, Any]) -> dict[str, Any]:
         "val_pick_feasible": metrics.get("step5_val_pick_feasible"),
     }
     if policy == "alert_band_precision":
+        val_band = metrics.get(_alert_band_nested_key("val"))
+        scalar = metrics.get("step5_alert_band_scalar_score")
+        if scalar is None and isinstance(val_band, Mapping):
+            scalar = val_band.get("scalar_score")
         threshold_analysis.update(
             {
                 "target_alerts_per_hour": metrics.get("step5_target_alerts_per_hour"),
                 "deployment_target_alerts_per_hour": metrics.get(
                     "step5_deployment_target_alerts_per_hour",
                 ),
-                "alert_band_scalar_score": metrics.get("step5_alert_band_scalar_score"),
+                "alert_band_scalar_score": scalar,
                 "alert_band": _build_alert_band_analysis(metrics),
             },
         )

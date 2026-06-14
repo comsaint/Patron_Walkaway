@@ -17,6 +17,7 @@ from trainer_hightier.reporting.writer import (
     build_metrics_detailed,
     build_pipeline_debug,
     build_run_summary,
+    slim_training_metrics_body,
 )
 from trainer_hightier.trainer import HighTierTrainArgs
 
@@ -192,6 +193,29 @@ def test_build_run_summary_includes_split_periods(tmp_path) -> None:
 def test_build_metrics_detailed_and_pipeline_debug_smoke() -> None:
     """Smoke nested payloads from flat Step 5 metrics."""
 
+    val_alert_band = {
+        "scalar_score": 57.8,
+        "min_precision": 0.57,
+        "mean_precision": 0.59,
+        "deployment_target_alerts_per_hour": 1.0,
+        "target_alerts_per_hour": [1.0, 2.0],
+        "points": [
+            {
+                "target_alerts_per_hour": 1.0,
+                "precision": 0.55,
+                "recall": 0.01,
+                "alerts": 10,
+                "true_positives": 5,
+            },
+            {
+                "target_alerts_per_hour": 2.0,
+                "precision": 0.52,
+                "recall": 0.02,
+                "alerts": 20,
+                "true_positives": 10,
+            },
+        ],
+    }
     metrics = {
         "model_version": "mv2",
         "train_ap": 0.55,
@@ -203,10 +227,7 @@ def test_build_metrics_detailed_and_pipeline_debug_smoke() -> None:
         "step5_target_alerts_per_hour": [1.0, 2.0],
         "step5_threshold": 0.42,
         "step5_val_pick_feasible": True,
-        "val_op_precision_at_1_alerts_per_hour": 0.55,
-        "val_op_precision_at_2_alerts_per_hour": 0.52,
-        "test_op_precision_at_1_alerts_per_hour": 0.53,
-        "test_op_precision_at_2_alerts_per_hour": 0.50,
+        "step5_val_alert_band": val_alert_band,
         "step5_feature_columns": ["x"],
         "session_clean_cache_hit": True,
         "prepare_training_frame_seconds": 1.0,
@@ -240,3 +261,42 @@ def test_build_metrics_detailed_and_pipeline_debug_smoke() -> None:
     assert sm["elapsed_seconds"] == 22.0
     assert sm["diff_summary"]["unchanged"] == 1192
     assert sm["changed_partitions"]["t_bet"] == []
+
+
+def test_slim_training_metrics_body_removes_redundant_keys() -> None:
+    """Phase-1 dedupe drops duplicate player-game, alert-band, and alias keys."""
+
+    body = {
+        "val_precision": 0.6,
+        "val_player_game_precision": 0.6,
+        "player_cooldown_simulated": True,
+        "player_cooldown_simulated_min": 120,
+        "player_alert_policy_cooldown_min": 120,
+        "val_op_precision_at_1_alerts_per_hour": 0.61,
+        "val_alert_band_scalar_score": 57.0,
+        "step5_val_alert_band": {"scalar_score": 57.0, "points": []},
+        "step5_alert_band_scalar_score": 57.0,
+        "step5_model_path": "/tmp/model.pkl",
+        "model_path": "/tmp/model.pkl",
+        "step5_training_metrics_path": "/tmp/training_metrics.json",
+        "training_metrics_path": "/tmp/training_metrics.json",
+        "sample_policy_fingerprint": "abc",
+        "sample_policy": {"sample_policy_fingerprint": "abc"},
+        "step5_feature_columns": ["a", "b"],
+        "feature_screening": {
+            "selected_features": ["a", "b"],
+            "feature_selection_policy_fingerprint": "fp1",
+        },
+        "feature_selection_policy_fingerprint": "fp1",
+    }
+    slim = slim_training_metrics_body(body)
+    assert "val_player_game_precision" not in slim
+    assert slim["val_precision"] == 0.6
+    assert "player_cooldown_simulated" not in slim
+    assert "val_op_precision_at_1_alerts_per_hour" not in slim
+    assert "step5_model_path" not in slim
+    assert "step5_training_metrics_path" not in slim
+    assert "step5_alert_band_scalar_score" not in slim
+    assert "sample_policy_fingerprint" not in slim
+    assert "selected_features" not in slim["feature_screening"]
+    assert "feature_selection_policy_fingerprint" not in slim
