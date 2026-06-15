@@ -958,6 +958,8 @@ def run_offline_production_pipeline(
         batch,
         mapping_parquet=ctx.mapping_parquet,
         supplier_plan=plan,
+        txn_use_cleaned_parquet=True,
+        cleaned_casino_txn_root=ctx.cfg.cleaned_casino_txn_root,
     )
     fail_frac = float(ctx.cfg.scorer_feast_entity_missing_fail_fraction)
     needs_feast = bool(plan.feast_mid_cols or plan.feast_slow_cols)

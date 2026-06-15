@@ -346,3 +346,27 @@ def test_build_scorer_supplier_plan_routes_txn_lite_columns() -> None:
     assert_scorer_supplier_plan_or_raise(plan)
     routes = scorer_supplier_route_counts(plan)
     assert routes["txn_lite_builder"] == 7
+
+
+def test_build_scorer_supplier_plan_routes_txn_without_registry_rows() -> None:
+    """Known txn__* model columns route even when frozen snapshot omits registry rows."""
+
+    from trainer_hightier.config import TXN_LITE_FEATURE_COLUMNS
+    from trainer_hightier.serving.candidate_registry_loader import CandidateRegistrySnapshot
+    from trainer_hightier.serving.feature_supply import build_scorer_supplier_plan
+
+    snap = CandidateRegistrySnapshot(
+        registry_version="test",
+        updated_at=None,
+        path=Path("missing.yaml"),
+        rows=(),
+        model_feature_columns=(),
+        experimental_numeric_columns=(),
+        full_candidate_feature_columns=(),
+        feature_group_tags={},
+        ablation_experimental_group_ids=(),
+    )
+    txn_cols = TXN_LITE_FEATURE_COLUMNS
+    plan = build_scorer_supplier_plan(snap, txn_cols)
+    assert plan.txn_cols == txn_cols
+    assert plan.unknown_cols == ()

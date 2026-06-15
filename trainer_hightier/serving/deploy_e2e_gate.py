@@ -46,8 +46,13 @@ from trainer_hightier.core.model_bundle_paths import (
     resolve_model_bundle_for_reports,
 )
 from trainer_hightier.deploy import main as deploy_main
+from trainer_hightier.serving.feature_contract import (
+    registry_fingerprint_from_model_bundle,
+    run_supplier_contract_gate,
+)
 from trainer_hightier.serving.feature_supply import (
     ScorerSupplierPlan,
+    assert_deploy_external_data_roots_or_raise,
     assert_scorer_supplier_plan_or_raise,
     build_scorer_supplier_plan,
     load_frozen_registry_for_bundle,
@@ -68,6 +73,7 @@ class DeployE2EGateOptions:
     bundle_dir: Path
     local_cleaned_bet: Path
     local_cleaned_session: Path
+    local_cleaned_casino_txn: Path | None
     output_json: Path | None
     gaming_day_start: date | None
     gaming_day_end: date | None
@@ -212,6 +218,12 @@ def parse_gate_args(argv: list[str] | None = None) -> DeployE2EGateOptions:
         help="cleaned session parquet (required for slow layer)",
     )
     pr.add_argument(
+        "--local-cleaned-casino-txn",
+        type=Path,
+        default=None,
+        help="Optional L0 cleaned t_casino_txn root for offline parity only (production uses ClickHouse)",
+    )
+    pr.add_argument(
         "--output-json",
         type=Path,
         default=None,
@@ -284,6 +296,11 @@ def parse_gate_args(argv: list[str] | None = None) -> DeployE2EGateOptions:
         bundle_dir=Path(args.bundle_dir).resolve(),
         local_cleaned_bet=_resolve_cli_data_path(args.local_cleaned_bet),
         local_cleaned_session=_resolve_cli_data_path(args.local_cleaned_session),
+        local_cleaned_casino_txn=(
+            _resolve_cli_data_path(args.local_cleaned_casino_txn)
+            if args.local_cleaned_casino_txn is not None
+            else None
+        ),
         output_json=_resolve_cli_data_path(args.output_json) if args.output_json else None,
         gaming_day_start=g_start,
         gaming_day_end=g_end,
@@ -725,6 +742,56 @@ def run_deploy_smoke_gate(
         )
 
 
+def run_supplier_contract_gate_step(
+    *,
+    bundle_root: Path,
+    model_bundle: Path,
+    plan: ScorerSupplierPlan,
+    cfg: Any,
+    mapping: Path,
+    allowlist: Path | None,
+) -> GateStepResult:
+    """Cross-check ``deploy_contract.json`` and run deploy-stage supplier validators."""
+    try:
+        detail = run_supplier_contract_gate(
+            bundle_root=bundle_root,
+            model_bundle=model_bundle,
+            plan=plan,
+            registry_fingerprint=registry_fingerprint_from_model_bundle(model_bundle),
+            feature_count=len(model_feature_columns_from_pickle(model_bundle)),
+            cfg=cfg,
+            mapping=mapping,
+            allowlist=allowlist,
+            stage="deploy_e2e",
+        )
+        return GateStepResult(name="supplier_contract", ok=True, detail=detail)
+    except Exception as exc:
+        return GateStepResult(
+            name="supplier_contract",
+            ok=False,
+            detail={"traceback": traceback.format_exc()},
+            error=str(exc),
+        )
+
+
+def run_external_data_roots_gate(
+    *,
+    plan: ScorerSupplierPlan,
+    cfg: Any,
+) -> GateStepResult:
+    """Verify deploy-host supplier readiness (ClickHouse txn_lite when required)."""
+    try:
+        detail = assert_deploy_external_data_roots_or_raise(plan, cfg=cfg)
+        return GateStepResult(name="external_data_roots", ok=True, detail=detail)
+    except Exception as exc:
+        return GateStepResult(
+            name="external_data_roots",
+            ok=False,
+            detail={"traceback": traceback.format_exc()},
+            error=str(exc),
+        )
+
+
 def run_scorability_gate(
     *,
     opts: DeployE2EGateOptions,
@@ -793,6 +860,8 @@ def run_deploy_e2e_gate(opts: DeployE2EGateOptions) -> DeployE2EGateReport:
     cfg = apply_hightier_serving_environ_overrides(
         deploy_main._serving_config_for_bundle(bundle_root, rel),
     )
+    if opts.local_cleaned_casino_txn is not None:
+        cfg = replace(cfg, cleaned_casino_txn_root=opts.local_cleaned_casino_txn.resolve())
     set_hightier_serving_deploy_override(cfg)
     import trainer_hightier.serving.runtime_config  # noqa: F401
 
@@ -829,6 +898,49 @@ def run_deploy_e2e_gate(opts: DeployE2EGateOptions) -> DeployE2EGateReport:
             },
         ),
     )
+    steps.append(
+        run_supplier_contract_gate_step(
+            bundle_root=bundle_root,
+            model_bundle=model_bundle,
+            plan=plan,
+            cfg=cfg,
+            mapping=mapping,
+            allowlist=allowlist,
+        ),
+    )
+    if not steps[-1].ok:
+        hard_fail = steps[-1]
+        report = DeployE2EGateReport(
+            schema_version=REPORT_SCHEMA_VERSION,
+            generated_at=datetime.now(timezone.utc).isoformat(),
+            verdict="fail",
+            bundle_dir=str(bundle_root),
+            runtime=runtime,
+            steps=steps,
+            supplier_routes=scorer_supplier_route_counts(plan),
+            failure_reason=hard_fail.error,
+            artifact_paths={},
+        )
+        if opts.output_json is not None:
+            write_gate_report(opts.output_json, report)
+        return report
+    steps.append(run_external_data_roots_gate(plan=plan, cfg=cfg))
+    if not steps[-1].ok:
+        hard_fail = steps[-1]
+        report = DeployE2EGateReport(
+            schema_version=REPORT_SCHEMA_VERSION,
+            generated_at=datetime.now(timezone.utc).isoformat(),
+            verdict="fail",
+            bundle_dir=str(bundle_root),
+            runtime=runtime,
+            steps=steps,
+            supplier_routes=scorer_supplier_route_counts(plan),
+            failure_reason=hard_fail.error,
+            artifact_paths={},
+        )
+        if opts.output_json is not None:
+            write_gate_report(opts.output_json, report)
+        return report
     steps.append(
         run_startup_refresh_gate(
             bundle_root=bundle_root,

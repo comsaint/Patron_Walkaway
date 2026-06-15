@@ -164,12 +164,18 @@ def _build_materialize_copy_sql(
     train_source: str,
     cleaned_read: str,
     extra_window_hours: tuple[int, ...],
+    availability_cutoff_expr: str = "tr.pcd",
+    train_rows_extra_select: str = "",
 ) -> str:
     """Build DuckDB SQL for bet-grain txn_lite features.
 
     Args:
         train_source: DuckDB table expression for training/scoring bets
             (e.g. ``read_parquet('path')`` or registered ``scoring_bets``).
+        availability_cutoff_expr: SQL expression for PIT availability cutoff
+            (default ``tr.pcd`` for cleaned offline replay).
+        train_rows_extra_select: Optional leading-comma extra SELECT columns
+            for ``train_rows`` (e.g. ``avail_cutoff`` for production scoring).
     """
 
     lookback_h = _join_lookback_hours(extra_window_hours)
@@ -181,6 +187,7 @@ def _build_materialize_copy_sql(
     extra_agg_sql = ""
     if extra_agg:
         extra_agg_sql = ",\n  " + ",\n  ".join(extra_agg)
+    extra_select = train_rows_extra_select or ""
 
     inner = f"""
 WITH {_txn_valid_cte(cleaned_read)},
@@ -188,7 +195,7 @@ train_rows AS (
   SELECT
     TRY_CAST(bet_id AS DOUBLE) AS bet_id,
     TRY_CAST(player_id AS BIGINT) AS player_id,
-    CAST(payout_complete_dtm AS TIMESTAMPTZ) AS pcd
+    CAST(payout_complete_dtm AS TIMESTAMPTZ) AS pcd{extra_select}
   FROM {train_source} AS b
   WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
     AND TRY_CAST(player_id AS BIGINT) IS NOT NULL
@@ -206,7 +213,7 @@ joined AS (
   LEFT JOIN txn_valid AS txn
     ON tr.player_id = txn.player_id
    AND txn.event_ts < tr.pcd
-   AND txn.available_ts <= tr.pcd
+   AND txn.available_ts <= {availability_cutoff_expr}
    AND txn.event_ts >= tr.pcd - INTERVAL {lookback_h} HOUR
 )
 SELECT
@@ -399,7 +406,7 @@ def compute_txn_lite_features_for_bets(
     duckdb_runtime: DuckDbRuntimeConfig,
     extra_window_hours: tuple[int, ...] = (),
 ) -> pd.DataFrame:
-    """Compute bet-grain ``txn__*`` columns for in-memory scoring bets."""
+    """Compute bet-grain ``txn__*`` columns from L0 cleaned parquet (offline / training)."""
 
     out_feature_cols = txn_lite_feature_columns(extra_window_hours=extra_window_hours)
     if bets.empty:
@@ -416,16 +423,61 @@ def compute_txn_lite_features_for_bets(
         cleaned_root,
         exclude_partial=True,
     )
+    return compute_txn_lite_features_from_txn_source(
+        bets,
+        txn_source_read=cleaned_read,
+        duckdb_runtime=duckdb_runtime,
+        extra_window_hours=extra_window_hours,
+        availability_cutoff_expr="tr.pcd",
+    )
+
+
+def compute_txn_lite_features_from_txn_source(
+    bets: pd.DataFrame,
+    *,
+    txn_source_read: str,
+    duckdb_runtime: DuckDbRuntimeConfig,
+    extra_window_hours: tuple[int, ...] = (),
+    availability_cutoff_expr: str = "tr.pcd",
+    train_rows_extra_select: str = "",
+    scoring_bets_frame: pd.DataFrame | None = None,
+    txn_frame: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Compute bet-grain ``txn__*`` from a DuckDB txn source expression or in-memory frame."""
+
+    out_feature_cols = txn_lite_feature_columns(extra_window_hours=extra_window_hours)
+    if bets.empty:
+        return pd.DataFrame(columns=["bet_id", *out_feature_cols])
+    required = frozenset({"bet_id", "player_id", "payout_complete_dtm"})
+    missing = required - frozenset(bets.columns)
+    if missing:
+        raise ValueError(
+            f"compute_txn_lite_features_from_txn_source missing columns {sorted(missing)}; "
+            f"got {list(bets.columns)!r}",
+        )
+    source_read = txn_source_read
     copy_sql = _build_materialize_copy_sql(
         train_source="scoring_bets",
-        cleaned_read=cleaned_read,
+        cleaned_read=source_read,
         extra_window_hours=extra_window_hours,
+        availability_cutoff_expr=availability_cutoff_expr,
+        train_rows_extra_select=train_rows_extra_select,
     )
-    work = bets[list(required)].copy()
+    work = scoring_bets_frame if scoring_bets_frame is not None else bets[list(required)].copy()
     con = duckdb.connect(database=":memory:")
     try:
         apply_duckdb_runtime_pragmas(con, duckdb_runtime)
         con.register("scoring_bets", work)
+        if txn_frame is not None:
+            con.register("fetched_txn", txn_frame)
+            source_read = "fetched_txn"
+            copy_sql = _build_materialize_copy_sql(
+                train_source="scoring_bets",
+                cleaned_read=source_read,
+                extra_window_hours=extra_window_hours,
+                availability_cutoff_expr=availability_cutoff_expr,
+                train_rows_extra_select=train_rows_extra_select,
+            )
         out = con.execute(copy_sql).df()
     finally:
         con.close()
@@ -436,6 +488,19 @@ def default_cleaned_casino_txn_root() -> Path:
     """Default L0 cleaned root for txn_lite v1."""
 
     return DEFAULT_T_CASINO_TXN_CLEANED_ROOT.resolve()
+
+
+def resolved_cleaned_casino_txn_root(
+    cfg: "HightierServingConfig | None" = None,
+) -> Path:
+    """Return deploy-configured or package-default L0 cleaned ``t_casino_txn`` root."""
+
+    from trainer_hightier.config import HightierServingConfig, default_hightier_serving_config
+
+    serving: HightierServingConfig = cfg or default_hightier_serving_config()
+    if serving.cleaned_casino_txn_root is not None:
+        return Path(serving.cleaned_casino_txn_root).resolve()
+    return default_cleaned_casino_txn_root()
 
 
 def write_txn_lite_sidecars(

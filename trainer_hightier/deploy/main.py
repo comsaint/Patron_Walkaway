@@ -41,6 +41,51 @@ from trainer_hightier.serving.contracts import (
 )
 
 
+def _installed_trainer_hightier_version() -> str:
+    """Return installed ``trainer-hightier`` distribution version."""
+
+    try:
+        from importlib.metadata import version
+
+        return str(version("trainer-hightier")).strip()
+    except Exception:
+        return "unknown"
+
+
+def _read_bundle_package_version(bundle_root: Path) -> str | None:
+    """Read ``package_version`` from bundle metadata when present."""
+
+    info = Path(bundle_root).resolve() / "bundle_info.json"
+    if not info.is_file():
+        return None
+    try:
+        body = json.loads(info.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    raw = body.get("package_version")
+    return str(raw).strip() if raw else None
+
+
+def _assert_installed_package_matches_bundle_or_raise(bundle_root: Path) -> None:
+    """Fail fast when conda/site-packages has a stale wheel vs bundle ``bundle_info.json``."""
+
+    expected = _read_bundle_package_version(bundle_root)
+    if not expected:
+        return
+    installed = _installed_trainer_hightier_version()
+    if installed == expected:
+        return
+    raise RuntimeError(
+        "[deploy] trainer_hightier version mismatch: "
+        f"installed={installed!r}, bundle expects={expected!r}. "
+        "From the bundle root run: "
+        "pip install --force-reinstall wheels/trainer_hightier-*.whl "
+        "or pip install --force-reinstall -r requirements.txt"
+    )
+
+
 def _parse_deploy_args(argv: list[str] | None) -> argparse.Namespace:
     pr = argparse.ArgumentParser(description="trainer_hightier deploy bundle runner")
     pr.add_argument("--bundle-dir", type=Path, required=True)
@@ -111,6 +156,7 @@ def _serving_config_for_bundle(bundle_root: Path, rel: dict[str, Any]) -> Highti
         validator_out_dir=br / ls / "validator_out",
         production_cleaned_bet_mirror_dir=br / "source_mirror" / "cleaned_bet",
         production_cleaned_session_mirror_parquet=br / "source_mirror" / "cleaned_session.parquet",
+        cleaned_casino_txn_root=None,
         scorer_feast_repo_path=(br / feast_repo).resolve(),
         scorer_feast_readiness_path=(br / rel.get(
             "feast_readiness_path", f"{feast_art}/feast_online_readiness.json"
@@ -332,8 +378,14 @@ def _preflight_frozen_artifacts(bundle_root: Path, rel: dict[str, Any]) -> None:
 def _preflight_feature_supplyability(bundle_root: Path, rel: dict[str, Any]) -> None:
     """Verify model feature columns have runtime suppliers (registry + bundled parquet)."""
 
+    from trainer_hightier.serving.feature_contract import (
+        registry_fingerprint_from_model_bundle,
+        run_supplier_contract_gate,
+    )
     from trainer_hightier.serving.feature_supply import (
+        assert_deploy_external_data_roots_or_raise,
         assert_feature_supplyability_or_raise,
+        build_scorer_supplier_plan,
         load_frozen_registry_for_bundle,
         model_feature_columns_from_pickle,
     )
@@ -380,6 +432,25 @@ def _preflight_feature_supplyability(bundle_root: Path, rel: dict[str, Any]) -> 
         manifest=man if isinstance(man, dict) else None,
         scorer_v2_feast_mode=True,
     )
+    plan = build_scorer_supplier_plan(snap, model_feats)
+    mapping_path = bundle_root / rel["canonical_mapping_parquet"]
+    allowlist_path = bundle_root / rel.get(
+        "adt_allowlist_parquet",
+        "mapping/adt_allowed_players_q0p99.parquet",
+    )
+    contract_detail = run_supplier_contract_gate(
+        bundle_root=bundle_root,
+        model_bundle=model_bundle,
+        plan=plan,
+        registry_fingerprint=registry_fingerprint_from_model_bundle(model_bundle),
+        feature_count=len(model_feats),
+        mapping=mapping_path,
+        allowlist=allowlist_path if allowlist_path.is_file() else None,
+        stage="deploy_preflight",
+    )
+    logging.info("[deploy] supplier contract preflight %s", contract_detail)
+    roots = assert_deploy_external_data_roots_or_raise(plan)
+    logging.info("[deploy] external data roots ok %s", roots)
 
 
 def _emit_deploy_boot_info(bundle_root: Path, cfg: HightierServingConfig, rel: dict[str, Any]) -> None:
@@ -1273,6 +1344,7 @@ def main(argv: list[str] | None = None) -> int:
     mode = str(args.mode)
 
     _preflight_frozen_artifacts(br, rel)
+    _assert_installed_package_matches_bundle_or_raise(br)
     if mode in ("all", "scorer"):
         _startup_feast_refresh_or_raise(
             br,

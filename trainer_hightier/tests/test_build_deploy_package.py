@@ -24,7 +24,7 @@ from trainer_hightier.build_deploy_package import (
     _write_pyproject_version,
     build_deploy_package,
 )
-from trainer_hightier.config import FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME
+from trainer_hightier.config import FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME, DEPLOY_CONTRACT_FILENAME
 from trainer_hightier.core.model_bundle_paths import DEPLOY_E2E_GATE_REPORT_FILENAME
 from trainer_hightier.serving.adt_allowlist import sha256_file
 
@@ -111,6 +111,31 @@ def test_pack_default_preserves_repo_pyproject_version(tmp_path: Path) -> None:
 
     assert pyproj.read_text(encoding="utf-8") == before_text
     assert _read_pyproject_version(pyproj) == before_version
+
+
+def test_pack_writes_deploy_contract_json(tmp_path: Path) -> None:
+    model_src = tmp_path / "model_contract"
+    snap_src = tmp_path / "snap_contract"
+    art = snap_src / "x"
+    art.mkdir(parents=True)
+    slow = art / "slow.parquet"
+    allow = art / "allow.parquet"
+    _write_slow_bet_fixture(slow)
+    _write_parquet(allow)
+    _write_minimal_model_bundle(model_src)
+    _write_frozen_registry_abc_fixture(model_src)
+    man = {"version": "mv", "slow_patron_parquet": str(slow.resolve()), "adt_allowlist_parquet": str(allow.resolve())}
+    (snap_src / "active_manifest.json").write_text(json.dumps(man), encoding="utf-8")
+    mapping = tmp_path / "map-contract.parquet"
+    _write_parquet(mapping)
+    out = tmp_path / "bundle-contract"
+    build_deploy_package(_minimal_pack_argv(model_src=model_src, snap_src=snap_src, mapping=mapping, out=out))
+    contract_path = out / "models" / DEPLOY_CONTRACT_FILENAME
+    assert contract_path.is_file()
+    payload = json.loads(contract_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == "deploy_contract_v1"
+    assert payload["flags"]["deploy_requires_clickhouse"] is True
+    assert any(r["supplier_id"] == "bundle_static_artifact" for r in payload["requirements"])
 
 
 def test_pack_bump_version_restores_repo_pyproject(tmp_path: Path) -> None:

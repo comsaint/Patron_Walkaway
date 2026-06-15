@@ -100,6 +100,7 @@ TXN_L0_SOURCE_CONTRACT_REF: Final[str] = "doc/ssot/Data pipeline - SSOT.md#5.2"
 TXN_L0_REGISTRY_TABLE_KEY: Final[str] = "gmwds_t_casino_txn"
 TXN_L0_EVENT_TIME_COLUMN: Final[str] = "start_dtm"
 TXN_L0_OBSERVED_AT_COLUMN: Final[str] = "__etl_insert_Dtm"
+TXN_L0_INGEST_CAP_SEC: Final[int] = 128
 TXN_L0_LOGICAL_KEY_COLUMN: Final[str] = "casino_txn_id"
 TXN_L0_INGEST_FIX_RULE_ID: Final[str] = "TXN-INGEST-FIX-001"
 TXN_L0_PARTIAL_MIN_POST_DEDUP_ROWS: Final[int] = 100_000
@@ -243,6 +244,13 @@ SCORER_FEAST_MID_SMOKE_COLUMNS: Final[tuple[str, ...]] = (
     "fe__std_wager_w7d",
     "fe__avg_abs_wager_w7d",
 )
+#: Per-model deploy supplier contract (derived at package time; cross-checked at deploy).
+DEPLOY_CONTRACT_SCHEMA_VERSION: Final[str] = "deploy_contract_v1"
+DEPLOY_CONTRACT_FILENAME: Final[str] = "deploy_contract.json"
+#: Phase 2+: fail package when contract preconditions fail (missing validator, legacy buckets).
+FEATURE_CONTRACT_PACKAGE_STRICT: Final[bool] = True
+#: Phase 1 deploy rollout: log contract drift; set True for strict deploy preflight/e2e.
+FEATURE_CONTRACT_DEPLOY_STRICT: Final[bool] = False
 #: Default training mid snapshot used to seed production Feast bootstrap (repo-local).
 DEFAULT_TRAINING_MID_SNAPSHOT_PARQUET: Final[str] = (
     "trainer_hightier/artifacts/training_data/_main_trainer_mid_term_daily_snapshot.parquet"
@@ -1032,6 +1040,7 @@ class HightierServingConfig:
     source_db: str = "GDP_GMWDS_Raw"
     tbet: str = "t_bet"
     tsession: str = "t_session"
+    tcasino_txn: str = "t_casino_txn"
     casino_player_id_clean_sql: str = (
         "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') "
         "THEN NULL ELSE trim(casino_player_id) END"
@@ -1130,6 +1139,8 @@ class HightierServingConfig:
     snapshot_refresh_lock_stale_minutes: int = SNAPSHOT_REFRESH_LOCK_STALE_MINUTES
     production_cleaned_bet_mirror_dir: Path | None = None
     production_cleaned_session_mirror_parquet: Path | None = None
+    #: L0 cleaned ``t_casino_txn`` root for live ``txn__*`` scoring; ``None`` uses package default.
+    cleaned_casino_txn_root: Path | None = None
     production_bet_mirror_retention_days: int = PRODUCTION_BET_MIRROR_RETENTION_DAYS
     production_session_mirror_retention_days: int = PRODUCTION_SESSION_MIRROR_RETENTION_DAYS
     production_bet_mirror_rewrite_days: int = PRODUCTION_BET_MIRROR_REWRITE_DAYS
@@ -1213,6 +1224,8 @@ def apply_hightier_serving_environ_overrides(cfg: HightierServingConfig) -> High
         kw["ch_secure"] = raw in ("1", "true", "yes", "on")
     if (v := str(os.environ.get("SOURCE_DB", "")).strip()):
         kw["source_db"] = v
+    if (v := str(os.environ.get("CLEANED_CASINO_TXN_ROOT", "")).strip()):
+        kw["cleaned_casino_txn_root"] = Path(v)
     if not kw:
         return cfg
     return replace(cfg, **kw)

@@ -159,6 +159,66 @@ def test_offline_pipeline_mock_feast(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert "fe__bets_cnt__w1d" in summary["feature_null_fraction"]
 
 
+def test_offline_staging_routes_txn_lite_to_cleaned_parquet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Offline parity must not require a ClickHouse txn connection."""
+    import trainer_hightier.serving.scorer as scorer_mod
+    from trainer_hightier.serving.feature_supply import ScorerSupplierPlan
+
+    captured: dict[str, object] = {}
+    cleaned_root = tmp_path / "cleaned_txn"
+
+    def _fake_attach_txn_lite_features(
+        bets: pd.DataFrame,
+        *,
+        txn_columns: tuple[str, ...],
+        use_cleaned_parquet: bool = False,
+        cleaned_casino_txn_root: Path | None = None,
+        **_kwargs: object,
+    ) -> pd.DataFrame:
+        captured["txn_columns"] = txn_columns
+        captured["use_cleaned_parquet"] = use_cleaned_parquet
+        captured["cleaned_casino_txn_root"] = cleaned_casino_txn_root
+        return bets.assign(txn__cash_out_cnt__w1h=0.0)
+
+    monkeypatch.setattr(scorer_mod, "attach_canonical_id", lambda frame, **_k: frame.copy())
+    monkeypatch.setattr(
+        "trainer_hightier.serving.short_term_scoring_context.attach_live_short_term_pit",
+        lambda staged, _pool, short_columns: staged,
+    )
+    monkeypatch.setattr(scorer_mod, "attach_txn_lite_features", _fake_attach_txn_lite_features)
+
+    batch = scorer_mod._ScoringBatch(
+        bets=_fake_bets(),
+        cursor=pd.Series(pd.to_datetime(["2026-05-18T11:00:00+00:00"], utc=True)),
+        pool=_fake_bets(),
+    )
+    plan = ScorerSupplierPlan(
+        baseline_cols=(),
+        feast_trial_cols=(),
+        feast_mid_cols=(),
+        mid_composite_cols=(),
+        feast_slow_cols=(),
+        short_term_cols=(),
+        unknown_cols=(),
+        txn_cols=("txn__cash_out_cnt__w1h",),
+    )
+
+    scorer_mod._build_staged_features(
+        batch,
+        mapping_parquet=None,
+        supplier_plan=plan,
+        txn_use_cleaned_parquet=True,
+        cleaned_casino_txn_root=cleaned_root,
+    )
+
+    assert captured["txn_columns"] == ("txn__cash_out_cnt__w1h",)
+    assert captured["use_cleaned_parquet"] is True
+    assert captured["cleaned_casino_txn_root"] == cleaned_root
+
+
 def test_run_offline_serving_backtest_monkeypatched(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -28,6 +28,7 @@ from trainer_hightier.config import (
     MID_TERM_SNAPSHOT_AGE_AUDIT_COLUMN,
     MID_TERM_SNAPSHOT_MISSING_AUDIT_COLUMN,
     SLOW_PATRON_GRAIN_CANONICAL_ASOF,
+    TXN_LITE_FEATURE_COLUMNS,
 )
 from trainer_hightier.feature_experiment.feature_cadence import (
     MID_TERM_COMPOSITE_FEATURE_COLUMNS,
@@ -140,6 +141,8 @@ _KNOWN_SOURCES: frozenset[str] = frozenset(
         "t_casino_txn",
     }
 )
+
+_TXN_LITE_COLUMN_SET: frozenset[str] = frozenset(TXN_LITE_FEATURE_COLUMNS)
 
 
 def _parquet_lower_column_index(path: Path) -> dict[str, str]:
@@ -537,18 +540,12 @@ def assert_feature_supplyability_or_raise(
             pass
         elif src == "t_casino_txn":
             if require_runtime_artifacts:
-                from trainer_hightier.feature_experiment.materialize_txn_lite import (
-                    default_cleaned_casino_txn_root,
-                    discover_cleaned_txn_partitions,
+                _assert_ch_txn_supplier_ready_or_raise(
+                    n_txn_features=sum(
+                        1 for f in model_feats if by_id.get(f) and by_id[f].source == "t_casino_txn"
+                    ),
+                    cfg=None,
                 )
-
-                txn_root = default_cleaned_casino_txn_root()
-                paths, _, _ = discover_cleaned_txn_partitions(txn_root, exclude_partial=True)
-                if not paths:
-                    raise FileNotFoundError(
-                        f"[feature-supply] model expects txn__* but no eligible cleaned txn partitions "
-                        f"under {txn_root}",
-                    )
 
     if unknown:
         raise ValueError(
@@ -761,6 +758,8 @@ def _infer_runtime_supplier(
 ) -> str | None:
     """Infer runtime supplier when registry row omits ``runtime_supplier``."""
 
+    if feature_id in _TXN_LITE_COLUMN_SET:
+        return "txn_lite_builder"
     if row is not None and row.runtime_supplier:
         return row.runtime_supplier
     if row is not None:
@@ -827,6 +826,10 @@ def _collect_closure_feature_ids(
         row = by_id.get(fid)
         if row is None and fid not in _SPIKE_MID_TERM_COLUMN_SET and fid not in _SPIKE_SLOW_COLUMN_SET:
             if fid in model_feats and fid in _MID_TERM_AUDIT_MODEL_COLUMNS:
+                seen.add(fid)
+                needed.append(fid)
+                continue
+            if fid in model_feats and fid in _TXN_LITE_COLUMN_SET:
                 seen.add(fid)
                 needed.append(fid)
                 continue
@@ -995,12 +998,96 @@ def assert_scorer_supplier_plan_or_raise(plan: ScorerSupplierPlan) -> None:
     if plan.unknown_cols:
         tip = ", ".join(plan.unknown_cols[:12])
         ellipsis = "" if len(plan.unknown_cols) <= 12 else ", …"
+        txn_unknown = [c for c in plan.unknown_cols if c in _TXN_LITE_COLUMN_SET]
+        if txn_unknown:
+            raise ValueError(
+                "[feature-supply] installed trainer_hightier lacks txn_lite_builder routing "
+                f"for model columns [{', '.join(txn_unknown)}]. "
+                "Reinstall the bundle wheel from the bundle root: "
+                "pip install --force-reinstall wheels/trainer_hightier-*.whl "
+                "(or pip install --force-reinstall -r requirements.txt). "
+                "Do not rely on an older conda/site-packages copy of the same version."
+            )
         raise ValueError(
             "[feature-supply] scorer v2 supplier plan has unknown columns: "
             f"[{tip}{ellipsis}]"
         )
     assert_composite_implementations_or_raise(plan)
     assert_feast_plan_schema_support_or_raise(plan)
+
+
+def _assert_ch_txn_supplier_ready_or_raise(
+    *,
+    n_txn_features: int,
+    cfg: Any | None = None,
+) -> dict[str, Any]:
+    """Verify ClickHouse ``t_casino_txn`` is ready for production txn_lite scoring."""
+
+    from trainer_hightier.serving.txn_lite_ch_runtime import assert_ch_txn_supplier_ready_or_raise
+
+    detail = assert_ch_txn_supplier_ready_or_raise(cfg=cfg)
+    detail["n_txn_features"] = int(n_txn_features)
+    return detail
+
+
+def _assert_cleaned_casino_txn_partitions_or_raise(
+    txn_root: Path,
+    *,
+    n_txn_features: int,
+) -> dict[str, Any]:
+    """Verify L0 cleaned ``t_casino_txn`` partitions exist for txn_lite scoring."""
+
+    from trainer_hightier.feature_experiment.materialize_txn_lite import discover_cleaned_txn_partitions
+
+    root = Path(txn_root).resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(
+            "[feature-supply] model requires txn__* "
+            f"({n_txn_features} feature(s)) but cleaned casino_txn root missing: {root}. "
+            "Populate bundle source_mirror/cleaned_casino_txn/ or set CLEANED_CASINO_TXN_ROOT in .env"
+        )
+    paths, included, excluded = discover_cleaned_txn_partitions(root, exclude_partial=True)
+    if not paths:
+        raise FileNotFoundError(
+            "[feature-supply] model expects txn__* but no eligible cleaned txn partitions "
+            f"under {root} (included={included}, excluded_partial={excluded})"
+        )
+    return {
+        "cleaned_casino_txn_root": str(root),
+        "cleaned_casino_txn_partition_count": len(included),
+        "cleaned_casino_txn_excluded_partial": list(excluded),
+    }
+
+
+def assert_deploy_external_data_roots_or_raise(
+    plan: ScorerSupplierPlan,
+    *,
+    cfg: Any | None = None,
+) -> dict[str, Any]:
+    """Verify deploy-host supplier readiness for the active model plan.
+
+    Scorer v2 mid/long features come from bundle-local Feast online store (refreshed from
+    ClickHouse at startup). Baseline, short-term PIT, and txn_lite features come from
+    ClickHouse at score time. This gate covers **additional** external roots not bundled
+    in the wheel (legacy cleaned txn root checks removed for production).
+    """
+    from trainer_hightier.config import default_hightier_serving_config
+
+    _ = cfg or default_hightier_serving_config()
+    out: dict[str, Any] = {
+        "clickhouse_required": bool(
+            plan.baseline_cols or plan.short_term_cols or plan.feast_trial_cols or plan.txn_cols
+        ),
+        "feast_online_required": bool(
+            plan.feast_mid_cols or plan.feast_slow_cols or plan.mid_composite_cols
+        ),
+    }
+    if plan.txn_cols:
+        out["txn_lite"] = _assert_ch_txn_supplier_ready_or_raise(
+            n_txn_features=len(plan.txn_cols),
+            cfg=cfg,
+        )
+    return out
 
 
 def scorer_supplier_route_counts(plan: ScorerSupplierPlan) -> dict[str, int]:

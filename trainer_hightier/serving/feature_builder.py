@@ -948,6 +948,7 @@ def attach_txn_lite_features(
     bets: pd.DataFrame,
     *,
     txn_columns: tuple[str, ...],
+    use_cleaned_parquet: bool = False,
     cleaned_casino_txn_root: Path | None = None,
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
 ) -> pd.DataFrame:
@@ -955,18 +956,32 @@ def attach_txn_lite_features(
 
     if not txn_columns or bets.empty:
         return bets
-    from trainer_hightier.feature_experiment.materialize_txn_lite import (
-        compute_txn_lite_features_for_bets,
-        default_cleaned_casino_txn_root,
-    )
-
-    root = Path(cleaned_casino_txn_root or default_cleaned_casino_txn_root()).resolve()
     runtime = duckdb_runtime or DuckDbRuntimeConfig()
-    txn_df = compute_txn_lite_features_for_bets(
-        bets,
-        cleaned_casino_txn_root=root,
-        duckdb_runtime=runtime,
-    )
+    if use_cleaned_parquet:
+        from trainer_hightier.feature_experiment.materialize_txn_lite import (
+            compute_txn_lite_features_for_bets,
+            resolved_cleaned_casino_txn_root,
+        )
+
+        root = (
+            Path(cleaned_casino_txn_root).resolve()
+            if cleaned_casino_txn_root is not None
+            else resolved_cleaned_casino_txn_root()
+        )
+        txn_df = compute_txn_lite_features_for_bets(
+            bets,
+            cleaned_casino_txn_root=root,
+            duckdb_runtime=runtime,
+        )
+    else:
+        from trainer_hightier.serving.txn_lite_ch_runtime import (
+            compute_txn_lite_features_for_bets_ch,
+        )
+
+        txn_df = compute_txn_lite_features_for_bets_ch(
+            bets,
+            duckdb_runtime=runtime,
+        )
     if txn_df.empty:
         raise ValueError("attach_txn_lite_features: txn_lite query returned no rows")
     out = bets.merge(txn_df, on="bet_id", how="left", suffixes=("", "_txn_dup"))

@@ -961,6 +961,8 @@ def _build_staged_features(
     *,
     mapping_parquet: Path | None,
     supplier_plan: ScorerSupplierPlan,
+    txn_use_cleaned_parquet: bool = False,
+    cleaned_casino_txn_root: Path | None = None,
 ) -> pd.DataFrame:
     """Phase 2: hot PIT + short-term bounded PIT on the scoring batch.
 
@@ -980,7 +982,12 @@ def _build_staged_features(
     )
     staged = attach_live_short_term_pit(staged, pool, short_columns=short_cols)
     if supplier_plan.txn_cols:
-        staged = attach_txn_lite_features(staged, txn_columns=supplier_plan.txn_cols)
+        staged = attach_txn_lite_features(
+            staged,
+            txn_columns=supplier_plan.txn_cols,
+            use_cleaned_parquet=txn_use_cleaned_parquet,
+            cleaned_casino_txn_root=cleaned_casino_txn_root,
+        )
     return staged
 
 

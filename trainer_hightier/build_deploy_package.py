@@ -57,7 +57,9 @@ from trainer_hightier.serving.adt_allowlist import sha256_file
 from trainer_hightier.serving.feature_supply import (
     MANIFEST_KEY_FE_DERIVED,
     assert_feature_supplyability_or_raise,
+    build_scorer_supplier_plan,
 )
+from trainer_hightier.serving.feature_contract import build_and_write_deploy_contract
 from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_parquet_path
 
 logger = logging.getLogger(__name__)
@@ -93,6 +95,7 @@ _METADATA_MANIFEST_PASS_THROUGH: frozenset[str] = frozenset(
         "slow_monthly_grace_days",
         "slow_stale_hard_cap_days",
         "sha256_by_layer",
+        "deploy_requires_ch_txn_supplier",
     }
 )
 
@@ -780,7 +783,7 @@ Optional flags: `--skip-mlflow-upload`, `--output-zip PATH`.
 ## Prerequisites
 
 - Python 3.9+
-- ClickHouse reachable from the production host (credentials in `.env`)
+- ClickHouse reachable from the production host (credentials in `.env`); ``txn__*`` features are supplied live from ``t_casino_txn`` at score time
 - `pip install -r requirements.txt` using PyPI or an internal package index
 - `feast` CLI on PATH (used by startup refresh)
 
@@ -1060,6 +1063,11 @@ CH_PASS=
 
 # CH_SECURE=false
 # SOURCE_DB=GDP_GMWDS_Raw
+
+# txn__* features are supplied live from ClickHouse t_casino_txn (no cleaned partition copy required).
+
+# Optional: offline parity only
+# CLEANED_CASINO_TXN_ROOT=D:/data/cleaned__gmwds_t_casino_txn
 
 # DEPLOY_LOG_LEVEL=INFO
 """,
@@ -1382,6 +1390,31 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
             validation_stage="package",
             scorer_v2_feast_mode=True,
         )
+        plan = build_scorer_supplier_plan(frozen_snap, model_cols)
+        if plan.txn_cols:
+            logger.info(
+                "[pack] model uses txn__* (%d cols); production scorer queries ClickHouse t_casino_txn",
+                len(plan.txn_cols),
+            )
+            metadata_manifest["deploy_requires_ch_txn_supplier"] = True
+        reg_sha_metric = metrics.get("feature_candidate_registry_sha256") if metrics else None
+        reg_sha_s = (
+            reg_sha_metric.strip()
+            if isinstance(reg_sha_metric, str) and reg_sha_metric.strip()
+            else ""
+        )
+        contract_detail = build_and_write_deploy_contract(
+            plan=plan,
+            model_bundle_dir=models_dir,
+            model_version=mver,
+            registry_fingerprint=reg_sha_s,
+            feature_count=len(model_cols),
+            bundle_root=root,
+            mapping=map_dest_path,
+            allowlist=allow_pack_path,
+        )
+        metadata_manifest["deploy_contract_path"] = contract_detail["deploy_contract_path"]
+        metadata_manifest.update(contract_detail.get("flags", {}))
 
     out_manifest = snap_dir / "active_manifest.json"
     out_manifest.write_text(json.dumps(metadata_manifest, indent=2), encoding="utf-8")
