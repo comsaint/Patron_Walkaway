@@ -220,6 +220,14 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--clock-feature-ablation",
+        action="store_true",
+        help=(
+            "Add-one ablation for fe__clock__is_late_night, fe__clock__is_weekend, "
+            "and fe__clock__hour_of_day vs baseline; writes clock_feature_ablation_report.json."
+        ),
+    )
+    p.add_argument(
         "--skip-fqg",
         action="store_true",
         help="Skip Feature Quality Gate (FQG); for bring-up/debug only.",
@@ -395,6 +403,7 @@ def _build_report(
     capacity_alerts_per_hour_cap: float,
     ablation_v0: dict[str, Any] | None = None,
     txn_window_ablation_v0: dict[str, Any] | None = None,
+    clock_feature_ablation_v0: dict[str, Any] | None = None,
     feature_quality: dict[str, Any] | None = None,
     candidate_registry: dict[str, Any] | None = None,
     feast_auto_apply: Mapping[str, Any] | None = None,
@@ -441,6 +450,8 @@ def _build_report(
         out["ablation_v0"] = ablation_v0
     if txn_window_ablation_v0 is not None:
         out["txn_window_ablation_v0"] = txn_window_ablation_v0
+    if clock_feature_ablation_v0 is not None:
+        out["clock_feature_ablation_v0"] = clock_feature_ablation_v0
     if external_sources is not None:
         out["external_sources"] = external_sources
     return out
@@ -494,6 +505,12 @@ _TXN_WINDOW_ADDITIVE_ARMS: dict[str, tuple[str, ...]] = {
 _TXN_CONFIRMATORY_ARMS: dict[str, tuple[str, ...]] = {
     "ref_v01_6col": _TXN_V01_6COL,
     "promoted_v02_7col": _TXN_V01_6COL + ("txn__net_cash_flow__w4h",),
+}
+
+_CLOCK_FEATURE_ABLATION_ARMS: dict[str, tuple[str, ...]] = {
+    "add_fe__clock__is_late_night": ("fe__clock__is_late_night",),
+    "add_fe__clock__is_weekend": ("fe__clock__is_weekend",),
+    "add_fe__clock__hour_of_day": ("fe__clock__hour_of_day",),
 }
 
 
@@ -606,6 +623,67 @@ def _run_txn_window_ablation_phase(
         "arms": arms_block,
         "timing_sec": timing,
         "note": "Probe columns not in feature_candidate_registry until an arm passes Gate 1.",
+    }
+
+
+def _run_clock_feature_ablation_phase(
+    *,
+    splits_dir: Path,
+    duckdb_runtime: DuckDbRuntimeConfig,
+    objective_min_precision: float,
+    random_seed: int,
+    step5: Step5TrainConfig,
+    run_dir: Path,
+    baseline_report: Mapping[str, Any],
+    baseline_cols: tuple[str, ...],
+    capacity_alerts_per_hour_cap: float,
+    budget_deadline_perf: float,
+    arms: Mapping[str, tuple[str, ...]],
+) -> dict[str, Any]:
+    """Train baseline+single clock-feature arms; compare Gate 1 vs baseline."""
+
+    arms_block: dict[str, Any] = {}
+    timing: dict[str, float] = {}
+    t0_all = time.perf_counter()
+    for arm_id, clock_cols in arms.items():
+        if time.perf_counter() > budget_deadline_perf:
+            raise RuntimeError("Exceeded single_round_budget_sec during clock feature ablation arms")
+        present = _feature_columns_present_in_splits(splits_dir, clock_cols)
+        cols = tuple(dict.fromkeys(baseline_cols + present))
+        sub = _safe_ablation_dir_name(arm_id)
+        out_a = run_dir / f"clock_feature_ablation_{sub}_lgbm"
+        logger.info("[FE] clock feature ablation %s (%d cols) → %s", arm_id, len(present), out_a)
+        t0 = time.perf_counter()
+        res_a = _b5.train_lgbm_from_splits(
+            splits_dir=splits_dir,
+            duckdb_runtime=duckdb_runtime,
+            objective_min_precision=float(objective_min_precision),
+            random_seed=random_seed,
+            step5=step5,
+            output_dir=out_a,
+            feature_columns=cols,
+        )
+        timing[f"train_clock_feature_ablation_{sub}_sec"] = round(time.perf_counter() - t0, 3)
+        g1 = compute_gate1_vs_baseline(
+            dict(baseline_report),
+            res_a.report,
+            capacity_alerts_per_hour_cap=capacity_alerts_per_hour_cap,
+            arm_side_key_prefix="arm",
+        )
+        arms_block[arm_id] = {
+            "experiment_kind": "add_one_clock_feature",
+            "clock_feature_columns": list(present),
+            "feature_columns": list(cols),
+            "model_dir": str(out_a.resolve()),
+            "metrics": res_a.report,
+            "gate1_vs_baseline": g1,
+        }
+    timing["train_clock_feature_ablation_total_sec"] = round(time.perf_counter() - t0_all, 3)
+    return {
+        "experiment_kind": "clock_feature_ablation_v0",
+        "arms": arms_block,
+        "timing_sec": timing,
+        "note": "Per-feature add-one for group_l_clock_context (excludes fe__clock__day_of_week).",
     }
 
 
@@ -1116,6 +1194,7 @@ def main() -> None:
     budget_deadline = t_wall0 + budget
     ablation_v0: dict[str, Any] | None = None
     txn_window_ablation_v0: dict[str, Any] | None = None
+    clock_feature_ablation_v0: dict[str, Any] | None = None
     if _txn_window_ablation_enabled(ns, cfg_yaml):
         if txn_lite_path is None:
             raise RuntimeError(
@@ -1154,6 +1233,22 @@ def main() -> None:
             allow=allow_train,
         )
         for ak, av in ablation_v0["timing_sec"].items():
+            timing[ak] = av
+    if bool(getattr(ns, "clock_feature_ablation", False)):
+        clock_feature_ablation_v0 = _run_clock_feature_ablation_phase(
+            splits_dir=paths.splits_dir,
+            duckdb_runtime=duck,
+            objective_min_precision=float(ns.min_precision),
+            random_seed=rnd,
+            step5=step5,
+            run_dir=paths.run_dir,
+            baseline_report=res_base.report,
+            baseline_cols=baseline_cols,
+            capacity_alerts_per_hour_cap=cap_alerts_hr,
+            budget_deadline_perf=budget_deadline,
+            arms=_CLOCK_FEATURE_ABLATION_ARMS,
+        )
+        for ak, av in clock_feature_ablation_v0["timing_sec"].items():
             timing[ak] = av
 
     if time.perf_counter() - t_wall0 > budget:
@@ -1224,6 +1319,7 @@ def main() -> None:
         capacity_alerts_per_hour_cap=cap_alerts_hr,
         ablation_v0=ablation_v0,
         txn_window_ablation_v0=txn_window_ablation_v0,
+        clock_feature_ablation_v0=clock_feature_ablation_v0,
         feature_quality=fq_quality_echo,
         candidate_registry=registry_echo,
         feast_auto_apply=feast_apply_echo,
@@ -1245,6 +1341,10 @@ def main() -> None:
         tw_path = paths.run_dir / "txn_window_ablation_report.json"
         tw_path.write_text(json.dumps(txn_window_ablation_v0, indent=2, default=str), encoding="utf-8")
         logger.info("[FE] wrote %s", tw_path)
+    if clock_feature_ablation_v0 is not None:
+        clk_path = paths.run_dir / "clock_feature_ablation_report.json"
+        clk_path.write_text(json.dumps(clock_feature_ablation_v0, indent=2, default=str), encoding="utf-8")
+        logger.info("[FE] wrote %s", clk_path)
 
 
 if __name__ == "__main__":
