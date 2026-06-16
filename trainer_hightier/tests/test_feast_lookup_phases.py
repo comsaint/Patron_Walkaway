@@ -10,6 +10,9 @@ from trainer_hightier.serving.feast_online_adapter import (
     FeastLookupPhaseTimings,
     _format_feast_lookup_phases_log,
     _log_feast_lookup_phases,
+    clear_feature_store_cache,
+    get_cached_feature_store,
+    get_cached_online_feature_refs,
 )
 
 
@@ -63,3 +66,67 @@ def test_log_feast_lookup_phases_warns_when_total_exceeds_threshold(
     assert len(warn_records) == 1
     assert "slow lookup phases_ms" in warn_records[0].message
     assert "store_init=2000.0" in warn_records[0].message
+
+
+def test_feature_store_cache_reuses_store_until_registry_changes(tmp_path, monkeypatch) -> None:
+    """Second lookup reuses FeatureStore; registry mtime bump rebuilds cache."""
+    repo = tmp_path / "feast_repo"
+    data_dir = repo / "data"
+    data_dir.mkdir(parents=True)
+    registry = data_dir / "registry.db"
+    registry.write_bytes(b"v1")
+
+    init_count = 0
+
+    class _FakeStore:
+        def __init__(self, repo_path: str) -> None:
+            nonlocal init_count
+            init_count += 1
+            self.repo_path = repo_path
+
+    monkeypatch.setattr("feast.FeatureStore", _FakeStore)
+    clear_feature_store_cache()
+
+    store1, init_ms1, reused1 = get_cached_feature_store(repo)
+    store2, init_ms2, reused2 = get_cached_feature_store(repo)
+    assert init_count == 1
+    assert store1 is store2
+    assert reused1 is False
+    assert reused2 is True
+    assert init_ms2 == 0.0
+
+    registry.write_bytes(b"v2")
+    store3, _init_ms3, reused3 = get_cached_feature_store(repo)
+    assert init_count == 2
+    assert store3 is not store1
+    assert reused3 is False
+
+
+def test_cached_online_feature_refs_reuses_column_set(tmp_path, monkeypatch) -> None:
+    """Resolved online refs are cached per repo mtime and column tuple."""
+    repo = tmp_path / "feast_repo"
+    data_dir = repo / "data"
+    data_dir.mkdir(parents=True)
+    (data_dir / "registry.db").write_bytes(b"v1")
+
+    calls = {"n": 0}
+
+    def _fake_resolve(mid_columns, slow_columns, *, feast_repo=None):
+        calls["n"] += 1
+        return ("fv:a",)
+
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_adapter.resolve_online_feature_refs",
+        _fake_resolve,
+    )
+    clear_feature_store_cache()
+
+    mid = ("fe__x",)
+    slow: tuple[str, ...] = ()
+    refs1, ms1, reused1 = get_cached_online_feature_refs(mid, slow, feast_repo=repo)
+    refs2, ms2, reused2 = get_cached_online_feature_refs(mid, slow, feast_repo=repo)
+    assert calls["n"] == 1
+    assert refs1 == refs2 == ("fv:a",)
+    assert reused1 is False
+    assert reused2 is True
+    assert ms2 == 0.0

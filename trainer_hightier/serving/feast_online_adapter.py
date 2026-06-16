@@ -311,6 +311,82 @@ def _feast_lookup_phase_context(feast_repo: Path) -> dict[str, Any]:
     return ctx
 
 
+@dataclass
+class _CachedFeastSdkResources:
+    """Process-local cached Feast SDK handles for a single repo."""
+
+    feast_repo_key: str
+    registry_mtime: float
+    store: Any
+
+
+_FEAST_SDK_CACHE: _CachedFeastSdkResources | None = None
+_FEAST_REFS_CACHE: dict[tuple[str, float, tuple[str, ...], tuple[str, ...]], tuple[str, ...]] = {}
+
+
+def _feast_registry_mtime(feast_repo: Path) -> float:
+    """Return ``registry.db`` mtime for cache invalidation after Feast refresh."""
+    _, registry_db = _feast_repo_sqlite_paths(feast_repo)
+    if registry_db.is_file():
+        return float(registry_db.stat().st_mtime)
+    return 0.0
+
+
+def clear_feature_store_cache() -> None:
+    """Drop cached ``FeatureStore`` and resolved online refs (tests / registry reload)."""
+    global _FEAST_SDK_CACHE
+    _FEAST_SDK_CACHE = None
+    _FEAST_REFS_CACHE.clear()
+
+
+def get_cached_feature_store(feast_repo: Path) -> tuple[Any, float, bool]:
+    """Return ``(FeatureStore, init_ms, reused)``; rebuild when registry mtime changes."""
+    global _FEAST_SDK_CACHE
+    from feast import FeatureStore
+
+    repo = Path(feast_repo).resolve()
+    repo_key = str(repo)
+    registry_mtime = _feast_registry_mtime(repo)
+    if (
+        _FEAST_SDK_CACHE is not None
+        and _FEAST_SDK_CACHE.feast_repo_key == repo_key
+        and _FEAST_SDK_CACHE.registry_mtime == registry_mtime
+    ):
+        return _FEAST_SDK_CACHE.store, 0.0, True
+
+    t0 = time.perf_counter()
+    store = FeatureStore(repo_path=repo_key)
+    init_ms = _elapsed_ms_since(t0)
+    _FEAST_SDK_CACHE = _CachedFeastSdkResources(
+        feast_repo_key=repo_key,
+        registry_mtime=registry_mtime,
+        store=store,
+    )
+    return store, init_ms, False
+
+
+def get_cached_online_feature_refs(
+    mid_columns: tuple[str, ...],
+    slow_columns: tuple[str, ...],
+    *,
+    feast_repo: Path,
+) -> tuple[tuple[str, ...], float, bool]:
+    """Return ``(refs, resolve_ms, reused)`` keyed by repo mtime and column sets."""
+    repo = Path(feast_repo).resolve()
+    repo_key = str(repo)
+    registry_mtime = _feast_registry_mtime(repo)
+    cache_key = (repo_key, registry_mtime, mid_columns, slow_columns)
+    cached = _FEAST_REFS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached, 0.0, True
+
+    t0 = time.perf_counter()
+    refs = resolve_online_feature_refs(mid_columns, slow_columns, feast_repo=repo)
+    resolve_ms = _elapsed_ms_since(t0)
+    _FEAST_REFS_CACHE[cache_key] = refs
+    return refs, resolve_ms, False
+
+
 def _format_feast_lookup_phases_log(
     phases: FeastLookupPhaseTimings,
     *,
@@ -333,6 +409,8 @@ def _format_feast_lookup_phases_log(
     ]
     if ctx.get("refresh_lock_present"):
         parts.append("refresh_lock=1")
+    if ctx.get("store_reused"):
+        parts.append("store_reused=1")
     if "online_store_bytes" in ctx:
         parts.append(f"online_store_bytes={ctx['online_store_bytes']}")
     return " ".join(parts)
@@ -423,8 +501,6 @@ class FeastSdkOnlineAdapter:
         slow_columns: tuple[str, ...],
     ) -> pd.DataFrame:
         """Call ``FeatureStore.get_online_features`` and return a canonical-id keyed frame."""
-        from feast import FeatureStore
-
         total_t0 = time.perf_counter()
         ids = [str(x).strip() for x in canonical_ids if str(x).strip()]
         wanted = tuple(dict.fromkeys([*mid_columns, *slow_columns]))
@@ -434,19 +510,18 @@ class FeastSdkOnlineAdapter:
         feast_repo = Path(self.feast_repo).resolve()
         ctx = _feast_lookup_phase_context(feast_repo)
 
-        t0 = time.perf_counter()
-        store = FeatureStore(repo_path=str(feast_repo))
-        feature_store_init_ms = _elapsed_ms_since(t0)
+        store, feature_store_init_ms, store_reused = get_cached_feature_store(feast_repo)
+        if store_reused:
+            ctx["store_reused"] = True
 
-        t0 = time.perf_counter()
-        refs = list(
-            resolve_online_feature_refs(
-                mid_columns,
-                slow_columns,
-                feast_repo=feast_repo,
-            )
+        refs_tuple, resolve_refs_ms, refs_reused = get_cached_online_feature_refs(
+            mid_columns,
+            slow_columns,
+            feast_repo=feast_repo,
         )
-        resolve_refs_ms = _elapsed_ms_since(t0)
+        refs = list(refs_tuple)
+        if refs_reused:
+            ctx["store_reused"] = True
         if not refs:
             raise ValueError(
                 f"[feast_adapter] no online feature refs resolved for columns={wanted!r}"
