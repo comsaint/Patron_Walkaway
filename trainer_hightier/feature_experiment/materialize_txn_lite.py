@@ -137,24 +137,24 @@ def _join_lookback_hours(extra_window_hours: tuple[int, ...]) -> int:
     return max((1, *extra_window_hours))
 
 
-def _cash_out_sum_sql(hours: int) -> str:
-    """Aggregate CASHOUT sum for one lookback window."""
+def _cash_out_sum_sql(hours: int, *, cutoff: str = "pcd") -> str:
+    """Aggregate CASHOUT sum for one lookback window before ``cutoff``."""
 
     suffix = f"w{hours}h"
     return (
         f"CAST(SUM(CASE WHEN type = 'CASHOUT'"
-        f" AND event_ts >= pcd - INTERVAL {hours} HOUR AND event_ts < pcd"
+        f" AND event_ts >= {cutoff} - INTERVAL {hours} HOUR AND event_ts < {cutoff}"
         f" THEN txn_value ELSE 0 END) AS DOUBLE) AS txn__cash_out_sum__{suffix}"
     )
 
 
-def _buyin_cash_sum_sql(hours: int) -> str:
-    """Aggregate BUYIN/CASH sum for one lookback window."""
+def _buyin_cash_sum_sql(hours: int, *, cutoff: str = "pcd") -> str:
+    """Aggregate BUYIN/CASH sum for one lookback window before ``cutoff``."""
 
     suffix = f"w{hours}h"
     return (
         f"CAST(SUM(CASE WHEN type = 'BUYIN' AND sub_type = 'CASH'"
-        f" AND event_ts >= pcd - INTERVAL {hours} HOUR AND event_ts < pcd"
+        f" AND event_ts >= {cutoff} - INTERVAL {hours} HOUR AND event_ts < {cutoff}"
         f" THEN txn_value ELSE 0 END) AS DOUBLE) AS txn__buyin_cash_sum__{suffix}"
     )
 
@@ -269,6 +269,191 @@ SELECT
   txn__buyin_prize_redemption_flag__w1h{outer_extra_sql}
 FROM ({inner}) AS agg
 """.strip()
+
+
+def _build_player_game_txn_copy_sql(
+    *,
+    train_source: str,
+    cleaned_read: str,
+    extra_window_hours: tuple[int, ...],
+) -> str:
+    """Build DuckDB SQL for player-game txn_lite at ``player_game_ready_ts`` PIT."""
+
+    lookback_h = _join_lookback_hours(extra_window_hours)
+    extra_hours = tuple(h for h in extra_window_hours if h > 1)
+    extra_agg = []
+    for hours in extra_hours:
+        extra_agg.append(_cash_out_sum_sql(hours, cutoff="pit_ts"))
+        extra_agg.append(_buyin_cash_sum_sql(hours, cutoff="pit_ts"))
+    extra_agg_sql = ""
+    if extra_agg:
+        extra_agg_sql = ",\n  " + ",\n  ".join(extra_agg)
+
+    inner = f"""
+WITH {_txn_valid_cte(cleaned_read)},
+train_rows AS (
+  SELECT
+    TRY_CAST(player_id AS BIGINT) AS player_id,
+    TRY_CAST(game_id AS BIGINT) AS game_id,
+    CAST(player_game_ready_ts AS TIMESTAMPTZ) AS pit_ts
+  FROM {train_source} AS b
+  WHERE TRY_CAST(player_id AS BIGINT) IS NOT NULL
+    AND TRY_CAST(game_id AS BIGINT) IS NOT NULL
+    AND b.player_game_ready_ts IS NOT NULL
+),
+joined AS (
+  SELECT
+    tr.player_id,
+    tr.game_id,
+    tr.pit_ts,
+    txn.type,
+    txn.sub_type,
+    txn.txn_value,
+    txn.event_ts
+  FROM train_rows AS tr
+  LEFT JOIN txn_valid AS txn
+    ON tr.player_id = txn.player_id
+   AND txn.event_ts < tr.pit_ts
+   AND txn.available_ts <= tr.pit_ts
+   AND txn.event_ts >= tr.pit_ts - INTERVAL {lookback_h} HOUR
+)
+SELECT
+  player_id,
+  game_id,
+  MAX(CASE
+    WHEN type = 'CASHOUT'
+     AND event_ts >= pit_ts - INTERVAL 15 MINUTE
+     AND event_ts < pit_ts
+    THEN 1 ELSE 0 END) AS txn__has_cash_out__w15m,
+  CAST(SUM(CASE
+    WHEN type = 'CASHOUT'
+     AND event_ts >= pit_ts - INTERVAL 1 HOUR AND event_ts < pit_ts
+    THEN 1 ELSE 0 END) AS DOUBLE) AS txn__cash_out_cnt__w1h,
+  CAST(SUM(CASE
+    WHEN type = 'CASHOUT'
+     AND event_ts >= pit_ts - INTERVAL 1 HOUR AND event_ts < pit_ts
+    THEN txn_value ELSE 0 END) AS DOUBLE) AS txn__cash_out_sum__w1h,
+  CAST(SUM(CASE
+    WHEN type = 'BUYIN' AND sub_type = 'CASH'
+     AND event_ts >= pit_ts - INTERVAL 1 HOUR AND event_ts < pit_ts
+    THEN txn_value ELSE 0 END) AS DOUBLE) AS txn__buyin_cash_sum__w1h,
+  MAX(CASE
+    WHEN type = 'BUYIN' AND sub_type = 'PRIZE REDEMPTION'
+     AND event_ts >= pit_ts - INTERVAL 1 HOUR AND event_ts < pit_ts
+    THEN 1 ELSE 0 END) AS txn__buyin_prize_redemption_flag__w1h{extra_agg_sql}
+FROM joined
+GROUP BY player_id, game_id
+""".strip()
+
+    outer_extra = []
+    for hours in extra_hours:
+        suffix = f"w{hours}h"
+        outer_extra.append(f"txn__cash_out_sum__{suffix}")
+        outer_extra.append(f"txn__buyin_cash_sum__{suffix}")
+        outer_extra.append(
+            f"txn__cash_out_sum__{suffix} - txn__buyin_cash_sum__{suffix}"
+            f" AS txn__net_cash_flow__{suffix}",
+        )
+    outer_extra_sql = ""
+    if outer_extra:
+        outer_extra_sql = ",\n  " + ",\n  ".join(outer_extra)
+
+    return f"""
+SELECT
+  player_id,
+  game_id,
+  txn__has_cash_out__w15m,
+  txn__cash_out_cnt__w1h,
+  txn__cash_out_sum__w1h,
+  CASE WHEN txn__cash_out_sum__w1h > txn__buyin_cash_sum__w1h THEN 1 ELSE 0 END
+    AS txn__net_cash_out_flag__w1h,
+  txn__cash_out_sum__w1h - txn__buyin_cash_sum__w1h AS txn__net_cash_flow__w1h,
+  txn__buyin_cash_sum__w1h,
+  txn__buyin_prize_redemption_flag__w1h{outer_extra_sql}
+FROM ({inner}) AS agg
+""".strip()
+
+
+def enrich_player_game_splits_with_txn_pg(
+    pg_splits_dir: Path,
+    out_dir: Path,
+    *,
+    duckdb_runtime: DuckDbRuntimeConfig,
+    cleaned_casino_txn_root: Path | None = None,
+    extra_window_hours: tuple[int, ...] = (),
+    exclude_partial_partitions: bool = True,
+) -> dict[str, Any]:
+    """Join player-game txn_lite features at ``player_game_ready_ts`` onto PG splits."""
+
+    sd = Path(pg_splits_dir).resolve()
+    od = Path(out_dir).resolve()
+    od.mkdir(parents=True, exist_ok=True)
+    cleaned_root = Path(cleaned_casino_txn_root or default_cleaned_casino_txn_root()).resolve()
+    cleaned_read, included_partitions, excluded_partitions = resolve_cleaned_casino_txn_read_sql(
+        cleaned_root,
+        exclude_partial=exclude_partial_partitions,
+    )
+    txn_cols = txn_lite_feature_columns(extra_window_hours=extra_window_hours)
+    coalesce_txn = ",\n    ".join(
+        f"coalesce(txn.{col}, 0) AS {col}" for col in txn_cols
+    )
+    split_stats: dict[str, dict[str, int]] = {}
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        for split in ("train", "val", "test"):
+            src = sd / f"{split}.parquet"
+            dst = od / f"{split}.parquet"
+            if not src.is_file():
+                raise FileNotFoundError(f"player_game txn_pg enrich requires {src}")
+            src_sql = _path_esc(src)
+            dst_sql = _path_esc(dst)
+            txn_sql = _build_player_game_txn_copy_sql(
+                train_source=f"read_parquet('{src_sql}')",
+                cleaned_read=cleaned_read,
+                extra_window_hours=extra_window_hours,
+            )
+            con.execute(
+                f"""
+                COPY (
+                  SELECT
+                    pg.*,
+                    {coalesce_txn}
+                  FROM read_parquet('{src_sql}') AS pg
+                  LEFT JOIN ({txn_sql}) AS txn
+                    USING (player_id, game_id)
+                ) TO '{dst_sql}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+                """,
+            )
+            split_stats[split] = {
+                "input_player_games": int(
+                    con.execute(f"SELECT count(*) FROM read_parquet('{src_sql}')").fetchone()[0],
+                ),
+                "output_player_games": int(
+                    con.execute(f"SELECT count(*) FROM read_parquet('{dst_sql}')").fetchone()[0],
+                ),
+            }
+    finally:
+        con.close()
+
+    meta: dict[str, Any] = {
+        "join_grain": "player_id x game_id x player_game_ready_ts",
+        "pit_cutoff_column": "player_game_ready_ts",
+        "pit_event_time": "txn_event_ts",
+        "pit_available_time": "txn_available_ts",
+        "cleaned_input_root": str(cleaned_root),
+        "included_partitions": included_partitions,
+        "excluded_partial_partitions": excluded_partitions,
+        "feature_columns": list(txn_cols),
+        "split_stats": split_stats,
+    }
+    logger.info(
+        "[txn_pg] enriched player-game splits %s → %s stats=%s",
+        sd,
+        od,
+        split_stats,
+    )
+    return meta
 
 
 def parquet_fingerprint(path: Path) -> str:

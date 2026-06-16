@@ -1034,13 +1034,14 @@ def _attach_feast_mid_slow(
     cids = sorted(
         {str(x).strip() for x in staged["canonical_id"].tolist() if str(x).strip()}
     )
-    t0 = time.perf_counter()
+    t_adapter = time.perf_counter()
     lookup_df = adapter.lookup_mid_slow(
         cids,
         mid_columns=mid_columns,
         slow_columns=slow_columns,
     )
-    lookup_latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+    adapter_lookup_ms = round((time.perf_counter() - t_adapter) * 1000.0, 3)
+    t_join = time.perf_counter()
     lookup = join_feast_lookup(
         staged,
         lookup_df,
@@ -1048,6 +1049,26 @@ def _attach_feast_mid_slow(
         mid_columns=mid_columns,
         slow_columns=slow_columns,
     )
+    join_ms = round((time.perf_counter() - t_join) * 1000.0, 3)
+    lookup_latency_ms = adapter_lookup_ms
+    warn_ms = float(default_hightier_serving_config().scorer_feast_lookup_latency_warn_ms)
+    logger.debug(
+        "[hightier_scorer] feast attach adapter_lookup_ms=%.1f join_ms=%.1f "
+        "n_staged=%d n_cids=%d",
+        adapter_lookup_ms,
+        join_ms,
+        len(staged),
+        len(cids),
+    )
+    if adapter_lookup_ms > warn_ms or join_ms > warn_ms:
+        logger.warning(
+            "[hightier_scorer] slow feast attach adapter_lookup_ms=%.1f join_ms=%.1f "
+            "n_staged=%d n_cids=%d",
+            adapter_lookup_ms,
+            join_ms,
+            len(staged),
+            len(cids),
+        )
     lookup_diag = FeastLookupDiagnostics(
         lookup_latency_ms=lookup_latency_ms,
         n_requested=lookup.diagnostics.n_requested,

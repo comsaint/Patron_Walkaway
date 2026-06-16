@@ -263,6 +263,103 @@ class FeastLookupResult:
     diagnostics: FeastLookupDiagnostics
 
 
+@dataclass(frozen=True)
+class FeastLookupPhaseTimings:
+    """Per-phase Feast online lookup timings (milliseconds)."""
+
+    feature_store_init_ms: float
+    resolve_refs_ms: float
+    get_online_features_ms: float
+    to_df_ms: float
+    dedupe_ms: float
+    total_ms: float
+
+
+def _elapsed_ms_since(t0: float) -> float:
+    """Return milliseconds elapsed since *t0* (``time.perf_counter`` origin)."""
+    return round((time.perf_counter() - t0) * 1000.0, 3)
+
+
+def _feast_repo_sqlite_paths(feast_repo: Path) -> tuple[Path, Path]:
+    """Return ``(online_store.db, registry.db)`` under a Feast repo ``data/`` dir."""
+    repo = Path(feast_repo).resolve()
+    data_dir = repo / "data"
+    return data_dir / "online_store.db", data_dir / "registry.db"
+
+
+def _feast_refresh_lock_path_for_repo(feast_repo: Path) -> Path:
+    """Return bundle-local Feast refresh lock path (same layout as deploy main)."""
+    cfg = default_hightier_serving_config()
+    if cfg.scorer_feast_readiness_path is not None:
+        readiness = Path(cfg.scorer_feast_readiness_path)
+    else:
+        readiness = (
+            Path(feast_repo).resolve().parent / "artifacts" / "feast" / "feast_online_readiness.json"
+        )
+    return readiness.parent / ".feast_online_refresh.lock"
+
+
+def _feast_lookup_phase_context(feast_repo: Path) -> dict[str, Any]:
+    """Cheap filesystem hints for correlating slow lookups with refresh / store size."""
+    online_db, registry_db = _feast_repo_sqlite_paths(feast_repo)
+    lock_path = _feast_refresh_lock_path_for_repo(feast_repo)
+    ctx: dict[str, Any] = {"refresh_lock_present": lock_path.is_file()}
+    if online_db.is_file():
+        ctx["online_store_bytes"] = int(online_db.stat().st_size)
+    if registry_db.is_file():
+        ctx["registry_mtime"] = float(registry_db.stat().st_mtime)
+    return ctx
+
+
+def _format_feast_lookup_phases_log(
+    phases: FeastLookupPhaseTimings,
+    *,
+    n_entities: int,
+    n_refs: int,
+    n_cols: int,
+    ctx: dict[str, Any],
+) -> str:
+    """Format phase timings and context for structured Feast lookup logs."""
+    parts = [
+        f"store_init={phases.feature_store_init_ms:.1f}",
+        f"resolve_refs={phases.resolve_refs_ms:.1f}",
+        f"rpc={phases.get_online_features_ms:.1f}",
+        f"to_df={phases.to_df_ms:.1f}",
+        f"dedupe={phases.dedupe_ms:.1f}",
+        f"total={phases.total_ms:.1f}",
+        f"n_entities={n_entities}",
+        f"n_refs={n_refs}",
+        f"n_cols={n_cols}",
+    ]
+    if ctx.get("refresh_lock_present"):
+        parts.append("refresh_lock=1")
+    if "online_store_bytes" in ctx:
+        parts.append(f"online_store_bytes={ctx['online_store_bytes']}")
+    return " ".join(parts)
+
+
+def _log_feast_lookup_phases(
+    phases: FeastLookupPhaseTimings,
+    *,
+    n_entities: int,
+    n_refs: int,
+    n_cols: int,
+    ctx: dict[str, Any],
+) -> None:
+    """Emit DEBUG phase breakdown; WARNING when total exceeds scorer warn threshold."""
+    msg = _format_feast_lookup_phases_log(
+        phases,
+        n_entities=n_entities,
+        n_refs=n_refs,
+        n_cols=n_cols,
+        ctx=ctx,
+    )
+    logger.debug("[feast_adapter] lookup phases_ms %s", msg)
+    warn_ms = float(default_hightier_serving_config().scorer_feast_lookup_latency_warn_ms)
+    if phases.total_ms > warn_ms:
+        logger.warning("[feast_adapter] slow lookup phases_ms %s", msg)
+
+
 class OnlineFeastAdapter(Protocol):
     """Batch Feast online lookup for mid-term ``fe__*`` and long-term ``patron__*`` columns."""
 
@@ -328,35 +425,60 @@ class FeastSdkOnlineAdapter:
         """Call ``FeatureStore.get_online_features`` and return a canonical-id keyed frame."""
         from feast import FeatureStore
 
+        total_t0 = time.perf_counter()
         ids = [str(x).strip() for x in canonical_ids if str(x).strip()]
         wanted = tuple(dict.fromkeys([*mid_columns, *slow_columns]))
         if not ids:
             return pd.DataFrame(columns=["canonical_id", *wanted])
-        store = FeatureStore(repo_path=str(Path(self.feast_repo).resolve()))
+
+        feast_repo = Path(self.feast_repo).resolve()
+        ctx = _feast_lookup_phase_context(feast_repo)
+
+        t0 = time.perf_counter()
+        store = FeatureStore(repo_path=str(feast_repo))
+        feature_store_init_ms = _elapsed_ms_since(t0)
+
+        t0 = time.perf_counter()
         refs = list(
             resolve_online_feature_refs(
                 mid_columns,
                 slow_columns,
-                feast_repo=Path(self.feast_repo),
+                feast_repo=feast_repo,
             )
         )
+        resolve_refs_ms = _elapsed_ms_since(t0)
         if not refs:
             raise ValueError(
                 f"[feast_adapter] no online feature refs resolved for columns={wanted!r}"
             )
+
         t0 = time.perf_counter()
-        out = store.get_online_features(
+        raw = store.get_online_features(
             features=list(refs),
             entity_rows=_feast_entity_rows(ids),
-        ).to_df()
-        latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
-        logger.debug(
-            "[feast_adapter] lookup n=%d cols=%d latency_ms=%.3f",
-            len(ids),
-            len(wanted),
-            latency_ms,
         )
+        get_online_features_ms = _elapsed_ms_since(t0)
+
+        t0 = time.perf_counter()
+        out = raw.to_df()
+        to_df_ms = _elapsed_ms_since(t0)
+
         if out.empty:
+            phases = FeastLookupPhaseTimings(
+                feature_store_init_ms=feature_store_init_ms,
+                resolve_refs_ms=resolve_refs_ms,
+                get_online_features_ms=get_online_features_ms,
+                to_df_ms=to_df_ms,
+                dedupe_ms=0.0,
+                total_ms=_elapsed_ms_since(total_t0),
+            )
+            _log_feast_lookup_phases(
+                phases,
+                n_entities=len(ids),
+                n_refs=len(refs),
+                n_cols=len(wanted),
+                ctx=ctx,
+            )
             return pd.DataFrame(columns=["canonical_id", *wanted])
         if "canonical_id" not in out.columns:
             raise ValueError("[feast_adapter] Feast response missing canonical_id column")
@@ -364,7 +486,27 @@ class FeastSdkOnlineAdapter:
         keep = ["canonical_id", *extra, *[c for c in wanted if c in out.columns]]
         keep = list(dict.fromkeys(keep))
         slim = out[[c for c in keep if c in out.columns]].copy()
-        return _dedupe_lookup_by_canonical_id(slim)
+
+        t0 = time.perf_counter()
+        result = _dedupe_lookup_by_canonical_id(slim)
+        dedupe_ms = _elapsed_ms_since(t0)
+
+        phases = FeastLookupPhaseTimings(
+            feature_store_init_ms=feature_store_init_ms,
+            resolve_refs_ms=resolve_refs_ms,
+            get_online_features_ms=get_online_features_ms,
+            to_df_ms=to_df_ms,
+            dedupe_ms=dedupe_ms,
+            total_ms=_elapsed_ms_since(total_t0),
+        )
+        _log_feast_lookup_phases(
+            phases,
+            n_entities=len(ids),
+            n_refs=len(refs),
+            n_cols=len(wanted),
+            ctx=ctx,
+        )
+        return result
 
 
 def default_feast_repo_path() -> Path:

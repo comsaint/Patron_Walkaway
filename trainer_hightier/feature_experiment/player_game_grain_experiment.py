@@ -12,13 +12,15 @@ from typing import Any
 
 import pyarrow.parquet as pq
 
-from trainer_hightier.config import Step5TrainConfig, configs_from_run_profile, get_run_profile
+from trainer_hightier.config import Step5TrainConfig, configs_from_run_profile, get_run_profile, txn_lite_feature_columns
 from trainer_hightier.feature_experiment.candidate_registry_loader import (
     baseline_features_for_main_trainer,
     load_candidate_registry,
 )
 from trainer_hightier.feature_experiment.equal_capacity_eval import pg_top_k_metrics
+from trainer_hightier.feature_experiment.materialize_txn_lite import enrich_player_game_splits_with_txn_pg
 from trainer_hightier.player_game_grain import (
+    enrich_player_game_splits_with_baseline_bet_features,
     materialize_player_game_splits,
     player_game_composition_features,
     prepare_bet_splits_for_player_game_materialize,
@@ -131,6 +133,7 @@ def run_player_game_grain_experiment(
     random_seed: int,
     skip_baseline: bool = False,
     baseline_report_json: Path | None = None,
+    pg_splits_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Materialize player-game splits, train arms, and emit decision report."""
 
@@ -145,36 +148,67 @@ def run_player_game_grain_experiment(
     imported_baseline = _load_baseline_report(baseline_report_json)
 
     materialize_input_dir = out_dir / "materialize_input"
-    pg_splits_dir = out_dir / "player_game_splits"
-    t0 = time.perf_counter()
-    prepare_bet_splits_for_player_game_materialize(
-        splits_dir,
-        materialize_input_dir,
+    if pg_splits_dir is not None:
+        pg_splits_dir = Path(pg_splits_dir).resolve()
+        mat_audits: dict[str, Any] = {}
+        timing["prepare_materialize_input_sec"] = 0.0
+        timing["materialize_sec"] = 0.0
+    else:
+        pg_splits_dir = out_dir / "player_game_splits"
+        t0 = time.perf_counter()
+        prepare_bet_splits_for_player_game_materialize(
+            splits_dir,
+            materialize_input_dir,
+            duckdb_runtime=duck,
+        )
+        timing["prepare_materialize_input_sec"] = round(time.perf_counter() - t0, 3)
+        t1 = time.perf_counter()
+        mat = materialize_player_game_splits(materialize_input_dir, pg_splits_dir, duckdb_runtime=duck)
+        timing["materialize_sec"] = round(time.perf_counter() - t1, 3)
+        mat_audits = _audit_dict(mat.audits)
+
+    pg_splits_txn_dir = out_dir / "player_game_splits_txn_pg"
+    t_txn = time.perf_counter()
+    txn_pg_meta = enrich_player_game_splits_with_txn_pg(
+        pg_splits_dir,
+        pg_splits_txn_dir,
         duckdb_runtime=duck,
     )
-    timing["prepare_materialize_input_sec"] = round(time.perf_counter() - t0, 3)
-    t1 = time.perf_counter()
-    mat = materialize_player_game_splits(materialize_input_dir, pg_splits_dir, duckdb_runtime=duck)
-    timing["materialize_sec"] = round(time.perf_counter() - t1, 3)
+    timing["enrich_txn_pg_sec"] = round(time.perf_counter() - t_txn, 3)
+
+    baseline_cols = _feature_columns_present_in_splits(splits_dir, baseline_feature_target)
+    if not baseline_cols:
+        raise RuntimeError("No baseline feature columns remain in bet splits.")
+    pg_splits_baseline_dir = out_dir / "player_game_splits_baseline_parity"
+    t_b1 = time.perf_counter()
+    baseline_parity_meta = enrich_player_game_splits_with_baseline_bet_features(
+        pg_splits_txn_dir,
+        splits_dir,
+        pg_splits_baseline_dir,
+        feature_columns=baseline_cols,
+        duckdb_runtime=duck,
+    )
+    timing["enrich_baseline_parity_sec"] = round(time.perf_counter() - t_b1, 3)
+    baseline_parity_feats = _feature_columns_present_in_splits(
+        pg_splits_baseline_dir,
+        baseline_feature_target,
+    )
 
     schema_names = frozenset(pq.read_schema(pg_splits_dir / "train.parquet").names)
+    txn_schema_names = frozenset(pq.read_schema(pg_splits_txn_dir / "train.parquet").names)
     pg_feats = player_game_composition_features(include_settlement=False)
     pg_settle_feats = player_game_composition_features(
         include_settlement=True,
         frame_columns=schema_names,
     )
+    txn_feats = tuple(c for c in txn_lite_feature_columns() if c in txn_schema_names)
+    pg_txn_feats = pg_feats + txn_feats
 
     baseline_report: dict[str, Any] | None = imported_baseline
     baseline_dir = out_dir / "baseline_top3_mean"
     if imported_baseline is not None:
         logger.info("[PG-W2] Using imported baseline report from %s", baseline_report_json)
     elif not skip_baseline:
-        baseline_cols = _feature_columns_present_in_splits(
-            splits_dir,
-            baseline_feature_target,
-        )
-        if not baseline_cols:
-            raise RuntimeError("No baseline feature columns remain in bet splits.")
         baseline_dir.mkdir(parents=True, exist_ok=True)
         t1 = time.perf_counter()
         res_base = _b5.train_lgbm_from_splits(
@@ -194,18 +228,25 @@ def run_player_game_grain_experiment(
 
     arms: dict[str, dict[str, Any]] = {}
     arm_specs = [
-        ("player_game_composition", pg_feats, True),
-        ("player_game_with_settlement", pg_settle_feats, "pg__casino_win_sum" in schema_names),
+        ("player_game_composition", pg_feats, pg_splits_dir, True),
+        ("player_game_with_settlement", pg_settle_feats, pg_splits_dir, "pg__casino_win_sum" in schema_names),
+        ("player_game_composition_txn_pg", pg_txn_feats, pg_splits_txn_dir, bool(txn_feats)),
+        (
+            "player_game_baseline_parity",
+            baseline_parity_feats,
+            pg_splits_baseline_dir,
+            bool(baseline_parity_feats),
+        ),
     ]
-    for arm_id, feat_cols, enabled in arm_specs:
+    for arm_id, feat_cols, train_splits_dir, enabled in arm_specs:
         if not enabled:
-            arms[arm_id] = {"skipped": True, "reason": "settlement column absent"}
+            arms[arm_id] = {"skipped": True, "reason": "settlement column absent or no txn features"}
             continue
         arm_dir = out_dir / arm_id
         arm_dir.mkdir(parents=True, exist_ok=True)
         t_arm = time.perf_counter()
         res_pg = train_player_game_lgbm_from_splits(
-            pg_splits_dir=pg_splits_dir,
+            pg_splits_dir=Path(train_splits_dir),
             duckdb_runtime=duck,
             objective_min_precision=float(objective_min_precision),
             random_seed=int(random_seed),
@@ -222,22 +263,44 @@ def run_player_game_grain_experiment(
         }
 
     decision: dict[str, Any] | None = None
-    if baseline_report is not None and arms.get("player_game_composition", {}).get("skipped") is False:
+    decision_txn_pg: dict[str, Any] | None = None
+    decision_baseline_parity: dict[str, Any] | None = None
+    if baseline_report is not None:
         baseline_k = int(baseline_report.get("val_alerts", 0))
-        decision = _decision_gate(
-            baseline_report,
-            out_dir / "player_game_composition",
-            pg_splits_dir / "val.parquet",
-            baseline_k=baseline_k,
-        )
+        if arms.get("player_game_composition", {}).get("skipped") is False:
+            decision = _decision_gate(
+                baseline_report,
+                out_dir / "player_game_composition",
+                pg_splits_dir / "val.parquet",
+                baseline_k=baseline_k,
+            )
+        if arms.get("player_game_composition_txn_pg", {}).get("skipped") is False:
+            decision_txn_pg = _decision_gate(
+                baseline_report,
+                out_dir / "player_game_composition_txn_pg",
+                pg_splits_txn_dir / "val.parquet",
+                baseline_k=baseline_k,
+            )
+        if arms.get("player_game_baseline_parity", {}).get("skipped") is False:
+            decision_baseline_parity = _decision_gate(
+                baseline_report,
+                out_dir / "player_game_baseline_parity",
+                pg_splits_baseline_dir / "val.parquet",
+                baseline_k=baseline_k,
+            )
 
     return {
-        "experiment_kind": "player_game_grain_w2_v0",
+        "experiment_kind": "player_game_grain_w2_v1_b1",
         "splits_dir": str(splits_dir),
         "out_dir": str(out_dir),
         "materialize_input_dir": str(materialize_input_dir),
         "player_game_splits_dir": str(pg_splits_dir),
-        "materialize_audit": _audit_dict(mat.audits),
+        "player_game_splits_txn_pg_dir": str(pg_splits_txn_dir),
+        "player_game_splits_baseline_parity_dir": str(pg_splits_baseline_dir),
+        "txn_pg_enrich": txn_pg_meta,
+        "baseline_parity_enrich": baseline_parity_meta,
+        "baseline_parity_feature_count": len(baseline_parity_feats),
+        "materialize_audit": mat_audits,
         "timing_sec": timing,
         "baseline_top3_mean": baseline_report,
         "baseline_source": (
@@ -247,9 +310,14 @@ def run_player_game_grain_experiment(
         ),
         "player_game_arms": arms,
         "decision": decision,
+        "decision_txn_pg": decision_txn_pg,
+        "decision_baseline_parity": decision_baseline_parity,
         "method_note": (
             "Baseline: bet-level LightGBM + top3_mean player-game aggregation. "
-            "Player-game arms: native one-row-per-player-game model with pg__ composition features."
+            "Player-game arms: native one-row-per-player-game model. "
+            "txn_pg: txn__* at player_id + player_game_ready_ts PIT (not bet pcd). "
+            "baseline_parity: same 42 MVP features as baseline — non-txn from representative "
+            "bet, txn__* from player_game_ready_ts PIT."
         ),
     }
 
@@ -279,6 +347,12 @@ def main() -> None:
         help="Skip bet-level baseline training when no imported baseline report is provided",
     )
     parser.add_argument(
+        "--pg-splits-dir",
+        type=Path,
+        default=None,
+        help="Reuse existing player-game splits (skip bet materialize)",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=None,
@@ -293,13 +367,20 @@ def main() -> None:
         random_seed=int(ns.random_seed),
         skip_baseline=bool(ns.skip_baseline),
         baseline_report_json=Path(ns.baseline_report_json) if ns.baseline_report_json else None,
+        pg_splits_dir=Path(ns.pg_splits_dir) if ns.pg_splits_dir else None,
     )
     out_json = Path(ns.output).resolve() if ns.output else out_dir / "player_game_grain_decision_report.json"
     out_json.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     logger.info("Wrote player-game grain experiment report → %s", out_json)
     if report.get("decision") is not None:
         proceed = report["decision"]["proceed_to_serving_migration"]
-        logger.info("Offline gate proceed_to_serving_migration=%s", proceed)
+        logger.info("Offline gate (composition) proceed_to_serving_migration=%s", proceed)
+    if report.get("decision_txn_pg") is not None:
+        proceed_txn = report["decision_txn_pg"]["proceed_to_serving_migration"]
+        logger.info("Offline gate (composition+txn_pg) proceed_to_serving_migration=%s", proceed_txn)
+    if report.get("decision_baseline_parity") is not None:
+        proceed_b1 = report["decision_baseline_parity"]["proceed_to_serving_migration"]
+        logger.info("Offline gate (baseline_parity) proceed_to_serving_migration=%s", proceed_b1)
 
 
 if __name__ == "__main__":

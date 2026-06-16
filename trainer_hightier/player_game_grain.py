@@ -875,6 +875,102 @@ def _build_player_game_candidates(df: pd.DataFrame, scores: np.ndarray) -> pd.Da
     ]
 
 
+def enrich_player_game_splits_with_baseline_bet_features(
+    pg_txn_splits_dir: Path,
+    bet_splits_dir: Path,
+    out_dir: Path,
+    *,
+    feature_columns: tuple[str, ...],
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> dict[str, Any]:
+    """Join MVP baseline bet features from the representative bet onto PG splits.
+
+    Non-``txn__*`` columns come from the bet row matching ``representative_bet_id``.
+    ``txn__*`` columns are retained from ``pg_txn_splits_dir`` (PIT at ``player_game_ready_ts``).
+    """
+
+    if not feature_columns:
+        raise ValueError("enrich_player_game_splits_with_baseline_bet_features requires feature_columns")
+    pg_dir = Path(pg_txn_splits_dir).resolve()
+    bet_dir = Path(bet_splits_dir).resolve()
+    od = Path(out_dir).resolve()
+    od.mkdir(parents=True, exist_ok=True)
+    bet_cols = tuple(c for c in feature_columns if not c.startswith("txn__"))
+    txn_cols = tuple(c for c in feature_columns if c.startswith("txn__"))
+    bet_schema = _split_schema_names(bet_dir / "train.parquet")
+    pg_schema = _split_schema_names(pg_dir / "train.parquet")
+    missing_bet = sorted(frozenset(bet_cols).difference(bet_schema))
+    missing_txn = sorted(frozenset(txn_cols).difference(pg_schema))
+    if missing_bet:
+        raise ValueError(
+            f"baseline bet enrich missing columns in bet splits: {missing_bet}; "
+            f"bet_dir={bet_dir!r}",
+        )
+    if missing_txn:
+        raise ValueError(
+            f"baseline bet enrich missing txn columns in pg_txn splits: {missing_txn}; "
+            f"pg_dir={pg_dir!r}",
+        )
+    bet_select = ",\n        ".join(f"bet.{col} AS {col}" for col in bet_cols)
+    split_stats: dict[str, dict[str, int]] = {}
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        for split in ("train", "val", "test"):
+            pg_src = pg_dir / f"{split}.parquet"
+            bet_src = bet_dir / f"{split}.parquet"
+            dst = od / f"{split}.parquet"
+            if not pg_src.is_file() or not bet_src.is_file():
+                raise FileNotFoundError(
+                    f"baseline bet enrich requires {pg_src} and {bet_src}",
+                )
+            pg_sql = _sql_quote_path(pg_src)
+            bet_sql = _sql_quote_path(bet_src)
+            dst_sql = _sql_quote_path(dst)
+            con.execute(
+                f"""
+                COPY (
+                  SELECT
+                    pg.*,
+                    {bet_select}
+                  FROM read_parquet('{pg_sql}') AS pg
+                  INNER JOIN read_parquet('{bet_sql}') AS bet
+                    ON pg.representative_bet_id = bet.bet_id
+                ) TO '{dst_sql}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+                """,
+            )
+            pg_count = int(
+                con.execute(f"SELECT count(*) FROM read_parquet('{pg_sql}')").fetchone()[0],
+            )
+            out_count = int(
+                con.execute(f"SELECT count(*) FROM read_parquet('{dst_sql}')").fetchone()[0],
+            )
+            split_stats[split] = {
+                "input_player_games": pg_count,
+                "output_player_games": out_count,
+                "dropped_unmatched": pg_count - out_count,
+            }
+            if out_count < pg_count:
+                logger.warning(
+                    "[PG-B1] %s baseline enrich dropped %d/%d unmatched representative bets",
+                    split,
+                    pg_count - out_count,
+                    pg_count,
+                )
+    finally:
+        con.close()
+    meta: dict[str, Any] = {
+        "join_grain": "representative_bet_id = bet_id",
+        "bet_feature_columns": list(bet_cols),
+        "txn_feature_columns": list(txn_cols),
+        "bet_splits_dir": str(bet_dir),
+        "pg_txn_splits_dir": str(pg_dir),
+        "split_stats": split_stats,
+    }
+    logger.info("[PG-B1] enriched baseline parity splits %s → %s stats=%s", pg_dir, od, split_stats)
+    return meta
+
+
 def _resolve_pg_objective(
     objective: HighTierObjectiveConfig | None,
     objective_min_precision: float,
@@ -923,6 +1019,20 @@ def train_player_game_lgbm_from_splits(
     X_tr, y_tr = _b5._prepare_xy(df_tr, feature_columns=feat_cols)
     X_va, y_va = _b5._prepare_xy(df_va, feature_columns=feat_cols)
     X_te, y_te = _b5._prepare_xy(df_te, feature_columns=feat_cols)
+
+    cat_cols = [c for c in feat_cols if c in _b5.CAT_COLUMNS]
+    union_cats: dict[str, pd.Index] = {}
+    for col in cat_cols:
+        combined = pd.concat(
+            [X_tr[col].astype(str), X_va[col].astype(str), X_te[col].astype(str)],
+            axis=0,
+            ignore_index=True,
+        )
+        union_cats[col] = pd.Index(pd.unique(combined))
+    for col in cat_cols:
+        X_tr[col] = pd.Categorical(X_tr[col], categories=union_cats[col])
+        X_va[col] = pd.Categorical(X_va[col], categories=union_cats[col])
+        X_te[col] = pd.Categorical(X_te[col], categories=union_cats[col])
 
     val_pos = int(np.sum(y_va == 1))
     if val_pos < 1 or int(np.sum(y_va == 0)) < 1:
@@ -1004,8 +1114,8 @@ def train_player_game_lgbm_from_splits(
             {
                 "model": model,
                 "feature_columns": list(feat_cols),
-                "categorical_columns": [],
-                "category_categories": {},
+                "categorical_columns": list(cat_cols),
+                "category_categories": {c: union_cats[c].tolist() for c in cat_cols},
                 "threshold": thr,
                 "model_grain": MODEL_GRAIN_PLAYER_GAME,
                 "score_aggregation": SCORE_AGGREGATION_NATIVE,
