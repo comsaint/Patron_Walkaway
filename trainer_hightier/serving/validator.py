@@ -57,6 +57,10 @@ _WARNED_TASK9_RETRY_WINDOW_CLAMPED = False
 # Task 9B: round-robin offset for no-bet retry selection (fairness across > limit backlog).
 _NO_BET_RETRY_ROT_OFFSET: int = 0
 
+# Task 9C: bet_id lookup recovery survives bet_cache.clear() and suppresses repeat warnings.
+_NO_BET_BET_ID_RESOLVED_CACHE: Dict[str, List[datetime]] = {}
+_NO_BET_BET_ID_RESOLVED_BET_IDS: set[str] = set()
+
 # Throttle O(n) in-memory cache prune (see VALIDATOR_CACHE_PRUNE_INTERVAL_SECONDS).
 _CACHE_PRUNE_LAST_MONO: float = 0.0
 _VALIDATOR_HEARTBEAT_LAST_MONO: float = 0.0
@@ -78,6 +82,72 @@ def _no_bet_bet_id_lookup_enabled() -> bool:
     if isinstance(raw, str):
         return raw.strip().lower() in ("1", "true", "yes", "on")
     return bool(raw)
+
+
+def _merge_bet_id_resolved_cache(bet_cache: Dict[str, List[datetime]]) -> None:
+    """Merge cross-cycle bet_id recovery payouts into the active validator bet_cache."""
+    for cid, vals in _NO_BET_BET_ID_RESOLVED_CACHE.items():
+        bet_cache.setdefault(cid, [])
+        bet_cache[cid].extend(vals)
+        bet_cache[cid] = sorted(set(bet_cache[cid]))
+
+
+def _bet_list_for_row(row: pd.Series, bet_cache: Dict[str, List[datetime]]) -> List[datetime]:
+    """Resolve bet payout times for a row from canonical_id-keyed bet_cache."""
+    cid_raw = row.get("canonical_id")
+    player_id = row.get("player_id")
+    if cid_raw is None or pd.isna(cid_raw) or str(cid_raw).strip() == "":
+        canonical_id = str(int(player_id)) if pd.notna(player_id) else None
+    else:
+        canonical_id = str(cid_raw)
+    if canonical_id is not None and canonical_id in bet_cache:
+        return bet_cache[canonical_id]
+    return bet_cache.get(str(int(player_id)) if pd.notna(player_id) else "", [])
+
+
+def _emit_no_bet_warning_if_still_empty(row: pd.Series, bet_cache: Dict[str, List[datetime]]) -> None:
+    """Emit no-bet WARNING after retry; skip rows recovered via bet_id lookup."""
+    bet_id = row.get("bet_id")
+    bid_key = str(bet_id) if bet_id is not None and not pd.isna(bet_id) else ""
+    if bid_key and bid_key in _NO_BET_BET_ID_RESOLVED_BET_IDS:
+        return
+    if _bet_list_for_row(row, bet_cache):
+        return
+
+    player_id = row.get("player_id")
+    casino_player_id = _norm_casino_player_id(row.get("casino_player_id"))
+    score_ts = pd.to_datetime(row["ts"])
+    if score_ts.tzinfo is None:
+        score_ts = score_ts.tz_localize(HK_TZ)
+    else:
+        score_ts = score_ts.tz_convert(HK_TZ)
+    bet_ts = row.get("bet_ts")
+    if pd.isna(bet_ts):
+        bet_ts = score_ts
+    else:
+        bet_ts = pd.to_datetime(bet_ts)
+        if bet_ts.tzinfo is None:
+            bet_ts = bet_ts.tz_localize(HK_TZ)
+        else:
+            bet_ts = bet_ts.tz_convert(HK_TZ)
+    scored_at = row.get("scored_at")
+    if pd.isna(scored_at):
+        scored_at_hk = score_ts
+    else:
+        scored_at_hk = pd.to_datetime(scored_at)
+        if scored_at_hk.tzinfo is None:
+            scored_at_hk = scored_at_hk.tz_localize(HK_TZ)
+        else:
+            scored_at_hk = scored_at_hk.tz_convert(HK_TZ)
+
+    logger.warning(
+        "[validator] No bet data for casino_player_id=%s player_id=%s bet_id=%s bet_ts=%s scored_at=%s — leaving PENDING (cannot verify late arrivals)",
+        casino_player_id,
+        player_id,
+        bet_id,
+        bet_ts.isoformat(),
+        scored_at_hk.isoformat(),
+    )
 
 
 def _record_validator_stage_timing(stage: str, seconds: float) -> None:
@@ -811,6 +881,7 @@ def _fetch_bets_for_no_bet_rows(
                 alert_player_id = bet_to_alert_pid.get(bid_str)
                 if alert_player_id is None:
                     continue
+                _NO_BET_BET_ID_RESOLVED_BET_IDS.add(bid_str)
                 if ch_pid is not None and int(ch_pid) != int(alert_player_id):
                     logger.debug(
                         "[validator] no-bet retry bet_id lookup: TBET player_id=%s != alert player_id=%s bet_id=%s",
@@ -821,6 +892,15 @@ def _fetch_bets_for_no_bet_rows(
                 for cid in bet_to_cids.get(bid_str, ()):
                     cache.setdefault(cid, [])
                     cache[cid].append(payout_hk)
+                    _NO_BET_BET_ID_RESOLVED_CACHE.setdefault(cid, [])
+                    _NO_BET_BET_ID_RESOLVED_CACHE[cid].append(payout_hk)
+            if bet_id_hits > 0:
+                logger.info(
+                    "[validator] no-bet bet_id lookup resolved: n_ids=%s hits=%s failed_chunks=%s (player_id drift recovery)",
+                    len(unique_bids),
+                    bet_id_hits,
+                    bet_id_failed_queries,
+                )
             logger.debug(
                 "[validator] no-bet bet_id lookup: n_ids=%s chunks=%s rows_raw=%s hits=%s failed_chunks=%s",
                 len(unique_bids),
@@ -832,6 +912,8 @@ def _fetch_bets_for_no_bet_rows(
 
     for cid in list(cache.keys()):
         cache[cid] = sorted(set(cache[cid]))
+    for cid in list(_NO_BET_BET_ID_RESOLVED_CACHE.keys()):
+        _NO_BET_BET_ID_RESOLVED_CACHE[cid] = sorted(set(_NO_BET_BET_ID_RESOLVED_CACHE[cid]))
     return cache, {
         "selected": len(selected_rows),
         "queries": total_queries,
@@ -1325,6 +1407,7 @@ def validate_alert_row(
     force_finalize: bool = False,
     *,
     gap_base_at_bet_ts: bool = False,
+    defer_no_bet_warning: bool = False,
 ) -> Dict:
     """Validate a single alert row.
 
@@ -1412,10 +1495,8 @@ def validate_alert_row(
     # Do not conclude MATCH when we have no bet data (e.g. fetch failed, wrong range, or TZ mismatch).
     # Otherwise find_gap_within_window(..., []) would treat "no bets in window" as a LABEL_LOOKAHEAD_MIN gap and we'd falsely MATCH.
     if not bet_list:
-        logger.warning(
-            "[validator] No bet data for casino_player_id=%s player_id=%s bet_id=%s bet_ts=%s scored_at=%s — leaving PENDING (cannot verify late arrivals)",
-            casino_player_id, player_id, bet_id, bet_ts.isoformat(), scored_at_hk.isoformat(),
-        )
+        if not defer_no_bet_warning:
+            _emit_no_bet_warning_if_still_empty(row, bet_cache)
         res_base.update({"result": None, "reason": "PENDING"})
         res_base["_no_bet_data"] = True
         return res_base
@@ -1719,7 +1800,7 @@ def validate_predictions_once(
         updated_count = 0
         no_bet_pending_rows: List[pd.Series] = []
 
-        def _validate_prediction_row(prow: pd.Series) -> Dict:
+        def _validate_prediction_row(prow: pd.Series, *, defer_no_bet_warning: bool = False) -> Dict:
             vrow = _prediction_row_to_validator_series(prow)
             return validate_observation_row(
                 vrow,
@@ -1727,6 +1808,7 @@ def validate_predictions_once(
                 session_cache_disabled,
                 force_finalize=force_finalize,
                 gap_base_at_bet_ts=True,
+                defer_no_bet_warning=defer_no_bet_warning,
             )
 
         for _, prow in pending_df.iterrows():
@@ -1734,7 +1816,7 @@ def validate_predictions_once(
                 logger.debug("[validator][prediction] budget exhausted mid-batch")
                 break
             vrow = _prediction_row_to_validator_series(prow)
-            res = _validate_prediction_row(prow)
+            res = _validate_prediction_row(prow, defer_no_bet_warning=True)
             if res.get("result") is None:
                 if bool(res.get("_no_bet_data")):
                     no_bet_pending_rows.append(prow.copy())
@@ -1795,6 +1877,13 @@ def validate_predictions_once(
                 updated_count += updated_delta
                 if processed_added:
                     new_processed_ids.append(prow["bet_id"])
+
+        if no_bet_pending_rows:
+            for prow in no_bet_pending_rows:
+                _emit_no_bet_warning_if_still_empty(
+                    _prediction_row_to_validator_series(prow),
+                    bet_cache,
+                )
 
         for key, saved_row in list(existing_results.items()):
             if saved_row.get("reason") != "PENDING":
@@ -2088,6 +2177,7 @@ def _validate_alerts_once(
         pass
 
     bet_cache.clear()
+    _merge_bet_id_resolved_cache(bet_cache)
     # Phase 1 (Task 3): keep validate_alert_row signature compatibility, but
     # disable session fetch/query path in validator cycle to cut ClickHouse load.
     session_cache_disabled: Dict[str, List[Dict]] = {}
@@ -2239,6 +2329,7 @@ def _validate_alerts_once(
             bet_cache,
             session_cache_disabled,
             force_finalize=force_finalize,
+            defer_no_bet_warning=True,
         )
         on_alert_decision(res)
         if res.get("result") is None:
@@ -2320,6 +2411,9 @@ def _validate_alerts_once(
             if processed_added:
                 cycle_bet_to_reason[str(row["bet_id"])] = str(res.get("reason", "UNKNOWN"))
                 new_processed_ids.append(row["bet_id"])
+
+        for row in no_bet_pending_rows:
+            _emit_no_bet_warning_if_still_empty(row, bet_cache)
 
     if cycle_bet_to_reason:
         verified_this_cycle = len(cycle_bet_to_reason)
