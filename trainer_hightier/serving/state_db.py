@@ -159,6 +159,16 @@ def init_state_db(path: Optional[Path] = None) -> Path:
             "CREATE INDEX IF NOT EXISTS idx_alerts_player_game ON alerts(player_id, game_id)"
         )
         _init_runtime_rated_threshold(conn)
+        from trainer_hightier.serving.player_game_ready_queue import (
+            init_player_game_ready_queue_tables,
+        )
+
+        init_player_game_ready_queue_tables(conn)
+        from trainer_hightier.serving.player_game_shadow_scorer import (
+            init_player_game_shadow_tables,
+        )
+
+        init_player_game_shadow_tables(conn)
         _meta_set_if_missing(conn, META_KEY_SCHEMA_VERSION, STATE_SCHEMA_VERSION)
         conn.commit()
     logger.debug("[state_db] initialized %s", db_path)

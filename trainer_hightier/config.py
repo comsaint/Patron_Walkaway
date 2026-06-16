@@ -1089,6 +1089,25 @@ class HightierServingConfig:
     #: Upper bound on cold-start / backfill window for incremental fetches (hours).
     scorer_dynamic_lookback_cap_hours: int = 8
     hightier_scorer_max_bets_per_cycle: int = 2000
+    #: Wave 4: enqueue / defer player-games without changing production alerts.
+    player_game_ready_queue_dry_run_enabled: bool = False
+    #: Lookback window for player-game re-fetch during ready-queue dry-run.
+    player_game_ready_queue_refetch_lookback_hours: float = 8.0
+    #: Wave 5: shadow native player-game scoring (requires ready-queue dry-run).
+    player_game_shadow_scoring_enabled: bool = False
+    player_game_shadow_model_bundle_dir: Path | None = field(
+        default_factory=lambda: _REPO_ROOT
+        / "out"
+        / "player_game_w2"
+        / "player_game_baseline_parity",
+    )
+    #: Wave 6 shadow gate thresholds (staging review before production switch).
+    player_game_shadow_gate_max_ready_lag_sec_p95: float = 120.0
+    player_game_shadow_gate_max_pending_age_sec_p95: float = 120.0
+    player_game_shadow_gate_min_alert_volume_ratio: float = 0.5
+    player_game_shadow_gate_max_alert_volume_ratio: float = 2.0
+    player_game_shadow_gate_max_score_delta_p95_abs: float = 0.15
+    player_game_shadow_gate_min_overlap: int = 10
     #: Split ADT allowlist ``player_id`` IN-lists into chunks of this size (ClickHouse query limits).
     hightier_scorer_player_id_chunk_size: int = 500
     #: Cap rows buffered while merging chunk query results (0 = disabled). Prevents OOM if mis-tuned.

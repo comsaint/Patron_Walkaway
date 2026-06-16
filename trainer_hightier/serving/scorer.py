@@ -1264,6 +1264,69 @@ def score_once(
     n_batch_rows = len(batch.bets)
     queue_drained = _queue_drained_from_batch_rows(n_batch_rows, cap=cap)
 
+    if cfg.player_game_ready_queue_dry_run_enabled:
+        try:
+            from trainer_hightier.serving.player_game_ready_queue import (
+                run_player_game_ready_queue_dry_run_cycle,
+            )
+
+            run_player_game_ready_queue_dry_run_cycle(
+                conn,
+                incremental_bets=batch.bets,
+            )
+        except Exception as exc:
+            logger.warning("[hightier_scorer] player_game ready-queue dry-run failed: %s", exc)
+
+    if cfg.player_game_shadow_scoring_enabled:
+        if not cfg.player_game_ready_queue_dry_run_enabled:
+            logger.warning(
+                "[hightier_scorer] player_game_shadow_scoring_enabled requires "
+                "player_game_ready_queue_dry_run_enabled",
+            )
+        else:
+            try:
+                from trainer_hightier.serving.player_game_shadow_scorer import (
+                    load_player_game_shadow_bundle,
+                    run_player_game_shadow_scoring,
+                )
+
+                pg_bundle = load_player_game_shadow_bundle(cfg)
+                if pg_bundle is not None:
+                    run_player_game_shadow_scoring(
+                        conn,
+                        batch=batch,
+                        pg_bundle=pg_bundle,
+                        mapping_parquet=mapping_parquet,
+                        feast_adapter=feast_adapter,
+                        manifest=manifest,
+                    )
+                    from trainer_hightier.serving.player_game_shadow_scorer import (
+                        evaluate_player_game_shadow_gate,
+                        summarize_player_game_shadow_comparison,
+                    )
+
+                    pg_cmp = summarize_player_game_shadow_comparison(conn)
+                    pg_gate = evaluate_player_game_shadow_gate(
+                        pg_cmp,
+                        max_ready_lag_sec_p95=float(cfg.player_game_shadow_gate_max_ready_lag_sec_p95),
+                        max_pending_age_sec_p95=float(cfg.player_game_shadow_gate_max_pending_age_sec_p95),
+                        min_alert_volume_ratio=float(cfg.player_game_shadow_gate_min_alert_volume_ratio),
+                        max_alert_volume_ratio=float(cfg.player_game_shadow_gate_max_alert_volume_ratio),
+                        max_score_delta_p95_abs=float(cfg.player_game_shadow_gate_max_score_delta_p95_abs),
+                        min_overlap=int(cfg.player_game_shadow_gate_min_overlap),
+                    )
+                    logger.info(
+                        "[pg_shadow_gate] overlap=%d legacy_alerts=%d shadow_alerts=%d "
+                        "both=%d proceed=%s",
+                        pg_cmp.n_overlap,
+                        pg_cmp.n_legacy_alert,
+                        pg_cmp.n_shadow_alert,
+                        pg_cmp.n_both_alert,
+                        pg_gate["proceed_to_production_switch"],
+                    )
+            except Exception as exc:
+                logger.warning("[hightier_scorer] player_game shadow scoring failed: %s", exc)
+
     registry_snap = load_frozen_registry_for_bundle(Path(bundle.bundle_dir))
     supplier_plan = build_scorer_supplier_plan(registry_snap, bundle.feature_columns)
     assert_scorer_supplier_plan_or_raise(supplier_plan)
