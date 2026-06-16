@@ -125,6 +125,95 @@ def _load_baseline_report(path: Path | None) -> dict[str, Any] | None:
     return payload
 
 
+def refresh_player_game_decision_report(
+    *,
+    out_dir: Path,
+    baseline_report_json: Path,
+) -> dict[str, Any]:
+    """Rebuild decision gates from existing W2 artifacts without retraining."""
+
+    out_dir = Path(out_dir).resolve()
+    baseline_report = _load_baseline_report(baseline_report_json)
+    if baseline_report is None:
+        raise ValueError("baseline_report_json is required for refresh-only mode")
+    pg_splits_dir = out_dir / "player_game_splits"
+    pg_splits_txn_dir = out_dir / "player_game_splits_txn_pg"
+    pg_splits_baseline_dir = out_dir / "player_game_splits_baseline_parity"
+    baseline_k = int(baseline_report.get("val_alerts", 0))
+    arms: dict[str, dict[str, Any]] = {}
+    arm_specs = [
+        ("player_game_composition", out_dir / "player_game_composition", pg_splits_dir / "val.parquet"),
+        (
+            "player_game_composition_txn_pg",
+            out_dir / "player_game_composition_txn_pg",
+            pg_splits_txn_dir / "val.parquet",
+        ),
+        (
+            "player_game_baseline_parity",
+            out_dir / "player_game_baseline_parity",
+            pg_splits_baseline_dir / "val.parquet",
+        ),
+    ]
+    for arm_id, arm_dir, val_path in arm_specs:
+        metrics_path = arm_dir / "training_metrics.json"
+        model_path = arm_dir / "model.pkl"
+        if not model_path.is_file() or not val_path.is_file():
+            arms[arm_id] = {"skipped": True, "reason": "model or val split missing"}
+            continue
+        report_payload = (
+            json.loads(metrics_path.read_text(encoding="utf-8"))
+            if metrics_path.is_file()
+            else {}
+        )
+        arms[arm_id] = {
+            "skipped": False,
+            "model_dir": str(arm_dir),
+            "report": report_payload,
+            "threshold": float(report_payload.get("threshold", 0.0)),
+        }
+    decision = None
+    decision_txn_pg = None
+    decision_baseline_parity = None
+    if arms.get("player_game_composition", {}).get("skipped") is False:
+        decision = _decision_gate(
+            baseline_report,
+            out_dir / "player_game_composition",
+            pg_splits_dir / "val.parquet",
+            baseline_k=baseline_k,
+        )
+    if arms.get("player_game_composition_txn_pg", {}).get("skipped") is False:
+        decision_txn_pg = _decision_gate(
+            baseline_report,
+            out_dir / "player_game_composition_txn_pg",
+            pg_splits_txn_dir / "val.parquet",
+            baseline_k=baseline_k,
+        )
+    if arms.get("player_game_baseline_parity", {}).get("skipped") is False:
+        decision_baseline_parity = _decision_gate(
+            baseline_report,
+            out_dir / "player_game_baseline_parity",
+            pg_splits_baseline_dir / "val.parquet",
+            baseline_k=baseline_k,
+        )
+    return {
+        "experiment_kind": "player_game_grain_w2_v1_b1_refresh",
+        "out_dir": str(out_dir),
+        "player_game_splits_dir": str(pg_splits_dir),
+        "player_game_splits_txn_pg_dir": str(pg_splits_txn_dir),
+        "player_game_splits_baseline_parity_dir": str(pg_splits_baseline_dir),
+        "baseline_top3_mean": baseline_report,
+        "baseline_source": str(Path(baseline_report_json).resolve()),
+        "player_game_arms": arms,
+        "decision": decision,
+        "decision_txn_pg": decision_txn_pg,
+        "decision_baseline_parity": decision_baseline_parity,
+        "method_note": (
+            "Refresh-only: decision gates recomputed from existing artifacts. "
+            "Serving migration gate = decision_baseline_parity."
+        ),
+    }
+
+
 def run_player_game_grain_experiment(
     *,
     splits_dir: Path,
@@ -326,7 +415,12 @@ def main() -> None:
     """CLI entry for Wave 2 player-game grain offline experiment."""
 
     parser = argparse.ArgumentParser(description="Player-game grain Wave 2 offline experiment")
-    parser.add_argument("--splits-dir", type=Path, required=True, help="Step 4 bet split directory")
+    parser.add_argument(
+        "--splits-dir",
+        type=Path,
+        required=False,
+        help="Step 4 bet split directory (not required with --refresh-decision-only)",
+    )
     parser.add_argument("--out-dir", type=Path, required=True, help="Experiment output directory")
     parser.add_argument(
         "--min-precision",
@@ -358,8 +452,29 @@ def main() -> None:
         default=None,
         help="Decision report JSON (default: <out-dir>/player_game_grain_decision_report.json)",
     )
+    parser.add_argument(
+        "--refresh-decision-only",
+        action="store_true",
+        help="Recompute decision gates from existing W2 artifacts (skip train/materialize)",
+    )
     ns = parser.parse_args()
     out_dir = Path(ns.out_dir).resolve()
+    if ns.refresh_decision_only:
+        if ns.baseline_report_json is None:
+            parser.error("--refresh-decision-only requires --baseline-report-json")
+        report = refresh_player_game_decision_report(
+            out_dir=out_dir,
+            baseline_report_json=Path(ns.baseline_report_json),
+        )
+        out_json = Path(ns.output).resolve() if ns.output else out_dir / "player_game_grain_decision_report.json"
+        out_json.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+        logger.info("Wrote refreshed player-game decision report → %s", out_json)
+        if report.get("decision_baseline_parity") is not None:
+            proceed_b1 = report["decision_baseline_parity"]["proceed_to_serving_migration"]
+            logger.info("Offline gate (baseline_parity) proceed_to_serving_migration=%s", proceed_b1)
+        return
+    if ns.splits_dir is None:
+        parser.error("--splits-dir is required unless --refresh-decision-only is set")
     report = run_player_game_grain_experiment(
         splits_dir=Path(ns.splits_dir),
         out_dir=out_dir,
