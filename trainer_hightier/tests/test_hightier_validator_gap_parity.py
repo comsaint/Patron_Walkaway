@@ -70,3 +70,45 @@ def test_no_bet_warning_suppressed_after_bet_id_resolved(
         res2 = hv.validate_alert_row(row, bet_cache, {})
         assert res2.get("_no_bet_data") is not True
         assert res2.get("result") is not None
+
+
+def test_bet_id_resolved_cache_survives_bet_cache_clear() -> None:
+    """bet_cache.clear() drops per-cycle data but merge restores bet_id recovery."""
+
+    hv._NO_BET_BET_ID_RESOLVED_CACHE.clear()
+    hv._NO_BET_BET_ID_RESOLVED_BET_IDS.clear()
+
+    hk = ZoneInfo("Asia/Hong_Kong")
+    bet_ts = datetime(2024, 1, 1, 12, 5, tzinfo=hk)
+    hv._NO_BET_BET_ID_RESOLVED_CACHE["148965936"] = [bet_ts]
+    hv._NO_BET_BET_ID_RESOLVED_BET_IDS.add("699154634")
+
+    bet_cache: dict[str, list[datetime]] = {
+        "other_player": [datetime(2024, 1, 1, 10, 0, tzinfo=hk)],
+    }
+    bet_cache.clear()
+    assert "148965936" not in bet_cache
+
+    hv._merge_bet_id_resolved_cache(bet_cache)
+    assert bet_cache["148965936"] == [bet_ts]
+
+    old_enough = datetime.now(hk) - timedelta(minutes=int(hv.config.LABEL_LOOKAHEAD_MIN) + 30)
+    row = pd.Series(
+        {
+            "ts": old_enough,
+            "bet_ts": bet_ts,
+            "player_id": 148965936,
+            "casino_player_id": "97172654",
+            "canonical_id": "148965936",
+            "bet_id": 699154634,
+            "score": 0.9,
+            "table_id": 1,
+            "position_idx": 1,
+            "session_id": "s1",
+            "model_version": "m1",
+            "scored_at": old_enough,
+        }
+    )
+    res = hv.validate_alert_row(row, bet_cache, {})
+    assert res.get("_no_bet_data") is not True
+    assert res.get("result") is not None
