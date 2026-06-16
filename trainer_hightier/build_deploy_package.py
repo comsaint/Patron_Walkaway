@@ -1056,12 +1056,12 @@ def _write_dotenv_example(path: Path) -> None:
 # =============================================================================
 
 # CH_HOST=gdpedw
-# CH_PORT=8123
+# CH_PORT=8443
 CH_USER=
 CH_PASS=
 # CH_PASSWORD=
 
-# CH_SECURE=false
+# CH_SECURE=true
 # SOURCE_DB=GDP_GMWDS_Raw
 
 # txn__* features are supplied live from ClickHouse t_casino_txn (no cleaned partition copy required).

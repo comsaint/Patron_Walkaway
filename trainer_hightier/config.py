@@ -1047,10 +1047,10 @@ class HightierServingConfig:
     )
     #: ClickHouse TCP/HTTP endpoint (``clickhouse_connect``).
     ch_host: str = "gdpedw"
-    ch_port: int = 8123
+    ch_port: int = 8443
     ch_user: str = ""
     ch_password: str = ""
-    ch_secure: bool = False
+    ch_secure: bool = True
     placeholder_player_id: int = -1
     walkaway_gap_min: int = 30
     alert_horizon_min: int = 15
