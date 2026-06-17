@@ -46,7 +46,9 @@ from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
 
 logger = logging.getLogger(__name__)
 
-BOUNDED_SHORT_TERM_MATERIALIZER_VERSION: Final[str] = "bounded_hot_pool_v2_peer_inclusive"
+BOUNDED_SHORT_TERM_MATERIALIZER_VERSION: Final[str] = "bounded_hot_pool_v4_stake_escalation"
+FE_DERIVED_FULL_MATERIALIZE_BATCH_SIZE: Final[int] = 10_000
+FE_DERIVED_PATRON_POOL_PLAYER_CHUNK_SIZE: Final[int] = 500
 
 _TRAINING_BET_STAGING_COLUMNS: Final[tuple[str, ...]] = (
     "bet_id",
@@ -68,63 +70,8 @@ def _path_esc(path: Path) -> str:
     return str(Path(path).resolve()).replace("\\", "/")
 
 
-def materialize_fe_derived_parquet(
-    *,
-    cleaned_bet_parquet: Path,
-    training_parquet_for_bet_ids: Path,
-    out_parquet: Path,
-    duckdb_runtime: DuckDbRuntimeConfig,
-    canonical_mapping_parquet: Path | None = None,
-) -> Path:
-    """Compute ``fe__*`` columns keyed by ``bet_id``; write standalone Parquet.
 
-    Args:
-        cleaned_bet_parquet: Hive-partition cleaned bet root (trainer default layout).
-        training_parquet_for_bet_ids: Step-3-style training parquet; used to derive
-            which ``canonical_id`` (via mapping) timelines to scan (reduces DuckDB
-            workload while including all ``player_id`` aliases per canonical).
-        out_parquet: Output path (written with Snappy compression).
-        duckdb_runtime: DuckDB PRAGMA preset.
-        canonical_mapping_parquet: Optional ``player_id``→``canonical_id`` map; defaults
-            to :func:`~trainer_hightier.utils.canonical_mapping.default_canonical_mapping_parquet_path`.
-
-    Returns:
-        Resolved ``out_parquet`` path.
-
-    Raises:
-        FileNotFoundError: If cleaned bet glob yields no readable Parquet, training
-            parquet is missing, or canonical mapping parquet is missing.
-    """
-
-    src_root = Path(cleaned_bet_parquet).resolve()
-    tp = Path(training_parquet_for_bet_ids).resolve()
-    dst = Path(out_parquet).resolve()
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    cmap_path = (
-        Path(canonical_mapping_parquet).resolve()
-        if canonical_mapping_parquet is not None
-        else default_canonical_mapping_parquet_path().resolve()
-    )
-    if not tp.is_file():
-        raise FileNotFoundError(training_parquet_for_bet_ids)
-    if not cleaned_bet_dataset_has_any_parquet(src_root):
-        raise FileNotFoundError(f"No cleaned bet parquet under {src_root}")
-    if not cmap_path.is_file():
-        raise FileNotFoundError(
-            f"canonical_player_mapping parquet missing: {cmap_path}; "
-            "run trainer_hightier.utils.canonical_mapping materialization first."
-        )
-    bet_from = resolved_cleaned_bet_read_parquet_sql(src_root)
-    tp_esc = _path_esc(tp).replace("'", "''")
-    cmap_esc = _path_esc(cmap_path).replace("'", "''")
-    dst_esc = _path_esc(dst).replace("'", "''")
-
-    sql = f"""
-WITH tid AS (
-  SELECT DISTINCT TRY_CAST(bet_id AS DOUBLE) AS bet_id
-  FROM read_parquet('{tp_esc}')
-  WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
-),
+_FE_DERIVED_AFTER_TID_CTE: Final[str] = """
 pid_from_train AS (
   SELECT DISTINCT TRY_CAST(_b.player_id AS BIGINT) AS player_id
   FROM {bet_from} AS _b
@@ -158,6 +105,7 @@ src AS (
     COALESCE(c.canonical_id, CAST(b."player_id" AS VARCHAR)) AS canonical_id,
     TRY_CAST(b."session_id" AS BIGINT) AS session_id,
     TRY_CAST(b."table_id" AS BIGINT) AS table_id,
+    TRY_CAST(b."game_id" AS BIGINT) AS game_id,
     TRY_CAST(b."gaming_day_event" AS DATE) AS gaming_day_event,
     CAST(b."payout_complete_dtm" AS TIMESTAMPTZ) AS pcd,
     TRY_CAST(b."wager" AS DOUBLE) AS wager,
@@ -186,6 +134,8 @@ src_lagged AS (
     ROW_NUMBER() OVER w_session AS bet_idx_in_session,
     MIN(pcd) OVER w_session AS first_pcd_in_session,
     SUM(wager) OVER w_session_prior AS wager_sum_in_session_prior,
+    SUM(wager) OVER w_session AS wager_sum_in_session,
+    SUM(theo_win) OVER w_session AS theo_win_sum_in_session,
     COUNT(*) OVER w_canon_day_prior AS bets_today_so_far,
     SUM(wager) OVER w_canon_day_prior AS wager_today_so_far,
     MIN(pcd) OVER w_canon_day_inclusive AS first_pcd_today
@@ -213,7 +163,16 @@ src_with_iv AS (
       WHEN table_id IS NOT NULL AND lag1_table_id IS NOT NULL AND table_id <> lag1_table_id THEN 1
       WHEN table_id IS NOT NULL AND lag1_table_id IS NOT NULL THEN 0
       ELSE NULL
-    END AS changed_table_vs_lag1
+    END AS changed_table_vs_lag1,
+    SUM(CASE WHEN COALESCE(casino_win, 0) <= 0 THEN 1 ELSE 0 END)
+      OVER (
+        PARTITION BY canonical_id ORDER BY pcd, bet_id
+        ROWS UNBOUNDED PRECEDING
+      ) AS _loss_streak_grp,
+    CASE
+      WHEN lag1_casino_win > 0 AND lag1_wager > 1e-9 AND wager >= 2.0 * lag1_wager THEN 1.0
+      ELSE 0.0
+    END AS loss_then_double_flag
   FROM src_lagged AS s
 ),
 ordered AS (
@@ -256,7 +215,34 @@ ordered AS (
     AVG(interarrival_sec) OVER w7d AS interarrival_avg_w7d,
     STDDEV_POP(interarrival_sec) OVER w7d AS interarrival_std_w7d,
     AVG(payout_odds) OVER w7d AS payout_odds_avg_w7d,
-    STDDEV_POP(payout_odds) OVER w7d AS payout_odds_std_w7d
+    STDDEV_POP(payout_odds) OVER w7d AS payout_odds_std_w7d,
+    CAST(
+      CASE
+        WHEN COALESCE(casino_win, 0) > 0 THEN ROW_NUMBER() OVER (
+          PARTITION BY canonical_id, _loss_streak_grp ORDER BY pcd, bet_id
+        )
+        ELSE 0
+      END AS DOUBLE
+    ) AS fe__outcome__consecutive_loss_streak,
+    CASE
+      WHEN COALESCE(SUM(CASE WHEN casino_win > 0 THEN 1 ELSE 0 END) OVER w1h, 0) > 0
+      THEN CAST(
+        SUM(loss_then_double_flag) OVER w1h
+        / COALESCE(SUM(CASE WHEN casino_win > 0 THEN 1 ELSE 0 END) OVER w1h, 0)
+        AS DOUBLE)
+      ELSE CAST(NULL AS DOUBLE)
+    END AS fe__outcome__loss_then_double_ratio__w1h,
+    CAST(
+      AVG(
+        CASE
+          WHEN lag1_casino_win > 0 AND lag1_wager > 1e-9 THEN wager / lag1_wager
+          ELSE NULL
+        END
+      ) OVER w1h AS DOUBLE
+    ) AS fe__outcome__wager_after_loss_step_ratio__w1h,
+    REGR_SLOPE(wager, EXTRACT(epoch FROM pcd)) OVER w1h_peer AS wager_regr_slope_w1h_peer,
+    AVG(wager) OVER w_last3 AS wager_avg_last3,
+    AVG(wager) OVER w_prior3 AS wager_avg_prior3
   FROM src_with_iv AS s
   WINDOW
     w5m AS (
@@ -298,6 +284,14 @@ ordered AS (
     w_5_prior_rows AS (
       PARTITION BY canonical_id ORDER BY pcd, bet_id
       ROWS BETWEEN 4 PRECEDING AND 1 PRECEDING
+    ),
+    w_last3 AS (
+      PARTITION BY canonical_id ORDER BY pcd, bet_id
+      ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    ),
+    w_prior3 AS (
+      PARTITION BY canonical_id ORDER BY pcd, bet_id
+      ROWS BETWEEN 5 PRECEDING AND 3 PRECEDING
     )
 )
 SELECT
@@ -385,6 +379,9 @@ SELECT
     + CASE WHEN lag3_casino_win IS NOT NULL AND lag3_casino_win > 0 THEN 1 ELSE 0 END
     AS DOUBLE
   ) AS fe__outcome__last_3_bets_loss_count,
+  fe__outcome__consecutive_loss_streak,
+  fe__outcome__loss_then_double_ratio__w1h,
+  fe__outcome__wager_after_loss_step_ratio__w1h,
 
   -- Group N: stake_dynamics
   CASE
@@ -408,6 +405,18 @@ SELECT
     THEN CAST(std_wager_w1h / avg_wager_w1h AS DOUBLE)
     ELSE CAST(NULL AS DOUBLE)
   END AS fe__stake__wager_cv__w1h,
+  CASE
+    WHEN wager_regr_slope_w1h_peer IS NOT NULL
+       AND avg_wager_w1h IS NOT NULL AND avg_wager_w1h > 1e-9
+    THEN CAST(wager_regr_slope_w1h_peer / avg_wager_w1h AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__stake__wager_trend_slope__w1h,
+  CASE
+    WHEN wager_avg_prior3 IS NOT NULL AND wager_avg_prior3 > 1e-9
+       AND wager_avg_last3 IS NOT NULL
+    THEN CAST(wager_avg_last3 / wager_avg_prior3 AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__stake__wager_last3_vs_prior3_ratio__w1h,
 
   -- Group K: canonical_today (partition by canonical_id × gaming_day; static cmap is PIT-safe)
   CAST(COALESCE(bets_today_so_far, 0) AS DOUBLE) AS fe__canonical__bets_cnt__today,
@@ -435,6 +444,17 @@ SELECT
     AS fe__session__elapsed_sec_since_first_bet_in_session,
   CAST(COALESCE(wager_sum_in_session_prior, 0.0) AS DOUBLE)
     AS fe__session__wager_sum_in_session_so_far,
+    
+  -- New derived PIT-safe session features matching sess__* semantics but running totals
+  ln(1 + greatest(coalesce(CAST(bet_idx_in_session AS DOUBLE), 0.0), 0.0)) AS fe__session__num_games_with_wager_log1p,
+  ln(1 + greatest(coalesce(CAST(bet_idx_in_session AS DOUBLE), 0.0), 0.0)) AS fe__session__num_bets_log1p,
+  ln(1 + greatest(coalesce(CAST(wager_sum_in_session AS DOUBLE), 0.0), 0.0)) AS fe__session__turnover_log1p,
+  sign(coalesce(CAST(theo_win_sum_in_session AS DOUBLE), 0.0)) * ln(1 + abs(coalesce(CAST(theo_win_sum_in_session AS DOUBLE), 0.0))) AS fe__session__theo_win_log1p_signed,
+  CASE
+    WHEN coalesce(CAST(wager_sum_in_session AS DOUBLE), 0.0) > 0 AND coalesce(CAST(bet_idx_in_session AS DOUBLE), 0.0) > 0
+    THEN ln(1 + CAST(wager AS DOUBLE) / (CAST(wager_sum_in_session AS DOUBLE) / CAST(bet_idx_in_session AS DOUBLE)))
+    ELSE 0.0
+  END AS fe__session__bet_wager_over_sess_avg_log1p,
 
   -- Group F: rate_decay (short-window count + velocity ratios; tail of 1d window)
   CAST(cnt_w5m AS DOUBLE) AS fe__rate__bets_cnt__w5m,
@@ -504,17 +524,370 @@ SELECT
     THEN CAST(payout_odds / lag1_payout_odds AS DOUBLE)
     ELSE CAST(NULL AS DOUBLE)
   END AS fe__odds__payout_odds_step_ratio
+""".strip()
+
+_TID_SELECT_FROM_STAGED: Final[str] = """
+  SELECT DISTINCT TRY_CAST(bet_id AS DOUBLE) AS bet_id
+  FROM staged_tid
+  WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
+""".strip()
+
+
+def _fe_derived_window_materialize_sql(
+    *,
+    bet_from: str,
+    cmap_esc: str,
+    tid_select_sql: str,
+) -> str:
+    """Build full-window ``fe__*`` materialize SQL for one ``tid`` source."""
+
+    return f"""
+WITH tid AS (
+{tid_select_sql}
+),
+{_FE_DERIVED_AFTER_TID_CTE.format(bet_from=bet_from, cmap_esc=cmap_esc)}
 FROM ordered
 WHERE bet_id IN (SELECT bet_id FROM tid)
-"""
+""".strip()
 
-    sql = sql.strip()
+
+def _iter_training_bet_id_batches(
+    training_parquet: Path,
+    *,
+    batch_size: int,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> Iterator[pd.DataFrame]:
+    """Yield ``bet_id`` slices from a training parquet without loading all ids."""
+
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1; got {batch_size}")
+    t_esc = _path_esc(training_parquet)
     con = duckdb.connect(database=":memory:")
     try:
         apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        con.execute(
+            f"""
+            CREATE TEMP TABLE _training_bet_ids_ordered AS
+            SELECT
+              TRY_CAST(bet_id AS DOUBLE) AS bet_id,
+              ROW_NUMBER() OVER (
+                ORDER BY TRY_CAST(bet_id AS DOUBLE) ASC
+              ) AS rn
+            FROM read_parquet('{t_esc}')
+            WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
+            """,
+        )
+        total_row = con.execute("SELECT COALESCE(MAX(rn), 0)::BIGINT FROM _training_bet_ids_ordered").fetchone()
+        total = int(total_row[0]) if total_row else 0
+        for start in range(0, total, batch_size):
+            end = min(start + batch_size, total)
+            df = con.execute(
+                f"""
+                SELECT bet_id
+                FROM _training_bet_ids_ordered
+                WHERE rn > {start} AND rn <= {end}
+                """,
+            ).fetchdf()
+            if not df.empty:
+                yield df
+    finally:
+        con.close()
+
+
+def _write_fe_derived_batch_parquet(
+    *,
+    bet_id_batch: pd.DataFrame,
+    bet_from: str,
+    cmap_esc: str,
+    out_parquet: Path,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> None:
+    """Materialize one ``bet_id`` batch to a standalone parquet part."""
+
+    dst_esc = _path_esc(out_parquet).replace("'", "''")
+    sql = _fe_derived_window_materialize_sql(
+        bet_from=bet_from,
+        cmap_esc=cmap_esc,
+        tid_select_sql=_TID_SELECT_FROM_STAGED,
+    )
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        con.register("staged_tid", bet_id_batch)
         con.execute(f"COPY ({sql}) TO '{dst_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)")
     finally:
         con.close()
+
+
+def _collect_training_player_ids(
+    training_parquet: Path,
+    *,
+    cleaned_bet_from: str,
+    cmap_esc: str,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> list[int]:
+    """Resolve all ``player_id`` aliases for training ``bet_id`` rows (via canonical map)."""
+
+    tp_esc = _path_esc(training_parquet).replace("'", "''")
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        rows = con.execute(
+            f"""
+            WITH tid AS (
+              SELECT DISTINCT TRY_CAST(bet_id AS DOUBLE) AS bet_id
+              FROM read_parquet('{tp_esc}')
+              WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
+            ),
+            train_pid AS (
+              SELECT DISTINCT TRY_CAST(_b."player_id" AS BIGINT) AS player_id
+              FROM {cleaned_bet_from} AS _b
+              INNER JOIN tid ON TRY_CAST(_b."bet_id" AS DOUBLE) = tid.bet_id
+              WHERE TRY_CAST(_b."player_id" AS BIGINT) IS NOT NULL
+            ),
+            cmap AS (
+              SELECT DISTINCT
+                TRY_CAST(player_id AS BIGINT) AS player_id,
+                TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id
+              FROM read_parquet('{cmap_esc}')
+              WHERE TRY_CAST(player_id AS BIGINT) IS NOT NULL
+                AND TRIM(CAST(canonical_id AS VARCHAR)) <> ''
+            ),
+            cid AS (
+              SELECT DISTINCT c.canonical_id
+              FROM train_pid AS p
+              INNER JOIN cmap AS c ON p.player_id = c.player_id
+            )
+            SELECT DISTINCT c.player_id
+            FROM cmap AS c
+            INNER JOIN cid ON c.canonical_id = cid.canonical_id
+            ORDER BY 1
+            """,
+        ).fetchall()
+        return [int(row[0]) for row in rows]
+    finally:
+        con.close()
+
+
+def _materialize_patron_bet_pool_parquet(
+    *,
+    cleaned_bet_from: str,
+    cmap_esc: str,
+    player_ids: list[int],
+    out_parquet: Path,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> Path:
+    """Scan cleaned bets once (chunked by ``player_id``) into a local patron pool."""
+
+    if not player_ids:
+        raise ValueError("player_ids must be non-empty for patron bet pool materialization")
+    dst = Path(out_parquet).resolve()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    pool_dir = dst.parent / f"{dst.stem}__pool_parts"
+    if pool_dir.is_dir():
+        shutil.rmtree(pool_dir)
+    pool_dir.mkdir(parents=True, exist_ok=True)
+
+    pool_parts: list[Path] = []
+    chunk_size = FE_DERIVED_PATRON_POOL_PLAYER_CHUNK_SIZE
+    for chunk_idx, start in enumerate(range(0, len(player_ids), chunk_size)):
+        chunk = player_ids[start : start + chunk_size]
+        ids_sql = ",".join(str(int(pid)) for pid in chunk)
+        part = pool_dir / f"pool_{chunk_idx:06d}.parquet"
+        part_esc = _path_esc(part).replace("'", "''")
+        con = duckdb.connect(database=":memory:")
+        try:
+            apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+            con.execute(
+                f"""
+                COPY (
+                  SELECT
+                    TRY_CAST(b."bet_id" AS DOUBLE) AS bet_id,
+                    TRY_CAST(b."player_id" AS BIGINT) AS player_id,
+                    COALESCE(c.canonical_id, CAST(b."player_id" AS VARCHAR)) AS canonical_id,
+                    TRY_CAST(b."session_id" AS BIGINT) AS session_id,
+                    TRY_CAST(b."table_id" AS BIGINT) AS table_id,
+                    TRY_CAST(b."game_id" AS BIGINT) AS game_id,
+                    TRY_CAST(b."gaming_day_event" AS DATE) AS gaming_day_event,
+                    CAST(b."payout_complete_dtm" AS TIMESTAMPTZ) AS payout_complete_dtm,
+                    TRY_CAST(b."wager" AS DOUBLE) AS wager,
+                    TRY_CAST(b."payout_odds" AS DOUBLE) AS payout_odds,
+                    TRY_CAST(b."casino_win" AS DOUBLE) AS casino_win,
+                    TRY_CAST(b."theo_win" AS DOUBLE) AS theo_win,
+                    TRY_CAST(b."base_ha" AS DOUBLE) AS base_ha
+                  FROM {cleaned_bet_from} AS b
+                  LEFT JOIN (
+                    SELECT DISTINCT
+                      TRY_CAST(player_id AS BIGINT) AS player_id,
+                      TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id
+                    FROM read_parquet('{cmap_esc}')
+                    WHERE TRY_CAST(player_id AS BIGINT) IS NOT NULL
+                      AND TRIM(CAST(canonical_id AS VARCHAR)) <> ''
+                  ) AS c ON TRY_CAST(b."player_id" AS BIGINT) = c.player_id
+                  WHERE TRY_CAST(b."player_id" AS BIGINT) IN ({ids_sql})
+                    AND TRY_CAST(b."bet_id" AS DOUBLE) IS NOT NULL
+                    AND b."payout_complete_dtm" IS NOT NULL
+                ) TO '{part_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+                """,
+            )
+        finally:
+            con.close()
+        pool_parts.append(part)
+        if (chunk_idx + 1) % 20 == 0:
+            logger.info("[fe_derived] patron pool parts=%d (last_chunk_players=%d)", chunk_idx + 1, len(chunk))
+
+    _merge_fe_derived_batch_parquets(pool_parts, out_parquet=dst, duckdb_runtime=duckdb_runtime)
+    shutil.rmtree(pool_dir, ignore_errors=True)
+    return dst
+
+
+def _merge_fe_derived_batch_parquets(
+    batch_paths: list[Path],
+    *,
+    out_parquet: Path,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> None:
+    """Concatenate batch parquet parts into one output file."""
+
+    dst_esc = _path_esc(out_parquet)
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        if len(batch_paths) == 1:
+            single_esc = _path_esc(batch_paths[0])
+            con.execute(
+                f"COPY (SELECT * FROM read_parquet('{single_esc}')) "
+                f"TO '{dst_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
+            )
+        else:
+            paths_esc = "[" + ",".join(f"'{_path_esc(p)}'" for p in batch_paths) + "]"
+            con.execute(
+                f"COPY (SELECT * FROM read_parquet({paths_esc})) "
+                f"TO '{dst_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
+            )
+    finally:
+        con.close()
+
+
+def materialize_fe_derived_parquet(
+    *,
+    cleaned_bet_parquet: Path,
+    training_parquet_for_bet_ids: Path,
+    out_parquet: Path,
+    duckdb_runtime: DuckDbRuntimeConfig,
+    canonical_mapping_parquet: Path | None = None,
+    batch_size: int | None = None,
+) -> Path:
+    """Compute ``fe__*`` columns keyed by ``bet_id``; write standalone Parquet.
+
+    Args:
+        cleaned_bet_parquet: Hive-partition cleaned bet root (trainer default layout).
+        training_parquet_for_bet_ids: Step-3-style training parquet; used to derive
+            which ``canonical_id`` (via mapping) timelines to scan (reduces DuckDB
+            workload while including all ``player_id`` aliases per canonical).
+        out_parquet: Output path (written with Snappy compression).
+        duckdb_runtime: DuckDB PRAGMA preset.
+        canonical_mapping_parquet: Optional ``player_id``→``canonical_id`` map; defaults
+            to :func:`~trainer_hightier.utils.canonical_mapping.default_canonical_mapping_parquet_path`.
+        batch_size: Training ``bet_id`` rows per DuckDB window batch; defaults to
+            :data:`FE_DERIVED_FULL_MATERIALIZE_BATCH_SIZE`.
+
+    Returns:
+        Resolved ``out_parquet`` path.
+
+    Raises:
+        FileNotFoundError: If cleaned bet glob yields no readable Parquet, training
+            parquet is missing, or canonical mapping parquet is missing.
+    """
+
+    src_root = Path(cleaned_bet_parquet).resolve()
+    tp = Path(training_parquet_for_bet_ids).resolve()
+    dst = Path(out_parquet).resolve()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    cmap_path = (
+        Path(canonical_mapping_parquet).resolve()
+        if canonical_mapping_parquet is not None
+        else default_canonical_mapping_parquet_path().resolve()
+    )
+    if not tp.is_file():
+        raise FileNotFoundError(training_parquet_for_bet_ids)
+    if not cleaned_bet_dataset_has_any_parquet(src_root):
+        raise FileNotFoundError(f"No cleaned bet parquet under {src_root}")
+    if not cmap_path.is_file():
+        raise FileNotFoundError(
+            f"canonical_player_mapping parquet missing: {cmap_path}; "
+            "run trainer_hightier.utils.canonical_mapping materialization first."
+        )
+    cleaned_bet_from = resolved_cleaned_bet_read_parquet_sql(src_root)
+    cmap_esc = _path_esc(cmap_path).replace("'", "''")
+
+    effective_batch_size = int(
+        batch_size if batch_size is not None else FE_DERIVED_FULL_MATERIALIZE_BATCH_SIZE,
+    )
+    if effective_batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {effective_batch_size}")
+
+    batch_dir = dst.parent / f"{dst.stem}__fe_derived_batches"
+    if batch_dir.is_dir():
+        shutil.rmtree(batch_dir)
+    batch_dir.mkdir(parents=True, exist_ok=True)
+
+    player_ids = _collect_training_player_ids(
+        tp,
+        cleaned_bet_from=cleaned_bet_from,
+        cmap_esc=cmap_esc,
+        duckdb_runtime=duckdb_runtime,
+    )
+    pool_path = batch_dir / "patron_bet_pool.parquet"
+    logger.info("[fe_derived] building patron bet pool (%d player_ids)", len(player_ids))
+    _materialize_patron_bet_pool_parquet(
+        cleaned_bet_from=cleaned_bet_from,
+        cmap_esc=cmap_esc,
+        player_ids=player_ids,
+        out_parquet=pool_path,
+        duckdb_runtime=duckdb_runtime,
+    )
+    pool_esc = _path_esc(pool_path).replace("'", "''")
+    bet_from = f"read_parquet('{pool_esc}')"
+
+    batch_paths: list[Path] = []
+    batch_idx = 0
+    for bet_id_batch in _iter_training_bet_id_batches(
+        tp,
+        batch_size=effective_batch_size,
+        duckdb_runtime=duckdb_runtime,
+    ):
+        part = batch_dir / f"part_{batch_idx:06d}.parquet"
+        _write_fe_derived_batch_parquet(
+            bet_id_batch=bet_id_batch,
+            bet_from=bet_from,
+            cmap_esc=cmap_esc,
+            out_parquet=part,
+            duckdb_runtime=duckdb_runtime,
+        )
+        batch_paths.append(part)
+        batch_idx += 1
+        if batch_idx % 10 == 0:
+            logger.info(
+                "[fe_derived] materialized %d batches (last_part=%s rows=%d)",
+                batch_idx,
+                part.name,
+                len(bet_id_batch),
+            )
+
+    if not batch_paths:
+        raise ValueError(
+            f"fe_derived materialization produced no rows from {training_parquet_for_bet_ids}",
+        )
+
+    _merge_fe_derived_batch_parquets(batch_paths, out_parquet=dst, duckdb_runtime=duckdb_runtime)
+    shutil.rmtree(batch_dir, ignore_errors=True)
+    logger.info(
+        "[fe_derived] wrote %s (%d batches, batch_size=%d)",
+        dst.name,
+        len(batch_paths),
+        effective_batch_size,
+    )
     return dst
 
 
@@ -925,6 +1298,7 @@ src AS (
     TRIM(CAST(b."canonical_id" AS VARCHAR)) AS canonical_id,
     TRY_CAST(b."session_id" AS BIGINT) AS session_id,
     TRY_CAST(b."table_id" AS BIGINT) AS table_id,
+    TRY_CAST(b."game_id" AS BIGINT) AS game_id,
     TRY_CAST(b."gaming_day_event" AS DATE) AS gaming_day_event,
     CAST(b."payout_complete_dtm" AS TIMESTAMPTZ) AS pcd,
     TRY_CAST(b."wager" AS DOUBLE) AS wager,
@@ -953,6 +1327,7 @@ src_lagged AS (
     LAG(table_id) OVER w_target AS lag1_table_id,
     LAG(payout_odds) OVER w_target AS lag1_payout_odds,
     LAG(wager) OVER w_target AS lag1_wager,
+    LAG(casino_win) OVER w_target AS lag1_casino_win,
     COUNT(*) OVER w_target_day_prior AS bets_today_so_far,
     SUM(wager) OVER w_target_day_prior AS wager_today_so_far,
     MIN(pcd) OVER w_target_day_inclusive AS first_pcd_today
@@ -970,7 +1345,16 @@ src_lagged AS (
 ),
 src_with_iv AS (
   SELECT s.*,
-    EXTRACT(epoch FROM (pcd - lag1_pcd)) AS interarrival_sec
+    EXTRACT(epoch FROM (pcd - lag1_pcd)) AS interarrival_sec,
+    SUM(CASE WHEN COALESCE(casino_win, 0) <= 0 THEN 1 ELSE 0 END)
+      OVER (
+        PARTITION BY target_bet_id ORDER BY pcd, bet_id
+        ROWS UNBOUNDED PRECEDING
+      ) AS _loss_streak_grp,
+    CASE
+      WHEN lag1_casino_win > 0 AND lag1_wager > 1e-9 AND wager >= 2.0 * lag1_wager THEN 1.0
+      ELSE 0.0
+    END AS loss_then_double_flag
   FROM src_lagged AS s
 ),
 ordered AS (
@@ -984,6 +1368,7 @@ ordered AS (
     COALESCE(SUM(casino_win) OVER w1h_peer, 0.0) AS cw_sum_w1h_peer,
     COALESCE(SUM(theo_win) OVER w1h, 0.0) AS tw_sum_w1h,
     COALESCE(SUM(theo_win) OVER w1h_peer, 0.0) AS tw_sum_w1h_peer,
+    COALESCE(SUM(CASE WHEN casino_win > 0 THEN 1 ELSE 0 END) OVER w1h, 0) AS loss_cnt_w1h,
     COUNT(*) OVER w1h AS cnt_w1h,
     COUNT(*) OVER w1d AS fe__bets_cnt__w1d_raw,
     COALESCE(SUM(wager) OVER w1d, 0.0) AS fe__wager_sum__w1d_raw,
@@ -1008,7 +1393,34 @@ ordered AS (
     AVG(payout_odds) OVER w7d AS payout_odds_avg_w7d,
     STDDEV_POP(payout_odds) OVER w7d AS payout_odds_std_w7d,
     MAX(wager) OVER w1h AS max_wager_w1h,
-    MAX(payout_odds) OVER w1h AS max_payout_odds_w1h
+    MAX(payout_odds) OVER w1h AS max_payout_odds_w1h,
+    CAST(
+      CASE
+        WHEN COALESCE(casino_win, 0) > 0 THEN ROW_NUMBER() OVER (
+          PARTITION BY target_bet_id, _loss_streak_grp ORDER BY pcd, bet_id
+        )
+        ELSE 0
+      END AS DOUBLE
+    ) AS fe__outcome__consecutive_loss_streak,
+    CASE
+      WHEN COALESCE(SUM(CASE WHEN casino_win > 0 THEN 1 ELSE 0 END) OVER w1h, 0) > 0
+      THEN CAST(
+        SUM(loss_then_double_flag) OVER w1h
+        / COALESCE(SUM(CASE WHEN casino_win > 0 THEN 1 ELSE 0 END) OVER w1h, 0)
+        AS DOUBLE)
+      ELSE CAST(NULL AS DOUBLE)
+    END AS fe__outcome__loss_then_double_ratio__w1h,
+    CAST(
+      AVG(
+        CASE
+          WHEN lag1_casino_win > 0 AND lag1_wager > 1e-9 THEN wager / lag1_wager
+          ELSE NULL
+        END
+      ) OVER w1h AS DOUBLE
+    ) AS fe__outcome__wager_after_loss_step_ratio__w1h,
+    REGR_SLOPE(wager, EXTRACT(epoch FROM pcd)) OVER w1h_peer AS wager_regr_slope_w1h_peer,
+    AVG(wager) OVER w_last3 AS wager_avg_last3,
+    AVG(wager) OVER w_prior3 AS wager_avg_prior3
   FROM src_with_iv AS s
   WINDOW
     w5m AS (
@@ -1042,6 +1454,14 @@ ordered AS (
     w30d AS (
       PARTITION BY target_bet_id ORDER BY pcd
       RANGE BETWEEN INTERVAL '30 DAY' PRECEDING AND INTERVAL '1 MICROSECOND' PRECEDING
+    ),
+    w_last3 AS (
+      PARTITION BY target_bet_id ORDER BY pcd, bet_id
+      ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    ),
+    w_prior3 AS (
+      PARTITION BY target_bet_id ORDER BY pcd, bet_id
+      ROWS BETWEEN 5 PRECEDING AND 3 PRECEDING
     )
 )
 SELECT
@@ -1066,6 +1486,9 @@ SELECT
       AS DOUBLE)
     ELSE CAST(NULL AS DOUBLE)
   END AS fe__outcome__casino_win_to_theo_ratio__w1h,
+  fe__outcome__consecutive_loss_streak,
+  fe__outcome__loss_then_double_ratio__w1h,
+  fe__outcome__wager_after_loss_step_ratio__w1h,
   CASE
     WHEN fe__wager_sum__w1d_raw > 1e-9
     THEN CAST(fe__wager_sum__w15m_raw / fe__wager_sum__w1d_raw AS DOUBLE)
@@ -1102,6 +1525,18 @@ SELECT
     THEN CAST(std_wager_w1h / avg_wager_w1h AS DOUBLE)
     ELSE CAST(NULL AS DOUBLE)
   END AS fe__stake__wager_cv__w1h,
+  CASE
+    WHEN wager_regr_slope_w1h_peer IS NOT NULL
+       AND avg_wager_w1h IS NOT NULL AND avg_wager_w1h > 1e-9
+    THEN CAST(wager_regr_slope_w1h_peer / avg_wager_w1h AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__stake__wager_trend_slope__w1h,
+  CASE
+    WHEN wager_avg_prior3 IS NOT NULL AND wager_avg_prior3 > 1e-9
+       AND wager_avg_last3 IS NOT NULL
+    THEN CAST(wager_avg_last3 / wager_avg_prior3 AS DOUBLE)
+    ELSE CAST(NULL AS DOUBLE)
+  END AS fe__stake__wager_last3_vs_prior3_ratio__w1h,
   CASE
     WHEN avg_abs_wager_w7d IS NOT NULL AND avg_abs_wager_w7d > 1e-12 AND std_wager_w7d IS NOT NULL
     THEN CAST(std_wager_w7d / avg_abs_wager_w7d AS DOUBLE)
@@ -1172,7 +1607,17 @@ SELECT
     WHEN lag1_payout_odds IS NOT NULL AND lag1_payout_odds > 1e-9 AND payout_odds IS NOT NULL
     THEN CAST(payout_odds / lag1_payout_odds AS DOUBLE)
     ELSE CAST(NULL AS DOUBLE)
-  END AS fe__odds__payout_odds_step_ratio
+  END AS fe__odds__payout_odds_step_ratio,
+  CAST(EXTRACT(hour FROM pcd AT TIME ZONE 'Asia/Hong_Kong') AS DOUBLE) AS fe__clock__hour_of_day,
+  CAST(EXTRACT(isodow FROM pcd AT TIME ZONE 'Asia/Hong_Kong') AS DOUBLE) AS fe__clock__day_of_week,
+  CASE
+    WHEN EXTRACT(isodow FROM pcd AT TIME ZONE 'Asia/Hong_Kong') >= 6 THEN 1.0
+    ELSE 0.0
+  END AS fe__clock__is_weekend,
+  CASE
+    WHEN EXTRACT(hour FROM pcd AT TIME ZONE 'Asia/Hong_Kong') BETWEEN 0 AND 5 THEN 1.0
+    ELSE 0.0
+  END AS fe__clock__is_late_night
 FROM ordered
 WHERE target_bet_id IN (SELECT bet_id FROM tid)
   AND bet_id = target_bet_id
@@ -1243,6 +1688,7 @@ def _prepare_pool_for_fe_derived(pool: pd.DataFrame) -> pd.DataFrame:
         "canonical_id",
         "session_id",
         "table_id",
+        "game_id",
         "gaming_day_event",
         "payout_complete_dtm",
         "wager",
