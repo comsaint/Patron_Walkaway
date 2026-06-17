@@ -7,13 +7,14 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from trainer_hightier.config import SCORER_POLL_INTERVAL_SECONDS
+from trainer_hightier.config import DuckDbRuntimeConfig, SCORER_POLL_INTERVAL_SECONDS
 from trainer_hightier.player_game_grain import (
     PLAYER_GAME_LABEL_COLUMN,
     PLAYER_GAME_PCD_COLUMN,
     PLAYER_GAME_READY_TS_COLUMN,
     aggregate_bets_to_player_game_rows,
     compute_serving_due_ts,
+    enrich_player_game_splits_with_baseline_bet_features,
     materialize_player_game_split_parquet,
     summarize_player_game_dq,
 )
@@ -216,3 +217,60 @@ def test_materialize_player_game_split_parquet_writes_compat_columns(tmp_path: P
     assert out.iloc[0]["walkaway_label"] == out.iloc[0][PLAYER_GAME_LABEL_COLUMN]
     assert out.iloc[0]["payout_complete_dtm"] == out.iloc[0][PLAYER_GAME_READY_TS_COLUMN]
     assert out.iloc[0][PLAYER_GAME_READY_TS_COLUMN] == pd.Timestamp("2026-05-28 22:55:30+08:00")
+
+
+def _write_split_parquet(path: Path, rows: list[dict[str, object]]) -> None:
+    """Write one minimal split parquet for enrich tests."""
+
+    pd.DataFrame(rows).to_parquet(path, index=False)
+
+
+def test_enrich_baseline_bet_features_joins_rep_bet_columns(tmp_path: Path) -> None:
+    """Baseline bet features attach via representative_bet_id; txn columns stay from PG."""
+
+    pg_dir = tmp_path / "pg_txn_splits"
+    bet_dir = tmp_path / "bet_splits"
+    out_dir = tmp_path / "baseline_parity_splits"
+    pg_dir.mkdir()
+    bet_dir.mkdir()
+
+    pg_row = {
+        "player_id": 10,
+        "game_id": 100,
+        "representative_bet_id": 2,
+        "player_game_label": 1,
+        "txn__cash_out_cnt__w1h": 9.0,
+    }
+    bet_rows = [
+        {"bet_id": 1, "wager": 100.0},
+        {"bet_id": 2, "wager": 3000.0},
+    ]
+    for split in ("train", "val", "test"):
+        _write_split_parquet(pg_dir / f"{split}.parquet", [pg_row])
+        _write_split_parquet(bet_dir / f"{split}.parquet", bet_rows)
+
+    meta = enrich_player_game_splits_with_baseline_bet_features(
+        pg_dir,
+        bet_dir,
+        out_dir,
+        feature_columns=("wager", "txn__cash_out_cnt__w1h"),
+        duckdb_runtime=DuckDbRuntimeConfig(memory_limit="512MB"),
+    )
+    out = pd.read_parquet(out_dir / "val.parquet")
+    assert meta["join_grain"] == "representative_bet_id = bet_id"
+    assert float(out.iloc[0]["wager"]) == 3000.0
+    assert float(out.iloc[0]["txn__cash_out_cnt__w1h"]) == 9.0
+    assert meta["split_stats"]["val"]["output_player_games"] == 1
+
+
+def test_enrich_baseline_bet_features_requires_feature_columns(tmp_path: Path) -> None:
+    """Empty feature column tuple fails fast."""
+
+    with pytest.raises(ValueError, match="requires feature_columns"):
+        enrich_player_game_splits_with_baseline_bet_features(
+            tmp_path / "pg",
+            tmp_path / "bet",
+            tmp_path / "out",
+            feature_columns=(),
+            duckdb_runtime=DuckDbRuntimeConfig(memory_limit="512MB"),
+        )
