@@ -51,10 +51,17 @@ def test_mid_slow_bounds_use_explicit_serving_day() -> None:
 
 
 def test_label_payout_bounds_extends_lookahead() -> None:
-    """extended_end includes LABEL_LOOKAHEAD + WALKAWAY_GAP beyond window_end."""
+    """extended_end is window_end + label_lookahead_min (gap + horizon)."""
+    from trainer_hightier.config import DEFAULT_WALKAWAY_LABEL_CONTRACT
+
     bets = _fake_bets()
-    window_end, extended_end = _label_payout_bounds(bets)
+    window_end, extended_end = _label_payout_bounds(
+        bets,
+        label_contract=DEFAULT_WALKAWAY_LABEL_CONTRACT,
+    )
     assert extended_end > window_end
+    delta_min = (pd.Timestamp(extended_end) - pd.Timestamp(window_end)).total_seconds() / 60.0
+    assert abs(delta_min - 45.0) < 1e-6
 
 
 def test_payout_bound_hk_naive_mixed_tz_compare() -> None:

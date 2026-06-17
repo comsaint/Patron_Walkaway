@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import warnings
 from pathlib import Path
 from unittest.mock import patch
 
@@ -42,6 +43,25 @@ def _file_handler_for_path(root: logging.Logger, path: Path) -> logging.FileHand
     return None
 
 
+def _handler_order_file_before_stream(root: logging.Logger, log_path: Path) -> bool:
+    """Return True when the deploy file handler precedes the stderr stream handler."""
+    file_idx: int | None = None
+    stream_idx: int | None = None
+    for idx, handler in enumerate(root.handlers):
+        if isinstance(handler, deploy_main._FlushingFileHandler):
+            try:
+                if str(Path(handler.baseFilename).resolve()) == str(log_path.resolve()):
+                    file_idx = idx
+            except OSError:
+                continue
+        elif isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+            if getattr(handler, "stream", None) is sys.stderr:
+                stream_idx = idx
+    if file_idx is None or stream_idx is None:
+        return False
+    return file_idx < stream_idx
+
+
 @pytest.fixture(autouse=True)
 def _isolate_root_logging() -> None:
     """Temporarily detach root handlers so deploy bootstrap counts stay stable."""
@@ -59,6 +79,29 @@ def _isolate_root_logging() -> None:
     root.setLevel(saved_level)
 
 
+def test_configure_deploy_log_noise_filters_lowers_feast_verbosity() -> None:
+    feast_logger = logging.getLogger("feast.infra.registry")
+    prior = feast_logger.level
+    deploy_main._configure_deploy_log_noise_filters()
+    assert feast_logger.level == logging.WARNING
+    feast_logger.setLevel(prior)
+
+
+def test_configure_deploy_log_noise_filters_suppresses_copy_deprecation_message() -> None:
+    from trainer_hightier.serving import ch_adapter
+
+    # Other tests may have applied the filters already; pytest then restores the global
+    # warnings filters, so force a re-apply past the idempotency flag.
+    ch_adapter._LOG_NOISE_FILTERS_APPLIED = False
+    deploy_main._configure_deploy_log_noise_filters()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.warn(
+            "The copy keyword is deprecated and will be removed in a future version.",
+            FutureWarning,
+        )
+    assert len(caught) == 0
+
+
 def test_init_deploy_logging_creates_stream_and_file_handlers(
     tmp_path: Path,
     bundle_rel: dict[str, str],
@@ -74,6 +117,40 @@ def test_init_deploy_logging_creates_stream_and_file_handlers(
     assert log_path.is_file()
     assert any(getattr(h, "stream", None) is sys.stderr for h in _stream_handlers(root))
     assert _file_handler_for_path(root, log_path) is not None
+    assert isinstance(_file_handler_for_path(root, log_path), deploy_main._FlushingFileHandler)
+    assert _handler_order_file_before_stream(root, log_path)
+
+
+def test_init_deploy_logging_writes_to_file_without_manual_flush(
+    tmp_path: Path,
+    bundle_rel: dict[str, str],
+) -> None:
+    """Flushing file handler persists records without an explicit handler.flush()."""
+    log_path = deploy_main._init_deploy_logging(
+        tmp_path,
+        bundle_rel,
+        level=logging.INFO,
+    )
+    assert log_path is not None
+    token = "deploy_logging_flush_marker"
+    logging.getLogger("test.deploy.logging.flush").info(token)
+    assert token in log_path.read_text(encoding="utf-8")
+
+
+def test_disable_windows_console_quick_edit_skips_non_windows() -> None:
+    with patch.object(deploy_main.sys, "platform", "linux"):
+        assert deploy_main._disable_windows_console_quick_edit() is False
+
+
+def test_disable_windows_console_quick_edit_windows_success() -> None:
+    with patch.object(deploy_main.sys, "platform", "win32"):
+        with patch("ctypes.windll") as mock_windll:
+            mock_kernel32 = mock_windll.kernel32
+            mock_kernel32.GetStdHandle.return_value = 7
+            mock_kernel32.GetConsoleMode.return_value = 1
+            mock_kernel32.SetConsoleMode.return_value = 1
+            assert deploy_main._disable_windows_console_quick_edit() is True
+            mock_kernel32.SetConsoleMode.assert_called_once()
 
 
 def test_init_deploy_logging_idempotent_no_duplicate_handlers(

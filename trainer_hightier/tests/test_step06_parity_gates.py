@@ -24,7 +24,7 @@ def test_step6_config_defaults_deploy_e2e_and_full_short_replay() -> None:
     cfg = Step6ParityConfig()
     assert cfg.run_short_full_replay_in_step6 is True
     assert cfg.step6_deploy_e2e_enabled is True
-    assert cfg.step6_total_timeout_seconds == 600
+    assert cfg.step6_total_timeout_seconds == 1800
     assert cfg.step6_auto_retry_once is True
     assert cfg.hard_fail_deploy_e2e_gate is True
     assert cfg.step6_deploy_e2e_max_bets == 500
@@ -127,6 +127,249 @@ def test_run_production_feature_replay_uses_training_mid_snapshot_for_parity(
         batch_size=1,
     )
     assert captured.get("use_training_mid_snapshot_for_parity") is True
+
+
+def test_raw_source_w1h_sanity_passes_gaming_day_event_to_pool_builder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Raw w1h sanity must carry gaming_day_event for compute_scoring_bounds_for_bets."""
+    import pandas as pd
+
+    mod = _load_step06_module()
+    col = mod.RAW_W1H_SANITY_COLUMN
+    test_df = pd.DataFrame(
+        {
+            "bet_id": [1.0],
+            "player_id": [100],
+            "payout_complete_dtm": pd.to_datetime(["2026-05-01 12:00:00"]).tz_localize(
+                "Asia/Hong_Kong",
+            ),
+            "gaming_day_event": pd.to_datetime(["2026-05-01"]),
+            col: [5.0],
+        },
+    )
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    map_p = tmp_path / "map.parquet"
+    pd.DataFrame({"player_id": [100], "canonical_id": ["c100"]}).to_parquet(map_p, index=False)
+    captured: dict[str, list[str]] = {}
+
+    def _fake_build_pool(bets: pd.DataFrame, **_kwargs: object) -> pd.DataFrame:
+        captured["columns"] = list(bets.columns)
+        raise ValueError(
+            "[raw_source_sanity] raw partition pool empty; check raw_partition_dir and dates",
+        )
+
+    monkeypatch.setattr(mod, "build_pool_from_raw_partitions", _fake_build_pool)
+    with pytest.raises(ValueError, match="raw partition pool empty"):
+        mod.run_raw_source_w1h_sanity_check(
+            test_df,
+            raw_partition_dir=raw_dir,
+            mapping_parquet=map_p,
+        )
+    assert "gaming_day_event" in captured["columns"]
+
+
+def test_raw_source_w1h_sanity_fails_when_no_rows_compared(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enabled raw-source sanity must not pass with zero eligible comparisons."""
+    import pandas as pd
+
+    mod = _load_step06_module()
+    col = mod.RAW_W1H_SANITY_COLUMN
+    test_df = pd.DataFrame(
+        {
+            "bet_id": [1.0],
+            "player_id": [100],
+            "payout_complete_dtm": pd.to_datetime(["2026-05-01 12:00:00"]).tz_localize(
+                "Asia/Hong_Kong",
+            ),
+            "gaming_day_event": pd.to_datetime(["2026-05-01"]),
+            col: [5.0],
+        },
+    )
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    map_p = tmp_path / "map.parquet"
+    pd.DataFrame({"player_id": [100], "canonical_id": ["c100"]}).to_parquet(map_p, index=False)
+    from trainer_hightier.serving import feature_builder
+
+    monkeypatch.setattr(mod, "build_pool_from_raw_partitions", lambda *_a, **_k: pd.DataFrame())
+    monkeypatch.setattr(feature_builder, "attach_canonical_id", lambda df, **_k: df)
+    monkeypatch.setattr(feature_builder, "attach_synthetic_etl_and_prediction_visible", lambda df: df)
+    monkeypatch.setattr(
+        feature_builder,
+        "attach_trial_bet_behavior_1h",
+        lambda staged, *_a, **_k: staged.assign(**{col: [pd.NA]}),
+    )
+
+    report = mod.run_raw_source_w1h_sanity_check(
+        test_df,
+        raw_partition_dir=raw_dir,
+        mapping_parquet=map_p,
+    )
+
+    assert report["verdict"] == "fail"
+    assert report["n_rows_compared"] == 0
+    assert "0 eligible rows" in report["issues"][0]
+
+
+def test_raw_source_w1h_sanity_fails_on_severe_undercount(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TA-WP-4.9: raw recompute >> training ``bet__bets_cnt__w1h`` must fail (e.g. 125 vs 5)."""
+    import pandas as pd
+
+    mod = _load_step06_module()
+    col = mod.RAW_W1H_SANITY_COLUMN
+    test_df = pd.DataFrame(
+        {
+            "bet_id": [1.0],
+            "player_id": [100],
+            "payout_complete_dtm": pd.to_datetime(["2026-05-01 12:00:00"]).tz_localize(
+                "Asia/Hong_Kong",
+            ),
+            "gaming_day_event": pd.to_datetime(["2026-05-01"]),
+            col: [5.0],
+        },
+    )
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    map_p = tmp_path / "map.parquet"
+    pd.DataFrame({"player_id": [100], "canonical_id": ["c100"]}).to_parquet(map_p, index=False)
+    from trainer_hightier.serving import feature_builder
+
+    monkeypatch.setattr(mod, "build_pool_from_raw_partitions", lambda bets, **_k: bets.copy())
+    monkeypatch.setattr(feature_builder, "attach_canonical_id", lambda df, **_k: df)
+    monkeypatch.setattr(feature_builder, "attach_synthetic_etl_and_prediction_visible", lambda df: df)
+    monkeypatch.setattr(
+        feature_builder,
+        "attach_trial_bet_behavior_1h",
+        lambda staged, _pool, **_k: staged.assign(**{col: [125.0]}),
+    )
+
+    report = mod.run_raw_source_w1h_sanity_check(
+        test_df,
+        raw_partition_dir=raw_dir,
+        mapping_parquet=map_p,
+    )
+
+    assert report["verdict"] == "fail"
+    assert report["n_rows_compared"] == 1
+    assert report["n_severe_undercount"] == 1
+    assert "severe training under-count" in report["issues"][0]
+
+
+def test_run_pre_train_feature_gate_fails_when_raw_sanity_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TA-WP-4.10: Step 4.5 gate must fail when raw-source sanity fails."""
+    import pandas as pd
+
+    from trainer_hightier.config import PreTrainFeatureGateConfig
+
+    mod = _load_step06_module()
+    col = mod.RAW_W1H_SANITY_COLUMN
+    test_p = tmp_path / "test.parquet"
+    pd.DataFrame(
+        {
+            "bet_id": [1.0],
+            "is_back_bet": [0],
+            "bet_type": ["BANKER"],
+            "type_of_bet": ["MAIN_BET"],
+            "payout_complete_dtm": pd.to_datetime(["2026-05-01 12:00:00"]).tz_localize(
+                "Asia/Hong_Kong",
+            ),
+            "gaming_day_event": pd.to_datetime(["2026-05-01"]),
+            "session_id": [10],
+            "player_id": [100],
+            "table_id": [2],
+            "position_idx": [1],
+            "wager": [10.0],
+            "casino_win": [0.0],
+            "payout_odds": [1.0],
+            "status": ["WIN"],
+            col: [5.0],
+        },
+    ).to_parquet(test_p, index=False)
+
+    def _mock_prod(bets: pd.DataFrame, **kwargs: object) -> pd.DataFrame:
+        cols = tuple(kwargs.get("trial_columns", ())) + tuple(kwargs.get("fe_columns", ()))
+        return bets[["bet_id"]].assign(**{c: [5.0] for c in cols})
+
+    monkeypatch.setattr(
+        "trainer_hightier.serving.short_term_scoring_context.build_short_term_features_for_batch",
+        _mock_prod,
+    )
+    monkeypatch.setattr(
+        mod,
+        "run_raw_source_w1h_sanity_check",
+        lambda *_a, **_k: {
+            "verdict": "fail",
+            "issues": ["severe undercount mocked"],
+            "n_rows_compared": 1,
+        },
+    )
+
+    report = mod.run_pre_train_feature_gate(
+        test_p,
+        columns=(col,),
+        cleaned_bet_root=tmp_path / "cleaned",
+        mapping_parquet=tmp_path / "map.parquet",
+        gate_cfg=PreTrainFeatureGateConfig(run_pre_train_gate=True, max_rows=100),
+        raw_partition_dir=tmp_path / "raw",
+    )
+
+    assert report["verdict"] == "fail"
+    assert "severe undercount mocked" in report["issues"][0]
+    assert report["raw_source_w1h_sanity"]["verdict"] == "fail"
+
+
+def test_maybe_run_pre_train_feature_gate_raises_on_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TA-WP-4.10: trainer must halt before Step 5 when Step 4.5 gate fails."""
+    import pandas as pd
+
+    from dataclasses import replace
+
+    from trainer_hightier import trainer as tr_mod
+    from trainer_hightier.config import PreTrainFeatureGateConfig, Step4SplitConfig
+
+    mod = _load_step06_module()
+    splits = tmp_path / "splits"
+    splits.mkdir()
+    pd.DataFrame({"bet_id": [1.0]}).to_parquet(splits / "test.parquet", index=False)
+
+    monkeypatch.setattr(tr_mod, "_load_step06_verify_module", lambda: mod)
+    monkeypatch.setattr(tr_mod, "_pre_train_gate_columns", lambda _a: (mod.RAW_W1H_SANITY_COLUMN,))
+    monkeypatch.setattr(
+        mod,
+        "run_pre_train_feature_gate",
+        lambda *_a, **_k: {"verdict": "fail", "issues": ["raw sanity fail"]},
+    )
+    monkeypatch.setattr(
+        mod,
+        "default_pre_train_gate_json_path",
+        lambda: tmp_path / "pre_train_feature_gate.json",
+    )
+
+    args = tr_mod.HighTierTrainArgs(
+        output_dir=tmp_path / "out",
+        run_step4=True,
+        pre_train_gate=PreTrainFeatureGateConfig(run_pre_train_gate=True),
+        step4_split=replace(Step4SplitConfig(), splits_output_dir=splits),
+    )
+    metrics: dict[str, object] = {}
+    with pytest.raises(RuntimeError, match="pre-train feature gate failed"):
+        tr_mod._maybe_run_pre_train_feature_gate(args, metrics=metrics)
+    assert metrics["pre_train_feature_gate_verdict"] == "fail"
 
 
 def test_trainer_step6_fails_after_retry_exhausted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

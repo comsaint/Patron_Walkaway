@@ -2,8 +2,10 @@
 
 No standalone CLI — invoked from :mod:`trainer_hightier.trainer`. Reads
 ``train.parquet`` / ``val.parquet`` / ``test.parquet`` under the Step 4 splits
-directory; picks a validation threshold under ``HighTierObjectiveConfig.min_precision``;
-writes ``model.pkl`` + ``training_metrics.json`` under the given ``output_dir`` (bundle dir when called from ``run_training``).
+directory; picks a validation threshold under ``HighTierObjectiveConfig`` (default:
+alert-band precision at 1–2 alerts/hour); writes ``model.pkl`` under the given ``output_dir`` (bundle dir when called from ``run_training``).
+``training_metrics.json`` is written when ``persist_training_metrics=True`` (feature experiments);
+main trainer passes ``False`` and uses :class:`~trainer_hightier.reporting.writer.BundleReportWriter`.
 
 Numeric prefix matches steps 1–4; use :func:`importlib.import_module` if importing
 from code.
@@ -23,13 +25,37 @@ from typing import Any, Final
 import duckdb
 import lightgbm as lgb
 import numpy as np
-import optuna
-from optuna.trial import TrialState
+
+try:
+    import optuna
+    from optuna.trial import TrialState
+except ModuleNotFoundError:  # serving bundles omit the "training" extra; only needed when skip_optuna=False
+    optuna = None  # type: ignore[assignment]
+    TrialState = None  # type: ignore[assignment]
 import pandas as pd
 import pyarrow.parquet as pq
-from sklearn.metrics import average_precision_score
+from trainer_hightier.evaluation.alert_band_objective import (
+    alert_band_meta_dict,
+    evaluate_alert_band_on_candidates,
+)
+from trainer_hightier.reporting.writer import slim_training_metrics_body
+from trainer_hightier.evaluation.metrics_blocks import (
+    metrics_at_threshold,
+    split_metrics_block,
+)
+from trainer_hightier.evaluation.player_alert_policy import (
+    build_player_alert_policy_metadata,
+    operational_simulated_metrics_block,
+)
 
-from trainer_hightier.config import DuckDbRuntimeConfig, Step5TrainConfig
+from trainer_hightier.config import (
+    DuckDbRuntimeConfig,
+    HighTierObjectiveConfig,
+    OptunaFloatParamRange,
+    OptunaIntParamRange,
+    Step5OptunaSearchConfig,
+    Step5TrainConfig,
+)
 from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
 
 logger = logging.getLogger(__name__)
@@ -38,9 +64,18 @@ _PACKAGE_ROOT = Path(__file__).resolve().parent
 
 PAYOUT_TS_COLUMN: Final[str] = "payout_complete_dtm"
 LABEL_COLUMN: Final[str] = "walkaway_label"
+PLAYER_ID_COLUMN: Final[str] = "player_id"
+GAME_ID_COLUMN: Final[str] = "game_id"
+BET_ID_COLUMN: Final[str] = "bet_id"
+ALERT_TS_COLUMN: Final[str] = "alert_ts"
 CAT_COLUMNS: Final[frozenset[str]] = frozenset({"bet_type", "type_of_bet"})
+STEP5_GROUP_COLUMNS: Final[frozenset[str]] = frozenset({PLAYER_ID_COLUMN, GAME_ID_COLUMN})
+EVALUATION_GRAIN_PLAYER_GAME: Final[str] = "player_game"
+PLAYER_GAME_SCORE_AGGREGATION: Final[str] = "top3_mean"
 
 DEFAULT_MODEL_FILENAME: Final[str] = "model.pkl"
+_VAL_ALERTS_PER_HR_SOFT_CAP: Final[float] = 3.0
+_VAL_ALERTS_PENALTY_WEIGHT: Final[float] = 0.005
 DEFAULT_METRICS_FILENAME: Final[str] = "training_metrics.json"
 
 
@@ -64,6 +99,23 @@ class Step5Result:
     metrics_path: Path
     report: dict[str, Any]
     threshold: float
+
+
+@dataclass(frozen=True)
+class PlayerGameAggregationResult:
+    """Bet rows aggregated to ``player_id + game_id`` for evaluation."""
+
+    y_true: np.ndarray
+    scores: np.ndarray
+    excluded_bets: int
+    player_game_count: int
+    bet_count: int
+    candidates: pd.DataFrame
+
+
+# Backward-compatible aliases for unit tests.
+_metrics_at_threshold = metrics_at_threshold
+_split_metrics_block = split_metrics_block
 
 
 def split_window_hours_from_parquet(
@@ -117,9 +169,149 @@ def _validate_parquet_schema(parquet_path: Path, required: frozenset[str]) -> No
 
 
 def _load_split_frame(parquet_path: Path, *, feature_columns: tuple[str, ...]) -> pd.DataFrame:
-    cols = list(feature_columns) + [LABEL_COLUMN, PAYOUT_TS_COLUMN]
+    cols = list(feature_columns) + [
+        LABEL_COLUMN,
+        PAYOUT_TS_COLUMN,
+        PLAYER_ID_COLUMN,
+        GAME_ID_COLUMN,
+        BET_ID_COLUMN,
+    ]
     _validate_parquet_schema(parquet_path, frozenset(cols))
     return pd.read_parquet(Path(parquet_path).resolve(), columns=cols)
+
+
+def _empty_player_game_candidates() -> pd.DataFrame:
+    """Return an empty player-game candidate frame with the expected schema."""
+
+    return pd.DataFrame(
+        columns=[
+            PLAYER_ID_COLUMN,
+            GAME_ID_COLUMN,
+            "player_game_score",
+            "player_game_label",
+            ALERT_TS_COLUMN,
+            BET_ID_COLUMN,
+        ],
+    )
+
+
+def _coerce_group_id_series(series: pd.Series) -> pd.Series:
+    """Coerce identifier columns to nullable ``Int64`` for stable player-game grouping."""
+
+    if pd.api.types.is_integer_dtype(series.dtype):
+        return series.astype("Int64")
+    return pd.to_numeric(series, errors="coerce").astype("Int64")
+
+
+def top3_mean_bet_scores(values: np.ndarray) -> float:
+    """Return mean of the highest up-to-3 bet scores in one player-game group."""
+
+    vals = np.asarray(values, dtype=np.float64).reshape(-1)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return float("nan")
+    top = np.sort(vals)[-min(3, int(vals.size)) :]
+    return float(np.mean(top))
+
+
+def aggregate_bets_to_player_game(
+    df: pd.DataFrame,
+    scores: np.ndarray,
+    *,
+    split_name: str,
+) -> PlayerGameAggregationResult:
+    """Aggregate bet-level scores/labels to one row per ``player_id + game_id``.
+
+    Score uses ``top3_mean`` (mean of highest up-to-3 bet scores); label uses
+    ``max`` (any positive within the game). Representative ``alert_ts`` / ``bet_id``
+    come from the chronologically last bet in the group. Rows with null keys or
+    non-finite scores are excluded with a warning.
+    """
+
+    if len(df) != int(len(scores)):
+        raise ValueError(
+            f"aggregate_bets_to_player_game: df length {len(df)} != scores length {len(scores)} "
+            f"(split={split_name!r})",
+        )
+    need_cols = STEP5_GROUP_COLUMNS | {
+        LABEL_COLUMN,
+        PAYOUT_TS_COLUMN,
+        BET_ID_COLUMN,
+    }
+    for col in need_cols:
+        if col not in df.columns:
+            raise ValueError(
+                f"aggregate_bets_to_player_game missing column {col!r}; "
+                f"split={split_name!r}, got {list(df.columns)!r}",
+            )
+    work = df[
+        [PLAYER_ID_COLUMN, GAME_ID_COLUMN, LABEL_COLUMN, PAYOUT_TS_COLUMN, BET_ID_COLUMN]
+    ].copy()
+    work["_score"] = np.asarray(scores, dtype=np.float64).reshape(-1)
+    work[PLAYER_ID_COLUMN] = _coerce_group_id_series(work[PLAYER_ID_COLUMN])
+    work[GAME_ID_COLUMN] = _coerce_group_id_series(work[GAME_ID_COLUMN])
+    lbl = pd.to_numeric(work[LABEL_COLUMN], errors="coerce")
+    alert_ts = pd.to_datetime(work[PAYOUT_TS_COLUMN], errors="coerce")
+    valid = (
+        work[PLAYER_ID_COLUMN].notna()
+        & work[GAME_ID_COLUMN].notna()
+        & lbl.notna()
+        & alert_ts.notna()
+        & np.isfinite(work["_score"].to_numpy())
+    )
+    excluded = int((~valid).sum())
+    if excluded > 0:
+        logger.warning(
+            "Step 5 %s: excluded %d bet rows with null player_id/game_id/label/"
+            "payout_complete_dtm or non-finite score",
+            split_name,
+            excluded,
+        )
+    work = work.loc[valid].copy()
+    if work.empty:
+        return PlayerGameAggregationResult(
+            y_true=np.array([], dtype=np.int8),
+            scores=np.array([], dtype=np.float64),
+            excluded_bets=excluded,
+            player_game_count=0,
+            bet_count=0,
+            candidates=_empty_player_game_candidates(),
+        )
+    work["_bet_id_sort"] = pd.to_numeric(work[BET_ID_COLUMN], errors="coerce").fillna(-1)
+    work = work.sort_values(
+        by=[PLAYER_ID_COLUMN, GAME_ID_COLUMN, PAYOUT_TS_COLUMN, "_bet_id_sort"],
+        ascending=[True, True, True, True],
+        kind="mergesort",
+    )
+
+    def _agg_top3_mean(series: pd.Series) -> float:
+        return top3_mean_bet_scores(series.to_numpy())
+
+    grouped = (
+        work.groupby([PLAYER_ID_COLUMN, GAME_ID_COLUMN], as_index=False, dropna=True)
+        .agg(
+            player_game_score=("_score", _agg_top3_mean),
+            player_game_label=(LABEL_COLUMN, "max"),
+            bet_count=(LABEL_COLUMN, "count"),
+        )
+    )
+    rep = work.groupby([PLAYER_ID_COLUMN, GAME_ID_COLUMN], as_index=False, dropna=True).last()
+    candidates = grouped.merge(
+        rep[[PLAYER_ID_COLUMN, GAME_ID_COLUMN, PAYOUT_TS_COLUMN, BET_ID_COLUMN]],
+        on=[PLAYER_ID_COLUMN, GAME_ID_COLUMN],
+        how="left",
+    )
+    candidates = candidates.rename(columns={PAYOUT_TS_COLUMN: ALERT_TS_COLUMN})
+    y_pg = np.asarray(grouped["player_game_label"], dtype=np.int8)
+    s_pg = np.asarray(grouped["player_game_score"], dtype=np.float64)
+    return PlayerGameAggregationResult(
+        y_true=y_pg,
+        scores=s_pg,
+        excluded_bets=excluded,
+        player_game_count=int(len(grouped)),
+        bet_count=int(len(work)),
+        candidates=candidates,
+    )
 
 
 def _prepare_xy(df: pd.DataFrame, *, feature_columns: tuple[str, ...]) -> tuple[pd.DataFrame, np.ndarray]:
@@ -141,6 +333,91 @@ def _prepare_xy(df: pd.DataFrame, *, feature_columns: tuple[str, ...]) -> tuple[
         categorical_columns=CAT_COLUMNS,
     )
     return X, y
+
+
+def _resolve_objective_config(
+    objective: HighTierObjectiveConfig | None,
+    objective_min_precision: float,
+) -> HighTierObjectiveConfig:
+    """Merge explicit objective config with legacy ``objective_min_precision`` override."""
+
+    if objective is not None:
+        return objective
+    return HighTierObjectiveConfig(min_precision=float(objective_min_precision))
+
+
+def _pick_validation_threshold(
+    val_pg: PlayerGameAggregationResult,
+    *,
+    objective_cfg: HighTierObjectiveConfig,
+    val_window_hours: float | None,
+    cooldown_min: int,
+) -> tuple[ThresholdPickResult, float, dict[str, Any] | None]:
+    """Return threshold pick, Optuna scalar score, and optional band metadata."""
+
+    if objective_cfg.selection_policy == "min_precision":
+        pick = pick_threshold_precision_floor(
+            val_pg.y_true,
+            val_pg.scores,
+            min_precision=float(objective_cfg.min_precision),
+        )
+        objective_val = _val_optuna_objective_score(
+            pick,
+            val_window_hours=val_window_hours,
+            alert_count_at_pick=int(pick.alert_count),
+            objective_min_precision=float(objective_cfg.min_precision),
+        )
+        return pick, objective_val, None
+
+    band = evaluate_alert_band_on_candidates(
+        val_pg.candidates,
+        window_hours=val_window_hours,
+        target_alerts_per_hour=tuple(objective_cfg.target_alerts_per_hour),
+        deployment_target_alerts_per_hour=float(objective_cfg.deployment_target_alerts_per_hour),
+        cooldown_min=cooldown_min,
+        split_prefix="val",
+    )
+    deploy = next(
+        (
+            p
+            for p in band.points
+            if math.isclose(p.target_alerts_per_hour, float(objective_cfg.deployment_target_alerts_per_hour))
+        ),
+        band.points[0],
+    )
+    pick = ThresholdPickResult(
+        threshold=float(band.deployment_threshold),
+        feasible=True,
+        precision=float(deploy.precision),
+        recall=float(deploy.recall),
+        alert_count=int(deploy.alerts),
+        n_samples=int(len(val_pg.y_true)),
+    )
+    band_meta = alert_band_meta_dict(
+        band,
+        deployment_target_alerts_per_hour=float(objective_cfg.deployment_target_alerts_per_hour),
+        target_alerts_per_hour=tuple(objective_cfg.target_alerts_per_hour),
+    )
+    return pick, float(band.scalar_score), band_meta
+
+
+def _val_optuna_objective_score(
+    pick: ThresholdPickResult,
+    *,
+    val_window_hours: float | None,
+    alert_count_at_pick: int,
+    objective_min_precision: float,
+) -> float:
+    """Maximize recall at precision floor; penalize excessive validation alert rate."""
+
+    if not pick.feasible:
+        return float(pick.precision) - float(objective_min_precision) - 1.0
+    recall = float(pick.recall)
+    if val_window_hours is None or val_window_hours <= 0:
+        return recall
+    alerts_per_hour = float(alert_count_at_pick) / float(val_window_hours)
+    penalty = max(0.0, alerts_per_hour - _VAL_ALERTS_PER_HR_SOFT_CAP) * _VAL_ALERTS_PENALTY_WEIGHT
+    return recall - penalty
 
 
 def pick_threshold_precision_floor(
@@ -226,80 +503,83 @@ def pick_threshold_precision_floor(
     )
 
 
-def _metrics_at_threshold(
-    y_true: np.ndarray,
-    scores: np.ndarray,
-    threshold: float,
-) -> tuple[float, float, float, int]:
-    """Return precision, recall, f1, alert_count for ``scores >= threshold``."""
+def _lgb_fixed_params(cfg: Step5TrainConfig, seed: int) -> dict[str, Any]:
+    """Return non-tuned LightGBM kwargs from :attr:`Step5TrainConfig.lgb_fixed`."""
 
-    y = np.asarray(y_true, dtype=np.int8).reshape(-1)
-    s = np.asarray(scores, dtype=np.float64).reshape(-1)
-    if not math.isfinite(float(threshold)):
-        return 0.0, 0.0, 0.0, 0
-    pred = (s >= float(threshold)).astype(np.int8)
-    tp = int(np.sum((pred == 1) & (y == 1)))
-    fp = int(np.sum((pred == 1) & (y == 0)))
-    fn = int(np.sum((pred == 0) & (y == 1)))
-    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
-    alerts = int(np.sum(pred == 1))
-    return float(prec), float(rec), float(f1), alerts
-
-
-def _split_metrics_block(
-    split: str,
-    y_true: np.ndarray,
-    scores: np.ndarray,
-    threshold: float,
-    *,
-    window_hours: float | None,
-) -> dict[str, Any]:
-    """Build flat metrics keys aligned with main ``trainer`` density naming."""
-
-    y = np.asarray(y_true, dtype=np.int8).reshape(-1)
-    s = np.asarray(scores, dtype=np.float64).reshape(-1)
-    n = int(len(y))
-    n_pos = int(np.sum(y == 1))
-    n_neg = int(np.sum(y == 0))
-    has_both = n_pos >= 1 and n_neg >= 1 and np.isfinite(s).all()
-    ap = float(average_precision_score(y, s)) if has_both else 0.0
-    prec, rec, f1, alerts = _metrics_at_threshold(y, s, threshold)
+    fixed = cfg.lgb_fixed
     out: dict[str, Any] = {
-        f"{split}_ap": ap,
-        f"{split}_precision": prec,
-        f"{split}_recall": rec,
-        f"{split}_f1": f1,
-        f"{split}_samples": n,
-        f"{split}_positives": n_pos,
-        f"{split}_alerts": alerts,
-        f"{split}_window_hours": float(window_hours) if window_hours is not None else None,
-        f"{split}_alerts_per_hour": None,
-        f"{split}_true_labels_per_hour": None,
+        "objective": fixed.objective,
+        "metric": fixed.metric,
+        "verbosity": int(fixed.verbosity),
+        "n_estimators": int(cfg.lgb_n_estimators_cap),
+        "random_state": int(seed),
+        "n_jobs": int(fixed.n_jobs),
     }
-    if window_hours is not None and math.isfinite(float(window_hours)) and float(window_hours) > 0:
-        wh = float(window_hours)
-        out[f"{split}_alerts_per_hour"] = float(alerts) / wh
-        out[f"{split}_true_labels_per_hour"] = float(n_pos) / wh
+    device = fixed.device
+    if device is not None and str(device).strip():
+        out["device"] = str(device).strip()
+        if str(device).strip().lower() == "gpu":
+            out["gpu_device_id"] = int(fixed.gpu_device_id)
     return out
 
 
-def _baseline_lgb_params(cfg: Step5TrainConfig, seed: int) -> dict[str, Any]:
+def _baseline_tunable_params(cfg: Step5TrainConfig) -> dict[str, Any]:
+    """Return baseline tunable LightGBM kwargs from ``baseline_*`` config fields."""
+
     return {
-        "objective": "binary",
-        "metric": "binary_logloss",
-        "verbosity": -1,
-        "n_estimators": int(cfg.lgb_n_estimators_cap),
         "learning_rate": float(cfg.baseline_learning_rate),
         "num_leaves": int(cfg.baseline_num_leaves),
+        "max_depth": int(cfg.baseline_max_depth),
         "min_child_samples": int(cfg.baseline_min_child_samples),
         "subsample": float(cfg.baseline_subsample),
         "colsample_bytree": float(cfg.baseline_colsample_bytree),
+        "reg_alpha": float(cfg.baseline_reg_alpha),
         "reg_lambda": float(cfg.baseline_reg_lambda),
-        "random_state": int(seed),
-        "n_jobs": 1,
     }
+
+
+def _suggest_float_param(trial: optuna.Trial, name: str, spec: OptunaFloatParamRange) -> float:
+    """Sample one float hyperparameter from config bounds."""
+
+    return float(
+        trial.suggest_float(
+            name,
+            float(spec.low),
+            float(spec.high),
+            log=bool(spec.log),
+        ),
+    )
+
+
+def _suggest_int_param(trial: optuna.Trial, name: str, spec: OptunaIntParamRange) -> int:
+    """Sample one int hyperparameter from config bounds."""
+
+    return int(
+        trial.suggest_int(
+            name,
+            int(spec.low),
+            int(spec.high),
+        ),
+    )
+
+
+def _optuna_tunable_params(trial: optuna.Trial, search: Step5OptunaSearchConfig) -> dict[str, Any]:
+    """Sample all Optuna tunable LightGBM kwargs from :class:`Step5OptunaSearchConfig`."""
+
+    return {
+        "learning_rate": _suggest_float_param(trial, "learning_rate", search.learning_rate),
+        "num_leaves": _suggest_int_param(trial, "num_leaves", search.num_leaves),
+        "max_depth": _suggest_int_param(trial, "max_depth", search.max_depth),
+        "min_child_samples": _suggest_int_param(trial, "min_child_samples", search.min_child_samples),
+        "subsample": _suggest_float_param(trial, "subsample", search.subsample),
+        "colsample_bytree": _suggest_float_param(trial, "colsample_bytree", search.colsample_bytree),
+        "reg_alpha": _suggest_float_param(trial, "reg_alpha", search.reg_alpha),
+        "reg_lambda": _suggest_float_param(trial, "reg_lambda", search.reg_lambda),
+    }
+
+
+def _baseline_lgb_params(cfg: Step5TrainConfig, seed: int) -> dict[str, Any]:
+    return {**_lgb_fixed_params(cfg, seed), **_baseline_tunable_params(cfg)}
 
 
 def _rebuild_lgb_params_from_optuna_best(
@@ -309,38 +589,11 @@ def _rebuild_lgb_params_from_optuna_best(
 ) -> dict[str, Any]:
     """Rebuild full LightGBM kwargs from Optuna ``best_params``."""
 
-    hp = dict(best_params)
-    return {
-        "objective": "binary",
-        "metric": "binary_logloss",
-        "verbosity": -1,
-        "n_estimators": int(cfg.lgb_n_estimators_cap),
-        "learning_rate": float(hp["learning_rate"]),
-        "num_leaves": int(hp["num_leaves"]),
-        "min_child_samples": int(hp["min_child_samples"]),
-        "subsample": float(hp["subsample"]),
-        "colsample_bytree": float(hp["colsample_bytree"]),
-        "reg_lambda": float(hp["reg_lambda"]),
-        "random_state": int(seed),
-        "n_jobs": 1,
-    }
+    return {**_lgb_fixed_params(cfg, seed), **dict(best_params)}
 
 
 def _suggest_lgb_params(trial: optuna.Trial, cfg: Step5TrainConfig, seed: int) -> dict[str, Any]:
-    return {
-        "objective": "binary",
-        "metric": "binary_logloss",
-        "verbosity": -1,
-        "n_estimators": int(cfg.lgb_n_estimators_cap),
-        "learning_rate": trial.suggest_float("learning_rate", 0.02, 0.2, log=True),
-        "num_leaves": trial.suggest_int("num_leaves", 16, 96),
-        "min_child_samples": trial.suggest_int("min_child_samples", 10, 300),
-        "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
-        "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 5.0, log=True),
-        "random_state": int(seed),
-        "n_jobs": 1,
-    }
+    return {**_lgb_fixed_params(cfg, seed), **_optuna_tunable_params(trial, cfg.optuna_search)}
 
 
 def _optuna_trial_debug_log(study: optuna.study.Study, trial: optuna.trial.FrozenTrial) -> None:
@@ -385,7 +638,7 @@ def _train_one_lgbm(
         X_tr,
         y_tr,
         eval_set=[(X_va, y_va)],
-        eval_metric="binary_logloss",
+        eval_metric=str(hp["metric"]),
         callbacks=callbacks,
     )
     return clf
@@ -423,6 +676,11 @@ def train_lgbm_from_splits(
     step5: Step5TrainConfig | None = None,
     output_dir: Path,
     feature_columns: tuple[str, ...],
+    persist_training_metrics: bool = True,
+    train_parquet: Path | None = None,
+    sample_policy_meta: dict[str, Any] | None = None,
+    feature_screening_meta: dict[str, Any] | None = None,
+    objective: HighTierObjectiveConfig | None = None,
 ) -> Step5Result:
     """Train LightGBM on Step 4 splits; optional Optuna; pick threshold on val; write artifacts.
 
@@ -430,6 +688,11 @@ def train_lgbm_from_splits(
         feature_columns: Model input columns (excluding label / payout_ts). Required; use
             :func:`~trainer_hightier.feature_experiment.candidate_registry_loader.baseline_features_for_main_trainer`
             or full-candidate tuples from the candidate registry snapshot.
+        train_parquet: Optional sampled train split; defaults to ``splits_dir/train.parquet``.
+        sample_policy_meta: Optional downsampling disclosure block from
+            :func:`~trainer_hightier.utils.train_negative_sampling.materialize_sampled_train_parquet`.
+        feature_screening_meta: Optional screening hook disclosure from
+            :func:`~trainer_hightier.utils.feature_screening_hook.resolve_step5_feature_columns`.
     """
 
     if not feature_columns:
@@ -439,8 +702,10 @@ def train_lgbm_from_splits(
         )
     feat_cols = tuple(feature_columns)
     cfg = step5 or Step5TrainConfig()
+    cooldown_min = int(cfg.player_alert_policy.cooldown_min)
+    objective_cfg = _resolve_objective_config(objective, float(objective_min_precision))
     sd = Path(splits_dir).resolve()
-    train_p = sd / "train.parquet"
+    train_p = Path(train_parquet).resolve() if train_parquet is not None else sd / "train.parquet"
     val_p = sd / "val.parquet"
     test_p = sd / "test.parquet"
     for pth in (train_p, val_p, test_p):
@@ -494,7 +759,7 @@ def train_lgbm_from_splits(
             f"got positives={val_pos}, n={len(y_va)}.",
         )
 
-    def _evaluate_hp(hp: dict[str, Any]) -> tuple[lgb.LGBMClassifier, ThresholdPickResult, float]:
+    def _evaluate_hp(hp: dict[str, Any]) -> tuple[lgb.LGBMClassifier, ThresholdPickResult, float, dict[str, Any] | None]:
         model = _train_one_lgbm(
             X_tr,
             y_tr,
@@ -504,23 +769,20 @@ def train_lgbm_from_splits(
             early_stopping_rounds=int(cfg.early_stopping_rounds),
         )
         val_scores = model.predict_proba(X_va)[:, 1]
-        pick = pick_threshold_precision_floor(
-            y_va,
-            val_scores,
-            min_precision=float(objective_min_precision),
+        val_pg = aggregate_bets_to_player_game(df_va, val_scores, split_name="val")
+        val_pick, objective_val, band_meta = _pick_validation_threshold(
+            val_pg,
+            objective_cfg=objective_cfg,
+            val_window_hours=wh_val,
+            cooldown_min=cooldown_min,
         )
-        objective_val: float
-        if pick.feasible:
-            objective_val = float(pick.recall)
-        else:
-            objective_val = float(pick.precision) - float(objective_min_precision) - 1.0
-        return model, pick, objective_val
+        return model, val_pick, objective_val, band_meta
 
     t0 = time.perf_counter()
 
     if cfg.skip_optuna:
         best_hp = _baseline_lgb_params(cfg, random_seed)
-        model, val_pick, _obj = _evaluate_hp(best_hp)
+        model, val_pick, _obj, val_band_meta = _evaluate_hp(best_hp)
         study_summary = {
             "optuna_max_time_sec_configured": float(cfg.optuna_timeout_sec),
             "optuna_max_trials_configured": None,
@@ -533,11 +795,17 @@ def train_lgbm_from_splits(
             "optuna_best_params": {},
         }
     else:
+        if optuna is None:
+            raise ModuleNotFoundError(
+                "optuna is required when skip_optuna=False; "
+                'install the "training" extra (pip install trainer-hightier[training]) '
+                "or set Step5TrainConfig.skip_optuna=True"
+            )
         sampler = optuna.samplers.TPESampler(seed=int(random_seed))
 
         def objective(trial: optuna.Trial) -> float:
             hp = _suggest_lgb_params(trial, cfg, random_seed)
-            _, _, obj_inner = _evaluate_hp(hp)
+            _, _, obj_inner, _ = _evaluate_hp(hp)
             return float(obj_inner)
 
         study = optuna.create_study(direction="maximize", sampler=sampler)
@@ -581,7 +849,7 @@ def train_lgbm_from_splits(
             study_summary["optuna_best_params"] = {}
             study_summary["optuna_stopping_reason"] = "no_completed_trials"
             best_hp = _baseline_lgb_params(cfg, random_seed)
-        model, val_pick, _ = _evaluate_hp(best_hp)
+        model, val_pick, _, val_band_meta = _evaluate_hp(best_hp)
 
     final_model = model
     refit_best_iteration: int | None = None
@@ -599,39 +867,142 @@ def train_lgbm_from_splits(
     val_scores = final_model.predict_proba(X_va)[:, 1]
     test_scores = final_model.predict_proba(X_te)[:, 1]
 
-    if not val_pick.feasible:
+    if objective_cfg.selection_policy == "min_precision" and not val_pick.feasible:
         logger.warning(
             "Step 5: no threshold achieves min_precision=%.4f on validation; reporting best achievable "
             "precision=%.4f recall=%.4f at threshold=%.6f.",
-            float(objective_min_precision),
+            float(objective_cfg.min_precision),
             val_pick.precision,
             val_pick.recall,
             val_pick.threshold,
         )
 
     thr = float(val_pick.threshold)
-    block_tr = _split_metrics_block("train", y_tr, train_scores, thr, window_hours=wh_train)
-    block_va = _split_metrics_block("val", y_va, val_scores, thr, window_hours=wh_val)
-    block_te = _split_metrics_block("test", y_te, test_scores, thr, window_hours=wh_test)
+    pg_tr = aggregate_bets_to_player_game(df_tr, train_scores, split_name="train")
+    pg_va = aggregate_bets_to_player_game(df_va, val_scores, split_name="val")
+    pg_te = aggregate_bets_to_player_game(df_te, test_scores, split_name="test")
+    block_tr_pg = split_metrics_block(
+        "train", pg_tr.y_true, pg_tr.scores, thr, window_hours=wh_train,
+    )
+    block_va_pg = split_metrics_block(
+        "val", pg_va.y_true, pg_va.scores, thr, window_hours=wh_val,
+    )
+    block_te_pg = split_metrics_block(
+        "test", pg_te.y_true, pg_te.scores, thr, window_hours=wh_test,
+    )
+    block_tr_bl = split_metrics_block(
+        "train_bet_level", y_tr, train_scores, thr, window_hours=wh_train,
+    )
+    block_va_bl = split_metrics_block(
+        "val_bet_level", y_va, val_scores, thr, window_hours=wh_val,
+    )
+    block_te_bl = split_metrics_block(
+        "test_bet_level", y_te, test_scores, thr, window_hours=wh_test,
+    )
+    test_band_meta: dict[str, Any] | None = None
+    if objective_cfg.selection_policy == "alert_band_precision":
+        test_band = evaluate_alert_band_on_candidates(
+            pg_te.candidates,
+            window_hours=wh_test,
+            target_alerts_per_hour=tuple(objective_cfg.target_alerts_per_hour),
+            deployment_target_alerts_per_hour=float(objective_cfg.deployment_target_alerts_per_hour),
+            cooldown_min=cooldown_min,
+            split_prefix="test",
+        )
+        test_band_meta = alert_band_meta_dict(
+            test_band,
+            deployment_target_alerts_per_hour=float(objective_cfg.deployment_target_alerts_per_hour),
+            target_alerts_per_hour=tuple(objective_cfg.target_alerts_per_hour),
+        )
+    block_tr_op = operational_simulated_metrics_block(
+        "train",
+        pg_tr.candidates,
+        thr,
+        cooldown_min=cooldown_min,
+        window_hours=wh_train,
+    )
+    block_va_op = operational_simulated_metrics_block(
+        "val",
+        pg_va.candidates,
+        thr,
+        cooldown_min=cooldown_min,
+        window_hours=wh_val,
+    )
+    block_te_op = operational_simulated_metrics_block(
+        "test",
+        pg_te.candidates,
+        thr,
+        cooldown_min=cooldown_min,
+        window_hours=wh_test,
+    )
 
     elapsed = round(time.perf_counter() - t0, 3)
+    policy_meta = build_player_alert_policy_metadata(cfg.player_alert_policy)
     report: dict[str, Any] = {
+        "evaluation_grain": EVALUATION_GRAIN_PLAYER_GAME,
+        "player_game_group_key": [PLAYER_ID_COLUMN, GAME_ID_COLUMN],
+        "score_aggregation": PLAYER_GAME_SCORE_AGGREGATION,
+        "label_aggregation": "max",
+        "step5_threshold_grain": EVALUATION_GRAIN_PLAYER_GAME,
         "step5_seconds": elapsed,
         "step5_feature_columns": list(feat_cols),
         "step5_threshold": thr,
         "step5_val_pick_feasible": val_pick.feasible,
         "step5_val_precision_at_pick": val_pick.precision,
         "step5_val_recall_at_pick": val_pick.recall,
-        "step5_min_precision": float(objective_min_precision),
+        "step5_selection_policy": objective_cfg.selection_policy,
+        "step5_target_alerts_per_hour": list(objective_cfg.target_alerts_per_hour),
+        "step5_deployment_target_alerts_per_hour": float(objective_cfg.deployment_target_alerts_per_hour),
+        "step5_min_precision": float(objective_cfg.min_precision),
         "step5_optuna_skipped": bool(cfg.skip_optuna),
         "step5_refit_train_plus_val": bool(cfg.refit_train_plus_val),
         "step5_refit_rows": int(len(y_tr) + len(y_va)) if bool(cfg.refit_train_plus_val) else int(len(y_tr)),
         "step5_refit_best_iteration": refit_best_iteration,
-        **block_tr,
-        **block_va,
-        **block_te,
+        "train_excluded_bets_player_game": pg_tr.excluded_bets,
+        "val_excluded_bets_player_game": pg_va.excluded_bets,
+        "test_excluded_bets_player_game": pg_te.excluded_bets,
+        "train_player_game_count": pg_tr.player_game_count,
+        "val_player_game_count": pg_va.player_game_count,
+        "test_player_game_count": pg_te.player_game_count,
+        **block_tr_pg,
+        **block_va_pg,
+        **block_te_pg,
+        **block_tr_bl,
+        **block_va_bl,
+        **block_te_bl,
+        **block_tr_op,
+        **block_va_op,
+        **block_te_op,
+        **policy_meta,
     }
+    if test_band_meta is not None:
+        report["step5_test_alert_band"] = test_band_meta
     report.update(study_summary)
+    if val_band_meta is not None:
+        report["step5_val_alert_band"] = val_band_meta
+    if isinstance(sample_policy_meta, dict) and sample_policy_meta:
+        report["sample_policy"] = dict(sample_policy_meta)
+        report["val_test_evaluation_unsampled"] = bool(
+            sample_policy_meta.get("val_test_evaluation_unsampled", True),
+        )
+        if sample_policy_meta.get("enabled"):
+            report["train_rows_before_sampling"] = sample_policy_meta.get("train_rows_before")
+            report["train_rows_after_sampling"] = sample_policy_meta.get("train_rows_after")
+            report["train_negatives_before_sampling"] = sample_policy_meta.get("train_negatives_before")
+            report["train_negatives_after_sampling"] = sample_policy_meta.get("train_negatives_after")
+            report["train_evaluation_sampled"] = True
+        else:
+            report["train_evaluation_sampled"] = False
+    if isinstance(feature_screening_meta, dict) and feature_screening_meta:
+        report["feature_screening"] = dict(feature_screening_meta)
+        report["feature_selection_policy_fingerprint"] = feature_screening_meta.get(
+            "feature_selection_policy_fingerprint",
+        )
+        report["feature_selection_manifest_fingerprint"] = feature_screening_meta.get(
+            "feature_selection_manifest_fingerprint",
+        )
+        report["step5_feature_screening_enabled"] = bool(feature_screening_meta.get("enabled"))
+        report["step5_selected_feature_count"] = feature_screening_meta.get("selected_feature_count")
 
     out_dir = Path(output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -644,10 +1015,18 @@ def train_lgbm_from_splits(
                 "categorical_columns": list(CAT_COLUMNS),
                 "category_categories": {c: union_cats[c].tolist() for c in cat_cols},
                 "threshold": thr,
-                "min_precision": float(objective_min_precision),
+                "score_aggregation": PLAYER_GAME_SCORE_AGGREGATION,
+                "selection_policy": objective_cfg.selection_policy,
+                "target_alerts_per_hour": list(objective_cfg.target_alerts_per_hour),
+                "deployment_target_alerts_per_hour": float(objective_cfg.deployment_target_alerts_per_hour),
+                "min_precision": float(objective_cfg.min_precision),
+                "alert_band_scalar_score": (
+                    val_band_meta.get("scalar_score") if isinstance(val_band_meta, dict) else None
+                ),
                 "val_pick_feasible": val_pick.feasible,
                 "refit_train_plus_val": bool(cfg.refit_train_plus_val),
                 "refit_best_iteration": refit_best_iteration,
+                **policy_meta,
             },
             f,
             protocol=pickle.HIGHEST_PROTOCOL,
@@ -657,7 +1036,11 @@ def train_lgbm_from_splits(
     metrics_path = (out_dir / DEFAULT_METRICS_FILENAME).resolve()
     report["training_metrics_path"] = str(metrics_path)
     report["step5_training_metrics_path"] = str(metrics_path)
-    metrics_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    if persist_training_metrics:
+        metrics_path.write_text(
+            json.dumps(slim_training_metrics_body(report), indent=2, default=str),
+            encoding="utf-8",
+        )
 
     logger.info(
         "Step 5 trained LightGBM in %.3fs; threshold=%.6f feasible=%s val recall=%.4f prec=%.4f refit_train_plus_val=%s → %s",

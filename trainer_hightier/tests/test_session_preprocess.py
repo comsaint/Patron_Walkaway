@@ -9,9 +9,11 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from trainer_hightier.config import SessionPreprocessConfig
+from trainer_hightier.config import L0_PREPROCESS_DATA_SCOPE_TEST_UNBOUNDED, SessionPreprocessConfig
 
 _hpre = importlib.import_module("trainer_hightier.02_preprocess")
+
+_TEST_SESS_CFG = SessionPreprocessConfig(data_scope=L0_PREPROCESS_DATA_SCOPE_TEST_UNBOUNDED)
 
 
 def test_write_cleaned_session_parquet_default(tmp_path) -> None:
@@ -114,7 +116,7 @@ def test_preprocess_sessions_manual_ghost_dedup(tmp_path_factory) -> None:
     pq_path = td / "gmwds_t_session.parquet"
     pq.write_table(pa.Table.from_pandas(pd.DataFrame(rows)), pq_path)
 
-    out = _hpre.preprocess_sessions_from_parquet(pq_path)
+    out = _hpre.preprocess_sessions_from_parquet(pq_path, cfg=_TEST_SESS_CFG)
 
     assert len(out) == 2
     sids = sorted(int(pd.to_numeric(x, errors="coerce")) for x in out["session_id"].tolist())
@@ -154,7 +156,7 @@ def test_etl_insert_synthetic_caps_per_registry(tmp_path_factory) -> None:
     pq_path = td / "gmwds_t_session.parquet"
     pq.write_table(pa.Table.from_pandas(pd.DataFrame(rows)), pq_path)
 
-    out = _hpre.preprocess_sessions_from_parquet(pq_path)
+    out = _hpre.preprocess_sessions_from_parquet(pq_path, cfg=_TEST_SESS_CFG)
     cap = pd.Timestamp(t0) + timedelta(seconds=636)
     got = pd.Timestamp(out["__etl_insert_Dtm_synthetic"].iloc[0])
     assert got == cap
@@ -190,7 +192,7 @@ def test_session_null_end_excluded(tmp_path_factory) -> None:
     pq_path = td / "gmwds_t_session.parquet"
     pq.write_table(pa.Table.from_pandas(pd.DataFrame(rows)), pq_path)
 
-    out = _hpre.preprocess_sessions_from_parquet(pq_path)
+    out = _hpre.preprocess_sessions_from_parquet(pq_path, cfg=_TEST_SESS_CFG)
     assert len(out) == 0
 
 
@@ -226,7 +228,11 @@ def test_streaming_preprocess_fnd01_dedup_across_row_groups(tmp_path) -> None:
     pq.write_table(pa.Table.from_pandas(df), pq_path, row_group_size=1)
 
     out_path = tmp_path / "cleaned.parquet"
-    _, _buck = _hpre.preprocess_sessions_from_parquet_streaming(pq_path, out_path)
+    _, _buck = _hpre.preprocess_sessions_from_parquet_streaming(
+        pq_path,
+        out_path,
+        cfg=_TEST_SESS_CFG,
+    )
     assert _buck >= 1
     out = pd.read_parquet(out_path)
     assert len(out) == 1
@@ -281,12 +287,18 @@ def test_streaming_session_hash_buckets_matches_single_pass(tmp_path) -> None:
     _, b1 = _hpre.preprocess_sessions_from_parquet_streaming(
         pq_path,
         out1,
-        cfg=SessionPreprocessConfig(dedup_hash_buckets=1),
+        cfg=SessionPreprocessConfig(
+            data_scope=L0_PREPROCESS_DATA_SCOPE_TEST_UNBOUNDED,
+            dedup_hash_buckets=1,
+        ),
     )
     _, b8 = _hpre.preprocess_sessions_from_parquet_streaming(
         pq_path,
         out8,
-        cfg=SessionPreprocessConfig(dedup_hash_buckets=8),
+        cfg=SessionPreprocessConfig(
+            data_scope=L0_PREPROCESS_DATA_SCOPE_TEST_UNBOUNDED,
+            dedup_hash_buckets=8,
+        ),
     )
     assert b1 == 1 and b8 == 8
     g1 = pd.read_parquet(out1).sort_values(["session_id"]).reset_index(drop=True)
@@ -324,8 +336,12 @@ def test_session_preprocess_projection_drops_unlisted_wide_columns(tmp_path) -> 
     pq.write_table(pa.Table.from_pandas(pd.DataFrame(rows)), pq_path, row_group_size=1)
 
     out_path = tmp_path / "cleaned.parquet"
-    _, eff_sess = _hpre.preprocess_sessions_from_parquet_streaming(pq_path, out_path)
-    assert eff_sess == SessionPreprocessConfig().dedup_hash_buckets
+    _, eff_sess = _hpre.preprocess_sessions_from_parquet_streaming(
+        pq_path,
+        out_path,
+        cfg=_TEST_SESS_CFG,
+    )
+    assert eff_sess == SessionPreprocessConfig(data_scope=L0_PREPROCESS_DATA_SCOPE_TEST_UNBOUNDED,).dedup_hash_buckets
 
     cols = pq.read_schema(out_path).names
     assert "junk_metric_only_in_l0" not in cols

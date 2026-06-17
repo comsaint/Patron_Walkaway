@@ -37,6 +37,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL_FE_DERIVED_COLUMNS: tuple[str, ...] = (
     "fe__wager_sum__w15m",
     "fe__bets_cnt__w15m",
+    "fe__clock__hour_of_day",
+    "fe__clock__day_of_week",
+    "fe__clock__is_weekend",
+    "fe__clock__is_late_night",
     "fe__canonical__bets_cnt__today",
     "fe__canonical__wager_sum__today",
     "fe__canonical__avg_wager__today",
@@ -47,6 +51,10 @@ DEFAULT_MODEL_FE_DERIVED_COLUMNS: tuple[str, ...] = (
     "fe__odds__payout_odds_z__w1h",
     "fe__odds__payout_odds_to_recent_max_ratio__w1h",
     "fe__odds__payout_odds_step_ratio",
+    "fe__outcome__casino_win_sum__w15m",
+    "fe__outcome__casino_win_sum__w1h",
+    "fe__outcome__casino_win_to_theo_ratio__w1h",
+    "fe__stake__wager_last3_vs_prior3_ratio__w1h",
 )
 
 DEFAULT_MODEL_SLOW_PATRON_COLUMNS: tuple[str, ...] = (

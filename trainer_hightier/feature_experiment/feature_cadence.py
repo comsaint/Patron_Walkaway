@@ -2,7 +2,7 @@
 
 Short-term: all ``bet__*`` and short-horizon ``fe__*`` share ``SUPPLIER_SHORT_TERM_PIT``
 (point-in-time per ``bet_id``). Training may persist an offline PIT cache parquet; serving
-uses live bounded PIT (see ``doc/Scorer Runtime Contract - SSOT.md``).
+uses live bounded PIT (see ``doc/ssot/Scorer Runtime Contract - SSOT.md``).
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ SUPPLIER_LONG_TERM_MONTHLY: Final[str] = "long_term_monthly_snapshot"
 SUPPLIER_RAW: Final[str] = "clickhouse_raw"
 SUPPLIER_FEAST_TRIAL: Final[str] = "feast_trial_1h"
 SUPPLIER_FEAST_SLOW: Final[str] = "feast_slow_180d"
+SUPPLIER_TXN_LITE: Final[str] = "external_txn_lite_materializer"
 
 _LEGACY_FE_DERIVED_OWNER: Final[str] = "trainer_hightier/feature_experiment/materialize_fe_derived.py"
 
@@ -131,6 +132,8 @@ def default_training_supplier_for_row(row: FeatureRegistryEntryRow) -> str:
             return SUPPLIER_SHORT_TERM_PIT
         if h == "mid_term":
             return SUPPLIER_MID_TERM_DAILY
+    if src == "t_casino_txn":
+        return SUPPLIER_TXN_LITE
     return SUPPLIER_SHORT_TERM_PIT
 
 

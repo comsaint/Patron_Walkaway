@@ -28,6 +28,7 @@ from trainer_hightier.config import (
     MID_TERM_SNAPSHOT_AGE_AUDIT_COLUMN,
     MID_TERM_SNAPSHOT_MISSING_AUDIT_COLUMN,
     SLOW_PATRON_GRAIN_CANONICAL_ASOF,
+    TXN_LITE_FEATURE_COLUMNS,
 )
 from trainer_hightier.feature_experiment.feature_cadence import (
     MID_TERM_COMPOSITE_FEATURE_COLUMNS,
@@ -137,8 +138,11 @@ _KNOWN_SOURCES: frozenset[str] = frozenset(
         "feast_trial_1h",
         "feast_slow_180d",
         "fe_derived",
+        "t_casino_txn",
     }
 )
+
+_TXN_LITE_COLUMN_SET: frozenset[str] = frozenset(TXN_LITE_FEATURE_COLUMNS)
 
 
 def _parquet_lower_column_index(path: Path) -> dict[str, str]:
@@ -281,6 +285,8 @@ def audit_feature_supplier_routes(
                 supplier = "legacy_fe_derived_parquet"
             else:
                 supplier = "missing"
+        elif src == "t_casino_txn":
+            supplier = "txn_lite_builder"
         else:
             supplier = "unknown"
         rows.append(
@@ -477,6 +483,8 @@ def build_feature_supplier_summary(
             supplier = "bundled_slow_parquet"
         elif src == "fe_derived":
             supplier = "bundled_fe_derived_parquet" if fe_bundled else "missing"
+        elif src == "t_casino_txn":
+            supplier = "txn_lite_builder"
         else:
             supplier = "unknown"
         rows.append({"feature_id": feat, "source": src, "supplier": supplier})
@@ -530,6 +538,14 @@ def assert_feature_supplyability_or_raise(
             # Production primary supplier is online attach_trial_bet_behavior_1h; optional trial parquet
             # is not a substitute for readiness.
             pass
+        elif src == "t_casino_txn":
+            if require_runtime_artifacts:
+                _assert_ch_txn_supplier_ready_or_raise(
+                    n_txn_features=sum(
+                        1 for f in model_feats if by_id.get(f) and by_id[f].source == "t_casino_txn"
+                    ),
+                    cfg=None,
+                )
 
     if unknown:
         raise ValueError(
@@ -715,6 +731,7 @@ class RuntimeDependencyClosure:
     mid_composite_cols: tuple[str, ...]
     dependency_only_cols: tuple[str, ...]
     unknown_cols: tuple[str, ...]
+    txn_cols: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -729,6 +746,7 @@ class ScorerSupplierPlan:
     short_term_cols: tuple[str, ...]
     unknown_cols: tuple[str, ...]
     dependency_only_cols: tuple[str, ...] = ()
+    txn_cols: tuple[str, ...] = ()
 
 
 def _infer_runtime_supplier(
@@ -740,17 +758,22 @@ def _infer_runtime_supplier(
 ) -> str | None:
     """Infer runtime supplier when registry row omits ``runtime_supplier``."""
 
+    if feature_id in _TXN_LITE_COLUMN_SET:
+        return "txn_lite_builder"
     if row is not None and row.runtime_supplier:
         return row.runtime_supplier
     if row is not None:
         from trainer_hightier.feature_experiment.feature_cadence import (
             SUPPLIER_MID_TERM_DAILY,
             SUPPLIER_SHORT_TERM_PIT,
+            SUPPLIER_TXN_LITE,
         )
 
         ats = str(row.allowed_training_supplier or "").strip()
         if ats == SUPPLIER_SHORT_TERM_PIT:
             return "short_term_pit_builder"
+        if ats == SUPPLIER_TXN_LITE:
+            return "txn_lite_builder"
         if ats == SUPPLIER_MID_TERM_DAILY:
             if feature_id in MID_TERM_COMPOSITE_FEATURE_COLUMNS:
                 return "composite"
@@ -765,6 +788,8 @@ def _infer_runtime_supplier(
     src = row.source
     if src == "baseline_model":
         return "clickhouse_raw"
+    if src == "t_casino_txn":
+        return "txn_lite_builder"
     if src == "feast_trial_1h":
         return "short_term_pit_builder"
     if src == "feast_slow_180d" or feature_id in DEFAULT_MODEL_SLOW_PATRON_COLUMNS:
@@ -801,6 +826,10 @@ def _collect_closure_feature_ids(
         row = by_id.get(fid)
         if row is None and fid not in _SPIKE_MID_TERM_COLUMN_SET and fid not in _SPIKE_SLOW_COLUMN_SET:
             if fid in model_feats and fid in _MID_TERM_AUDIT_MODEL_COLUMNS:
+                seen.add(fid)
+                needed.append(fid)
+                continue
+            if fid in model_feats and fid in _TXN_LITE_COLUMN_SET:
                 seen.add(fid)
                 needed.append(fid)
                 continue
@@ -841,6 +870,7 @@ def build_runtime_dependency_closure(
     mid_comp: list[str] = []
     slow: list[str] = []
     short: list[str] = []
+    txn: list[str] = []
     unknown: list[str] = list(unknown_from_closure)
 
     def _append_unique(bucket: list[str], fid: str) -> None:
@@ -878,6 +908,8 @@ def build_runtime_dependency_closure(
                 elif sup_key == "short_term_pit_builder":
                     for dep in deps:
                         _append_unique(short, dep)
+        elif supplier == "txn_lite_builder" and is_model_output:
+            _append_unique(txn, fid)
 
     for fid in model_feats:
         _classify_into_buckets(fid, is_model_output=True)
@@ -905,6 +937,7 @@ def build_runtime_dependency_closure(
         mid_composite_cols=tuple(dict.fromkeys(mid_comp)),
         dependency_only_cols=dep_only_out,
         unknown_cols=unknown_out,
+        txn_cols=tuple(dict.fromkeys(txn)),
     )
 
 
@@ -923,6 +956,7 @@ def build_scorer_supplier_plan(
         short_term_cols=closure.short_term_cols,
         unknown_cols=closure.unknown_cols,
         dependency_only_cols=closure.dependency_only_cols,
+        txn_cols=closure.txn_cols,
     )
 
 
@@ -964,12 +998,96 @@ def assert_scorer_supplier_plan_or_raise(plan: ScorerSupplierPlan) -> None:
     if plan.unknown_cols:
         tip = ", ".join(plan.unknown_cols[:12])
         ellipsis = "" if len(plan.unknown_cols) <= 12 else ", …"
+        txn_unknown = [c for c in plan.unknown_cols if c in _TXN_LITE_COLUMN_SET]
+        if txn_unknown:
+            raise ValueError(
+                "[feature-supply] installed trainer_hightier lacks txn_lite_builder routing "
+                f"for model columns [{', '.join(txn_unknown)}]. "
+                "Reinstall the bundle wheel from the bundle root: "
+                "pip install --force-reinstall wheels/trainer_hightier-*.whl "
+                "(or pip install --force-reinstall -r requirements.txt). "
+                "Do not rely on an older conda/site-packages copy of the same version."
+            )
         raise ValueError(
             "[feature-supply] scorer v2 supplier plan has unknown columns: "
             f"[{tip}{ellipsis}]"
         )
     assert_composite_implementations_or_raise(plan)
     assert_feast_plan_schema_support_or_raise(plan)
+
+
+def _assert_ch_txn_supplier_ready_or_raise(
+    *,
+    n_txn_features: int,
+    cfg: Any | None = None,
+) -> dict[str, Any]:
+    """Verify ClickHouse ``t_casino_txn`` is ready for production txn_lite scoring."""
+
+    from trainer_hightier.serving.txn_lite_ch_runtime import assert_ch_txn_supplier_ready_or_raise
+
+    detail = assert_ch_txn_supplier_ready_or_raise(cfg=cfg)
+    detail["n_txn_features"] = int(n_txn_features)
+    return detail
+
+
+def _assert_cleaned_casino_txn_partitions_or_raise(
+    txn_root: Path,
+    *,
+    n_txn_features: int,
+) -> dict[str, Any]:
+    """Verify L0 cleaned ``t_casino_txn`` partitions exist for txn_lite scoring."""
+
+    from trainer_hightier.feature_experiment.materialize_txn_lite import discover_cleaned_txn_partitions
+
+    root = Path(txn_root).resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(
+            "[feature-supply] model requires txn__* "
+            f"({n_txn_features} feature(s)) but cleaned casino_txn root missing: {root}. "
+            "Populate bundle source_mirror/cleaned_casino_txn/ or set CLEANED_CASINO_TXN_ROOT in .env"
+        )
+    paths, included, excluded = discover_cleaned_txn_partitions(root, exclude_partial=True)
+    if not paths:
+        raise FileNotFoundError(
+            "[feature-supply] model expects txn__* but no eligible cleaned txn partitions "
+            f"under {root} (included={included}, excluded_partial={excluded})"
+        )
+    return {
+        "cleaned_casino_txn_root": str(root),
+        "cleaned_casino_txn_partition_count": len(included),
+        "cleaned_casino_txn_excluded_partial": list(excluded),
+    }
+
+
+def assert_deploy_external_data_roots_or_raise(
+    plan: ScorerSupplierPlan,
+    *,
+    cfg: Any | None = None,
+) -> dict[str, Any]:
+    """Verify deploy-host supplier readiness for the active model plan.
+
+    Scorer v2 mid/long features come from bundle-local Feast online store (refreshed from
+    ClickHouse at startup). Baseline, short-term PIT, and txn_lite features come from
+    ClickHouse at score time. This gate covers **additional** external roots not bundled
+    in the wheel (legacy cleaned txn root checks removed for production).
+    """
+    from trainer_hightier.config import default_hightier_serving_config
+
+    _ = cfg or default_hightier_serving_config()
+    out: dict[str, Any] = {
+        "clickhouse_required": bool(
+            plan.baseline_cols or plan.short_term_cols or plan.feast_trial_cols or plan.txn_cols
+        ),
+        "feast_online_required": bool(
+            plan.feast_mid_cols or plan.feast_slow_cols or plan.mid_composite_cols
+        ),
+    }
+    if plan.txn_cols:
+        out["txn_lite"] = _assert_ch_txn_supplier_ready_or_raise(
+            n_txn_features=len(plan.txn_cols),
+            cfg=cfg,
+        )
+    return out
 
 
 def scorer_supplier_route_counts(plan: ScorerSupplierPlan) -> dict[str, int]:
@@ -981,4 +1099,5 @@ def scorer_supplier_route_counts(plan: ScorerSupplierPlan) -> dict[str, int]:
         "mid_term_composite": len(plan.mid_composite_cols),
         "feast_online_slow": len(plan.feast_slow_cols),
         "short_term_pit_builder": len(plan.short_term_cols),
+        "txn_lite_builder": len(plan.txn_cols),
     }

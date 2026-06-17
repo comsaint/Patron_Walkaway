@@ -13,6 +13,7 @@ import pandas as pd
 from flask import Flask, jsonify, request
 from zoneinfo import ZoneInfo
 
+from trainer_hightier.serving.contracts import ALERTS_API_PROTOCOL_COLUMNS
 from trainer_hightier.serving.prediction_log import init_prediction_log_db
 from trainer_hightier.serving.runtime_config import HK_TZ, PREDICTION_LOG_DB_PATH, STATE_DB_PATH
 from trainer_hightier.serving.state_db import apply_sqlite_serving_pragmas, init_state_db
@@ -82,21 +83,12 @@ def _alerts_to_protocol_records(df: pd.DataFrame) -> list[dict]:
         if df["ts_dt"].dt.tz is None
         else df["ts_dt"].dt.tz_convert(ZoneInfo(HK_TZ))
     )
-    protocol_keys = [
-        "bet_id",
-        "ts",
-        "bet_ts",
-        "player_id",
-        "casino_player_id",
-        "table_id",
-        "position_idx",
-        "session_id",
-        "visit_avg_bet",
-        "is_known_player",
-    ]
+    protocol_keys = list(ALERTS_API_PROTOCOL_COLUMNS)
     out = pd.DataFrame(index=df.index)
     out["ts"] = _format_ts_hk_iso(ts_ser).replace("NaT", None)
-    for k in ["bet_id", "bet_ts", "player_id", "table_id", "position_idx", "session_id", "visit_avg_bet"]:
+    for k in protocol_keys:
+        if k in ("ts", "casino_player_id", "is_known_player"):
+            continue
         out[k] = df[k] if k in df.columns else None
     if "bet_ts" in df.columns:
         bet_ts_dt = pd.to_datetime(out["bet_ts"], errors="coerce")

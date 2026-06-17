@@ -1,0 +1,25 @@
+# txn_lite smoke: align training rows with 2026-05 casino_txn sample (~330k bets).
+training_sample_min_gaming_day: "2026-05-01"
+training_sample_max_gaming_day: "2026-05-31"
+
+train_day_fraction: 0.70
+val_day_fraction: 0.15
+random_seed: 42
+single_round_budget_sec: 7200
+capacity_alerts_per_hour_cap: 120
+feature_service_name: walkaway_bet_trial_v1
+run_profile: default
+
+feature_quality_gate:
+  skip: true
+
+external_sources:
+  t_casino_txn:
+    enabled: true
+    cleaned_root: trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_casino_txn
+
+# Window ablation: probe w4h/w24h sums before registry promotion (enable via --txn-window-ablation).
+txn_window_ablation:
+  enabled: false
+  extra_windows: [4, 24]
+  # arms_profile: confirmatory | additive | window (default when flag set)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from datetime import date
 from pathlib import Path
 
@@ -116,3 +117,32 @@ def test_attach_canonical_slow_snap_for_entities(tmp_path: Path) -> None:
     assert row is not None
     assert float(row[0]) == 10.0
     assert float(row[2]) == 42.0
+
+
+def test_group_cache_manifest_blob_excludes_target_scope(tmp_path: Path) -> None:
+    """Primitive cache key/manifest must not depend on training target scope."""
+    manifest_path = tmp_path / "202603.parquet.manifest.json"
+    _bt3._write_group_cache_manifest(
+        manifest_path,
+        aggregate_name="walkaway_bet_trial_v1",
+        group_id="slow_snap",
+        feast_subgroup="walkaway_canonical_slow_snap_v1",
+        month_yyyymm="202603",
+        cleaned_token="aa" * 32,
+        derived_stat={"path": "/tmp/slow.parquet"},
+        code_fp="bb" * 64,
+        out_stat={"num_rows": 123},
+    )
+    blob = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert "target_scope" not in blob
+    assert set(blob.keys()) == {
+        "schema_version",
+        "aggregate_feature_service",
+        "group_id",
+        "feast_subgroup_service",
+        "month_yyyymm",
+        "cleaned_fingerprint_token",
+        "derived_source_stat",
+        "code_fingerprint",
+        "output_parquet_stat",
+    }

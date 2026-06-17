@@ -6,6 +6,7 @@ filters + ``trainer.identity.build_canonical_mapping_from_links`` M:N resolution
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from datetime import datetime
@@ -59,6 +60,22 @@ def default_canonical_mapping_parquet_path() -> Path:
 def default_canonical_mapping_sidecar_path() -> Path:
     """JSON sidecar next to mapping Parquet."""
     return default_canonical_mapping_artifacts_dir() / "canonical_mapping_meta.json"
+
+
+def canonical_mapping_content_fingerprint(mapping_parquet: Path) -> str:
+    """Content fingerprint for ``player_id`` → ``canonical_id`` (row-order invariant)."""
+    src = Path(mapping_parquet).resolve()
+    if not src.is_file():
+        raise FileNotFoundError(f"canonical mapping parquet missing: {src}")
+    df = pd.read_parquet(src, columns=["player_id", "canonical_id"])
+    if df.empty:
+        return hashlib.sha256(b"").hexdigest()
+    pairs = sorted(
+        (int(row.player_id), str(row.canonical_id))
+        for row in df.itertuples(index=False)
+    )
+    blob = "\n".join(f"{pid}\t{cid}" for pid, cid in pairs).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
 
 
 def _normalize_cutoff_naive_hk(cutoff_dtm: datetime) -> datetime:
@@ -253,7 +270,9 @@ def build_canonical_mapping_from_cleaned_session_parquet(
         set() if dummy_df.empty else {int(x) for x in dummy_df["player_id"].tolist()}
     )
     canonical_map = build_canonical_mapping_from_links(links_df, dummy_pids)
-    canonical_map.to_parquet(out_pq, index=False)
+    canonical_map.sort_values(["player_id", "canonical_id"], kind="mergesort").reset_index(
+        drop=True,
+    ).to_parquet(out_pq, index=False)
 
     meta = {
         "cutoff_dtm": cutoff_naive.isoformat(sep=" "),

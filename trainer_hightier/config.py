@@ -1,4 +1,4 @@
-"""High-tier patron objective: fixed precision target → report alert rate.
+"""High-tier patron objective: alert-band precision at fixed operational capacity.
 
 This package is intentionally small vs ``trainer/``. Wire real IO and
 segmentation in later steps.
@@ -11,12 +11,15 @@ Other packages may still *call* shared helpers; only **config** stays local here
 
 from __future__ import annotations
 
+import calendar
+import hashlib
+import json
 import os
 
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 # Installed / editable package directory ``…/trainer_hightier/`` (contracts, modules).
@@ -29,6 +32,11 @@ DEFAULT_DEPLOY_OUTPUT_ROOT: Final[Path] = _REPO_ROOT / "out" / "deploy_hightier"
 DEFAULT_RANDOM_SEED: Final[int] = 42
 # Step 3 Feast feature service wired by :mod:`trainer_hightier.trainer`.
 DEFAULT_TRAINING_FEATURE_SERVICE: Final[str] = "walkaway_bet_trial_v1"
+# Inclusive lower bound on ``gaming_day_event`` for L0 session/bet preprocess (2024 shards excluded).
+DEFAULT_L0_PREPROCESS_GAMING_DAY_EVENT_MIN: Final[date] = date(2025, 1, 1)
+# Inclusive lower bound on ``gaming_day_event`` for training rows (Step 3 output → Step 5).
+# ``None`` keeps the full L0-preprocessed scope; set a later date only for explicit fast experiments.
+DEFAULT_TRAINING_GAMING_DAY_EVENT_MIN: Final[date | None] = None
 
 # --- Shared domain constants (keep aligned with defaults in ``HightierServingConfig``) ---
 HK_TZ: Final[str] = "Asia/Hong_Kong"
@@ -57,7 +65,7 @@ MANIFEST_KEY_MID_TERM_COVERAGE_END: Final[str] = "mid_term_coverage_end_exclusiv
 MANIFEST_KEY_MID_TERM_GENERATED_AT: Final[str] = "mid_term_generated_at"
 MANIFEST_KEY_MID_TERM_STALE_HARD_CAP_DAYS: Final[str] = "mid_term_stale_hard_cap_days"
 # Manifest JSON key (legacy string). Semantics: short-term **offline PIT cache** path — see
-# ``MANIFEST_KEY_SHORT_TERM_PIT_CACHE`` and ``doc/Scorer Runtime Contract - SSOT.md`` §Short-term.
+# ``MANIFEST_KEY_SHORT_TERM_PIT_CACHE`` and ``doc/ssot/Scorer Runtime Contract - SSOT.md`` §Short-term.
 MANIFEST_KEY_FE_SHORT_TERM: Final[str] = "fe_short_term_parquet"
 MANIFEST_KEY_SHORT_TERM_PIT_CACHE: Final[str] = MANIFEST_KEY_FE_SHORT_TERM
 MANIFEST_KEY_SLOW_ANCHOR_MAX: Final[str] = "slow_anchor_gaming_day_event_max"
@@ -81,11 +89,96 @@ FE_SHORT_TERM_DEPLOY_PARQUET_BASENAME: Final[str] = "fe_short_term_features.parq
 SHORT_TERM_PIT_CACHE_DEPLOY_BASENAME: Final[str] = FE_SHORT_TERM_DEPLOY_PARQUET_BASENAME
 # Step 3.5 training artifact: per-row PIT values for training ``bet_id`` only.
 TRAINING_SHORT_TERM_PIT_CACHE_BASENAME: Final[str] = "_main_trainer_fe_short_term.parquet"
+TRAINING_TXN_LITE_CACHE_BASENAME: Final[str] = "_main_trainer_txn_lite.parquet"
+# L0 ``t_casino_txn`` source integration (see Data pipeline SSOT §5.2).
+TXN_L0_RAW_ROOT: Final[Path] = _REPO_ROOT / "data" / "t_casino_txn"
+TXN_L0_CLEANED_ROOT: Final[Path] = (
+    TRAINER_HIGHTIER_PACKAGE_DIR / "artifacts" / "cleaned" / "cleaned__gmwds_t_casino_txn"
+)
+TXN_L0_CLEANING_POLICY_ID: Final[str] = "t_casino_txn_l0_v2_schema"
+TXN_L0_SOURCE_CONTRACT_REF: Final[str] = "doc/ssot/Data pipeline - SSOT.md#5.2"
+TXN_L0_REGISTRY_TABLE_KEY: Final[str] = "gmwds_t_casino_txn"
+TXN_L0_EVENT_TIME_COLUMN: Final[str] = "start_dtm"
+TXN_L0_OBSERVED_AT_COLUMN: Final[str] = "__etl_insert_Dtm"
+TXN_L0_INGEST_CAP_SEC: Final[int] = 128
+TXN_L0_LOGICAL_KEY_COLUMN: Final[str] = "casino_txn_id"
+TXN_L0_INGEST_FIX_RULE_ID: Final[str] = "TXN-INGEST-FIX-001"
+TXN_L0_PARTIAL_MIN_POST_DEDUP_ROWS: Final[int] = 100_000
+TXN_L0_PARTIAL_ROW_RATIO_VS_MEDIAN: Final[float] = 0.20
+TXN_L0_PARTIAL_MAX_SHARD_COUNT: Final[int] = 3
+# Feature-experiment Wave 1b: ``t_casino_txn`` txn_lite (BUYIN/CASHOUT only; see FND-19).
+DEFAULT_T_CASINO_TXN_CLEANED_ROOT: Final[Path] = TXN_L0_CLEANED_ROOT
+TXN_LITE_CLEANING_POLICY_ID: Final[str] = "t_casino_txn_l0_v2_schema+l1_fnd19"
+TXN_LITE_SOURCE_CONTRACT_REF: Final[str] = "doc/ssot/Data pipeline - SSOT.md#5.2"
+TXN_LITE_MATERIALIZER_VERSION: Final[str] = "txn_lite_cashflow_v1_l0"
+TXN_LITE_INCLUDED_TYPES: Final[tuple[str, ...]] = ("BUYIN", "CASHOUT")
+TXN_LITE_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
+    "txn__has_cash_out__w15m",
+    "txn__cash_out_cnt__w1h",
+    "txn__cash_out_sum__w1h",
+    "txn__net_cash_out_flag__w1h",
+    "txn__net_cash_flow__w1h",
+    "txn__buyin_cash_sum__w1h",
+    "txn__buyin_prize_redemption_flag__w1h",
+)
+# Window ablation probes (experiment-only; not in feature_candidate_registry until Gate 1 passes).
+TXN_LITE_WINDOW_ABLATION_EXTRA_HOURS: Final[tuple[int, ...]] = (4, 24)
+
+
+def txn_lite_feature_columns(*, extra_window_hours: tuple[int, ...] = ()) -> tuple[str, ...]:
+    """Return ``txn__*`` output columns for materialize (base v0 + optional longer-window sums)."""
+
+    extra_cols: list[str] = []
+    for hours in extra_window_hours:
+        if hours <= 1:
+            continue
+        suffix = f"w{hours}h"
+        extra_cols.extend(
+            (
+                f"txn__cash_out_sum__{suffix}",
+                f"txn__buyin_cash_sum__{suffix}",
+                f"txn__net_cash_flow__{suffix}",
+            ),
+        )
+    return tuple(dict.fromkeys(TXN_LITE_FEATURE_COLUMNS + tuple(extra_cols)))
+
+# ``t_session`` closed-session PIT features (experiment / session_pit supplier).
+SESSION_L0_EVENT_TIME_COLUMN: Final[str] = "session_end_dtm"
+SESSION_L0_OBSERVED_AT_COLUMN: Final[str] = "__etl_insert_Dtm"
+SESSION_L0_SYNTHETIC_OBSERVED_AT_COLUMN: Final[str] = "__etl_insert_Dtm_synthetic"
+SESSION_L0_INGEST_CAP_SEC: Final[int] = 636
+SESSION_PIT_MATERIALIZER_VERSION: Final[str] = "session_pit_closed_session_v1"
+SESSION_PIT_SOURCE_CONTRACT_REF: Final[str] = "contracts/preprocess_l0_data_contract_registry.yaml#t_session"
+SESSION_PIT_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
+    "fe__session__num_games_with_wager_log1p",
+    "fe__session__num_bets_log1p",
+    "fe__session__turnover_log1p",
+    "fe__session__theo_win_log1p_signed",
+    "fe__session__bet_wager_over_sess_avg_log1p",
+)
+
 # Month-sharded short-term PIT cache under ``artifacts/training_data/cache/``.
 SHORT_TERM_PIT_CACHE_DIRNAME: Final[str] = "short_term_pit_v1"
-SHORT_TERM_PIT_CACHE_SCHEMA_VERSION: Final[int] = 1
+SHORT_TERM_PIT_CACHE_SCHEMA_VERSION: Final[int] = 2
+SHORT_TERM_PIT_SUPPLIER_FAMILY: Final[str] = "short_term:w1h"
 # Training materialize batch size (decoupled from scorer cycle size for offline throughput).
-DEFAULT_TRAINING_SHORT_TERM_MATERIALIZE_BATCH_SIZE: Final[int] = 20_000
+DEFAULT_TRAINING_SHORT_TERM_MATERIALIZE_BATCH_SIZE: Final[int] = 100_000
+STEP35_MISS_PATH_INDEXED_REPLAY: Final[str] = "indexed_replay"
+STEP35_MISS_PATH_BOUNDED: Final[str] = "bounded_duckdb"
+DEFAULT_STEP35_MISS_PATH: Final[str] = STEP35_MISS_PATH_INDEXED_REPLAY
+INDEXED_REPLAY_GATE_MODE_HARD_FE: Final[str] = "hard_fe_soft_bet_pack"
+INDEXED_REPLAY_MATERIALIZER_VERSION: Final[str] = "indexed_replay_emit_opt_v1"
+LEGACY_BET_PACK_1H_COLUMNS: Final[tuple[str, ...]] = (
+    "bet__bets_cnt__w1h",
+    "bet__wager_sum__w1h",
+    "bet__back_bet_ratio__w1h",
+    "bet__payout_odds_avg__w1h",
+)
+LEGACY_BET_PACK_WAIVER_MAX_MISMATCH_RATIO: Final[float] = 1e-4
+LEGACY_BET_PACK_WAIVER_ROOT_CAUSE: Final[str] = (
+    "indexed full-month replay includes canonical alias player history that the "
+    "bounded 2000-row batch pool does not include"
+)
 # Neighbor months included when invalidating shards after partition inventory deltas.
 SHORT_TERM_PIT_SOURCE_NEIGHBOR_MONTHS: Final[int] = 1
 # Production snapshot lifecycle (HK wall-clock).
@@ -108,10 +201,78 @@ CASINO_PLAYER_ID_CLEAN_SQL: Final[str] = (
     "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') "
     "THEN NULL ELSE trim(casino_player_id) END"
 )
+# Player DQ v1: known test accounts + abnormal game pace (distinct game_id buckets).
+PLAYER_DQ_KNOWN_TEST_CASINO_PLAYER_ID_PREFIX: Final[str] = "4444"
+PLAYER_DQ_HARD_MAX_DISTINCT_GAME_ID_PER_HOUR: Final[int] = 240
+PLAYER_DQ_HARD_MAX_DISTINCT_GAME_ID_PER_DAY: Final[int] = 2880
+PLAYER_DQ_REVIEW_MAX_DISTINCT_GAME_ID_PER_HOUR: Final[int] = 120
+PLAYER_DQ_REVIEW_MAX_DISTINCT_GAME_ID_PER_DAY: Final[int] = 1440
 WALKAWAY_GAP_MIN: Final[int] = 30
 ALERT_HORIZON_MIN: Final[int] = 15
+#: Offline train/eval player-level alert cooldown (Step 5 operational simulation).
+#: 120m chosen from the 2026-06-12 episode policy study: cooldowns >=120m and the
+#: episode-cap policy tie within seed noise, all beat 60m; 120m is the simplest.
+PLAYER_ALERT_COOLDOWN_MIN: Final[int] = 120
+LABELS_CANONICAL_SHARD_COUNT: Final[int] = 32
+DEFAULT_USE_SHARDED_LABELS_CACHE: Final[bool] = False
 LABEL_LOOKAHEAD_MIN: Final[int] = 45
-BET_AVAIL_DELAY_MIN: Final[int] = 1
+#: Read-only sibling backup of pre–gap-partition ``labels_v1`` cache (Phase 1 walkaway experiments).
+LABELS_CACHE_READONLY_BACKUP_DIRNAME: Final[str] = "labels_v1__readonly_backup_gap30_20260617"
+#: Read-only backup basename for default ``walkaway_labels.parquet`` (gap=30 production).
+WALKAWAY_LABELS_READONLY_BACKUP_BASENAME: Final[str] = "walkaway_labels_gap30_readonly_backup_20260617.parquet"
+#: Full readonly snapshot of training caches before walkaway gap ablation runs.
+TRAINING_CACHES_READONLY_BACKUP_DIRNAME: Final[str] = (
+    "cache__readonly_backup_pre_walkaway_gap_ablation_20260617"
+)
+TRAINING_CACHES_BACKUP_MANIFEST_BASENAME: Final[str] = "BACKUP_MANIFEST.json"
+
+
+@dataclass(frozen=True)
+class WalkawayLabelContract:
+    """Named walkaway label semantics: gap *X* minutes without bets, alert horizon *Y* minutes."""
+
+    contract_id: str
+    walkaway_gap_min: int
+    alert_horizon_min: int
+
+    @property
+    def label_lookahead_min(self) -> int:
+        """Minutes from observation to label observation boundary (``gap + horizon``)."""
+        return int(self.walkaway_gap_min) + int(self.alert_horizon_min)
+
+
+DEFAULT_WALKAWAY_LABEL_CONTRACT: Final[WalkawayLabelContract] = WalkawayLabelContract(
+    contract_id="walkaway_v1_gap30",
+    walkaway_gap_min=WALKAWAY_GAP_MIN,
+    alert_horizon_min=ALERT_HORIZON_MIN,
+)
+
+
+def walkaway_label_contract_for_gap_min(
+    gap_min: int,
+    *,
+    alert_horizon_min: int | None = None,
+) -> WalkawayLabelContract:
+    """Resolve a :class:`WalkawayLabelContract` for experimental gap values."""
+    gap = int(gap_min)
+    if gap < 1:
+        raise ValueError(f"walkaway_gap_min must be >= 1, got {gap_min!r}")
+    horizon = int(ALERT_HORIZON_MIN if alert_horizon_min is None else alert_horizon_min)
+    if horizon < 1:
+        raise ValueError(f"alert_horizon_min must be >= 1, got {alert_horizon_min!r}")
+    if gap == WALKAWAY_GAP_MIN and horizon == ALERT_HORIZON_MIN:
+        return DEFAULT_WALKAWAY_LABEL_CONTRACT
+    return WalkawayLabelContract(
+        contract_id=f"walkaway_v1_gap{gap}",
+        walkaway_gap_min=gap,
+        alert_horizon_min=horizon,
+    )
+
+
+#: Bet availability delay before scoring (minutes). Keep >= ingest_delay_cap_sec (122s)
+#: from preprocess_l0_data_contract_registry so ``prediction_visible_ts_cf`` guarantees
+#: synthetic observed-at visibility at score time.
+BET_AVAIL_DELAY_MIN: Final[int] = 2
 SCORER_POLL_INTERVAL_SECONDS: Final[int] = 45
 #: Hard-fail scoring cycle when Feast entity row missing rate exceeds this fraction.
 SCORER_FEAST_ENTITY_MISSING_FAIL_FRACTION: Final[float] = 0.10
@@ -133,6 +294,10 @@ PRODUCTION_MID_ASOF_BACKFILL_DAYS: Final[int] = 30
 PRODUCTION_MID_FEAST_BOOTSTRAP_ANCHOR_DAYS: Final[int] = PRODUCTION_MID_ASOF_BACKFILL_DAYS
 #: Hard-fail when sampled mid Feast columns exceed this null fraction (aligns with training ~5%).
 SCORER_FEAST_MID_CELL_NULL_FAIL_FRACTION: Final[float] = 0.05
+#: Log WARNING when a scorer cycle Feast online lookup exceeds this latency (ms).
+SCORER_FEAST_LOOKUP_LATENCY_WARN_MS: Final[float] = 500.0
+#: Validator INFO heartbeat when no alerts are verified in a cycle.
+DEPLOY_VALIDATOR_HEARTBEAT_SECONDS: Final[int] = 300
 #: Informational allowlist coverage target for ops dashboards (not enforced as a hard gate).
 SCORER_FEAST_MID_TARGET_CANONICAL_COVERAGE_FRACTION: Final[float] = 0.95
 #: Shipped in deploy bundles for Feast bootstrap seed (training mid snapshot copy).
@@ -148,6 +313,13 @@ SCORER_FEAST_MID_SMOKE_COLUMNS: Final[tuple[str, ...]] = (
     "fe__std_wager_w7d",
     "fe__avg_abs_wager_w7d",
 )
+#: Per-model deploy supplier contract (derived at package time; cross-checked at deploy).
+DEPLOY_CONTRACT_SCHEMA_VERSION: Final[str] = "deploy_contract_v1"
+DEPLOY_CONTRACT_FILENAME: Final[str] = "deploy_contract.json"
+#: Phase 2+: fail package when contract preconditions fail (missing validator, legacy buckets).
+FEATURE_CONTRACT_PACKAGE_STRICT: Final[bool] = True
+#: Phase 1 deploy rollout: log contract drift; set True for strict deploy preflight/e2e.
+FEATURE_CONTRACT_DEPLOY_STRICT: Final[bool] = False
 #: Default training mid snapshot used to seed production Feast bootstrap (repo-local).
 DEFAULT_TRAINING_MID_SNAPSHOT_PARQUET: Final[str] = (
     "trainer_hightier/artifacts/training_data/_main_trainer_mid_term_daily_snapshot.parquet"
@@ -267,6 +439,285 @@ class DuckDbRuntimeConfig:
 
 
 @dataclass(frozen=True)
+class L0PreprocessDataScopeConfig:
+    """Inclusive ``gaming_day_event`` bounds applied when cleaning raw L0 Parquet."""
+
+    gaming_day_event_min: date | None = DEFAULT_L0_PREPROCESS_GAMING_DAY_EVENT_MIN
+    gaming_day_event_max: date | None = None
+
+    def manifest_block(self) -> dict[str, str | None]:
+        """JSON-serializable fragment for preprocess cache manifests."""
+        return {
+            "gaming_day_event_min": (
+                self.gaming_day_event_min.isoformat() if self.gaming_day_event_min is not None else None
+            ),
+            "gaming_day_event_max": (
+                self.gaming_day_event_max.isoformat() if self.gaming_day_event_max is not None else None
+            ),
+        }
+
+
+# Unbounded scope for unit tests that use synthetic pre-2025 fixtures.
+L0_PREPROCESS_DATA_SCOPE_TEST_UNBOUNDED: Final[L0PreprocessDataScopeConfig] = L0PreprocessDataScopeConfig(
+    gaming_day_event_min=None,
+    gaming_day_event_max=None,
+)
+
+
+@dataclass(frozen=True)
+class TrainingDataScopeConfig:
+    """Inclusive ``gaming_day_event`` bounds applied to training rows after Step 3."""
+
+    gaming_day_event_min: date | None = DEFAULT_TRAINING_GAMING_DAY_EVENT_MIN
+    gaming_day_event_max: date | None = None
+
+    def manifest_block(self) -> dict[str, str | None]:
+        """JSON-serializable fragment for run reports."""
+        return {
+            "gaming_day_event_min": (
+                self.gaming_day_event_min.isoformat() if self.gaming_day_event_min is not None else None
+            ),
+            "gaming_day_event_max": (
+                self.gaming_day_event_max.isoformat() if self.gaming_day_event_max is not None else None
+            ),
+        }
+
+
+# Unbounded training scope for unit tests.
+TRAINING_DATA_SCOPE_TEST_UNBOUNDED: Final[TrainingDataScopeConfig] = TrainingDataScopeConfig(
+    gaming_day_event_min=None,
+    gaming_day_event_max=None,
+)
+
+DEFAULT_RECENT_FULL_MONTHS: Final[int] = 3
+DATA_COMPLETENESS_MODE_WARN: Final[str] = "warn"
+DATA_COMPLETENESS_MODE_STRICT: Final[str] = "strict"
+TRAINING_RUN_KIND_SPEED: Final[str] = "speed_iteration"
+TRAINING_RUN_KIND_RELEASE: Final[str] = "release_promoted"
+NEG_SAMPLE_SCOPE_TRAIN_ONLY: Final[str] = "train_only"
+DataCompletenessMode = Literal["warn", "strict"]
+TrainingRunKind = Literal["speed_iteration", "release_promoted"]
+
+
+def _policy_blob_sha256(payload: dict[str, object]) -> str:
+    """Return SHA-256 hex digest of a sorted JSON policy blob."""
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class TrainingScopePolicy:
+    """Target-row horizon policy (SSOT TA-001 / TA-005).
+
+    When ``recent_full_months`` is ``None``, horizon filtering is disabled (legacy all-history
+    rows within ``TrainingDataScopeConfig``).
+    """
+
+    recent_full_months: int | None = 6  # experiment: recent 6 full months (was 3)
+    include_current_partial_month: bool = True  # ... and include current partial month
+    as_of_date: date | None = None
+    data_completeness_mode: DataCompletenessMode = DATA_COMPLETENESS_MODE_WARN
+
+    def manifest_block(self) -> dict[str, object]:
+        """JSON-serializable policy fragment for run artifacts."""
+        return {
+            "recent_full_months": self.recent_full_months,
+            "include_current_partial_month": bool(self.include_current_partial_month),
+            "as_of_date": self.as_of_date.isoformat() if self.as_of_date is not None else None,
+            "data_completeness_mode": str(self.data_completeness_mode),
+        }
+
+
+@dataclass(frozen=True)
+class ResolvedTrainingScope:
+    """Resolved target months and date bounds for a training run."""
+
+    policy: TrainingScopePolicy
+    as_of_date: date
+    horizon_enabled: bool
+    target_months: tuple[str, ...]
+    partial_target_months: frozenset[str]
+    target_start_date: date | None
+    target_end_date: date | None
+
+    def manifest_block(self) -> dict[str, object]:
+        """JSON-serializable resolved scope for run artifacts."""
+        return {
+            **self.policy.manifest_block(),
+            "horizon_enabled": bool(self.horizon_enabled),
+            "as_of_date_resolved": self.as_of_date.isoformat(),
+            "target_months": list(self.target_months),
+            "partial_target_months": sorted(self.partial_target_months),
+            "target_start_date": (
+                self.target_start_date.isoformat() if self.target_start_date is not None else None
+            ),
+            "target_end_date": (
+                self.target_end_date.isoformat() if self.target_end_date is not None else None
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class SamplePolicy:
+    """Train-only negative downsampling policy (SSOT TA-008)."""
+
+    neg_sample_frac: float = 1.0  # default off; speed runs may lower in trainer CLI later
+    neg_sample_seed: int = DEFAULT_RANDOM_SEED
+    neg_sample_scope: str = NEG_SAMPLE_SCOPE_TRAIN_ONLY
+
+    def __post_init__(self) -> None:
+        frac = float(self.neg_sample_frac)
+        if not (0.0 < frac <= 1.0):
+            raise ValueError(
+                f"neg_sample_frac must be in (0, 1], got {self.neg_sample_frac!r}",
+            )
+        if str(self.neg_sample_scope) != NEG_SAMPLE_SCOPE_TRAIN_ONLY:
+            raise ValueError(
+                f"neg_sample_scope must be {NEG_SAMPLE_SCOPE_TRAIN_ONLY!r}, "
+                f"got {self.neg_sample_scope!r}",
+            )
+
+    def manifest_block(self) -> dict[str, object]:
+        """JSON-serializable sampling policy fragment."""
+        return {
+            "neg_sample_frac": float(self.neg_sample_frac),
+            "neg_sample_seed": int(self.neg_sample_seed),
+            "neg_sample_scope": str(self.neg_sample_scope),
+            "enabled": float(self.neg_sample_frac) < 1.0,
+        }
+
+
+@dataclass(frozen=True)
+class FeatureScreeningPolicy:
+    """Optional pre-Step-5 feature screening hook (default off)."""
+
+    enabled: bool = False
+    manifest_path: Path | None = None
+
+    def manifest_block(self) -> dict[str, object]:
+        """JSON-serializable screening policy fragment."""
+        mp = self.manifest_path
+        return {
+            "enabled": bool(self.enabled),
+            "manifest_path": str(mp.resolve()) if mp is not None else None,
+        }
+
+
+def _shift_calendar_month(yyyymm: str, *, delta_months: int) -> str:
+    """Shift ``YYYYMM`` by *delta_months* on the calendar axis."""
+    ym = str(yyyymm).strip()
+    if len(ym) != 6 or not ym.isdigit():
+        raise ValueError(f"month must be six YYYYMM digits, got {yyyymm!r}")
+    y = int(ym[:4])
+    m = int(ym[4:6])
+    m += int(delta_months)
+    while m < 1:
+        m += 12
+        y -= 1
+    while m > 12:
+        m -= 12
+        y += 1
+    return f"{y:04d}{m:02d}"
+
+
+def _month_last_day(year: int, month: int) -> date:
+    """Return the last calendar day of ``year``/``month``."""
+    _, last = calendar.monthrange(year, month)
+    return date(year, month, last)
+
+
+def resolve_training_scope(
+    policy: TrainingScopePolicy,
+    *,
+    as_of: date | None = None,
+) -> ResolvedTrainingScope:
+    """Resolve target months and inclusive date bounds from horizon policy."""
+    as_of_date = policy.as_of_date or as_of or date.today()
+    if policy.recent_full_months is None:
+        return ResolvedTrainingScope(
+            policy=policy,
+            as_of_date=as_of_date,
+            horizon_enabled=False,
+            target_months=(),
+            partial_target_months=frozenset(),
+            target_start_date=None,
+            target_end_date=None,
+        )
+    recent = int(policy.recent_full_months)
+    if recent <= 0:
+        raise ValueError(f"recent_full_months must be positive when set, got {recent!r}")
+    anchor_y, anchor_m = as_of_date.year, as_of_date.month
+    anchor_ym = f"{anchor_y:04d}{anchor_m:02d}"
+    full_months = [_shift_calendar_month(anchor_ym, delta_months=-offset) for offset in range(recent, 0, -1)]
+    target_months = list(full_months)
+    partial: set[str] = set()
+    if policy.include_current_partial_month:
+        if anchor_ym not in target_months:
+            target_months.append(anchor_ym)
+        partial.add(anchor_ym)
+    earliest_ym = min(target_months)
+    start = date(int(earliest_ym[:4]), int(earliest_ym[4:6]), 1)
+    if partial:
+        end = as_of_date
+    else:
+        latest_ym = max(full_months)
+        end = _month_last_day(int(latest_ym[:4]), int(latest_ym[4:6]))
+    return ResolvedTrainingScope(
+        policy=policy,
+        as_of_date=as_of_date,
+        horizon_enabled=True,
+        target_months=tuple(sorted(target_months)),
+        partial_target_months=frozenset(partial),
+        target_start_date=start,
+        target_end_date=end,
+    )
+
+
+def training_scope_policy_fingerprint(resolved: ResolvedTrainingScope) -> str:
+    """Fingerprint for target horizon policy (distinct from L0 ``training_scope_fingerprint``)."""
+    return _policy_blob_sha256(
+        {
+            "kind": "training_scope_policy_v1",
+            **resolved.manifest_block(),
+        },
+    )
+
+
+def sample_policy_fingerprint(policy: SamplePolicy) -> str:
+    """Fingerprint for train-only negative downsampling policy."""
+    return _policy_blob_sha256({"kind": "sample_policy_v1", **policy.manifest_block()})
+
+
+def feature_selection_policy_fingerprint(policy: FeatureScreeningPolicy) -> str:
+    """Fingerprint for optional feature screening hook policy."""
+    return _policy_blob_sha256({"kind": "feature_screening_policy_v1", **policy.manifest_block()})
+
+
+def validate_sample_policy_for_run(
+    policy: SamplePolicy,
+    *,
+    run_kind: TrainingRunKind,
+) -> None:
+    """Fail-fast when release runs attempt downsampling."""
+    if run_kind == TRAINING_RUN_KIND_RELEASE and float(policy.neg_sample_frac) != 1.0:
+        raise ValueError(
+            "release_promoted runs require neg_sample_frac=1.0; "
+            f"got neg_sample_frac={policy.neg_sample_frac!r}",
+        )
+
+
+def validate_feature_screening_policy(policy: FeatureScreeningPolicy) -> None:
+    """Fail-fast when screening is enabled without a readable manifest path."""
+    if not policy.enabled:
+        return
+    if policy.manifest_path is None:
+        raise ValueError("feature_screening enabled=True requires manifest_path")
+    path = Path(policy.manifest_path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"feature_screening manifest not found at {path}")
+
+
+@dataclass(frozen=True)
 class SessionPreprocessConfig:
     """L0 ``t_session`` → cleaned Parquet: engine choice and pandas-shard batching only.
 
@@ -283,6 +734,8 @@ class SessionPreprocessConfig:
     dedup_hash_buckets: int = 8
     # Only for ``pandas_shards``: concatenate this many row groups per shard file.
     row_groups_per_shard: int = 8
+    #: Drop rows outside inclusive ``gaming_day_event`` bounds after HK day derivation.
+    data_scope: L0PreprocessDataScopeConfig = field(default_factory=L0PreprocessDataScopeConfig)
 
 
 @dataclass(frozen=True)
@@ -295,7 +748,7 @@ class BetPreprocessConfig:
     ``dedup_hash_buckets``: split ``ROW_NUMBER`` dedup by ``mod(abs(hash(bet_id)), N)`` so each
     bucket processes ~1/N of keys at a time (lower peak RAM on huge tables). ``1`` disables bucketing.
 
-    **ADT patron segment:** when ``adt_filter_quantile`` is set (e.g. ``0.99``), keep only bets whose
+    **ADT patron segment:** when ``adt_filter_quantile`` is set (e.g. ``0.95``), keep only bets whose
     ``player_id`` appears in ``adt_allowed_players_parquet`` (one row per allowed ``player_id``, written
     upstream from ``patron_profile_csv`` + ``canonical_mapping_parquet`` via ADT quantile threshold).
     ``patron_profile_csv`` / ``canonical_mapping_parquet`` remain on the config for DuckDB joins and
@@ -305,11 +758,13 @@ class BetPreprocessConfig:
 
     engine: str = "duckdb"
     preprocess_registry_yaml: Path | None = None
-    dedup_hash_buckets: int = 8
+    dedup_hash_buckets: int = 16
     adt_filter_quantile: float | None = None
     patron_profile_csv: Path | None = None
     canonical_mapping_parquet: Path | None = None
     adt_allowed_players_parquet: Path | None = None
+    #: Drop rows outside inclusive ``gaming_day_event`` bounds after HK day derivation.
+    data_scope: L0PreprocessDataScopeConfig = field(default_factory=L0PreprocessDataScopeConfig)
 
 
 @dataclass(frozen=True)
@@ -331,14 +786,40 @@ class CanonicalMappingConfig:
 
 
 @dataclass(frozen=True)
+class PlayerDqConfig:
+    """Player-level DQ for training universe (hard exclude + review flags).
+
+    Hard exclude applies at entity-set / legacy segment projection only; bet base clean
+    cache is unchanged. Review flags are written to ``player_dq_flags.parquet`` only.
+    """
+
+    enabled: bool = True
+    known_test_casino_player_id_prefixes: tuple[str, ...] = (
+        PLAYER_DQ_KNOWN_TEST_CASINO_PLAYER_ID_PREFIX,
+    )
+    hard_distinct_game_id_per_hour: int = PLAYER_DQ_HARD_MAX_DISTINCT_GAME_ID_PER_HOUR
+    hard_distinct_game_id_per_day: int = PLAYER_DQ_HARD_MAX_DISTINCT_GAME_ID_PER_DAY
+    review_distinct_game_id_per_hour: int = PLAYER_DQ_REVIEW_MAX_DISTINCT_GAME_ID_PER_HOUR
+    review_distinct_game_id_per_day: int = PLAYER_DQ_REVIEW_MAX_DISTINCT_GAME_ID_PER_DAY
+    artifacts_dir: Path | None = None
+
+
+@dataclass(frozen=True)
 class HighTierObjectiveConfig:
-    """Defaults for high-tier segment + precision-floor reporting."""
+    """Defaults for high-tier segment + threshold selection / reporting."""
 
     # Quantile in (0, 1) on patron **ADT** (from ``canonical_patron_profile.csv``): bet preprocess keeps
     # only bets tied (via canonical mapping) to patrons at or above this ADT quantile (~top ``1 - q``).
     # Align naming with ``trainer.training.high_roller_segmentation`` when wiring segment thresholds.
-    theo_train_quantile: float = 0.99
-    # Require precision >= this value on the **segment** when choosing a score threshold.
+    theo_train_quantile: float = 0.95
+    #: ``alert_band_precision``: maximize operational precision at ``target_alerts_per_hour``.
+    #: ``min_precision``: legacy recall@precision-floor picker (backward compatibility).
+    selection_policy: Literal["alert_band_precision", "min_precision"] = "alert_band_precision"
+    #: Target operational alert rates (alerts/hour) for band objective and reporting.
+    target_alerts_per_hour: tuple[float, ...] = (1.0, 2.0)
+    #: Deployed score threshold is calibrated to this alerts/hour target on validation.
+    deployment_target_alerts_per_hour: float = 1.0
+    #: Legacy precision floor when ``selection_policy='min_precision'``.
     min_precision: float = 0.60
     # Placeholder paths for later steps (Parquet / DuckDB exports).
     segment_scores_parquet: Path | None = None
@@ -448,12 +929,98 @@ class Step4SplitConfig:
     ``test`` receives the remainder after train and val.
     """
 
-    train_day_fraction: float = 0.80
-    val_day_fraction: float = 0.10
+    train_day_fraction: float = 0.70
+    val_day_fraction: float = 0.15
     #: When ``None``, defaults to ``trainer_hightier/artifacts/training_data/splits``.
     splits_output_dir: Path | None = None
     #: When set, drop split rows whose ``canonical_id`` is absent from this slow monthly Parquet.
     slow_patron_parquet: Path | None = None
+
+
+@dataclass(frozen=True)
+class OptunaFloatParamRange:
+    """Inclusive Optuna ``trial.suggest_float`` bounds."""
+
+    low: float
+    high: float
+    log: bool = False
+
+    def __post_init__(self) -> None:
+        if float(self.low) >= float(self.high):
+            raise ValueError(
+                f"OptunaFloatParamRange requires low < high; got low={self.low!r}, high={self.high!r}",
+            )
+
+
+@dataclass(frozen=True)
+class OptunaIntParamRange:
+    """Inclusive Optuna ``trial.suggest_int`` bounds."""
+
+    low: int
+    high: int
+
+    def __post_init__(self) -> None:
+        if int(self.low) >= int(self.high):
+            raise ValueError(
+                f"OptunaIntParamRange requires low < high; got low={self.low!r}, high={self.high!r}",
+            )
+
+
+@dataclass(frozen=True)
+class Step5LgbFixedConfig:
+    """LightGBM kwargs held fixed across baseline and Optuna runs."""
+
+    objective: str = "binary"
+    metric: str = "binary_logloss"
+    verbosity: int = -1
+    n_jobs: int = -1
+    device: str | None = None
+    gpu_device_id: int = 0
+
+
+@dataclass(frozen=True)
+class Step5OptunaSearchConfig:
+    """Optuna hyperparameter search space for Step 5 LightGBM tuning.
+
+    Defaults bias toward shallower trees, larger leaf support, and non-trivial L1/L2
+    so TPE cannot explore the deep ``num_leaves`` / near-zero regularization region
+    that overfit validation recall in prior runs.
+    """
+
+    learning_rate: OptunaFloatParamRange = field(
+        default_factory=lambda: OptunaFloatParamRange(0.02, 0.15, log=True),
+    )
+    num_leaves: OptunaIntParamRange = field(
+        default_factory=lambda: OptunaIntParamRange(16, 31),
+    )
+    max_depth: OptunaIntParamRange = field(
+        default_factory=lambda: OptunaIntParamRange(4, 10),
+    )
+    min_child_samples: OptunaIntParamRange = field(
+        default_factory=lambda: OptunaIntParamRange(50, 250),
+    )
+    subsample: OptunaFloatParamRange = field(
+        default_factory=lambda: OptunaFloatParamRange(0.6, 0.9),
+    )
+    colsample_bytree: OptunaFloatParamRange = field(
+        default_factory=lambda: OptunaFloatParamRange(0.6, 0.9),
+    )
+    reg_alpha: OptunaFloatParamRange = field(
+        default_factory=lambda: OptunaFloatParamRange(0.0, 1.0),
+    )
+    reg_lambda: OptunaFloatParamRange = field(
+        default_factory=lambda: OptunaFloatParamRange(0.1, 5.0, log=True),
+    )
+
+
+@dataclass(frozen=True)
+class PlayerAlertPolicyConfig:
+    """Shared train/serve player-level alert suppression policy."""
+
+    suppression_enabled: bool = True
+    cooldown_min: int = PLAYER_ALERT_COOLDOWN_MIN
+    threshold_selection_enabled: bool = False
+    sample_weight_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -464,18 +1031,26 @@ class Step5TrainConfig:
     #: When ``True``, use :data:`baseline_*` hyperparameters only (no Optuna).
     skip_optuna: bool = False
     #: ``study.optimize(..., timeout=...)`` wall-clock cap in seconds.
-    optuna_timeout_sec: float = 60 * 60 * 1  # 10-minute Optuna wall-clock budget
-    early_stopping_rounds: int = 50
+    optuna_timeout_sec: float = 60 * 60  # Optuna wall-clock budget (1h default)
+    #: Optuna TPE search bounds (ignored when ``skip_optuna`` is ``True``).
+    optuna_search: Step5OptunaSearchConfig = field(default_factory=Step5OptunaSearchConfig)
+    #: LightGBM kwargs not tuned by Optuna (objective, metric, verbosity, n_jobs).
+    lgb_fixed: Step5LgbFixedConfig = field(default_factory=Step5LgbFixedConfig)
+    early_stopping_rounds: int = 30
     #: Upper bound on boosting rounds (early stopping usually stops sooner).
     lgb_n_estimators_cap: int = 2000
+    #: Baseline LightGBM params (``--skip-optuna``); centered inside :attr:`optuna_search`.
     baseline_learning_rate: float = 0.05
-    baseline_num_leaves: int = 31
-    baseline_min_child_samples: int = 20
-    baseline_subsample: float = 0.8
-    baseline_colsample_bytree: float = 0.8
-    baseline_reg_lambda: float = 0.0
+    baseline_num_leaves: int = 24
+    baseline_max_depth: int = 8
+    baseline_min_child_samples: int = 100
+    baseline_subsample: float = 0.7
+    baseline_colsample_bytree: float = 0.7
+    baseline_reg_alpha: float = 0.1
+    baseline_reg_lambda: float = 1.0
     #: When ``True``, final artifact model refits on train+val (test remains holdout-only).
-    refit_train_plus_val: bool = True
+    refit_train_plus_val: bool = False
+    player_alert_policy: PlayerAlertPolicyConfig = field(default_factory=PlayerAlertPolicyConfig)
 
 
 @dataclass(frozen=True)
@@ -505,16 +1080,51 @@ class Step6ParityConfig:
     #: Optional short smoke replay on a subsample (diagnostic only).
     run_short_smoke_in_step6: bool = False
     #: Wall-clock budget for parity + deploy bundle build + deploy E2E (seconds).
-    step6_total_timeout_seconds: int = 600
+    step6_total_timeout_seconds: int = 1800
     #: Retry the full Step 6 sequence once on failure (shared timeout window).
     step6_auto_retry_once: bool = True
     #: Run production-like deploy E2E (fresh bundle venv) after parity.
     step6_deploy_e2e_enabled: bool = True
-    #: Scorability sample size for deploy E2E gate (keep small for 10-minute budget).
+    #: Scorability sample size for deploy E2E gate (keep small for 30-minute Step 6 budget).
     step6_deploy_e2e_max_bets: int = 500
+    #: Compare training short-term features against raw ``t_bet`` partition recompute.
+    run_raw_source_sanity: bool = True
+    hard_fail_raw_source_sanity: bool = True
+    raw_source_sanity_max_rows: int = 200
+    raw_source_undercount_ratio_threshold: float = 2.0
+    raw_source_undercount_fail_fraction: float = 0.02
 
 
 PRE_TRAIN_FEATURE_GATE_JSON_BASENAME: Final[str] = "pre_train_feature_gate.json"
+
+# Time-CV feature selection (Feature experimentation §1.8 / Wave 4).
+FEATURE_SELECTION_TIME_CV_N_FOLDS: Final[int] = 5
+FEATURE_SELECTION_TIME_CV_VAL_WINDOW_DAYS: Final[int] = 30
+FEATURE_SELECTION_TIME_CV_MIN_TRAIN_DAYS: Final[int] = 90
+FEATURE_SELECTION_TIME_CV_EARLY_STOP_FOLDS: Final[int] = 3
+FEATURE_SELECTION_TIME_CV_MEAN_DELTA_P1HR_PP: Final[float] = 1.0
+FEATURE_SELECTION_TIME_CV_MAX_CV_RATIO: Final[float] = 0.5
+FEATURE_SELECTION_TIME_CV_DROP_THRESHOLD_PP: Final[float] = -0.5
+FEATURE_SELECTION_TIME_CV_MARGINAL_LOW_PP: Final[float] = -0.5
+FEATURE_SELECTION_TIME_CV_WALL_TIME_LIMIT_SEC: Final[float] = 1200.0
+FEATURE_SELECTION_TIME_CV_PROTOTYPE_N_FOLDS: Final[int] = 3
+
+
+@dataclass(frozen=True)
+class FeatureSelectionTimeCvConfig:
+    """Expanding-window Time-CV for baseline feature pruning (operational P@1hr)."""
+
+    n_folds: int = FEATURE_SELECTION_TIME_CV_N_FOLDS
+    val_window_days: int = FEATURE_SELECTION_TIME_CV_VAL_WINDOW_DAYS
+    min_train_days: int = FEATURE_SELECTION_TIME_CV_MIN_TRAIN_DAYS
+    early_stop_folds: int = FEATURE_SELECTION_TIME_CV_EARLY_STOP_FOLDS
+    mean_delta_p1hr_pp: float = FEATURE_SELECTION_TIME_CV_MEAN_DELTA_P1HR_PP
+    max_cv_ratio: float = FEATURE_SELECTION_TIME_CV_MAX_CV_RATIO
+    drop_threshold_pp: float = FEATURE_SELECTION_TIME_CV_DROP_THRESHOLD_PP
+    marginal_low_pp: float = FEATURE_SELECTION_TIME_CV_MARGINAL_LOW_PP
+    wall_time_limit_sec: float = FEATURE_SELECTION_TIME_CV_WALL_TIME_LIMIT_SEC
+    prototype_n_folds: int = FEATURE_SELECTION_TIME_CV_PROTOTYPE_N_FOLDS
+    deployment_target_alerts_per_hour: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -528,21 +1138,20 @@ class HightierServingConfig:
     source_db: str = "GDP_GMWDS_Raw"
     tbet: str = "t_bet"
     tsession: str = "t_session"
+    tcasino_txn: str = "t_casino_txn"
     casino_player_id_clean_sql: str = (
         "CASE WHEN lower(trim(casino_player_id)) IN ('', 'null') "
         "THEN NULL ELSE trim(casino_player_id) END"
     )
     #: ClickHouse TCP/HTTP endpoint (``clickhouse_connect``).
     ch_host: str = "gdpedw"
-    ch_port: int = 8123
+    ch_port: int = 8443
     ch_user: str = ""
     ch_password: str = ""
-    ch_secure: bool = False
+    ch_secure: bool = True
     placeholder_player_id: int = -1
     walkaway_gap_min: int = 30
     alert_horizon_min: int = 15
-    #: ``trainer`` default is ``WALKAWAY_GAP_MIN + ALERT_HORIZON_MIN``.
-    label_lookahead_min: int = 45
     validator_alert_retention_days: int = 30
     validation_results_retention_days: int = 180
     validator_cache_prune_interval_seconds: int = 300
@@ -562,9 +1171,11 @@ class HightierServingConfig:
     prediction_validation_cycle_budget_seconds: float = 20.0
     prediction_validation_retention_days: int = 180
     scorer_state_retention_hours: int = 24
-    bet_avail_delay_min: int = 1
+    bet_avail_delay_min: int = BET_AVAIL_DELAY_MIN
     session_avail_delay_min: int = 15
     scorer_poll_interval_seconds: float = 30.0
+    scorer_feast_lookup_latency_warn_ms: float = SCORER_FEAST_LOOKUP_LATENCY_WARN_MS
+    deploy_validator_heartbeat_seconds: int = DEPLOY_VALIDATOR_HEARTBEAT_SECONDS
     #: When True and a cycle hits ``hightier_scorer_max_bets_per_cycle``, skip poll sleep (drain backlog).
     scorer_backlog_no_sleep_enabled: bool = True
     #: Allowlist incremental fetch: ``external_input`` (single JOIN query) or legacy ``chunk`` IN-lists.
@@ -574,6 +1185,25 @@ class HightierServingConfig:
     #: Upper bound on cold-start / backfill window for incremental fetches (hours).
     scorer_dynamic_lookback_cap_hours: int = 8
     hightier_scorer_max_bets_per_cycle: int = 2000
+    #: Wave 4: enqueue / defer player-games without changing production alerts.
+    player_game_ready_queue_dry_run_enabled: bool = False
+    #: Lookback window for player-game re-fetch during ready-queue dry-run.
+    player_game_ready_queue_refetch_lookback_hours: float = 8.0
+    #: Wave 5: shadow native player-game scoring (requires ready-queue dry-run).
+    player_game_shadow_scoring_enabled: bool = False
+    player_game_shadow_model_bundle_dir: Path | None = field(
+        default_factory=lambda: _REPO_ROOT
+        / "out"
+        / "player_game_w2"
+        / "player_game_baseline_parity",
+    )
+    #: Wave 6 shadow gate thresholds (staging review before production switch).
+    player_game_shadow_gate_max_ready_lag_sec_p95: float = 120.0
+    player_game_shadow_gate_max_pending_age_sec_p95: float = 120.0
+    player_game_shadow_gate_min_alert_volume_ratio: float = 0.5
+    player_game_shadow_gate_max_alert_volume_ratio: float = 2.0
+    player_game_shadow_gate_max_score_delta_p95_abs: float = 0.15
+    player_game_shadow_gate_min_overlap: int = 10
     #: Split ADT allowlist ``player_id`` IN-lists into chunks of this size (ClickHouse query limits).
     hightier_scorer_player_id_chunk_size: int = 500
     #: Cap rows buffered while merging chunk query results (0 = disabled). Prevents OOM if mis-tuned.
@@ -624,6 +1254,8 @@ class HightierServingConfig:
     snapshot_refresh_lock_stale_minutes: int = SNAPSHOT_REFRESH_LOCK_STALE_MINUTES
     production_cleaned_bet_mirror_dir: Path | None = None
     production_cleaned_session_mirror_parquet: Path | None = None
+    #: L0 cleaned ``t_casino_txn`` root for live ``txn__*`` scoring; ``None`` uses package default.
+    cleaned_casino_txn_root: Path | None = None
     production_bet_mirror_retention_days: int = PRODUCTION_BET_MIRROR_RETENTION_DAYS
     production_session_mirror_retention_days: int = PRODUCTION_SESSION_MIRROR_RETENTION_DAYS
     production_bet_mirror_rewrite_days: int = PRODUCTION_BET_MIRROR_REWRITE_DAYS
@@ -659,6 +1291,55 @@ class HightierServingConfig:
     scorer_feast_mid_smoke_columns: tuple[str, ...] = SCORER_FEAST_MID_SMOKE_COLUMNS
     #: Optional training mid snapshot parquet for bootstrap seed; ``None`` uses package default when present.
     training_mid_snapshot_parquet: Path | None = None
+    player_alert_policy: PlayerAlertPolicyConfig = field(
+        default_factory=lambda: PlayerAlertPolicyConfig(cooldown_min=ALERT_HORIZON_MIN),
+    )
+
+    @property
+    def label_lookahead_min(self) -> int:
+        """Minutes from alert/bet_ts to observation boundary (``gap + horizon``)."""
+        return int(self.walkaway_gap_min) + int(self.alert_horizon_min)
+
+    @property
+    def walkaway_label_contract(self) -> WalkawayLabelContract:
+        """Walkaway label contract aligned with training materialize."""
+        return walkaway_label_contract_for_gap_min(
+            self.walkaway_gap_min,
+            alert_horizon_min=self.alert_horizon_min,
+        )
+
+
+def hightier_serving_config_for_deploy_bundle(
+    bundle_root: Path,
+    rel: dict[str, object],
+) -> HightierServingConfig:
+    """Build :class:`HightierServingConfig` paths and walkaway fields from a deploy bundle."""
+    br = Path(bundle_root).resolve()
+    ls = str(rel.get("local_state_dir", "local_state"))
+    feast_art = str(rel.get("feast_artifacts_dir", "artifacts/feast"))
+    feast_repo = str(rel.get("feast_repo_dir", "feast_repo"))
+    base = HightierServingConfig()
+    gap_raw = rel.get("walkaway_gap_min", base.walkaway_gap_min)
+    horizon_raw = rel.get("alert_horizon_min", base.alert_horizon_min)
+    return replace(
+        base,
+        walkaway_gap_min=int(gap_raw),
+        alert_horizon_min=int(horizon_raw),
+        state_db_path=br / ls / "state.db",
+        prediction_log_db_path=br / ls / "prediction_log.db",
+        feature_state_db_path=br / ls / "feature_state.db",
+        snapshot_manifest_dir=br / str(rel.get("snapshot_manifest_dir", "snapshots")),
+        validator_out_dir=br / ls / "validator_out",
+        production_cleaned_bet_mirror_dir=br / "source_mirror" / "cleaned_bet",
+        production_cleaned_session_mirror_parquet=br / "source_mirror" / "cleaned_session.parquet",
+        scorer_feast_repo_path=(br / feast_repo).resolve(),
+        scorer_feast_readiness_path=(
+            br / str(rel.get("feast_readiness_path", f"{feast_art}/feast_online_readiness.json"))
+        ).resolve(),
+        adt_allowed_players_parquet=(
+            br / str(rel.get("adt_allowlist_parquet", "mapping/adt_allowed_players_q0p99.parquet"))
+        ).resolve(),
+    )
 
 
 _DEFAULT_HIGHTIER_SERVING: HightierServingConfig = HightierServingConfig()
@@ -704,6 +1385,8 @@ def apply_hightier_serving_environ_overrides(cfg: HightierServingConfig) -> High
         kw["ch_secure"] = raw in ("1", "true", "yes", "on")
     if (v := str(os.environ.get("SOURCE_DB", "")).strip()):
         kw["source_db"] = v
+    if (v := str(os.environ.get("CLEANED_CASINO_TXN_ROOT", "")).strip()):
+        kw["cleaned_casino_txn_root"] = Path(v)
     if not kw:
         return cfg
     return replace(cfg, **kw)

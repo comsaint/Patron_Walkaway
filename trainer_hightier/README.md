@@ -8,7 +8,7 @@
 |------|------|
 | **資料進場** | **僅** partition snapshot：`<repo>/data/partitions`（預設，**遞迴**掃描）或 `--partition-snapshot-dir` 下的 `t_session__part_YYYYMM.parquet` / `t_bet__part_YYYYMM.parquet`；**不再**讀 `<repo>/data/gmwds_t_*.parquet` 單檔 |
 | **Session 清洗** | L0 → 清洗後 Parquet（DuckDB 單段為預設；可選 pandas 分片後再 DuckDB merge） |
-| **訓練 / 特徵** | Step 3–5 與主 CLI 可跑通；特徵選欄由 [contracts/feature_candidate_registry.yaml](./contracts/feature_candidate_registry.yaml) 驅動；**四層命名與 short PIT cache** 見 [doc/Scorer Runtime Contract - SSOT.md](./doc/Scorer%20Runtime%20Contract%20-%20SSOT.md) §特徵四層 |
+| **訓練 / 特徵** | Step 3–5 與主 CLI 可跑通；特徵選欄由 [contracts/feature_candidate_registry.yaml](./contracts/feature_candidate_registry.yaml) 驅動；**四層命名與 short PIT cache** 見 [doc/ssot/Scorer Runtime Contract - SSOT.md](./doc/ssot/Scorer%20Runtime%20Contract%20-%20SSOT.md) §特徵四層 |
 | **Production serving** | Scorer v2 + Feast online mid/long；`build_deploy_package` 產出自包含 bundle；`deploy.main` 負責 startup / post-startup Feast refresh（見下文） |
 | **評估 demo** | `python -m trainer_hightier` 為合成資料的 precision floor 示範，**不是**完整訓練 CLI |
 
@@ -162,9 +162,10 @@ Supervisor 觀測：`local_state/feature_state.db` → `feature_state_meta` 鍵 
 
 | 文件 | 說明 |
 |------|------|
-| [doc/Scorer Runtime Contract - SSOT.md](./doc/Scorer%20Runtime%20Contract%20-%20SSOT.md) | Deploy / scoring contract |
-| [doc/Feast Post-Startup Refresh Supervisor - IMPLEMENTATION_PLAN.md](./doc/Feast%20Post-Startup%20Refresh%20Supervisor%20-%20IMPLEMENTATION_PLAN.md) | Post-startup daemon 設計 |
-| [doc/Feast Online Refresh - IMPLEMENTATION_PLAN.md](./doc/Feast%20Online%20Refresh%20-%20IMPLEMENTATION_PLAN.md) | Refresh orchestration CLI |
+| [doc/README.md](./doc/README.md) | **文件索引**（SSOT / IP / WP / 狀態表） |
+| [doc/ssot/Scorer Runtime Contract - SSOT.md](./doc/ssot/Scorer%20Runtime%20Contract%20-%20SSOT.md) | Deploy / scoring contract |
+| [doc/implementation/active/Feast Post-Startup Refresh Supervisor - IMPLEMENTATION_PLAN.md](./doc/implementation/active/Feast%20Post-Startup%20Refresh%20Supervisor%20-%20IMPLEMENTATION_PLAN.md) | Post-startup daemon 設計 |
+| [doc/implementation/active/Feast Online Refresh - IMPLEMENTATION_PLAN.md](./doc/implementation/active/Feast%20Online%20Refresh%20-%20IMPLEMENTATION_PLAN.md) | Refresh orchestration CLI |
 | bundle 內 `README_DEPLOY.md` | 建包時生成的 operator 速查 |
 
 ## 依賴

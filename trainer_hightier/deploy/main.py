@@ -25,6 +25,7 @@ from trainer_hightier.config import (
     HK_TZ,
     HightierServingConfig,
     apply_hightier_serving_environ_overrides,
+    hightier_serving_config_for_deploy_bundle,
     set_hightier_serving_deploy_override,
 )
 from trainer_hightier.serving.contracts import (
@@ -39,6 +40,51 @@ from trainer_hightier.serving.contracts import (
     META_KEY_SOURCE_MIRROR_BET_STATUS,
     META_KEY_SOURCE_MIRROR_SESSION_STATUS,
 )
+
+
+def _installed_trainer_hightier_version() -> str:
+    """Return installed ``trainer-hightier`` distribution version."""
+
+    try:
+        from importlib.metadata import version
+
+        return str(version("trainer-hightier")).strip()
+    except Exception:
+        return "unknown"
+
+
+def _read_bundle_package_version(bundle_root: Path) -> str | None:
+    """Read ``package_version`` from bundle metadata when present."""
+
+    info = Path(bundle_root).resolve() / "bundle_info.json"
+    if not info.is_file():
+        return None
+    try:
+        body = json.loads(info.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    raw = body.get("package_version")
+    return str(raw).strip() if raw else None
+
+
+def _assert_installed_package_matches_bundle_or_raise(bundle_root: Path) -> None:
+    """Fail fast when conda/site-packages has a stale wheel vs bundle ``bundle_info.json``."""
+
+    expected = _read_bundle_package_version(bundle_root)
+    if not expected:
+        return
+    installed = _installed_trainer_hightier_version()
+    if installed == expected:
+        return
+    raise RuntimeError(
+        "[deploy] trainer_hightier version mismatch: "
+        f"installed={installed!r}, bundle expects={expected!r}. "
+        "From the bundle root run: "
+        "pip install --force-reinstall wheels/trainer_hightier-*.whl "
+        "or pip install --force-reinstall -r requirements.txt"
+    )
 
 
 def _parse_deploy_args(argv: list[str] | None) -> argparse.Namespace:
@@ -72,6 +118,17 @@ def _parse_deploy_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="Disable post-startup Feast refresh supervisor daemon (debug only).",
     )
+    pr.add_argument(
+        "--record-production-flight",
+        action="store_true",
+        help="Enable production flight recorder (shadow hooks for scorer and validator).",
+    )
+    pr.add_argument(
+        "--recording-config",
+        type=Path,
+        default=None,
+        help="Flight recording YAML (default: bundle local_state/flight_recording_config.yaml).",
+    )
     return pr.parse_args(argv)
 
 
@@ -86,28 +143,7 @@ def _load_rel_paths(bundle_root: Path) -> dict[str, Any]:
 
 
 def _serving_config_for_bundle(bundle_root: Path, rel: dict[str, Any]) -> HightierServingConfig:
-    br = bundle_root.resolve()
-    ls = rel.get("local_state_dir", "local_state")
-    feast_art = rel.get("feast_artifacts_dir", "artifacts/feast")
-    feast_repo = rel.get("feast_repo_dir", "feast_repo")
-    base = HightierServingConfig()
-    return replace(
-        base,
-        state_db_path=br / ls / "state.db",
-        prediction_log_db_path=br / ls / "prediction_log.db",
-        feature_state_db_path=br / ls / "feature_state.db",
-        snapshot_manifest_dir=br / rel.get("snapshot_manifest_dir", "snapshots"),
-        validator_out_dir=br / ls / "validator_out",
-        production_cleaned_bet_mirror_dir=br / "source_mirror" / "cleaned_bet",
-        production_cleaned_session_mirror_parquet=br / "source_mirror" / "cleaned_session.parquet",
-        scorer_feast_repo_path=(br / feast_repo).resolve(),
-        scorer_feast_readiness_path=(br / rel.get(
-            "feast_readiness_path", f"{feast_art}/feast_online_readiness.json"
-        )).resolve(),
-        adt_allowed_players_parquet=(br / rel.get(
-            "adt_allowlist_parquet", "mapping/adt_allowed_players_q0p99.parquet"
-        )).resolve(),
-    )
+    return hightier_serving_config_for_deploy_bundle(bundle_root, rel)
 
 
 def _load_dotenv_if_present(bundle_root: Path) -> None:
@@ -167,13 +203,67 @@ def _root_has_file_handler(root: logging.Logger, path: Path) -> bool:
     return False
 
 
+def _configure_deploy_log_noise_filters() -> None:
+    """Reduce third-party chatter; keep deploy-owned INFO lines readable."""
+    from trainer_hightier.serving.ch_adapter import apply_serving_log_noise_filters
+
+    apply_serving_log_noise_filters()
+
+
+class _FlushingFileHandler(logging.FileHandler):
+    """FileHandler that flushes after each record so deploy_main.log stays current."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Write *record* and flush immediately."""
+        super().emit(record)
+        self.flush()
+
+
+def _disable_windows_console_quick_edit() -> bool:
+    """Disable CMD QuickEdit on Windows so accidental selection cannot pause the process.
+
+    No-op on non-Windows or when no console is attached. Fail-open on any API error.
+
+    Returns
+    -------
+    bool
+        True when QuickEdit was successfully disabled.
+    """
+    if sys.platform != "win32":
+        return False
+
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    std_input_handle = ctypes.c_uint32(-10 & 0xFFFFFFFF)
+    enable_extended_flags = 0x0080
+    enable_quick_edit_mode = 0x0040
+
+    handle = kernel32.GetStdHandle(std_input_handle)
+    if handle in (0, -1):
+        return False
+
+    mode = ctypes.c_uint32()
+    if kernel32.GetConsoleMode(handle, ctypes.byref(mode)) == 0:
+        return False
+
+    new_mode = (mode.value | enable_extended_flags) & ~enable_quick_edit_mode
+    if kernel32.SetConsoleMode(handle, new_mode) == 0:
+        return False
+    return True
+
+
 def _init_deploy_logging(
     bundle_root: Path,
     rel: dict[str, Any],
     *,
     level: int,
 ) -> Path | None:
-    """Configure root logger with stderr + bundle-local file handlers (idempotent).
+    """Configure root logger with bundle-local file + stderr handlers (idempotent).
+
+    File handler is registered before the console handler and flushes on every
+    record so ``deploy_main.log`` stays current even when stderr blocks.
+    On Windows, QuickEdit mode is disabled before handlers are attached.
 
     File handler creation failures are fail-open: console logging remains active.
 
@@ -182,22 +272,18 @@ def _init_deploy_logging(
     Path | None
         Resolved log file path when file logging is active, else ``None``.
     """
+    quick_edit_disabled = _disable_windows_console_quick_edit()
+
     formatter = logging.Formatter(_DEPLOY_LOG_FORMAT)
     root = logging.getLogger()
     root.setLevel(level)
-
-    if not _root_has_stream_handler(root, sys.stderr):
-        stream_handler = logging.StreamHandler(sys.stderr)
-        stream_handler.setFormatter(formatter)
-        stream_handler.setLevel(level)
-        root.addHandler(stream_handler)
 
     log_path = _deploy_log_file_path(bundle_root, rel)
     file_path: Path | None = None
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         if not _root_has_file_handler(root, log_path):
-            file_handler = logging.FileHandler(log_path, encoding="utf-8")
+            file_handler = _FlushingFileHandler(log_path, encoding="utf-8")
             file_handler.setFormatter(formatter)
             file_handler.setLevel(level)
             root.addHandler(file_handler)
@@ -210,12 +296,25 @@ def _init_deploy_logging(
             exc,
         )
 
+    if not _root_has_stream_handler(root, sys.stderr):
+        stream_handler = logging.StreamHandler(sys.stderr)
+        stream_handler.setFormatter(formatter)
+        stream_handler.setLevel(level)
+        root.addHandler(stream_handler)
+
+    quick_edit_status = (
+        str(quick_edit_disabled).lower()
+        if sys.platform == "win32"
+        else "n/a"
+    )
     logging.getLogger(__name__).info(
-        "[deploy] logging initialized level=%s file=%s handlers=%d",
+        "[deploy] logging initialized level=%s file=%s handlers=%d quick_edit_disabled=%s",
         logging.getLevelName(level),
         file_path if file_path is not None else "disabled",
         len(root.handlers),
+        quick_edit_status,
     )
+    _configure_deploy_log_noise_filters()
     return file_path
 
 
@@ -258,8 +357,14 @@ def _preflight_frozen_artifacts(bundle_root: Path, rel: dict[str, Any]) -> None:
 def _preflight_feature_supplyability(bundle_root: Path, rel: dict[str, Any]) -> None:
     """Verify model feature columns have runtime suppliers (registry + bundled parquet)."""
 
+    from trainer_hightier.serving.feature_contract import (
+        registry_fingerprint_from_model_bundle,
+        run_supplier_contract_gate,
+    )
     from trainer_hightier.serving.feature_supply import (
+        assert_deploy_external_data_roots_or_raise,
         assert_feature_supplyability_or_raise,
+        build_scorer_supplier_plan,
         load_frozen_registry_for_bundle,
         model_feature_columns_from_pickle,
     )
@@ -306,6 +411,25 @@ def _preflight_feature_supplyability(bundle_root: Path, rel: dict[str, Any]) -> 
         manifest=man if isinstance(man, dict) else None,
         scorer_v2_feast_mode=True,
     )
+    plan = build_scorer_supplier_plan(snap, model_feats)
+    mapping_path = bundle_root / rel["canonical_mapping_parquet"]
+    allowlist_path = bundle_root / rel.get(
+        "adt_allowlist_parquet",
+        "mapping/adt_allowed_players_q0p99.parquet",
+    )
+    contract_detail = run_supplier_contract_gate(
+        bundle_root=bundle_root,
+        model_bundle=model_bundle,
+        plan=plan,
+        registry_fingerprint=registry_fingerprint_from_model_bundle(model_bundle),
+        feature_count=len(model_feats),
+        mapping=mapping_path,
+        allowlist=allowlist_path if allowlist_path.is_file() else None,
+        stage="deploy_preflight",
+    )
+    logging.info("[deploy] supplier contract preflight %s", contract_detail)
+    roots = assert_deploy_external_data_roots_or_raise(plan)
+    logging.info("[deploy] external data roots ok %s", roots)
 
 
 def _emit_deploy_boot_info(bundle_root: Path, cfg: HightierServingConfig, rel: dict[str, Any]) -> None:
@@ -1032,7 +1156,7 @@ def _feast_refresh_supervisor_once(
         cfg, readiness, require_slow=require_slow
     )
     if not mid_needed and not slow_needed:
-        logging.info(
+        logging.debug(
             "[deploy] feast refresh supervisor: not needed mid=%s slow=%s",
             mid_reason,
             slow_reason,
@@ -1043,7 +1167,7 @@ def _feast_refresh_supervisor_once(
         wait_seconds=int(cfg.feast_background_refresh_lock_wait_seconds),
     )
     if fd is None:
-        logging.info(
+        logging.debug(
             "[deploy] feast refresh supervisor: refresh skipped; lock held elsewhere"
         )
         return
@@ -1199,6 +1323,7 @@ def main(argv: list[str] | None = None) -> int:
     mode = str(args.mode)
 
     _preflight_frozen_artifacts(br, rel)
+    _assert_installed_package_matches_bundle_or_raise(br)
     if mode in ("all", "scorer"):
         _startup_feast_refresh_or_raise(
             br,
@@ -1226,6 +1351,23 @@ def main(argv: list[str] | None = None) -> int:
         )
     _preflight_feature_supplyability(br, rel)
     _emit_deploy_boot_info(br, cfg, rel)
+
+    if bool(args.record_production_flight):
+        from trainer_hightier.serving.flight_recorder.attach import attach_production_flight_recorders
+
+        rec_ctx = attach_production_flight_recorders(
+            br,
+            config_path=args.recording_config,
+            export_sqlite=True,
+        )
+        logging.info(
+            "[deploy] production flight recorder enabled root=%s model_version=%s "
+            "fail_fast=%s evidence_grade=%s",
+            rec_ctx.recording.root,
+            rec_ctx.recording.model_version,
+            rec_ctx.config.fail_fast,
+            rec_ctx.config.evidence_grade,
+        )
 
     if mode == "api":
         from trainer_hightier.serving import api_server

@@ -35,6 +35,7 @@
 | **FND-16** | `t_session`<br>`session_id`, `casino_player_id`, `player_id` | 🟡 P1 | **同一 `session_id` 的多版本中，`casino_player_id` 可能「晚到補齊」(NULL → 非 NULL)，少數情況連 `player_id` 也會被更正**。同時 `t_bet` 本身不含 `casino_player_id` 欄位。 | 線上推論若只看「當下可得的 t_session」可能把實際有卡客暫時當作無卡；若未做 FND-01 去重與 available_time gate，會導致 D2 身份判定與 rated/non-rated 路由不穩定（且可能引入未來資訊）。 | 線上：有卡判定必須加 available_time gate（見 FND-13），並允許身份隨 `t_session` 更新而「升級」。離線/訓練：D2 mapping 必須先做 FND-01 去重再建表；同時保留 mapping cache（`player_id`→`casino_player_id`）作為兜底。 |
 | **FND-17** | `t_bet`（及 `t_session`）<br>`theo_win`, `adjusted_theo_win` | 🟡 P1 | **`theo_win` 與 `adjusted_theo_win` 非同義**：前者為系統依玩法／賠率等計算的「精算向」預期利潤；後者為評級／報表向的「調整後」理論贏。於 repo 內 `trainer/sample data/SmartTableData_tbet_sample.csv`（1000 筆）可重現：`bet_type='PLAYER'` 時 **`adjusted_theo_win = wager * 0.0124` 恆成立**（浮點誤差內），`theo_win` 則略低（約 **wager × 0.01235**）；在常見百家樂閒注定義下 **~1.235% 較貼近文獻精算期望**，**1.24% 多為表定／評級取捨**（實桌規則不同時須重算）。`BANKER` / `SMALL_TIGER` / `BIG_TIGER` / `TIE` 樣本中兩欄相等；部分邊注（如 `LUCKY_SIX`、`*_PAIR`）僅極小差異或四捨五入感。**上游 GDP／Smart Table 未在本 repo 提供完整公式**，其餘注種需以全量 Parquet 再驗或向來源單位確認。 | 與場方 ADT／評級報表對帳時若誤用欄位會系統性偏差；本專案 `trainer/etl/etl_player_profile.py` 彙總 profile 使用 **`SUM(theo_win)`**，與「僅認 `adjusted_theo_win`」的口徑可能不一致。 | 對外報表／評級對齊：優先釐清業務採 **`adjusted_theo_win`** 或 **`theo_win`**；建模特徵若需與 profile 一致，沿用 `theo_win` 鏈路前先確認產品定義。全量驗證見附錄 **[FND-17]**。 |
 | **FND-18** | `t_session` vs `t_bet`<br>`theo_win`, `turnover/wager`, `num_bets` | 🔴 P0 | **跨表對帳存在結構性落差（非 rounding）**：針對 `canonical_patron_profile.csv` 與 cleaned `t_bet` 的重疊 patrons，`|theo_diff| >= 100k` 的高差異案例可回溯到三類根因：1) `t_session` 去重後版本被 `is_deleted/is_canceled` gate 排除，但 `t_bet` 仍保留該 `session_id` 注單；2) `t_bet.session_id` 在 raw `t_session` 查無對應（原始來源覆蓋不一致）；3) 即使 `session_id` 對齊，`t_session` 的彙總欄位與 `t_bet` 聚合非嚴格等值（口徑差）。 | 若直接把 profile（session 口徑）與 bet 聚合視為「應完全一致」，會誤判資料品質、產生錯誤校驗告警，並在監控與模型回歸檢查中引入大量假陽性。 | 對帳必須先拆成「matched / session_only / bet_only」三層，再標記 root cause。高差異個案詳單與逐案根因見 `doc/fnd18_profile_vs_bet_root_cause_cases.md`；下游監控建議以容忍帶 + root-cause bucket 方式落地，而非單一 hard-equality。 |
+| **FND-19** | `t_casino_txn`<br>`casino_txn_id`, `start_dtm`, `status`, `type`, `player_id` | 🔴 P0 | **交易表是 CDC/事件表，不能直接 row-level 聚合**：2026-05 分區樣本有 **4,607,563 rows**、**4,442,245 distinct `casino_txn_id`**；`__ts_ms` **100% NULL**，無法作 CDC 排序；另有 **30 個 delete marker**。若只以 `updated_dtm` 取最新，delete marker 會被舊版非刪除 row 蓋掉。`bet_id` 100% NULL、`session_id` 約 96% NULL，不能用 bet/session direct join。`complete_dtm` 約 99.89% NULL；`gaming_day` 也不能當事件時間，觀察到 `gaming_day=2026-05-02` 但 `start_dtm=2026-04-23` 的回填/分區錯位。 | 若未先做 delete-aware dedup 與 type-specific filter，BUYIN/CASHOUT/CHANGE 特徵會重複計算、混入刪除/取消交易，或用錯時間造成 PIT leakage。`TD_FILL`、`TD_CREDIT`、`TRANSFER` 在此表幾乎沒有 `player_id`，不適合第一版 player-level txn feature。 | **清洗契約 v0**：先找出任一版本有 `__op='d'` 或 `__deleted='True'` 的 `casino_txn_id` 並整筆排除；剩餘版本以 `__etl_insert_Dtm DESC, updated_dtm DESC` 去重。PIT event time 用 `start_dtm`，`gaming_day` 僅作分區/稽核。有效事件需 `action='SUBMIT'`、`status <> 'CANCELED'`、`player_id IS NOT NULL`、`txn_value IS NOT NULL`；cashflow count/sum 建議再要求 `txn_value > 0`。`CASHOUT` 收 `COMPLETED`；`BUYIN` 收 `COMPLETED` 或 `SUBMITTED` 且 `buyin_status IN ('SUCCESS','PROVISIONAL_SUCCESS')`；`CHANGE` 僅作 activity proxy，不把 `txn_value` 視為 win/loss 方向。 |
 
 ---
 
@@ -729,4 +730,90 @@ ORDER BY ABS(p.p_theo - b.b_theo) DESC;
 --    並把 bet_only 回接 raw t_session 的 dedup 後版本，判斷是 deleted/canceled 還是 raw session 缺失。
 --    逐案分解表為 2026-05-13 全量掃描快照；數字與上式「當前 fixture 重算」可能因上游重跑而漂移。
 --    詳細逐案輸出請參考：doc/fnd18_profile_vs_bet_root_cause_cases.md
+```
+
+### [FND-19] `t_casino_txn` CDC 去重、PIT 時間與 player-level 清洗契約
+```sql
+-- 資料來源：data/new tables/t_casino_txn__part_202605.parquet
+-- 1) 基本 row / logical ID / 時間範圍
+SELECT
+  COUNT(*) AS rows,
+  COUNT(DISTINCT casino_txn_id) AS distinct_casino_txn_id,
+  COUNT(DISTINCT uuid) AS distinct_uuid,
+  COUNT(DISTINCT player_id) AS distinct_player_id,
+  MIN(gaming_day) AS min_gaming_day,
+  MAX(gaming_day) AS max_gaming_day,
+  MIN(start_dtm) AS min_start_dtm,
+  MAX(start_dtm) AS max_start_dtm,
+  MIN(__etl_insert_Dtm) AS min_etl_insert,
+  MAX(__etl_insert_Dtm) AS max_etl_insert
+FROM read_parquet('data/new tables/t_casino_txn__part_202605.parquet');
+
+-- 2) CDC 欄位完整性：本批 __ts_ms 100% NULL，不可用於排序
+SELECT __op, __deleted,
+       COUNT(*) AS n,
+       SUM(CASE WHEN __ts_ms IS NULL THEN 1 ELSE 0 END) AS ts_ms_null_n,
+       MIN(__etl_insert_Dtm) AS min_etl,
+       MAX(__etl_insert_Dtm) AS max_etl
+FROM read_parquet('data/new tables/t_casino_txn__part_202605.parquet')
+GROUP BY ALL
+ORDER BY n DESC;
+
+-- 3) Delete-aware dedup：先排除任何帶 delete marker 的 logical transaction，再取最新版本
+WITH ranked AS (
+  SELECT t.*,
+         MAX(CASE WHEN __op = 'd' OR __deleted = 'True' THEN 1 ELSE 0 END)
+           OVER (PARTITION BY casino_txn_id) AS has_delete,
+         ROW_NUMBER() OVER (
+           PARTITION BY casino_txn_id
+           ORDER BY __etl_insert_Dtm DESC NULLS LAST,
+                    updated_dtm DESC NULLS LAST
+         ) AS rn
+  FROM read_parquet('data/new tables/t_casino_txn__part_202605.parquet') t
+),
+clean_base AS (
+  SELECT *
+  FROM ranked
+  WHERE rn = 1 AND has_delete = 0
+)
+SELECT
+  COUNT(*) AS cleaned_ids,
+  SUM(CASE WHEN start_dtm IS NULL THEN 1 ELSE 0 END) AS start_null_n,
+  SUM(CASE WHEN txn_value IS NULL THEN 1 ELSE 0 END) AS value_null_n,
+  SUM(CASE WHEN action = 'SUBMIT' AND status <> 'CANCELED' THEN 1 ELSE 0 END) AS submit_not_canceled_n,
+  SUM(CASE WHEN action = 'SUBMIT' AND status <> 'CANCELED' AND player_id IS NOT NULL THEN 1 ELSE 0 END) AS submit_not_canceled_player_n,
+  SUM(CASE WHEN action = 'SUBMIT' AND status <> 'CANCELED' AND player_id IS NOT NULL AND type IN ('BUYIN','CASHOUT') THEN 1 ELSE 0 END) AS player_cashflow_n,
+  SUM(CASE WHEN action = 'SUBMIT' AND status <> 'CANCELED' AND player_id IS NOT NULL AND type IN ('BUYIN','CASHOUT','CHANGE') THEN 1 ELSE 0 END) AS player_cashflow_plus_change_n,
+  SUM(CASE WHEN CAST(txn_value AS DOUBLE) < 0 THEN 1 ELSE 0 END) AS negative_value_n,
+  SUM(CASE WHEN CAST(txn_value AS DOUBLE) = 0 THEN 1 ELSE 0 END) AS zero_value_n,
+  SUM(CASE WHEN action = 'CANCEL' OR status = 'CANCELED' THEN 1 ELSE 0 END) AS cancel_or_canceled_n
+FROM clean_base;
+
+-- 4) Type-specific 狀態：BUYIN 的 Cash 常以 SUBMITTED + buyin_status=SUCCESS 表示有效；
+--    TD_FILL / TD_CREDIT / TRANSFER 幾乎沒有 player_id，不適合第一版 player-level feature。
+WITH ranked AS (
+  SELECT t.*,
+         MAX(CASE WHEN __op = 'd' OR __deleted = 'True' THEN 1 ELSE 0 END)
+           OVER (PARTITION BY casino_txn_id) AS has_delete,
+         ROW_NUMBER() OVER (
+           PARTITION BY casino_txn_id
+           ORDER BY __etl_insert_Dtm DESC NULLS LAST,
+                    updated_dtm DESC NULLS LAST
+         ) AS rn
+  FROM read_parquet('data/new tables/t_casino_txn__part_202605.parquet') t
+),
+clean_base AS (
+  SELECT *
+  FROM ranked
+  WHERE rn = 1 AND has_delete = 0
+)
+SELECT type,
+       COUNT(*) FILTER (WHERE action='SUBMIT' AND status <> 'CANCELED' AND player_id IS NOT NULL) AS valid_player_rows,
+       COUNT(*) FILTER (WHERE action='SUBMIT' AND status='COMPLETED' AND player_id IS NOT NULL) AS completed_player_rows,
+       COUNT(*) FILTER (WHERE action='SUBMIT' AND status='SUBMITTED' AND player_id IS NOT NULL) AS submitted_player_rows,
+       COUNT(*) FILTER (WHERE action='SUBMIT' AND status='SUBMITTED' AND buyin_status='SUCCESS' AND player_id IS NOT NULL) AS submitted_success_player_rows
+FROM clean_base
+WHERE start_dtm IS NOT NULL AND txn_value IS NOT NULL
+GROUP BY type
+ORDER BY valid_player_rows DESC;
 ```

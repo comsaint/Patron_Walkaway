@@ -175,6 +175,7 @@ def test_feast_registry_ensure_result_to_metrics_roundtrip() -> None:
     assert d["feast_schema_drift_issues"] == ["missing anchor_gaming_day_event"]
 
 
+@patch("trainer_hightier.trainer._prepare_training_features_parquet")
 @patch("trainer_hightier.trainer._b3.ensure_feast_registry_ready")
 @patch("trainer_hightier.trainer._b3.build_training_data")
 @patch(
@@ -185,6 +186,7 @@ def test_maybe_build_training_dataset_logs_feast_echo(
     _mock_cb: MagicMock,
     mock_build: MagicMock,
     mock_ensure: MagicMock,
+    _mock_prepare: MagicMock,
     tmp_path: Path,
 ) -> None:
     """trainer Step 3 path records ``metrics['feast_auto_apply']`` after ensure."""

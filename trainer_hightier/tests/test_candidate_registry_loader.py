@@ -40,6 +40,14 @@ _EXPECTED_DEFAULT_BASELINE: Final[tuple[str, ...]] = (
     "fe__wager_sum__w15m_over_w1d",
     "fe__wager_cv_w7d",
     "fe__payout_odds_z_prior_w30d",
+    "fe__clock__hour_of_day",
+    "fe__clock__day_of_week",
+    "fe__clock__is_weekend",
+    "fe__clock__is_late_night",
+    "fe__outcome__casino_win_sum__w15m",
+    "fe__outcome__casino_win_sum__w1h",
+    "fe__outcome__casino_win_to_theo_ratio__w1h",
+    "fe__stake__wager_last3_vs_prior3_ratio__w1h",
     "fe__canonical__bets_cnt__today",
     "fe__canonical__wager_sum__today",
     "fe__canonical__avg_wager__today",
@@ -52,6 +60,13 @@ _EXPECTED_DEFAULT_BASELINE: Final[tuple[str, ...]] = (
     "fe__odds__payout_odds_z__w7d",
     "fe__odds__payout_odds_to_recent_max_ratio__w1h",
     "fe__odds__payout_odds_step_ratio",
+    "txn__has_cash_out__w15m",
+    "txn__cash_out_cnt__w1h",
+    "txn__cash_out_sum__w1h",
+    "txn__net_cash_out_flag__w1h",
+    "txn__net_cash_flow__w1h",
+    "txn__buyin_cash_sum__w1h",
+    "txn__buyin_prize_redemption_flag__w1h",
 )
 
 

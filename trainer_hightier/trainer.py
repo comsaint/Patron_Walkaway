@@ -43,12 +43,15 @@ from trainer_hightier.config import (
     DEFAULT_DEPLOY_OUTPUT_ROOT,
     DEFAULT_MODEL_DIR,
     DEFAULT_RANDOM_SEED,
+    DEFAULT_WALKAWAY_LABEL_CONTRACT,
     FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME,
     DEFAULT_RUN_PROFILE_NAME,
     DEFAULT_TRAINING_FEATURE_SERVICE,
     DEFAULT_TRAINING_SHORT_TERM_MATERIALIZE_BATCH_SIZE,
+    DEFAULT_STEP35_MISS_PATH,
     SHORT_TERM_TRIAL_BET_COLUMNS,
     TRAINING_SHORT_TERM_PIT_CACHE_BASENAME,
+    TRAINING_TXN_LITE_CACHE_BASENAME,
     DuckDbRuntimeConfig,
     HighTierObjectiveConfig,
     MLFLOW_EXPERIMENT_TRAIN_HIGHTIER,
@@ -56,12 +59,30 @@ from trainer_hightier.config import (
     MID_TERM_SNAPSHOT_MAX_LOOKBACK_DAYS,
     MID_TERM_SNAPSHOT_SCOPE_TRAINING,
     PartitionIngressConfig,
+    PlayerDqConfig,
     PreTrainFeatureGateConfig,
     PreTrainFeatureGateConfig,
     Step5TrainConfig,
     Step6ParityConfig,
     SessionPreprocessConfig,
     Step4SplitConfig,
+    SamplePolicy,
+    FeatureScreeningPolicy,
+    TrainingScopePolicy,
+    TrainingRunKind,
+    TRAINING_RUN_KIND_SPEED,
+    DATA_COMPLETENESS_MODE_STRICT,
+    ResolvedTrainingScope,
+    TrainingDataScopeConfig,
+    WALKAWAY_GAP_MIN,
+    WalkawayLabelContract,
+    feature_selection_policy_fingerprint,
+    resolve_training_scope,
+    sample_policy_fingerprint,
+    training_scope_policy_fingerprint,
+    validate_sample_policy_for_run,
+    validate_feature_screening_policy,
+    walkaway_label_contract_for_gap_min,
     configs_from_run_profile,
     get_run_profile,
     list_run_profile_names,
@@ -76,10 +97,12 @@ from trainer_hightier.core.mlflow_adapter import (
 )
 from trainer_hightier.core.model_bundle_paths import (
     DEPLOY_E2E_GATE_REPORT_FILENAME,
+    FEATURE_PARITY_REPORT_FILENAME,
     model_bundle_report_path,
     safe_version_subdirectory,
     write_latest_model_manifest,
 )
+from trainer_hightier.reporting.writer import BundleReportWriter
 from trainer_hightier.utils.canonical_mapping import (
     build_canonical_mapping_from_cleaned_session_parquet,
     default_canonical_mapping_parquet_path,
@@ -94,10 +117,7 @@ from trainer_hightier.utils.patron_session_metrics import (
 from trainer_hightier.utils.slow_patron_180d_monthly import (
     default_slow_patron_180d_monthly_parquet_path,
 )
-from trainer_hightier.utils.walkaway_labels import (
-    default_walkaway_labels_parquet_path,
-    materialize_walkaway_labels_from_cleaned_bet,
-)
+from trainer_hightier.utils.walkaway_labels import default_walkaway_labels_parquet_path
 
 # Subdirectory beside Step 5 bundle with Frozen snapshot + manifest for offline packaging.
 _DEPLOY_INPUTS_DIRNAME = "deploy_inputs"
@@ -113,11 +133,6 @@ _b5 = importlib.import_module("trainer_hightier.05_lgbm_train")
 
 logger = logging.getLogger("trainer_hightier")
 
-RUN_SUMMARY_FILENAME: Final[str] = "run_summary.json"
-METRICS_DETAILED_FILENAME: Final[str] = "metrics_detailed.json"
-PIPELINE_DEBUG_FILENAME: Final[str] = "pipeline_debug.json"
-SPLIT_REPORT_FILENAME: Final[str] = "split_report.json"
-
 _STEP5_CONFIG_DEFAULTS = Step5TrainConfig()
 _STEP6_CONFIG_DEFAULTS = Step6ParityConfig()
 _PRE_TRAIN_GATE_DEFAULTS = PreTrainFeatureGateConfig()
@@ -128,19 +143,15 @@ _PARTITION_INGRESS_DEFAULTS = PartitionIngressConfig()
 def _materialize_partition_inventory(
     *,
     manifests_dir: Path,
-    correction_months: tuple[str, ...],
-    backfill_month_count: int,
     previous_manifest_path: Path | None,
     snapshot_dir: Path,
-) -> tuple[str | None, tuple[Path, ...], tuple[Path, ...], list[str]]:
-    """Scan snapshot parquet shards → inventory JSON with fingerprint + recompute-month list."""
+) -> tuple[str | None, tuple[Path, ...], tuple[Path, ...], list[Any], list[Any], dict[str, Any]]:
+    """Scan snapshot parquet shards → inventory JSON with fingerprint (diagnostic)."""
 
     from trainer_hightier.utils.partition_inventory import (
-        compute_recompute_months,
         default_partition_inventory_path,
         infer_snapshot_id,
         inventory_to_manifest_dict,
-        load_partition_inventory_manifest,
         scan_partition_snapshot_dir,
         write_partition_inventory_manifest,
     )
@@ -152,28 +163,15 @@ def _materialize_partition_inventory(
     fp = manifest.get("fingerprint_sha256_hex")
     fp_s = str(fp).strip() if fp is not None else None
 
-    prev_obj: dict | None = None
-    if previous_manifest_path is not None:
-        pth = Path(previous_manifest_path).resolve()
-        if pth.is_file():
-            prev_obj = load_partition_inventory_manifest(pth)
-
-    recompute_list = compute_recompute_months(
-        current_manifest=manifest,
-        previous_manifest=prev_obj,
-        correction_months=correction_months,
-        backfill_month_count=int(backfill_month_count),
-    )
     manifests_dir.mkdir(parents=True, exist_ok=True)
     out_manifest = write_partition_inventory_manifest(
         default_partition_inventory_path(manifests_dir=manifests_dir, snapshot_id=snap_id),
         manifest,
     )
     logger.info(
-        "[Step 1b] partition inventory wrote %s fingerprint=%s recompute_months=%s",
+        "[Step 1b] partition inventory wrote %s fingerprint=%s",
         out_manifest.resolve(),
         fp_s,
-        recompute_list,
     )
     if bet_rows or sess_rows:
         logger.warning(
@@ -184,7 +182,7 @@ def _materialize_partition_inventory(
 
     bet_paths = tuple(sorted({r.path.resolve() for r in bet_rows}, key=str))
     sess_paths = tuple(sorted({r.path.resolve() for r in sess_rows}, key=str))
-    return fp_s, bet_paths, sess_paths, recompute_list
+    return fp_s, bet_paths, sess_paths, bet_rows, sess_rows, manifest
 
 
 @dataclass
@@ -206,6 +204,7 @@ class HighTierTrainArgs:
     bet_preprocess: BetPreprocessConfig = field(default_factory=BetPreprocessConfig)
     skip_bet_preprocess: bool = False
     canonical_mapping: CanonicalMappingConfig = field(default_factory=CanonicalMappingConfig)
+    player_dq: PlayerDqConfig = field(default_factory=PlayerDqConfig)
     # When True with ``objective.theo_train_quantile`` in (0,1), bet preprocess keeps only ADT-top patrons.
     filter_bets_by_adt_quantile: bool = True
     # After cleaned ``t_bet`` exists: join to mapping and write ``walkaway_labels.parquet`` (``trainer.labels`` parity).
@@ -227,6 +226,14 @@ class HighTierTrainArgs:
     partition_inventory_previous_manifest: Path | None = None
     partition_correction_months: tuple[str, ...] = ()
     partition_backfill_month_count: int = _PARTITION_INGRESS_DEFAULTS.backfill_month_count
+    #: When True (default): Step 3 / 3.5 read entity set v1 instead of ADT-segmented cleaned bet.
+    use_entity_set_v1: bool = True
+    #: When True: Step 2c labels use month×canonical_shard cache (default off until smoke sign-off).
+    use_sharded_labels_cache: bool = False
+    #: Walkaway label contract (gap X + horizon Y); default production gap=30.
+    walkaway_label_contract: WalkawayLabelContract = field(
+        default_factory=lambda: DEFAULT_WALKAWAY_LABEL_CONTRACT,
+    )
     # Step 4: deterministic arrange + time split on ``gaming_day`` (after Step 3 or --start-from-features).
     run_step4: bool = True
     step4_split: Step4SplitConfig = field(default_factory=Step4SplitConfig)
@@ -245,67 +252,29 @@ class HighTierTrainArgs:
     force_refresh_short_term_pit: bool = False
     #: Offline Step 3.5 batch size (decoupled from scorer ``hightier_scorer_max_bets_per_cycle``).
     training_short_term_materialize_batch_size: int = DEFAULT_TRAINING_SHORT_TERM_MATERIALIZE_BATCH_SIZE
+    #: Step 3.5 cache miss materializer (``indexed_replay`` default; fail-fast, no auto fallback).
+    step35_miss_path: str = DEFAULT_STEP35_MISS_PATH
     #: ``--run-profile`` CLI name (MLflow param); programmatic callers default to :data:`DEFAULT_RUN_PROFILE_NAME`.
     run_profile_name: str = DEFAULT_RUN_PROFILE_NAME
     #: Explicit patron sampling ratio for logs (e.g. ``0.01`` vs ``0.10``). When ``None`` and ADT bet filter is on,
     #: :func:`build_run_summary` derives approximate segment fraction as ``1 - objective.theo_train_quantile``.
     patron_sampling_ratio: float | None = None
+    #: Drop training rows outside inclusive ``gaming_day_event`` bounds before Step 3.5 / split.
+    training_data_scope: TrainingDataScopeConfig = field(default_factory=TrainingDataScopeConfig)
+    #: Target horizon / completeness policy (SSOT Training Acceleration).
+    training_scope_policy: TrainingScopePolicy = field(default_factory=TrainingScopePolicy)
+    #: Train-only negative downsampling (Step 4 → Step 5 layer).
+    sample_policy: SamplePolicy = field(default_factory=SamplePolicy)
+    #: Optional feature screening hook (default off).
+    feature_screening_policy: FeatureScreeningPolicy = field(default_factory=FeatureScreeningPolicy)
+    #: ``release_promoted`` forbids ``neg_sample_frac < 1.0``.
+    training_run_kind: TrainingRunKind = TRAINING_RUN_KIND_SPEED
 
 
 def _repo_root() -> Path:
     """Return repository root (parent of ``trainer_hightier`` package directory)."""
 
     return Path(__file__).resolve().parents[1]
-
-
-def _epoch_ms_to_iso_z(epoch_ms: int | None) -> str | None:
-    """Render epoch milliseconds as UTC ISO-8601 ``…Z`` string."""
-
-    if epoch_ms is None:
-        return None
-    try:
-        ms = int(epoch_ms)
-    except (TypeError, ValueError):
-        return None
-    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _resolved_patron_sampling_ratio(args: HighTierTrainArgs) -> tuple[float | None, str]:
-    """Return ``(ratio, source)`` for run-summary ``data_scope`` (explicit vs ADT-derived)."""
-
-    if args.patron_sampling_ratio is not None:
-        return float(args.patron_sampling_ratio), "explicit"
-    if args.filter_bets_by_adt_quantile:
-        q = float(args.objective.theo_train_quantile)
-        if 0.0 < q < 1.0:
-            return round(1.0 - q, 8), "adt_quantile_derived"
-    return None, "unknown"
-
-
-def _feature_list_sha256_hex(columns: object) -> str | None:
-    """Stable SHA256 over sorted feature column names (hex digest, no prefix)."""
-
-    if not isinstance(columns, list):
-        return None
-    names = [str(x) for x in columns]
-    payload = json.dumps(sorted(names), separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _path_relative_to_repo(path_str: str | None, *, repo_root: Path) -> str | None:
-    """Best-effort repo-relative path string for logs."""
-
-    if path_str is None:
-        return None
-    raw = str(path_str).strip()
-    if not raw:
-        return None
-    try:
-        p = Path(raw).resolve()
-        rel = p.relative_to(repo_root.resolve())
-        return str(rel).replace("\\", "/")
-    except ValueError:
-        return raw.replace("\\", "/")
 
 
 def _step4_gaming_day_periods_from_report(report: dict[str, Any]) -> dict[str, Any] | None:
@@ -337,212 +306,26 @@ def _step4_gaming_day_periods_from_report(report: dict[str, Any]) -> dict[str, A
     }
 
 
-def build_run_summary(metrics: dict[str, Any], args: HighTierTrainArgs) -> dict[str, Any]:
-    """Build compact ``run_summary.json`` payload (cross-run comparison)."""
+def _get_report_writer(metrics: dict[str, Any]) -> BundleReportWriter | None:
+    """Return the active :class:`BundleReportWriter` when attached to *metrics*."""
 
-    repo_root = _repo_root()
-    run_id = str(metrics.get("model_version") or "").strip() or "unknown_run"
-    started = _epoch_ms_to_iso_z(metrics.get("start_epoch_ms")) if isinstance(metrics.get("start_epoch_ms"), int) else None
-    finished = _epoch_ms_to_iso_z(metrics.get("finish_epoch_ms")) if isinstance(metrics.get("finish_epoch_ms"), int) else None
-    duration_sec = metrics.get("run_training_total_seconds")
-    patron_ratio, patron_src = _resolved_patron_sampling_ratio(args)
-    warn_keys = ("val_ap", "val_precision", "test_ap", "test_precision")
-    for wk in warn_keys:
-        if wk not in metrics:
-            logger.warning("[run_summary] missing metrics[%r]; cross-run comparison degraded.", wk)
-    feat_cols = metrics.get("step5_feature_columns")
-    n_feat = len(feat_cols) if isinstance(feat_cols, list) else None
-    feat_hash = _feature_list_sha256_hex(feat_cols) if isinstance(feat_cols, list) else None
-    thr = metrics.get("step5_threshold")
-    if "step5_optuna_skipped" not in metrics:
-        opt_enabled = False
-    else:
-        opt_enabled = not bool(metrics.get("step5_optuna_skipped"))
-    summary = {
-        "run_id": run_id,
-        "started_at": started,
-        "finished_at": finished,
-        "duration_sec": float(duration_sec) if isinstance(duration_sec, (int, float)) else None,
-        "data_scope": {
-            "population_scope": "adt_filtered_bets_when_enabled",
-            "filter_bets_by_adt_quantile": bool(args.filter_bets_by_adt_quantile),
-            "theo_train_quantile": float(args.objective.theo_train_quantile),
-            "patron_sampling_ratio": patron_ratio,
-            "patron_sampling_ratio_source": patron_src,
-        },
-        "model": {"algorithm": "lightgbm", "n_features_used": n_feat, "feature_list_sha256_hex": feat_hash},
-        "thresholding": {
-            "policy": "min_precision",
-            "policy_param": {"min_precision": float(args.objective.min_precision)},
-            "selected_threshold": float(thr) if isinstance(thr, (int, float)) else None,
-        },
-        "metrics": {
-            "val": {
-                "ap": metrics.get("val_ap"),
-                "precision": metrics.get("val_precision"),
-                "recall": metrics.get("val_recall"),
-                "f1": metrics.get("val_f1"),
-                "samples": metrics.get("val_samples"),
-                "positives": metrics.get("val_positives"),
-                "alerts": metrics.get("val_alerts"),
-                "alerts_per_hour": metrics.get("val_alerts_per_hour"),
-            },
-            "test": {
-                "ap": metrics.get("test_ap"),
-                "precision": metrics.get("test_precision"),
-                "recall": metrics.get("test_recall"),
-                "f1": metrics.get("test_f1"),
-                "samples": metrics.get("test_samples"),
-                "positives": metrics.get("test_positives"),
-                "alerts": metrics.get("test_alerts"),
-                "alerts_per_hour": metrics.get("test_alerts_per_hour"),
-            },
-        },
-        "optimization": {
-            "enabled": opt_enabled,
-            "backend": "optuna",
-            "max_time_sec_configured": metrics.get("optuna_max_time_sec_configured"),
-            "max_trials_configured": metrics.get("optuna_max_trials_configured"),
-            "wall_time_sec_actual": metrics.get("optuna_wall_time_sec_actual"),
-            "trials_completed": metrics.get("optuna_trials_completed"),
-            "trials_total": metrics.get("optuna_trials_total"),
-            "stopping_reason": metrics.get("optuna_stopping_reason"),
-            "best_value": metrics.get("optuna_best_value"),
-        },
-        "git_commit_short": _git_short_head(repo_root),
-        "run_profile": str(args.run_profile_name),
-        "split_periods": metrics.get("step4_split_periods"),
-    }
-    if patron_ratio is None and patron_src == "unknown":
-        logger.warning(
-            "[run_summary] patron_sampling_ratio unknown; set HighTierTrainArgs.patron_sampling_ratio "
-            "or enable filter_bets_by_adt_quantile with theo_train_quantile in (0,1).",
-        )
-    return summary
+    writer = metrics.get("report_writer")
+    return writer if isinstance(writer, BundleReportWriter) else None
 
 
-def build_metrics_detailed(metrics: dict[str, Any]) -> dict[str, Any]:
-    """Build ``metrics_detailed.json`` (train/val/test blocks + feature list)."""
-
-    run_id = str(metrics.get("model_version") or "").strip() or "unknown_run"
-
-    def _split(prefix: str) -> dict[str, Any]:
-        keys = ("ap", "precision", "recall", "f1")
-        return {k: metrics.get(f"{prefix}_{k}") for k in keys}
-
-    return {
-        "run_id": run_id,
-        "split_metrics": {"train": _split("train"), "val": _split("val"), "test": _split("test")},
-        "threshold_analysis": {
-            "selection_policy": f"min_precision={metrics.get('step5_min_precision')}",
-            "selected_threshold": metrics.get("step5_threshold"),
-            "val_pick_feasible": metrics.get("step5_val_pick_feasible"),
-        },
-        "budget_points": {
-            "alerts_per_hour": {
-                "train": metrics.get("train_alerts_per_hour"),
-                "val": metrics.get("val_alerts_per_hour"),
-                "test": metrics.get("test_alerts_per_hour"),
-            }
-        },
-        "feature_columns": metrics.get("step5_feature_columns"),
-        "candidate_registry": metrics.get("candidate_registry"),
-        "split_periods": metrics.get("step4_split_periods"),
-    }
-
-
-def build_pipeline_debug(metrics: dict[str, Any]) -> dict[str, Any]:
-    """Build ``pipeline_debug.json`` (timings, caches, lineage paths)."""
-
-    repo_root = _repo_root()
-    run_id = str(metrics.get("model_version") or "").strip() or "unknown_run"
-    return {
-        "run_id": run_id,
-        "cache": {
-            "session_clean_cache_hit": metrics.get("session_clean_cache_hit"),
-            "bet_base_clean_cache_hit": metrics.get("bet_base_clean_cache_hit"),
-            "bet_segment_clean_cache_hit": metrics.get("bet_segment_clean_cache_hit"),
-            "bet_clean_cache_hit": metrics.get("bet_clean_cache_hit"),
-        },
-        "partition": {
-            "inventory_fingerprint_sha256_hex": metrics.get("partition_inventory_fingerprint_sha256_hex"),
-            "recompute_months": metrics.get("partition_recompute_months"),
-            "snapshot_dir_effective": metrics.get("partition_snapshot_dir_effective"),
-            "inventory_baseline_path": metrics.get("partition_inventory_baseline_path"),
-        },
-        "timings_sec": {
-            "prepare_training_frame": metrics.get("prepare_training_frame_seconds"),
-            "build_training_dataset": metrics.get("build_training_dataset_seconds"),
-            "step4": metrics.get("step4_seconds"),
-            "step5": metrics.get("step5_seconds"),
-            "run_training_total": metrics.get("run_training_total_seconds"),
-            "main_trainer_fe_materialize": metrics.get("main_trainer_fe_materialize_sec"),
-            "main_trainer_fe_enrich": metrics.get("main_trainer_fe_enrich_sec"),
-        },
-        "feast_auto_apply": metrics.get("feast_auto_apply"),
-        "split_periods": metrics.get("step4_split_periods"),
-        "artifacts": {
-            "model_path": _path_relative_to_repo(
-                str(metrics.get("model_path") or metrics.get("step5_model_path") or ""),
-                repo_root=repo_root,
-            ),
-            "training_metrics_path": _path_relative_to_repo(
-                str(metrics.get("training_metrics_path") or metrics.get("step5_training_metrics_path") or ""),
-                repo_root=repo_root,
-            ),
-            "step4_split_report": _path_relative_to_repo(
-                str(metrics.get("step4_split_report_bundle") or metrics.get("step4_split_report") or ""),
-                repo_root=repo_root,
-            ),
-            "step4_splits_dir": _path_relative_to_repo(str(metrics.get("step4_splits_dir") or ""), repo_root=repo_root),
-            "main_trainer_training_parquet_for_step4": _path_relative_to_repo(
-                str(metrics.get("main_trainer_training_parquet_for_step4") or ""),
-                repo_root=repo_root,
-            ),
-        },
-        "session_dedup_hash_buckets_effective": metrics.get("session_dedup_hash_buckets_effective"),
-        "bet_dedup_hash_buckets_effective": metrics.get("bet_dedup_hash_buckets_effective"),
-    }
-
-
-def _materialize_split_report_in_bundle(
-    bundle_dir: Path,
+def _finalize_training_reports(
+    args: HighTierTrainArgs,
+    metrics: dict[str, Any],
+    writer: BundleReportWriter,
     *,
-    source_report: str | Path | None,
-) -> Path | None:
-    """Copy Step 4 ``split_report.json`` into the model bundle directory."""
+    status: str,
+    error: str | None = None,
+) -> Path:
+    """Write nested ``run_report.json`` via the bundle report writer."""
 
-    if source_report is None:
-        return None
-    src = Path(source_report).resolve()
-    if not src.is_file():
-        logger.warning("[Step 7] split report missing at %s; skip bundle copy.", src)
-        return None
-    dest = Path(bundle_dir).resolve() / SPLIT_REPORT_FILENAME
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dest)
-    logger.info("[Step 7] copied split report to %s", dest.resolve())
-    return dest
-
-
-def write_hightier_training_logs(parent_dir: Path, metrics: dict[str, Any], args: HighTierTrainArgs) -> None:
-    """Write ``run_summary.json``, ``metrics_detailed.json``, ``pipeline_debug.json`` under ``parent_dir``."""
-
-    pd = Path(parent_dir).resolve()
-    pd.mkdir(parents=True, exist_ok=True)
-    rs = build_run_summary(metrics, args)
-    md = build_metrics_detailed(metrics)
-    dbg = build_pipeline_debug(metrics)
-    (pd / RUN_SUMMARY_FILENAME).write_text(json.dumps(rs, indent=2, default=str), encoding="utf-8")
-    (pd / METRICS_DETAILED_FILENAME).write_text(json.dumps(md, indent=2, default=str), encoding="utf-8")
-    (pd / PIPELINE_DEBUG_FILENAME).write_text(json.dumps(dbg, indent=2, default=str), encoding="utf-8")
-    logger.info(
-        "[Step 7b] wrote %s, %s, %s under %s",
-        RUN_SUMMARY_FILENAME,
-        METRICS_DETAILED_FILENAME,
-        PIPELINE_DEBUG_FILENAME,
-        pd,
-    )
+    path = writer.finalize(metrics, args, status=status, error=error)
+    logger.info("[Step 7] wrote %s status=%s", path.resolve(), status)
+    return path
 
 
 def _git_short_head(repo_root: Path) -> str:
@@ -586,6 +369,9 @@ def _mlflow_initial_string_params(args: HighTierTrainArgs) -> dict[str, str]:
     }
     if args.patron_sampling_ratio is not None:
         out["patron_sampling_ratio"] = str(float(args.patron_sampling_ratio))[:64]
+    out["training_run_kind"] = str(args.training_run_kind)
+    out["recent_full_months"] = str(args.training_scope_policy.recent_full_months)
+    out["neg_sample_frac"] = str(float(args.sample_policy.neg_sample_frac))
     return out
 
 
@@ -650,34 +436,24 @@ def _mlflow_scalar_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _log_mlflow_whitelist_artifacts(args: HighTierTrainArgs, metrics: dict[str, Any]) -> None:
-    """Log minimal training artifacts under :data:`MLFLOW_HIGHTIER_ARTIFACT_PREFIX`."""
+def _log_mlflow_whitelist_artifacts(
+    args: HighTierTrainArgs,
+    metrics: dict[str, Any],
+    writer: BundleReportWriter | None = None,
+) -> None:
+    """Log registered JSON artifacts and ``model.pkl`` under :data:`MLFLOW_HIGHTIER_ARTIFACT_PREFIX`."""
 
     prefix = MLFLOW_HIGHTIER_ARTIFACT_PREFIX
-    mbd = metrics.get("model_bundle_dir")
-    rp = Path(mbd).resolve() / "run_report.json" if mbd else Path(args.output_dir).resolve() / "run_report.json"
-    if rp.is_file():
-        log_artifact_safe(rp, artifact_path=prefix)
-    smp = metrics.get("training_metrics_path") or metrics.get("step5_training_metrics_path")
-    if smp:
-        p = Path(str(smp))
-        if p.is_file():
-            log_artifact_safe(p, artifact_path=prefix)
+    active_writer = writer or _get_report_writer(metrics)
+    if active_writer is not None:
+        for path in active_writer.registered_json_paths():
+            if path.is_file():
+                log_artifact_safe(path, artifact_path=prefix)
     smp_model = metrics.get("model_path") or metrics.get("step5_model_path")
     if smp_model:
         pm = Path(str(smp_model))
         if pm.is_file():
             log_artifact_safe(pm, artifact_path=prefix)
-    sr = metrics.get("step4_split_report_bundle") or metrics.get("step4_split_report")
-    if sr:
-        sp = Path(str(sr))
-        if sp.is_file():
-            log_artifact_safe(sp, artifact_path=prefix)
-    bundle_root = rp.parent
-    for fname in (RUN_SUMMARY_FILENAME, METRICS_DETAILED_FILENAME, PIPELINE_DEBUG_FILENAME):
-        aux = bundle_root / fname
-        if aux.is_file():
-            log_artifact_safe(aux, artifact_path=prefix)
 
 
 def _resolve_splits_dir(args: HighTierTrainArgs) -> Path:
@@ -712,6 +488,7 @@ def _step5_splits_have_feature_columns(
 def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None) -> None:
     """Ingest partition shards (schema QC) then build cleaned session/bet artifacts."""
     from trainer_hightier.utils.partition_inventory import (
+        collapsed_preprocess_read_sources,
         expect_default_partition_snapshot_dir,
         expect_existing_partition_snapshot_dir,
         resolve_partition_inventory_previous_for_run,
@@ -739,13 +516,72 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
         snap_dir.resolve(),
         baseline_used.resolve() if baseline_used is not None else None,
     )
-    inv_fp, bet_partition_paths, session_partition_paths, recompute_months = _materialize_partition_inventory(
+    (
+        inv_fp,
+        bet_partition_paths,
+        session_partition_paths,
+        bet_inventory_rows,
+        session_inventory_rows,
+        partition_manifest,
+    ) = _materialize_partition_inventory(
         manifests_dir=manifests_dir,
-        correction_months=args.partition_correction_months,
-        backfill_month_count=args.partition_backfill_month_count,
         previous_manifest_path=baseline_used,
         snapshot_dir=snap_dir,
     )
+
+    from trainer_hightier.utils.cache_invalidation_v1 import (
+        RECOMPUTE_SOURCE_V2,
+        compute_l1_recompute_months,
+    )
+    from trainer_hightier.utils.partition_inventory import (
+        compute_recompute_months,
+        load_partition_inventory_manifest,
+        partition_month_union_from_manifest,
+    )
+    from trainer_hightier.utils.source_manifest_v2 import materialize_source_manifest_v2_phase1
+
+    sm_v2_meta = materialize_source_manifest_v2_phase1(
+        snapshot_dir=snap_dir,
+        bet_stats=bet_inventory_rows,
+        session_stats=session_inventory_rows,
+    )
+    available_months = partition_month_union_from_manifest(partition_manifest)
+    recompute_months = compute_l1_recompute_months(
+        changed_partitions=sm_v2_meta["source_manifest_v2_changed_partitions"],
+        correction_months=args.partition_correction_months,
+        backfill_month_count=args.partition_backfill_month_count,
+        available_months=available_months,
+    )
+    prev_inv: dict[str, Any] | None = None
+    if baseline_used is not None and Path(baseline_used).is_file():
+        prev_inv = load_partition_inventory_manifest(Path(baseline_used))
+    legacy_recompute = compute_recompute_months(
+        current_manifest=partition_manifest,
+        previous_manifest=prev_inv,
+        correction_months=args.partition_correction_months,
+        backfill_month_count=args.partition_backfill_month_count,
+    )
+    if legacy_recompute != recompute_months:
+        logger.info(
+            "[Step 1b] l1_recompute_months source=%s months=%s "
+            "(inventory_mtime_legacy=%s; scheduling uses source_manifest_v2 only)",
+            RECOMPUTE_SOURCE_V2,
+            recompute_months,
+            legacy_recompute,
+        )
+    else:
+        logger.info(
+            "[Step 1b] l1_recompute_months source=%s months=%s",
+            RECOMPUTE_SOURCE_V2,
+            recompute_months,
+        )
+    source_fp = str(sm_v2_meta.get("source_manifest_v2_aggregate_fingerprint_sha256_hex") or "").strip() or None
+    if metrics is not None:
+        metrics.update(sm_v2_meta)
+        metrics["l1_recompute_months"] = list(recompute_months)
+        metrics["l1_recompute_months_source"] = RECOMPUTE_SOURCE_V2
+        metrics["partition_recompute_months_inventory_legacy"] = list(legacy_recompute)
+        metrics["partition_recompute_months"] = list(recompute_months)
 
     sess_report = _ingest.validate_partition_session_ingress_or_raise(session_partition_paths)
     logger.info(
@@ -756,22 +592,36 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
     )
 
     ordered_sess = tuple(sorted((Path(p).resolve() for p in session_partition_paths), key=str))
-    session_primary = ordered_sess[0]
-    session_extras = ordered_sess[1:]
+    session_cache_primary = ordered_sess[0] if ordered_sess else None
+    session_cache_extras = ordered_sess[1:] if ordered_sess else ()
+    session_read = collapsed_preprocess_read_sources(
+        snapshot_dir=snap_dir,
+        table_name="t_session",
+        legacy_paths=ordered_sess,
+    )
+    if not session_read:
+        raise FileNotFoundError(f"no session preprocess sources under snapshot {snap_dir}")
+    session_preprocess_primary = session_read[0]
+    session_preprocess_extras = session_read[1:]
 
     cleaned_path = _hpre.default_cleaned_session_parquet_path()
     use_preprocess_caches = not args.ignore_caches
-    ses_cache_ok = use_preprocess_caches and _hpre.session_clean_cache_is_hit(
-        session_primary,
-        cleaned_path,
-        dedup_hash_buckets=args.session_preprocess.dedup_hash_buckets,
-        extra_source_session_parquets=session_extras or None,
-        partition_inventory_fingerprint_sha256_hex=inv_fp,
+    ses_cache_ok = (
+        session_cache_primary is not None
+        and use_preprocess_caches
+        and _hpre.session_clean_cache_is_hit(
+            session_cache_primary,
+            cleaned_path,
+            dedup_hash_buckets=args.session_preprocess.dedup_hash_buckets,
+            extra_source_session_parquets=session_cache_extras or None,
+            source_manifest_v2_fingerprint_sha256_hex=source_fp,
+            data_scope=args.session_preprocess.data_scope,
+        )
     )
     if metrics is not None:
         metrics["session_clean_cache_hit"] = bool(ses_cache_ok)
+        metrics["l0_preprocess_data_scope"] = args.session_preprocess.data_scope.manifest_block()
         metrics["partition_inventory_fingerprint_sha256_hex"] = inv_fp
-        metrics["partition_recompute_months"] = list(recompute_months)
         metrics["partition_snapshot_dir_effective"] = str(snap_dir.resolve())
         metrics["partition_inventory_baseline_path"] = (
             str(baseline_used.resolve()) if baseline_used is not None else None
@@ -783,24 +633,26 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
         )
     else:
         out_parquet, session_dedup_effective = _hpre.preprocess_sessions_from_parquet_streaming(
-            session_primary,
+            session_preprocess_primary,
             cleaned_path,
             cfg=args.session_preprocess,
             duckdb_runtime=args.duckdb_runtime,
-            extra_partition_sources=session_extras or None,
+            extra_partition_sources=session_preprocess_extras or None,
         )
         if metrics is not None:
             metrics["session_dedup_hash_buckets_effective"] = int(session_dedup_effective)
         _hpre.write_session_clean_cache_manifest(
-            session_primary,
+            session_cache_primary,
             out_parquet,
             dedup_hash_buckets=int(session_dedup_effective),
-            extra_source_session_parquets=session_extras or None,
-            partition_inventory_fingerprint_sha256_hex=inv_fp,
+            extra_source_session_parquets=session_cache_extras or None,
+            source_manifest_v2_fingerprint_sha256_hex=source_fp,
+            data_scope=args.session_preprocess.data_scope,
         )
         n_clean = int(pq.ParquetFile(out_parquet).metadata.num_rows) if pq.ParquetFile(out_parquet).metadata else 0
         logger.info(
-            "[Step 2] session preprocess OK (full table, no time window): cleaned rows=%d; written %s",
+            "[Step 2] session preprocess OK (gaming_day_event scope=%s): cleaned rows=%d; written %s",
+            args.session_preprocess.data_scope.manifest_block(),
             n_clean,
             out_parquet,
         )
@@ -854,6 +706,40 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
     if want_adt_bets and args.canonical_mapping.enabled:
         allowed_players_pq = default_adt_allowed_players_parquet_path(q_thr)
 
+    rank_meta: dict[str, Any] | None = None
+    selected_universe_fp: str | None = None
+    if args.canonical_mapping.enabled and profile_csv_path.is_file() and mapping_parquet_path.is_file():
+        from datetime import date as _date_cls
+
+        from trainer_hightier.config import default_hightier_serving_config
+        from trainer_hightier.utils.slow_month_turn import resolve_slow_month_turn_context
+        from trainer_hightier.utils.universe_cache_v1 import (
+            materialize_adt_rank_table_v1_cached,
+            write_selected_universe_manifest,
+        )
+
+        _rank_slow_ctx = resolve_slow_month_turn_context(_date_cls.today())
+        _rank_svc_cfg = default_hightier_serving_config()
+        rank_meta = materialize_adt_rank_table_v1_cached(
+            patron_profile_csv=profile_csv_path,
+            canonical_mapping_parquet=mapping_parquet_path,
+            duckdb_runtime=args.duckdb_runtime,
+            cleaned_session_parquet=cleaned_path if cleaned_path.is_file() else None,
+            slow_active_anchor=_rank_slow_ctx.slow_anchor_required,
+            slow_lookback_days=int(_rank_svc_cfg.production_slow_lookback_days),
+        )
+        if metrics is not None:
+            metrics.update(rank_meta)
+        if want_adt_bets and 0.0 < q_thr < 1.0:
+            sel_meta = write_selected_universe_manifest(
+                rank_table_path=Path(str(rank_meta["universe_adt_rank_table_path"])),
+                quantile=q_thr,
+                rank_fingerprint_sha256_hex=str(rank_meta["universe_adt_rank_fingerprint_sha256_hex"]),
+            )
+            selected_universe_fp = str(sel_meta["selected_universe_fingerprint_sha256_hex"])
+            if metrics is not None:
+                metrics.update(sel_meta)
+
     effective_bet_cfg = args.bet_preprocess
     if want_adt_bets and args.canonical_mapping.enabled:
         effective_bet_cfg = replace(
@@ -864,6 +750,8 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
             adt_allowed_players_parquet=allowed_players_pq,
         )
 
+    entity_set_policy_fp: str | None = None
+
     if not args.skip_bet_preprocess and bet_partition_paths:
         bet_report = _ingest.validate_partition_bet_ingress_or_raise(bet_partition_paths)
         logger.info(
@@ -872,14 +760,21 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
             bet_report.num_rows,
         )
         ordered_bets = tuple(sorted((Path(p).resolve() for p in bet_partition_paths), key=str))
-        bet_primary = ordered_bets[0]
-        bet_extras = ordered_bets[1:]
+        bet_cache_primary = ordered_bets[0]
+        bet_cache_extras = ordered_bets[1:]
+        bet_read = collapsed_preprocess_read_sources(
+            snapshot_dir=snap_dir,
+            table_name="t_bet",
+            legacy_paths=ordered_bets,
+        )
+        bet_preprocess_primary = bet_read[0]
+        bet_preprocess_extras = bet_read[1:]
         reg_yaml = (
             Path(args.bet_preprocess.preprocess_registry_yaml)
             if args.bet_preprocess.preprocess_registry_yaml is not None
             else _hpre.default_preprocess_registry_yaml_path()
         )
-        merged_bet_sources = _hbet.merge_bet_source_paths(bet_primary, bet_extras or None)
+        merged_bet_sources = _hbet.merge_bet_source_paths(bet_cache_primary, bet_cache_extras or None)
         base_bet_cfg = replace(
             effective_bet_cfg,
             adt_filter_quantile=None,
@@ -887,115 +782,194 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
             canonical_mapping_parquet=None,
             adt_allowed_players_parquet=None,
         )
-        bet_extras_arg = bet_extras or None
+        bet_cache_extras_arg = bet_cache_extras or None
+        bet_preprocess_extras_arg = bet_preprocess_extras or None
 
         if want_adt_bets and args.canonical_mapping.enabled and allowed_players_pq is not None:
-            from datetime import date as _date_cls
-
-            from trainer_hightier.config import default_hightier_serving_config
-            from trainer_hightier.utils.slow_month_turn import resolve_slow_month_turn_context
-
-            _slow_ctx = resolve_slow_month_turn_context(_date_cls.today())
-            _svc_cfg = default_hightier_serving_config()
-            materialize_adt_allowed_players_parquet(
-                profile_csv_path,
-                mapping_parquet_path,
-                quantile=q_thr,
-                duckdb_runtime=args.duckdb_runtime,
-                output_parquet=allowed_players_pq,
-                cleaned_session_parquet=cleaned_path,
-                slow_active_anchor=_slow_ctx.slow_anchor_required,
-                slow_lookback_days=int(_svc_cfg.production_slow_lookback_days),
-            )
             base_hit = use_preprocess_caches and _hbet.bet_base_clean_cache_is_hit(
                 merged_bet_sources,
                 base_bet_path,
                 preprocess_registry_yaml=reg_yaml,
                 dedup_hash_buckets=base_bet_cfg.dedup_hash_buckets,
                 cleaned_session_parquet=cleaned_path,
-                partition_inventory_fingerprint_sha256_hex=inv_fp,
+                source_manifest_v2_fingerprint_sha256_hex=source_fp,
+                data_scope=base_bet_cfg.data_scope,
             )
-            seg_hit = use_preprocess_caches and _hbet.bet_clean_cache_is_hit(
-                bet_primary,
-                cleaned_bet_path,
-                preprocess_registry_yaml=reg_yaml,
-                dedup_hash_buckets=effective_bet_cfg.dedup_hash_buckets,
-                cleaned_session_parquet=cleaned_path,
-                adt_filter_quantile=effective_bet_cfg.adt_filter_quantile,
-                patron_profile_csv=effective_bet_cfg.patron_profile_csv,
-                canonical_mapping_parquet=effective_bet_cfg.canonical_mapping_parquet,
-                adt_allowed_players_parquet=effective_bet_cfg.adt_allowed_players_parquet,
-                extra_source_bet_parquets=bet_extras_arg,
-                bet_base_cleaned_parquet=base_bet_path,
-                partition_inventory_fingerprint_sha256_hex=inv_fp,
-            )
+            bet_dedup_eff = int(base_bet_cfg.dedup_hash_buckets)
+            mf_bkt = _hbet.bet_base_manifest_dedup_hash_buckets(base_bet_path)
+            if base_hit and mf_bkt is not None:
+                bet_dedup_eff = int(mf_bkt)
+            if not base_hit:
+                _, bet_dedup_eff = _hpre.preprocess_bets_from_parquet_streaming(
+                    bet_preprocess_primary,
+                    base_bet_path,
+                    cfg=base_bet_cfg,
+                    duckdb_runtime=args.duckdb_runtime,
+                    extra_partition_sources=bet_preprocess_extras_arg,
+                )
+                _hbet.write_bet_base_clean_cache_manifest(
+                    merged_bet_sources,
+                    base_bet_path,
+                    preprocess_registry_yaml=reg_yaml,
+                    dedup_hash_buckets=int(bet_dedup_eff),
+                    cleaned_session_parquet=cleaned_path,
+                    source_manifest_v2_fingerprint_sha256_hex=source_fp,
+                    data_scope=base_bet_cfg.data_scope,
+                )
             if metrics is not None:
                 metrics["bet_base_clean_cache_hit"] = bool(base_hit)
-                metrics["bet_segment_clean_cache_hit"] = bool(seg_hit)
+                metrics["bet_dedup_hash_buckets_effective"] = int(bet_dedup_eff)
 
-            if base_hit and seg_hit:
+            hard_exclude_parquet: Path | None = None
+            hard_exclude_policy_fp = ""
+            if (
+                args.player_dq.enabled
+                and mapping_parquet_path.is_file()
+                and _hbet.cleaned_bet_dataset_has_any_parquet(base_bet_path)
+            ):
+                from trainer_hightier.utils.player_dq import materialize_player_dq_cached
+
+                dq_meta = materialize_player_dq_cached(
+                    bet_base_parquet=base_bet_path,
+                    canonical_mapping_parquet=mapping_parquet_path,
+                    cfg=args.player_dq,
+                    duckdb_runtime=args.duckdb_runtime,
+                    use_cache=use_preprocess_caches,
+                )
+                if metrics is not None:
+                    metrics.update(dq_meta)
+                hard_exclude_policy_fp = str(
+                    dq_meta.get("hard_exclude_policy_fingerprint_sha256_hex") or "",
+                ).strip()
+                hx_raw = dq_meta.get("player_dq_hard_exclude_parquet")
+                if hx_raw:
+                    hard_exclude_parquet = Path(str(hx_raw))
+
+            if args.use_entity_set_v1:
+                if rank_meta is None or source_fp is None:
+                    raise ValueError(
+                        "entity set v1 requires ADT rank table and source_manifest_v2 fingerprint",
+                    )
+                from trainer_hightier.utils.entity_set_v1 import materialize_entity_set_v1_cached
+                from trainer_hightier.utils.universe_cache_v1 import selected_universe_membership_fingerprint
+
+                if selected_universe_fp is None:
+                    selected_universe_fp = selected_universe_membership_fingerprint(
+                        Path(str(rank_meta["universe_adt_rank_table_path"])),
+                        quantile=q_thr,
+                    )
+                es_meta = materialize_entity_set_v1_cached(
+                    base_cleaned_parquet=base_bet_path,
+                    rank_table_path=Path(str(rank_meta["universe_adt_rank_table_path"])),
+                    selected_universe_fingerprint_sha256_hex=selected_universe_fp,
+                    selected_quantile=q_thr,
+                    training_scope=base_bet_cfg.data_scope,
+                    source_manifest_v2_fingerprint_sha256_hex=source_fp,
+                    duckdb_runtime=args.duckdb_runtime,
+                    output_parquet=cleaned_bet_path,
+                    use_cache=use_preprocess_caches,
+                    hard_exclude_parquet=hard_exclude_parquet,
+                    hard_exclude_policy_fingerprint_sha256_hex=hard_exclude_policy_fp,
+                )
+                entity_set_policy_fp = str(es_meta.get("entity_set_policy_fingerprint_sha256_hex") or "").strip() or None
+                if metrics is not None:
+                    metrics.update(es_meta)
+                    metrics["bet_segment_legacy_fallback_used"] = False
                 logger.info(
-                    "[Step 2b] bet base+segment cache hit; skip (use --ignore-caches to force): %s",
+                    "[Step 2b] entity set v1 OK: rows=%d cache_hit=%s -> %s",
+                    int(es_meta["entity_set_row_count"]),
+                    bool(es_meta["entity_set_cache_hit"]),
                     cleaned_bet_path.resolve(),
                 )
             else:
-                bet_dedup_eff = int(base_bet_cfg.dedup_hash_buckets)
-                mf_bkt = _hbet.bet_base_manifest_dedup_hash_buckets(base_bet_path)
-                if base_hit and mf_bkt is not None:
-                    bet_dedup_eff = int(mf_bkt)
-                if not base_hit:
-                    _, bet_dedup_eff = _hpre.preprocess_bets_from_parquet_streaming(
-                        bet_primary,
-                        base_bet_path,
-                        cfg=base_bet_cfg,
-                        duckdb_runtime=args.duckdb_runtime,
-                        extra_partition_sources=bet_extras_arg,
-                    )
-                    _hbet.write_bet_base_clean_cache_manifest(
-                        merged_bet_sources,
-                        base_bet_path,
-                        preprocess_registry_yaml=reg_yaml,
-                        dedup_hash_buckets=int(bet_dedup_eff),
-                        cleaned_session_parquet=cleaned_path,
-                        partition_inventory_fingerprint_sha256_hex=inv_fp,
-                    )
-                elif not seg_hit and mf_bkt is None:
-                    logger.warning(
-                        "[Step 2b] bet base cache hit without readable manifest buckets; "
-                        "using nominal dedup_hash_buckets=%s for segment manifest fingerprint",
-                        bet_dedup_eff,
-                    )
-                _hbet.segment_cleaned_bet_from_base_parquet(
-                    base_bet_path,
-                    allowed_players_pq,
-                    cleaned_bet_path,
-                    duckdb_runtime=args.duckdb_runtime,
+                from trainer_hightier.utils.entity_set_v1 import (
+                    bet_base_cleaned_fingerprint_sha256_hex,
+                    legacy_bet_segment_policy_fingerprint_sha256_hex,
+                    training_scope_fingerprint,
                 )
-                _hbet.write_bet_clean_cache_manifest(
-                    bet_primary,
+                from datetime import date as _date_cls
+
+                from trainer_hightier.config import default_hightier_serving_config
+                from trainer_hightier.utils.slow_month_turn import resolve_slow_month_turn_context
+
+                _slow_ctx = resolve_slow_month_turn_context(_date_cls.today())
+                _svc_cfg = default_hightier_serving_config()
+                materialize_adt_allowed_players_parquet(
+                    profile_csv_path,
+                    mapping_parquet_path,
+                    quantile=q_thr,
+                    duckdb_runtime=args.duckdb_runtime,
+                    output_parquet=allowed_players_pq,
+                    cleaned_session_parquet=cleaned_path,
+                    slow_active_anchor=_slow_ctx.slow_anchor_required,
+                    slow_lookback_days=int(_svc_cfg.production_slow_lookback_days),
+                )
+                seg_hit = use_preprocess_caches and _hbet.bet_clean_cache_is_hit(
+                    bet_cache_primary,
                     cleaned_bet_path,
                     preprocess_registry_yaml=reg_yaml,
-                    dedup_hash_buckets=int(bet_dedup_eff),
+                    dedup_hash_buckets=effective_bet_cfg.dedup_hash_buckets,
                     cleaned_session_parquet=cleaned_path,
                     adt_filter_quantile=effective_bet_cfg.adt_filter_quantile,
                     patron_profile_csv=effective_bet_cfg.patron_profile_csv,
                     canonical_mapping_parquet=effective_bet_cfg.canonical_mapping_parquet,
                     adt_allowed_players_parquet=effective_bet_cfg.adt_allowed_players_parquet,
-                    extra_source_bet_parquets=bet_extras_arg,
+                    extra_source_bet_parquets=bet_cache_extras_arg,
                     bet_base_cleaned_parquet=base_bet_path,
                     partition_inventory_fingerprint_sha256_hex=inv_fp,
-                )
-                n_b = _hbet.partitioned_cleaned_bet_total_rows(cleaned_bet_path)
-                logger.info(
-                    "[Step 2b] bet preprocess OK (base+ADT segment): cleaned rows=%d; written %s",
-                    n_b,
-                    cleaned_bet_path,
+                    data_scope=effective_bet_cfg.data_scope,
+                    hard_exclude_policy_fingerprint_sha256_hex=hard_exclude_policy_fp or None,
                 )
                 if metrics is not None:
-                    metrics["bet_dedup_hash_buckets_effective"] = int(bet_dedup_eff)
+                    metrics["bet_segment_clean_cache_hit"] = bool(seg_hit)
+                    metrics["bet_segment_legacy_fallback_used"] = True
+                if base_hit and seg_hit:
+                    logger.info(
+                        "[Step 2b] bet base+legacy segment cache hit; skip: %s",
+                        cleaned_bet_path.resolve(),
+                    )
+                else:
+                    if not seg_hit:
+                        _hbet.segment_cleaned_bet_from_base_parquet(
+                            base_bet_path,
+                            allowed_players_pq,
+                            cleaned_bet_path,
+                            duckdb_runtime=args.duckdb_runtime,
+                            hard_exclude_parquet=hard_exclude_parquet,
+                        )
+                        _hbet.write_bet_clean_cache_manifest(
+                            bet_cache_primary,
+                            cleaned_bet_path,
+                            preprocess_registry_yaml=reg_yaml,
+                            dedup_hash_buckets=int(bet_dedup_eff),
+                            cleaned_session_parquet=cleaned_path,
+                            adt_filter_quantile=effective_bet_cfg.adt_filter_quantile,
+                            patron_profile_csv=effective_bet_cfg.patron_profile_csv,
+                            canonical_mapping_parquet=effective_bet_cfg.canonical_mapping_parquet,
+                            adt_allowed_players_parquet=effective_bet_cfg.adt_allowed_players_parquet,
+                            extra_source_bet_parquets=bet_cache_extras_arg,
+                            bet_base_cleaned_parquet=base_bet_path,
+                            partition_inventory_fingerprint_sha256_hex=inv_fp,
+                            data_scope=effective_bet_cfg.data_scope,
+                            hard_exclude_policy_fingerprint_sha256_hex=hard_exclude_policy_fp or None,
+                        )
+                    n_b = _hbet.partitioned_cleaned_bet_total_rows(cleaned_bet_path)
+                    logger.info(
+                        "[Step 2b] bet preprocess OK (legacy base+segment): rows=%d -> %s",
+                        n_b,
+                        cleaned_bet_path,
+                    )
+                entity_set_policy_fp = legacy_bet_segment_policy_fingerprint_sha256_hex(
+                    selected_quantile=q_thr,
+                    bet_base_fingerprint_sha256_hex=bet_base_cleaned_fingerprint_sha256_hex(base_bet_path),
+                    training_scope_fingerprint_sha256_hex=training_scope_fingerprint(base_bet_cfg.data_scope),
+                    partition_inventory_fingerprint_sha256_hex=inv_fp or "",
+                    source_manifest_v2_fingerprint_sha256_hex=source_fp,
+                    hard_exclude_policy_fingerprint_sha256_hex=hard_exclude_policy_fp,
+                )
         else:
             bet_cache_ok = use_preprocess_caches and _hbet.bet_clean_cache_is_hit(
-                bet_primary,
+                bet_cache_primary,
                 cleaned_bet_path,
                 preprocess_registry_yaml=reg_yaml,
                 dedup_hash_buckets=effective_bet_cfg.dedup_hash_buckets,
@@ -1004,8 +978,9 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 patron_profile_csv=effective_bet_cfg.patron_profile_csv,
                 canonical_mapping_parquet=effective_bet_cfg.canonical_mapping_parquet,
                 adt_allowed_players_parquet=effective_bet_cfg.adt_allowed_players_parquet,
-                extra_source_bet_parquets=bet_extras_arg,
+                extra_source_bet_parquets=bet_cache_extras_arg,
                 partition_inventory_fingerprint_sha256_hex=inv_fp,
+                data_scope=effective_bet_cfg.data_scope,
             )
             if metrics is not None:
                 metrics["bet_clean_cache_hit"] = bool(bet_cache_ok)
@@ -1016,14 +991,14 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 )
             else:
                 out_b, bet_dedup_eff = _hpre.preprocess_bets_from_parquet_streaming(
-                    bet_primary,
+                    bet_preprocess_primary,
                     cleaned_bet_path,
                     cfg=effective_bet_cfg,
                     duckdb_runtime=args.duckdb_runtime,
-                    extra_partition_sources=bet_extras_arg,
+                    extra_partition_sources=bet_preprocess_extras_arg,
                 )
                 _hbet.write_bet_clean_cache_manifest(
-                    bet_primary,
+                    bet_cache_primary,
                     out_b,
                     preprocess_registry_yaml=reg_yaml,
                     dedup_hash_buckets=int(bet_dedup_eff),
@@ -1032,8 +1007,9 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     patron_profile_csv=effective_bet_cfg.patron_profile_csv,
                     canonical_mapping_parquet=effective_bet_cfg.canonical_mapping_parquet,
                     adt_allowed_players_parquet=effective_bet_cfg.adt_allowed_players_parquet,
-                    extra_source_bet_parquets=bet_extras_arg,
+                    extra_source_bet_parquets=bet_cache_extras_arg,
                     partition_inventory_fingerprint_sha256_hex=inv_fp,
+                    data_scope=effective_bet_cfg.data_scope,
                 )
                 n_b = _hbet.partitioned_cleaned_bet_total_rows(out_b)
                 logger.info(
@@ -1043,6 +1019,22 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 )
                 if metrics is not None:
                     metrics["bet_dedup_hash_buckets_effective"] = int(bet_dedup_eff)
+                from trainer_hightier.utils.entity_set_v1 import (
+                    bet_base_cleaned_fingerprint_sha256_hex,
+                    bet_clean_policy_fingerprint_sha256_hex,
+                    training_scope_fingerprint,
+                )
+
+                entity_set_policy_fp = bet_clean_policy_fingerprint_sha256_hex(
+                    cleaned_bet_fingerprint_sha256_hex=bet_base_cleaned_fingerprint_sha256_hex(
+                        cleaned_bet_path,
+                    ),
+                    training_scope_fingerprint_sha256_hex=training_scope_fingerprint(
+                        effective_bet_cfg.data_scope,
+                    ),
+                    source_manifest_v2_fingerprint_sha256_hex=source_fp,
+                    partition_inventory_fingerprint_sha256_hex=inv_fp,
+                )
     elif bet_partition_paths and args.skip_bet_preprocess:
         logger.info(
             "[Step 2b] bet preprocess skipped (skip_bet_preprocess=True); %d bet shard(s) available",
@@ -1055,8 +1047,6 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
 
     if (
         args.materialize_walkaway_labels
-        and not args.skip_bet_preprocess
-        and bool(bet_partition_paths)
         and _hbet.cleaned_bet_dataset_has_any_parquet(cleaned_bet_path)
     ):
         if not mapping_parquet_path.is_file():
@@ -1065,14 +1055,56 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 mapping_parquet_path,
             )
         else:
-            labels_out = args.objective.labels_parquet or default_walkaway_labels_parquet_path()
-            materialize_walkaway_labels_from_cleaned_bet(
+            from trainer_hightier.utils.cache_invalidation_v1 import label_invalid_months
+            from trainer_hightier.utils.entity_set_v1 import (
+                bet_base_cleaned_fingerprint_sha256_hex,
+                bet_clean_policy_fingerprint_sha256_hex,
+                training_scope_fingerprint,
+            )
+            from trainer_hightier.utils.labels_cache_v1 import materialize_labels_v1_cached
+
+            labels_fp = entity_set_policy_fp
+            if labels_fp is None:
+                labels_fp = bet_clean_policy_fingerprint_sha256_hex(
+                    cleaned_bet_fingerprint_sha256_hex=bet_base_cleaned_fingerprint_sha256_hex(
+                        cleaned_bet_path,
+                    ),
+                    training_scope_fingerprint_sha256_hex=training_scope_fingerprint(
+                        effective_bet_cfg.data_scope,
+                    ),
+                    source_manifest_v2_fingerprint_sha256_hex=source_fp,
+                    partition_inventory_fingerprint_sha256_hex=inv_fp,
+                )
+            labels_invalid = tuple(sorted(label_invalid_months(set(recompute_months))))
+            labels_out = (
+                args.objective.labels_parquet
+                or default_walkaway_labels_parquet_path(label_contract=args.walkaway_label_contract)
+            )
+            lbl_meta = materialize_labels_v1_cached(
                 cleaned_bet_parquet=cleaned_bet_path,
                 canonical_mapping_parquet=mapping_parquet_path,
-                out_parquet=labels_out,
+                entity_set_fingerprint=labels_fp,
                 duckdb_runtime=args.duckdb_runtime,
+                out_parquet=labels_out,
+                invalid_months=labels_invalid,
+                use_cache=use_preprocess_caches,
+                use_sharded_cache=bool(args.use_sharded_labels_cache),
+                label_contract=args.walkaway_label_contract,
             )
-            logger.info("[Step 2c] walkaway labels written %s", labels_out.resolve())
+            if metrics is not None:
+                metrics.update(lbl_meta)
+                metrics["entity_set_policy_fingerprint_sha256_hex"] = labels_fp
+                metrics["labels_invalid_months"] = list(labels_invalid)
+                metrics["walkaway_label_contract_id"] = str(args.walkaway_label_contract.contract_id)
+                metrics["walkaway_gap_min"] = int(args.walkaway_label_contract.walkaway_gap_min)
+                metrics["alert_horizon_min"] = int(args.walkaway_label_contract.alert_horizon_min)
+            logger.info(
+                "[Step 2c] walkaway labels %s cache_hit=%s rows=%d -> %s",
+                "OK" if lbl_meta.get("labels_row_count", 0) > 0 else "empty",
+                bool(lbl_meta.get("labels_cache_hit")),
+                int(lbl_meta.get("labels_row_count") or 0),
+                labels_out.resolve(),
+            )
 
 
 def _resolve_features_parquet(args: HighTierTrainArgs) -> Path:
@@ -1169,6 +1201,273 @@ COPY (
     return p
 
 
+def _init_training_acceleration_metrics(
+    args: HighTierTrainArgs,
+    metrics: dict[str, Any],
+) -> ResolvedTrainingScope:
+    """Resolve acceleration policies, validate guards, and seed run-report fields."""
+    validate_sample_policy_for_run(args.sample_policy, run_kind=args.training_run_kind)
+    validate_feature_screening_policy(args.feature_screening_policy)
+    resolved = resolve_training_scope(args.training_scope_policy)
+    scope_fp = training_scope_policy_fingerprint(resolved)
+    sample_fp = sample_policy_fingerprint(args.sample_policy)
+    screening_fp = feature_selection_policy_fingerprint(args.feature_screening_policy)
+    block: dict[str, Any] = {
+        "training_run_kind": str(args.training_run_kind),
+        "training_scope_policy_fingerprint": scope_fp,
+        "sample_policy_fingerprint": sample_fp,
+        "feature_selection_policy_fingerprint": screening_fp,
+        "resolved_target_scope": resolved.manifest_block(),
+        "sample_policy": args.sample_policy.manifest_block(),
+        "feature_screening_policy": args.feature_screening_policy.manifest_block(),
+        "training_scope_completeness": None,
+        "step35_indexed_replay_gate_summary": None,
+        "cache_hit_miss_summary": None,
+        "negative_sampling_summary": None,
+        "feature_screening_summary": None,
+    }
+    metrics["training_acceleration_policy"] = block
+    metrics["training_scope_policy_fingerprint"] = scope_fp
+    metrics["sample_policy_fingerprint"] = sample_fp
+    metrics["feature_selection_policy_fingerprint"] = screening_fp
+    metrics["_resolved_training_scope"] = resolved
+    return resolved
+
+
+def _apply_training_scope_horizon_to_parquet(
+    parquet_path: Path,
+    *,
+    resolved: ResolvedTrainingScope,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> tuple[Path, dict[str, Any]]:
+    """Keep only rows in resolved target months and inclusive target date bounds."""
+    if not resolved.horizon_enabled:
+        return parquet_path, {"horizon_filter_applied": False}
+    if resolved.target_start_date is None or resolved.target_end_date is None:
+        raise ValueError("resolved training scope missing target_start_date/target_end_date")
+
+    import duckdb
+
+    from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
+
+    p = Path(parquet_path).resolve()
+    if "gaming_day_event" not in pq.read_schema(p).names:
+        raise ValueError(
+            f"training parquet missing gaming_day_event before horizon filter; path={p}",
+        )
+    months_sql = ", ".join(f"'{ym}'" for ym in resolved.target_months)
+    start = resolved.target_start_date.isoformat()
+    end = resolved.target_end_date.isoformat()
+    p_esc = str(p).replace("\\", "/").replace("'", "''")
+    tmp = p.parent / f"{p.stem}.__horizon_filter__.parquet"
+    tmp_esc = str(tmp).replace("\\", "/").replace("'", "''")
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        n_before = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{p_esc}')").fetchone()[0])
+        con.execute(
+            f"""
+            COPY (
+                SELECT *
+                FROM read_parquet('{p_esc}')
+                WHERE strftime(CAST(gaming_day_event AS DATE), '%Y%m') IN ({months_sql})
+                  AND CAST(gaming_day_event AS DATE) >= DATE '{start}'
+                  AND CAST(gaming_day_event AS DATE) <= DATE '{end}'
+            ) TO '{tmp_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+            """,
+        )
+        n_after = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{tmp_esc}')").fetchone()[0])
+    finally:
+        con.close()
+    if n_after == 0:
+        raise ValueError(
+            "training scope horizon removed all rows "
+            f"(before={n_before}, resolved={resolved.manifest_block()})",
+        )
+    tmp.replace(p)
+    summary = {
+        "horizon_filter_applied": True,
+        "rows_before": n_before,
+        "rows_after": n_after,
+        "target_months": list(resolved.target_months),
+    }
+    logger.info(
+        "[Step 4] training scope horizon %s: rows %d -> %d (%s)",
+        resolved.manifest_block(),
+        n_before,
+        n_after,
+        p.name,
+    )
+    return p, summary
+
+
+def _audit_training_scope_completeness(
+    parquet_path: Path,
+    *,
+    resolved: ResolvedTrainingScope,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> dict[str, Any]:
+    """Audit per-month row counts; strict mode fails on empty full target months."""
+    if not resolved.horizon_enabled:
+        return {"skipped": True, "reason": "horizon_disabled"}
+
+    import duckdb
+
+    from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
+
+    p = Path(parquet_path).resolve()
+    p_esc = str(p).replace("\\", "/").replace("'", "''")
+    schema_names = pq.read_schema(p).names
+    censored_expr = (
+        "SUM(CASE WHEN walkaway_censored = TRUE THEN 1 ELSE 0 END)"
+        if "walkaway_censored" in schema_names
+        else "0"
+    )
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        rows = con.execute(
+            f"""
+            SELECT
+                strftime(CAST(gaming_day_event AS DATE), '%Y%m') AS ym,
+                COUNT(*) AS row_count,
+                MIN(CAST(gaming_day_event AS DATE)) AS min_day,
+                MAX(CAST(gaming_day_event AS DATE)) AS max_day,
+                {censored_expr} AS censored_rows
+            FROM read_parquet('{p_esc}')
+            GROUP BY 1
+            ORDER BY 1
+            """,
+        ).fetchall()
+    finally:
+        con.close()
+
+    by_month: dict[str, dict[str, Any]] = {}
+    for ym, row_count, min_day, max_day, censored_rows in rows:
+        by_month[str(ym)] = {
+            "row_count": int(row_count),
+            "min_gaming_day_event": str(min_day),
+            "max_gaming_day_event": str(max_day),
+            "censored_row_count": int(censored_rows),
+            "is_partial_month": str(ym) in resolved.partial_target_months,
+        }
+
+    full_months = [ym for ym in resolved.target_months if ym not in resolved.partial_target_months]
+    empty_full_months = [ym for ym in full_months if by_month.get(ym, {}).get("row_count", 0) == 0]
+    report: dict[str, Any] = {
+        "expected_target_months": list(resolved.target_months),
+        "full_target_months": full_months,
+        "partial_target_months": sorted(resolved.partial_target_months),
+        "by_month": by_month,
+        "empty_full_target_months": empty_full_months,
+        "data_completeness_mode": str(resolved.policy.data_completeness_mode),
+    }
+    if empty_full_months:
+        msg = f"training scope completeness: empty full target month(s) {empty_full_months}"
+        if resolved.policy.data_completeness_mode == DATA_COMPLETENESS_MODE_STRICT:
+            raise ValueError(msg)
+        logger.warning("[Step 4] %s (mode=warn)", msg)
+        report["completeness_warnings"] = [msg]
+    return report
+
+
+def _apply_training_data_scope_to_parquet(
+    parquet_path: Path,
+    *,
+    scope: TrainingDataScopeConfig,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> Path:
+    """Drop training rows outside inclusive ``gaming_day_event`` bounds."""
+
+    if scope.gaming_day_event_min is None and scope.gaming_day_event_max is None:
+        return parquet_path
+
+    import duckdb
+
+    from trainer_hightier.utils.duckdb_runtime import apply_duckdb_runtime_pragmas
+    from trainer_hightier.utils.hk_time_semantics import duckdb_gaming_day_event_scope_and_sql
+
+    p = Path(parquet_path).resolve()
+    if "gaming_day_event" not in pq.read_schema(p).names:
+        raise ValueError(
+            f"training parquet missing gaming_day_event before data-scope filter; path={p}",
+        )
+    scope_sql = duckdb_gaming_day_event_scope_and_sql(
+        min_day=scope.gaming_day_event_min,
+        max_day=scope.gaming_day_event_max,
+    )
+    p_esc = str(p).replace("\\", "/").replace("'", "''")
+    tmp = p.parent / f"{p.stem}.__scope_filter__.parquet"
+    tmp_esc = str(tmp).replace("\\", "/").replace("'", "''")
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        n_before = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{p_esc}')").fetchone()[0])
+        con.execute(
+            f"COPY (SELECT * FROM read_parquet('{p_esc}') WHERE TRUE{scope_sql}) "
+            f"TO '{tmp_esc}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
+        )
+        n_after = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{tmp_esc}')").fetchone()[0])
+    finally:
+        con.close()
+    if n_after == 0:
+        raise ValueError(
+            f"training data scope removed all rows (before={n_before}, scope={scope.manifest_block()})",
+        )
+    tmp.replace(p)
+    logger.info(
+        "[Step 4] training data scope %s: rows %d -> %d (%s)",
+        scope.manifest_block(),
+        n_before,
+        n_after,
+        p.name,
+    )
+    return p
+
+
+def _prepare_training_features_parquet(
+    parquet_path: Path,
+    *,
+    args: HighTierTrainArgs,
+    metrics: dict[str, Any] | None = None,
+) -> Path:
+    """Sync ``gaming_day_event``, apply date scope, optional target horizon, completeness audit."""
+
+    fp = _ensure_training_parquet_gaming_day_event_column(
+        parquet_path,
+        duckdb_runtime=args.duckdb_runtime,
+    )
+    fp = _apply_training_data_scope_to_parquet(
+        fp,
+        scope=args.training_data_scope,
+        duckdb_runtime=args.duckdb_runtime,
+    )
+    resolved_raw = metrics.get("_resolved_training_scope") if metrics is not None else None
+    resolved = (
+        resolved_raw
+        if isinstance(resolved_raw, ResolvedTrainingScope)
+        else resolve_training_scope(args.training_scope_policy)
+    )
+    fp, horizon_summary = _apply_training_scope_horizon_to_parquet(
+        fp,
+        resolved=resolved,
+        duckdb_runtime=args.duckdb_runtime,
+    )
+    completeness = _audit_training_scope_completeness(
+        fp,
+        resolved=resolved,
+        duckdb_runtime=args.duckdb_runtime,
+    )
+    if metrics is not None:
+        metrics["training_data_scope"] = args.training_data_scope.manifest_block()
+        accel = metrics.get("training_acceleration_policy")
+        if isinstance(accel, dict):
+            accel["horizon_filter"] = horizon_summary
+            accel["training_scope_completeness"] = completeness
+        metrics["training_scope_completeness"] = completeness
+    return fp
+
+
 def _assert_training_parquet_has_short_term_pit_columns(
     parquet_path: Path,
     *,
@@ -1202,8 +1501,9 @@ def _ensure_fe_enriched_training_parquet_for_step4(
     snap = load_candidate_registry(reg_p)
     baseline = baseline_features_for_main_trainer(snap)
     fe_baseline = tuple(c for c in baseline if str(c).startswith("fe__"))
+    txn_baseline = tuple(c for c in baseline if str(c).startswith("txn__"))
     trial_baseline = tuple(c for c in SHORT_TERM_TRIAL_BET_COLUMNS if c in baseline)
-    if not fe_baseline and not trial_baseline:
+    if not fe_baseline and not trial_baseline and not txn_baseline:
         return base_training_parquet
 
     raw_rows = load_registry_raw_feature_dicts(reg_p)
@@ -1228,8 +1528,73 @@ def _ensure_fe_enriched_training_parquet_for_step4(
     audit_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
 
     fe_short_out = out_dir / TRAINING_SHORT_TERM_PIT_CACHE_BASENAME
+    txn_out = out_dir / TRAINING_TXN_LITE_CACHE_BASENAME
     mid_snap_out = out_dir / "_main_trainer_mid_term_daily_snapshot.parquet"
     enriched = out_dir / "training_set_fe_enriched.parquet"
+
+    from trainer_hightier.utils.assembly_cache_v1 import (
+        assembly_cache_is_hit,
+        assembly_manifest_path,
+        assembly_policy_fingerprint_sha256_hex,
+        enrich_module_fingerprint_sha256_hex,
+        parquet_content_fingerprint,
+        registry_baseline_fingerprint_sha256_hex,
+        write_assembly_manifest,
+    )
+    from trainer_hightier.utils.source_manifest_v2 import sha256_file_bytes
+
+    entity_fp_for_assembly: str | None = None
+    if metrics is not None:
+        entity_raw = metrics.get("entity_set_policy_fingerprint_sha256_hex")
+        if entity_raw is not None and str(entity_raw).strip():
+            entity_fp_for_assembly = str(entity_raw).strip()
+    registry_fp = registry_baseline_fingerprint_sha256_hex(baseline)
+    training_base_fp = sha256_file_bytes(base_training_parquet)
+    enrich_fp = enrich_module_fingerprint_sha256_hex()
+    assembly_manifest_p = assembly_manifest_path(enriched)
+
+    def _assembly_policy_fp(
+        *,
+        short_fp: str | None,
+        mid_fp: str | None,
+        txn_fp: str | None = None,
+    ) -> str:
+        if not entity_fp_for_assembly:
+            raise ValueError("entity_set_policy_fingerprint_sha256_hex required for assembly policy")
+        return assembly_policy_fingerprint_sha256_hex(
+            registry_baseline_fingerprint_sha256_hex=registry_fp,
+            training_base_fingerprint_sha256_hex=training_base_fp,
+            entity_set_fingerprint_sha256_hex=entity_fp_for_assembly,
+            enrich_module_fingerprint_sha256_hex=enrich_fp,
+            short_term_parquet_fingerprint_sha256_hex=short_fp,
+            mid_term_snapshot_fingerprint_sha256_hex=mid_fp,
+            txn_lite_parquet_fingerprint_sha256_hex=txn_fp,
+        )
+
+    if (
+        entity_fp_for_assembly
+        and not args.ignore_caches
+        and not args.force_refresh_short_term_pit
+    ):
+        probe_fp = _assembly_policy_fp(
+            short_fp=parquet_content_fingerprint(fe_short_out if short_cols else None),
+            mid_fp=parquet_content_fingerprint(mid_snap_out if mid_cols else None),
+            txn_fp=parquet_content_fingerprint(txn_out if txn_baseline else None),
+        )
+        if assembly_cache_is_hit(
+            manifest_path=assembly_manifest_p,
+            enriched_parquet=enriched,
+            assembly_policy_fingerprint_sha256_hex=probe_fp,
+        ):
+            if metrics is not None:
+                metrics["assembly_cache_hit"] = True
+                metrics["assembly_policy_fingerprint_sha256_hex"] = probe_fp
+                metrics["assembly_manifest_path"] = str(assembly_manifest_p.resolve())
+                metrics["main_trainer_training_parquet_for_step4"] = str(enriched.resolve())
+            logger.info("[Step 3.5] assembly cache hit -> %s", enriched.resolve())
+            return enriched
+        if metrics is not None:
+            metrics["assembly_policy_fingerprint_sha256_hex"] = probe_fp
 
     t_m0 = time.perf_counter()
     short_fe_only = tuple(c for c in short_cols if str(c).startswith("fe__"))
@@ -1248,6 +1613,19 @@ def _ensure_fe_enriched_training_parquet_for_step4(
             rem = metrics.get("partition_recompute_months")
             if isinstance(rem, list):
                 recompute_months = tuple(str(m).strip() for m in rem if str(m).strip())
+        entity_fp: str | None = None
+        entity_delta_ids: tuple[int, ...] = ()
+        prev_entity_fp: str | None = None
+        if metrics is not None:
+            entity_raw = metrics.get("entity_set_policy_fingerprint_sha256_hex")
+            if entity_raw is not None and str(entity_raw).strip():
+                entity_fp = str(entity_raw).strip()
+            raw_ids = metrics.get("entity_delta_added_player_ids")
+            if isinstance(raw_ids, list):
+                entity_delta_ids = tuple(int(x) for x in raw_ids if str(x).strip())
+            prev_raw = metrics.get("entity_delta_previous_entity_set_fingerprint_sha256_hex")
+            if prev_raw is not None and str(prev_raw).strip():
+                prev_entity_fp = str(prev_raw).strip()
         force_short_refresh = bool(args.force_refresh_short_term_pit) or bool(args.ignore_caches)
         _, short_cache_meta = cache_mod.materialize_fe_derived_short_term_parquet_with_cache(
             cleaned_bet_parquet=cleaned,
@@ -1258,9 +1636,12 @@ def _ensure_fe_enriched_training_parquet_for_step4(
             short_term_columns=short_fe_only,
             trial_columns=trial_baseline,
             batch_size=int(args.training_short_term_materialize_batch_size),
-            partition_inventory_fingerprint_sha256=inv_fp,
+            entity_set_fingerprint_sha256_hex=entity_fp,
+            entity_delta_added_player_ids=entity_delta_ids,
+            previous_entity_set_fingerprint_sha256_hex=prev_entity_fp,
             recompute_months=recompute_months,
             force_refresh=force_short_refresh,
+            step35_miss_path=str(args.step35_miss_path),
         )
     mat_short_sec = round(time.perf_counter() - t_m0, 3)
 
@@ -1339,19 +1720,122 @@ def _ensure_fe_enriched_training_parquet_for_step4(
     )
     enr_sec = round(time.perf_counter() - t_e0, 3)
 
+    mat_txn_sec = 0.0
+    if txn_baseline:
+        txn_mod = importlib.import_module("trainer_hightier.feature_experiment.materialize_txn_lite")
+        t_txn0 = time.perf_counter()
+        force_txn = bool(args.ignore_caches) or bool(args.force_refresh_short_term_pit)
+        if force_txn or not txn_out.is_file():
+            txn_mod.materialize_txn_lite_parquet(
+                cleaned_casino_txn_root=txn_mod.default_cleaned_casino_txn_root(),
+                training_parquet_for_bet_ids=base_training_parquet,
+                out_parquet=txn_out,
+                duckdb_runtime=args.duckdb_runtime,
+            )
+        txn_join_tmp = out_dir / "_training_set_fe_enriched_txn_join.parquet"
+        en_mod.join_txn_lite_onto_parquet(
+            base_parquet=enriched,
+            txn_lite_parquet=txn_out,
+            out_parquet=txn_join_tmp,
+            duckdb_runtime=args.duckdb_runtime,
+            txn_feature_columns=txn_baseline,
+        )
+        txn_join_tmp.replace(enriched)
+        mat_txn_sec = round(time.perf_counter() - t_txn0, 3)
+
     if metrics is not None:
         metrics["main_trainer_fe_materialize_short_sec"] = mat_short_sec
         metrics["main_trainer_fe_materialize_mid_sec"] = mat_mid_sec
+        metrics["main_trainer_fe_materialize_txn_sec"] = mat_txn_sec
         metrics["main_trainer_fe_enrich_sec"] = enr_sec
         metrics["main_trainer_training_parquet_for_step4"] = str(enriched.resolve())
         metrics["main_trainer_fe_short_term_parquet"] = str(fe_short_out.resolve()) if short_cols else None
+        metrics["main_trainer_txn_lite_parquet"] = str(txn_out.resolve()) if txn_baseline else None
         if short_cache_meta:
             metrics["main_trainer_fe_short_term_cache"] = short_cache_meta
+            metrics["short_term_pit_primitive_hit_ratio"] = short_cache_meta.get(
+                "short_term_pit_primitive_hit_ratio",
+            )
+            metrics["short_term_pit_recompute_months"] = short_cache_meta.get(
+                "short_term_pit_recompute_months",
+            )
+            metrics["short_term_pit_source_invalid_months"] = short_cache_meta.get(
+                "short_term_pit_source_invalid_months",
+            )
+            metrics["short_term_pit_delta_fill_shards"] = short_cache_meta.get(
+                "short_term_pit_delta_fill_shards",
+            )
+            metrics["short_term_pit_subset_hit_shards"] = short_cache_meta.get(
+                "short_term_pit_subset_hit_shards",
+            )
+            metrics["short_term_pit_exact_hit_shards"] = short_cache_meta.get(
+                "short_term_pit_exact_hit_shards",
+            )
+            metrics["short_term_pit_cold_build_shards"] = short_cache_meta.get(
+                "short_term_pit_cold_build_shards",
+            )
+            metrics["entity_delta_fill_elapsed_seconds"] = short_cache_meta.get(
+                "entity_delta_fill_elapsed_seconds",
+            )
+            metrics["step35_miss_path"] = short_cache_meta.get("step35_miss_path")
+            metrics["cache_reason_counts"] = short_cache_meta.get("cache_reason_counts")
+            metrics["step35_materializer_by_shard"] = short_cache_meta.get(
+                "step35_materializer_by_shard",
+            )
+            metrics["step35_indexed_replay_shard_seconds"] = short_cache_meta.get(
+                "step35_indexed_replay_shard_seconds",
+            )
+            accel = metrics.get("training_acceleration_policy")
+            if isinstance(accel, dict):
+                accel["cache_hit_miss_summary"] = {
+                    "step35_miss_path": short_cache_meta.get("step35_miss_path"),
+                    "cache_hit": short_cache_meta.get("cache_hit"),
+                    "cache_hit_ratio": short_cache_meta.get("cache_hit_ratio"),
+                    "cache_hit_shards": short_cache_meta.get("cache_hit_shards"),
+                    "cache_miss_shards": short_cache_meta.get("cache_miss_shards"),
+                    "cache_reason_counts": short_cache_meta.get("cache_reason_counts"),
+                    "short_term_pit_delta_fill_shards": short_cache_meta.get(
+                        "short_term_pit_delta_fill_shards",
+                    ),
+                    "short_term_pit_subset_hit_shards": short_cache_meta.get(
+                        "short_term_pit_subset_hit_shards",
+                    ),
+                    "short_term_pit_exact_hit_shards": short_cache_meta.get(
+                        "short_term_pit_exact_hit_shards",
+                    ),
+                    "short_term_pit_cold_build_shards": short_cache_meta.get(
+                        "short_term_pit_cold_build_shards",
+                    ),
+                    "step35_materializer_by_shard": short_cache_meta.get(
+                        "step35_materializer_by_shard",
+                    ),
+                    "step35_indexed_replay_shard_seconds": short_cache_meta.get(
+                        "step35_indexed_replay_shard_seconds",
+                    ),
+                    "indexed_replay_gate_mode": short_cache_meta.get("indexed_replay_gate_mode"),
+                }
         metrics["main_trainer_mid_term_snapshot_parquet"] = str(mid_snap_out.resolve()) if mid_cols else None
         metrics["feature_cadence_audit"] = audit
         metrics["feature_cadence_audit_path"] = str(audit_path.resolve())
         if mid_meta:
             metrics["main_trainer_mid_term_snapshot_meta"] = mid_meta
+        if entity_fp_for_assembly and not args.ignore_caches:
+            final_fp = _assembly_policy_fp(
+                short_fp=parquet_content_fingerprint(fe_short_out if short_cols else None),
+                mid_fp=parquet_content_fingerprint(mid_snap_out if mid_cols else None),
+                txn_fp=parquet_content_fingerprint(txn_out if txn_baseline else None),
+            )
+            write_assembly_manifest(
+                manifest_path=assembly_manifest_p,
+                enriched_parquet=enriched,
+                assembly_policy_fingerprint_sha256_hex=final_fp,
+                registry_baseline_fingerprint_sha256_hex=registry_fp,
+                training_base_fingerprint_sha256_hex=training_base_fp,
+                entity_set_fingerprint_sha256_hex=entity_fp_for_assembly,
+            )
+            metrics["assembly_cache_hit"] = False
+            metrics["assembly_manifest_path"] = str(assembly_manifest_p.resolve())
+            metrics["assembly_policy_fingerprint_sha256_hex"] = final_fp
     logger.info(
         "[Step 3.5] cadence enrich: short_pit=%d (bet__=%d fe__=%d) mid=%d -> %s "
         "(short %.3fs, mid %.3fs, enrich %.3fs%s)",
@@ -1389,7 +1873,7 @@ def _maybe_run_step4(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None)
         logger.warning("[Step 4] skip: no features parquet at %s", fp.resolve())
         return
     logger.info("[Step 4] starting from features parquet %s", fp.resolve())
-    fp = _ensure_training_parquet_gaming_day_event_column(fp, duckdb_runtime=args.duckdb_runtime)
+    fp = _prepare_training_features_parquet(fp, args=args, metrics=metrics)
     fp_eff = _ensure_fe_enriched_training_parquet_for_step4(args, fp, metrics=metrics)
     reg_p = Path(args.feature_candidate_registry).resolve() if args.feature_candidate_registry else None
     snap = load_candidate_registry(reg_p)
@@ -1431,6 +1915,16 @@ def _maybe_run_step4(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None)
         periods = _step4_gaming_day_periods_from_report(res.report)
         if periods is not None:
             metrics["step4_split_periods"] = periods
+        accel = metrics.get("training_acceleration_policy")
+        if isinstance(accel, dict):
+            report = dict(res.report)
+            report["target_scope"] = accel.get("resolved_target_scope")
+            report["training_scope_completeness"] = metrics.get("training_scope_completeness")
+            res.split_report_json.write_text(
+                json.dumps(report, indent=2, default=str),
+                encoding="utf-8",
+            )
+            res = replace(res, report=report)
     logger.info("[Step 4] splits written %s (%.3fs)", res.splits_dir.resolve(), elapsed)
 
 
@@ -1445,7 +1939,10 @@ def _maybe_build_training_dataset(args: HighTierTrainArgs, *, metrics: dict[str,
             cleaned_bet_path.resolve(),
         )
         return
-    labels_path = args.objective.labels_parquet or default_walkaway_labels_parquet_path()
+    labels_path = (
+        args.objective.labels_parquet
+        or default_walkaway_labels_parquet_path(label_contract=args.walkaway_label_contract)
+    )
     if not labels_path.is_file():
         logger.warning(
             "[Step 3] skip training dataset: labels missing at %s (enable walkaway labels or materialize separately)",
@@ -1456,6 +1953,13 @@ def _maybe_build_training_dataset(args: HighTierTrainArgs, *, metrics: dict[str,
     ensure_res = _b3.ensure_feast_registry_ready(feast_repo.resolve(), auto_apply=args.auto_feast_apply)
     if metrics is not None:
         metrics["feast_auto_apply"] = _b3.feast_registry_ensure_result_to_metrics(ensure_res)
+    target_scope: ResolvedTrainingScope | None = None
+    if metrics is not None:
+        resolved_raw = metrics.get("_resolved_training_scope")
+        if isinstance(resolved_raw, ResolvedTrainingScope):
+            target_scope = resolved_raw
+    if target_scope is None:
+        target_scope = resolve_training_scope(args.training_scope_policy)
     cfg = _b3.BuildTrainingDataArgs(
         feast_repo=feast_repo.resolve(),
         cleaned_bet_parquet=cleaned_bet_path.resolve(),
@@ -1469,8 +1973,10 @@ def _maybe_build_training_dataset(args: HighTierTrainArgs, *, metrics: dict[str,
         training_set_keep_last_n_versions=10,
         feast_retrieval_cache_enabled=bool(args.feast_retrieval_cache) and not bool(args.ignore_caches),
         auto_feast_apply=bool(args.auto_feast_apply),
+        target_scope=target_scope,
     )
     out = _b3.build_training_data(cfg)
+    _prepare_training_features_parquet(out, args=args, metrics=metrics)
     logger.info("[Step 3] training dataset written %s", out)
     logger.info(
         "[Pipeline] After Step 3: Step 4 will split by gaming_day (if run_step4), then Step 5 LightGBM (if run_step5). "
@@ -1502,6 +2008,23 @@ def fit_model(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None)
             "Pass --feature-candidate-registry <path> or restore the YAML.",
         ) from exc
     feat_cols = baseline_features_for_main_trainer(snap)
+    from trainer_hightier.utils.feature_screening_hook import resolve_step5_feature_columns
+
+    feat_cols, screening_meta = resolve_step5_feature_columns(
+        baseline_features=feat_cols,
+        policy=args.feature_screening_policy,
+    )
+    if metrics is not None:
+        metrics["feature_screening_summary"] = screening_meta
+        accel = metrics.get("training_acceleration_policy")
+        if isinstance(accel, dict):
+            accel["feature_screening_summary"] = screening_meta
+    logger.info(
+        "[Step 5] model input features n=%d (baseline=%d screening=%s)",
+        len(feat_cols),
+        screening_meta.get("baseline_feature_count"),
+        "enabled" if screening_meta.get("enabled") else "noop",
+    )
     _step5_splits_have_feature_columns(splits_dir, feat_cols, registry_path=snap.path)
     logger.info(
         "[Step 5] baseline features from registry %s (n=%s)",
@@ -1516,6 +2039,20 @@ def fit_model(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None)
     }
     try:
         step5_out_dir = Path(args.step5_bundle_dir).resolve() if args.step5_bundle_dir is not None else Path(args.output_dir).resolve()
+        from trainer_hightier.utils.train_negative_sampling import materialize_sampled_train_parquet
+
+        train_source = splits_dir / "train.parquet"
+        sampled_train_p, sample_meta = materialize_sampled_train_parquet(
+            train_parquet=train_source,
+            splits_dir=splits_dir,
+            policy=args.sample_policy,
+            force_refresh=bool(args.ignore_caches),
+        )
+        if metrics is not None:
+            metrics["negative_sampling_summary"] = sample_meta
+            accel = metrics.get("training_acceleration_policy")
+            if isinstance(accel, dict):
+                accel["negative_sampling_summary"] = sample_meta
         logger.info(
             "[Step 5] training: train_lgbm_from_splits (splits_dir=%s, n_features=%d, skip_optuna=%s, out_dir=%s) …",
             splits_dir.resolve(),
@@ -1525,12 +2062,17 @@ def fit_model(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None)
         )
         result = _b5.train_lgbm_from_splits(
             splits_dir=splits_dir,
+            train_parquet=sampled_train_p,
+            sample_policy_meta=sample_meta,
+            feature_screening_meta=screening_meta,
             duckdb_runtime=args.duckdb_runtime,
+            objective=args.objective,
             objective_min_precision=float(args.objective.min_precision),
             random_seed=int(args.random_seed),
             step5=args.step5,
             output_dir=step5_out_dir,
             feature_columns=feat_cols,
+            persist_training_metrics=False,
         )
         logger.info(
             "[Step 5] train_lgbm_from_splits finished (model=%s, threshold=%s).",
@@ -1544,6 +2086,12 @@ def fit_model(args: HighTierTrainArgs, *, metrics: dict[str, Any] | None = None)
         raise
     if metrics is not None:
         metrics.update(result.report)
+        writer = _get_report_writer(metrics)
+        if writer is not None:
+            tm_path = writer.write_training_metrics(result.report)
+            metrics["training_metrics_path"] = str(tm_path.resolve())
+            metrics["step5_training_metrics_path"] = str(tm_path.resolve())
+        metrics["model_path"] = str(result.model_path.resolve())
         metrics["candidate_registry"] = reg_echo
         _freeze_feature_registry_snapshot(
             bundle_dir=Path(step5_out_dir),
@@ -1574,14 +2122,21 @@ def _freeze_feature_registry_snapshot(
     metrics["feature_candidate_registry_snapshot"] = dest.name
     metrics["feature_candidate_registry_sha256"] = digest
     metrics["feature_candidate_registry_frozen_from"] = str(src)[:500]
+    patch = {
+        "feature_candidate_registry_snapshot": dest.name,
+        "feature_candidate_registry_sha256": digest,
+        "feature_candidate_registry_frozen_from": str(src)[:500],
+    }
+    writer = _get_report_writer(metrics)
+    if writer is not None:
+        writer.patch_training_metrics(patch)
+        return
     tm_path = bd / _b5.DEFAULT_METRICS_FILENAME
     if tm_path.is_file():
         try:
             body = json.loads(tm_path.read_text(encoding="utf-8"))
             if isinstance(body, dict):
-                body["feature_candidate_registry_snapshot"] = dest.name
-                body["feature_candidate_registry_sha256"] = digest
-                body["feature_candidate_registry_frozen_from"] = str(src)[:500]
+                body.update(patch)
                 tm_path.write_text(json.dumps(body, indent=2, default=str), encoding="utf-8")
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             logger.warning("[registry_frozen] skip training_metrics merge: %s", exc)
@@ -1619,6 +2174,11 @@ def _persist_adt_allowlist_sha(
     if allow_dest.is_file():
         al_sha = sha256_file(allow_dest)
         metrics["adt_allowlist_sha256"] = al_sha
+        writer = _get_report_writer(metrics)
+        if writer is not None:
+            writer.patch_training_metrics({"adt_allowlist_sha256": al_sha})
+            logger.info("[deploy_inputs] merged adt_allowlist_sha256 into training_metrics.json")
+            return al_sha
         tm_path = bundle_dir / training_metrics_rel
         if tm_path.is_file():
             try:
@@ -1921,6 +2481,8 @@ def _maybe_run_pre_train_feature_gate(args: HighTierTrainArgs, metrics: dict[str
     cleaned_bet = repo / "trainer_hightier" / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet"
     mapping = default_canonical_mapping_parquet_path().resolve()
     out_json = step06_mod.default_pre_train_gate_json_path()
+    from trainer_hightier.utils.partition_inventory import default_partition_snapshot_dir
+
     report = step06_mod.run_pre_train_feature_gate(
         test_parquet,
         columns=gate_cols,
@@ -1929,6 +2491,7 @@ def _maybe_run_pre_train_feature_gate(args: HighTierTrainArgs, metrics: dict[str
         gate_cfg=args.pre_train_gate,
         duckdb_runtime=args.duckdb_runtime,
         output_json=out_json,
+        raw_partition_dir=default_partition_snapshot_dir(),
     )
     metrics["pre_train_feature_gate_json"] = str(out_json.resolve())
     metrics["pre_train_feature_gate_verdict"] = report.get("verdict")
@@ -1975,7 +2538,6 @@ def _run_step6_parity_gate(
     test_parquet = _resolve_step6_test_parquet(args, repo)
     cleaned_bet = repo / "trainer_hightier" / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet"
     feast_repo = repo / "trainer_hightier" / "feast_repo"
-    out_json = Path(bundle_dir).resolve() / "feature_parity_verification.json"
     report = step06_mod.build_report_from_config(
         model_dirs=[Path(bundle_dir).resolve()],
         test_parquet=test_parquet,
@@ -1984,7 +2546,12 @@ def _run_step6_parity_gate(
         as_of_date=_date_cls.today(),
         parity_cfg=args.step6,
     )
-    out_json.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    writer = _get_report_writer(metrics)
+    if writer is not None:
+        out_json = writer.write_gate_report(FEATURE_PARITY_REPORT_FILENAME, report)
+    else:
+        out_json = Path(bundle_dir).resolve() / FEATURE_PARITY_REPORT_FILENAME
+        out_json.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     metrics["feature_parity_verification_json"] = str(out_json.resolve())
     metrics["step6_slow_gate_failed"] = int(report.get("n_failed_slow_gate", 0))
     metrics["step6_all_feature_gate_failed"] = int(report.get("n_failed_all_feature_gate", 0))
@@ -2078,6 +2645,10 @@ def _run_step6_deploy_e2e_gate(
             verdict = "fail"
     metrics["step6_deploy_e2e_verdict"] = verdict
     logger.info("[Step 6] deploy_e2e verdict=%s report=%s", verdict, e2e_report_path.name)
+
+    writer = _get_report_writer(metrics)
+    if writer is not None and e2e_report_path.is_file():
+        writer.register_existing_json(e2e_report_path)
 
     if exit_code != 0 or (args.step6.hard_fail_deploy_e2e_gate and verdict != "pass"):
         raise RuntimeError(
@@ -2211,6 +2782,10 @@ def run_training(args: HighTierTrainArgs) -> None:
             log_tags_safe({"status": "RUNNING"})
             log_params_safe(_mlflow_initial_string_params(exec_args))
             metrics: dict[str, Any] = {"start_epoch_ms": int(time.time() * 1000)}
+            report_parent = exec_args.step5_bundle_dir.resolve() if exec_args.step5_bundle_dir else versions_root
+            writer = BundleReportWriter(report_parent)
+            metrics["report_writer"] = writer
+            _init_training_acceleration_metrics(exec_args, metrics)
             if exec_args.step5_bundle_dir is not None:
                 metrics["model_version"] = model_version
                 metrics["model_bundle_dir"] = str(exec_args.step5_bundle_dir.resolve())
@@ -2218,13 +2793,9 @@ def run_training(args: HighTierTrainArgs) -> None:
                 _run_training_execute_steps(exec_args, metrics)
                 metrics["finish_epoch_ms"] = int(time.time() * 1000)
                 metrics["run_training_total_seconds"] = round(time.perf_counter() - t0, 3)
-                if exec_args.step5_bundle_dir is not None:
-                    bundle_sr = _materialize_split_report_in_bundle(
-                        exec_args.step5_bundle_dir.resolve(),
-                        source_report=metrics.get("step4_split_report"),
-                    )
-                    if bundle_sr is not None:
-                        metrics["step4_split_report_bundle"] = str(bundle_sr.resolve())
+                bundle_sr = writer.copy_split_report(metrics.get("step4_split_report"))
+                if bundle_sr is not None:
+                    metrics["step4_split_report_bundle"] = str(bundle_sr.resolve())
                 if (
                     exec_args.step5_bundle_dir is not None
                     and (exec_args.step5_bundle_dir.resolve() / _b5.DEFAULT_MODEL_FILENAME).is_file()
@@ -2240,14 +2811,15 @@ def run_training(args: HighTierTrainArgs) -> None:
                         metrics,
                         bundle_dir=exec_args.step5_bundle_dir.resolve(),
                     )
-                rp_parent = exec_args.step5_bundle_dir.resolve() if exec_args.step5_bundle_dir else versions_root
-                rp = rp_parent / "run_report.json"
-                rp.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-                logger.info("[Step 7] run_training skeleton finished (report %s)", rp.resolve())
-                write_hightier_training_logs(rp_parent, metrics, exec_args)
+                from trainer_hightier.utils.source_manifest_v2 import finalize_cache_report_from_metrics
+
+                finalized = finalize_cache_report_from_metrics(metrics)
+                if finalized is not None:
+                    metrics["cache_report_finalized_path"] = str(finalized.resolve())
+                _finalize_training_reports(exec_args, metrics, writer, status="SUCCESS")
                 log_params_safe(_mlflow_post_run_string_params(metrics))
                 log_metrics_safe(_mlflow_scalar_metrics(metrics))
-                _log_mlflow_whitelist_artifacts(exec_args, metrics)
+                _log_mlflow_whitelist_artifacts(exec_args, metrics, writer)
                 if (
                     exec_args.step5_bundle_dir is not None
                     and (exec_args.step5_bundle_dir.resolve() / _b5.DEFAULT_MODEL_FILENAME).is_file()
@@ -2255,6 +2827,23 @@ def run_training(args: HighTierTrainArgs) -> None:
                     write_latest_model_manifest(versions_root, model_version, exec_args.step5_bundle_dir.resolve())
                 log_tags_safe({"status": "SUCCESS"})
             except Exception as e:
+                metrics["finish_epoch_ms"] = int(time.time() * 1000)
+                metrics["run_training_total_seconds"] = round(time.perf_counter() - t0, 3)
+                from trainer_hightier.utils.source_manifest_v2 import finalize_cache_report_from_metrics
+
+                finalized = finalize_cache_report_from_metrics(metrics)
+                if finalized is not None:
+                    metrics["cache_report_finalized_path"] = str(finalized.resolve())
+                _finalize_training_reports(
+                    exec_args,
+                    metrics,
+                    writer,
+                    status="FAILED",
+                    error=str(e)[:500],
+                )
+                log_params_safe(_mlflow_post_run_string_params(metrics))
+                log_metrics_safe(_mlflow_scalar_metrics(metrics))
+                _log_mlflow_whitelist_artifacts(exec_args, metrics, writer)
                 log_tags_safe({"status": "FAILED", "error": str(e)[:500]})
                 raise
     finally:
@@ -2298,6 +2887,17 @@ def _build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--walkaway-gap-min",
+        type=int,
+        default=WALKAWAY_GAP_MIN,
+        metavar="MINUTES",
+        help=(
+            "Walkaway gap X (minutes without bets) for Step 2c label contract. "
+            "Default 30 (production). Use 60 or 1440 for gap ablation; "
+            "non-default gaps write separate labels parquet and gap-partitioned L4 cache."
+        ),
+    )
+    p.add_argument(
         "--skip-walkaway-labels",
         action="store_true",
         dest="skip_walkaway_labels",
@@ -2310,6 +2910,24 @@ def _build_argparser() -> argparse.ArgumentParser:
         help=(
             "Skip Step 2b (t_bet L0 to cleaned bet). Use when cleaned bet already exists under "
             "artifacts/cleaned; downstream steps still read the default paths."
+        ),
+    )
+    p.add_argument(
+        "--use-legacy-bet-segment",
+        action="store_true",
+        dest="use_legacy_bet_segment",
+        help=(
+            "Use ADT-segmented cleaned__gmwds_t_bet preprocess path instead of entity set v1 "
+            "(default is entity set v1 when materialized)."
+        ),
+    )
+    p.add_argument(
+        "--use-sharded-labels-cache",
+        action="store_true",
+        dest="use_sharded_labels_cache",
+        help=(
+            "Step 2c: materialize walkaway labels via month×canonical_shard cache "
+            "(default monolithic labels cache)."
         ),
     )
     p.add_argument(
@@ -2401,7 +3019,7 @@ def _build_argparser() -> argparse.ArgumentParser:
         dest="patron_sampling_ratio",
         metavar="FRACTION",
         help=(
-            "Optional explicit patron sampling ratio recorded in run_summary.json "
+            "Optional explicit patron sampling ratio recorded in run_report.json summary "
             "(e.g. 0.01 vs 0.10). When omitted, ratio may be derived from "
             "HighTierObjectiveConfig.theo_train_quantile when ADT bet filtering is enabled."
         ),
@@ -2494,6 +3112,9 @@ def _train_args_from_cli_namespace(ns: argparse.Namespace) -> HighTierTrainArgs:
         ignore_caches=bool(ns.ignore_caches),
         force_refresh_short_term_pit=bool(ns.force_refresh_short_term_pit),
         skip_bet_preprocess=bool(ns.skip_bet_preprocess),
+        use_entity_set_v1=not bool(ns.use_legacy_bet_segment),
+        use_sharded_labels_cache=bool(ns.use_sharded_labels_cache),
+        walkaway_label_contract=walkaway_label_contract_for_gap_min(int(ns.walkaway_gap_min)),
         materialize_walkaway_labels=not bool(ns.skip_walkaway_labels),
         build_training_dataset=not bool(ns.skip_training_dataset),
         training_materialize_derived=not bool(ns.skip_training_materialize_derived),

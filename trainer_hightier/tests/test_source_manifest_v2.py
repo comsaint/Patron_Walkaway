@@ -1,0 +1,264 @@
+"""Tests for content-addressed source manifest v2 (Phase 1)."""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import time
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+
+from trainer_hightier.utils.partition_inventory import (
+    PartitionParquetStat,
+    scan_partition_snapshot_dir,
+)
+from trainer_hightier.utils.source_manifest_v2 import (
+    CHANGE_ADDED,
+    CHANGE_MODIFIED,
+    CHANGE_REMOVED,
+    CHANGE_UNCHANGED,
+    aggregate_source_files_fingerprint_sha256_hex,
+    backup_all_training_caches_readonly,
+    build_source_file_record,
+    build_source_manifest_v2,
+    diff_source_manifests,
+    load_source_manifest_v2,
+    materialize_source_manifest_v2_phase1,
+    sha256_file_bytes,
+    validate_partition_yyyymm,
+    write_cache_report_skeleton,
+)
+
+
+def _tiny_parquet_bytes(*, value: int = 1) -> bytes:
+    buf = io.BytesIO()
+    pq.write_table(pa.table({"col": [value]}), buf)
+    return buf.getvalue()
+
+
+def _write_legacy_snapshot(root: Path, *, months: tuple[str, ...] = ("202401",)) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    for ym in months:
+        (root / f"t_bet__part_{ym}.parquet").write_bytes(_tiny_parquet_bytes())
+        (root / f"t_session__part_{ym}.parquet").write_bytes(_tiny_parquet_bytes())
+
+
+def test_t1_identical_bytes_different_mtime_are_unchanged(tmp_path: Path) -> None:
+    snap = tmp_path / "snap"
+    _write_legacy_snapshot(snap)
+    cache = tmp_path / "cache"
+    first = materialize_source_manifest_v2_phase1(snapshot_dir=snap, cache_root=cache, run_id="run1")
+    assert first["source_manifest_v2_diff_summary"]["added"] == 2
+    bet_path = snap / "t_bet__part_202401.parquet"
+    os.utime(bet_path, (time.time() + 3600, time.time() + 3600))
+    second = materialize_source_manifest_v2_phase1(snapshot_dir=snap, cache_root=cache, run_id="run2")
+    summary = second["source_manifest_v2_diff_summary"]
+    assert summary["modified"] == 0
+    assert summary["unchanged"] == 2
+    assert summary["added"] == 0
+    assert summary["removed"] == 0
+
+
+def test_t2_single_file_modified_marks_one_partition(tmp_path: Path) -> None:
+    snap = tmp_path / "snap"
+    _write_legacy_snapshot(snap)
+    cache = tmp_path / "cache"
+    materialize_source_manifest_v2_phase1(snapshot_dir=snap, cache_root=cache, run_id="baseline")
+    (snap / "t_bet__part_202401.parquet").write_bytes(_tiny_parquet_bytes(value=99))
+    got = materialize_source_manifest_v2_phase1(snapshot_dir=snap, cache_root=cache, run_id="after_edit")
+    summary = got["source_manifest_v2_diff_summary"]
+    assert summary["modified"] == 1
+    assert summary["unchanged"] == 1
+    assert got["source_manifest_v2_changed_partitions"] == {"t_bet": ["202401"], "t_session": []}
+    change_set = json.loads(Path(got["source_manifest_v2_change_set_path"]).read_text(encoding="utf-8"))
+    kinds = {row["change_kind"] for row in change_set["changed_files"]}
+    assert kinds == {CHANGE_MODIFIED}
+
+
+def test_t3_added_partition_file(tmp_path: Path) -> None:
+    snap = tmp_path / "snap"
+    _write_legacy_snapshot(snap, months=("202401",))
+    cache = tmp_path / "cache"
+    materialize_source_manifest_v2_phase1(snapshot_dir=snap, cache_root=cache, run_id="baseline")
+    (snap / "t_bet__part_202402.parquet").write_bytes(_tiny_parquet_bytes())
+    got = materialize_source_manifest_v2_phase1(snapshot_dir=snap, cache_root=cache, run_id="after_add")
+    summary = got["source_manifest_v2_diff_summary"]
+    assert summary["added"] == 1
+    assert summary["unchanged"] == 2
+    assert got["source_manifest_v2_changed_partitions"]["t_bet"] == ["202402"]
+
+
+def test_t4_removed_partition_file(tmp_path: Path) -> None:
+    snap = tmp_path / "snap"
+    _write_legacy_snapshot(snap, months=("202401", "202402"))
+    cache = tmp_path / "cache"
+    materialize_source_manifest_v2_phase1(snapshot_dir=snap, cache_root=cache, run_id="baseline")
+    (snap / "t_session__part_202402.parquet").unlink()
+    got = materialize_source_manifest_v2_phase1(snapshot_dir=snap, cache_root=cache, run_id="after_remove")
+    summary = got["source_manifest_v2_diff_summary"]
+    assert summary["removed"] == 1
+    assert got["source_manifest_v2_changed_partitions"]["t_session"] == ["202402"]
+
+
+def test_t5_unmappable_partition_yyyymm_fail_fast(tmp_path: Path) -> None:
+    p = tmp_path / "bad.parquet"
+    p.write_bytes(_tiny_parquet_bytes())
+    stat = PartitionParquetStat(
+        path=p,
+        yyyymm="20X401",
+        role="t_bet",
+        mtime_ns=0,
+        size_bytes=1,
+        num_rows=1,
+    )
+    with pytest.raises(ValueError, match="partition_yyyymm must be six digits"):
+        build_source_file_record(stat, snapshot_dir=tmp_path, file_sha256=sha256_file_bytes(p))
+    with pytest.raises(ValueError, match="partition_yyyymm must be six digits"):
+        validate_partition_yyyymm("bad", path=p)
+
+
+def test_t6_missing_previous_manifest_treats_all_as_added(tmp_path: Path) -> None:
+    snap = tmp_path / "snap"
+    _write_legacy_snapshot(snap)
+    cache = tmp_path / "cache"
+    got = materialize_source_manifest_v2_phase1(snapshot_dir=snap, cache_root=cache, run_id="first")
+    summary = got["source_manifest_v2_diff_summary"]
+    assert summary == {"added": 2, "removed": 0, "modified": 0, "unchanged": 0}
+    assert got["source_manifest_v2_changed_partitions"]["t_bet"] == ["202401"]
+    assert got["source_manifest_v2_changed_partitions"]["t_session"] == ["202401"]
+
+
+def test_t6_corrupt_previous_manifest_treats_all_as_added(tmp_path: Path) -> None:
+    snap = tmp_path / "snap"
+    _write_legacy_snapshot(snap)
+    cache = tmp_path / "cache"
+    prev_dir = cache / "source_manifest_v2"
+    prev_dir.mkdir(parents=True)
+    (prev_dir / "previous.json").write_text("{not json", encoding="utf-8")
+    got = materialize_source_manifest_v2_phase1(snapshot_dir=snap, cache_root=cache, run_id="corrupt_prev")
+    assert got["source_manifest_v2_diff_summary"]["added"] == 2
+    assert load_source_manifest_v2(prev_dir / "previous.json") is not None
+
+
+def test_diff_classifies_unchanged_modified_added_removed() -> None:
+    prev = {
+        "files": [
+            {"table": "t_bet", "relative_path": "a.parquet", "file_sha256": "1", "partition_yyyymm": "202401"},
+            {"table": "t_bet", "relative_path": "mod.parquet", "file_sha256": "old", "partition_yyyymm": "202402"},
+            {"table": "t_bet", "relative_path": "gone.parquet", "file_sha256": "2", "partition_yyyymm": "202403"},
+        ],
+    }
+    cur = {
+        "files": [
+            {"table": "t_bet", "relative_path": "a.parquet", "file_sha256": "1", "partition_yyyymm": "202401"},
+            {"table": "t_bet", "relative_path": "mod.parquet", "file_sha256": "new", "partition_yyyymm": "202402"},
+            {"table": "t_bet", "relative_path": "added.parquet", "file_sha256": "3", "partition_yyyymm": "202404"},
+        ],
+    }
+    diff = diff_source_manifests(prev, cur)
+    assert len(diff.unchanged) == 1
+    assert len(diff.added) == 1
+    assert len(diff.removed) == 1
+    assert len(diff.modified) == 1
+
+
+def test_aggregate_fingerprint_stable_for_same_files() -> None:
+    manifest = {
+        "files": [
+            {"table": "t_bet", "relative_path": "a.parquet", "file_sha256": "1"},
+            {"table": "t_session", "relative_path": "b.parquet", "file_sha256": "2"},
+        ],
+    }
+    fp1 = aggregate_source_files_fingerprint_sha256_hex(manifest)
+    fp2 = aggregate_source_files_fingerprint_sha256_hex(manifest)
+    assert fp1 == fp2
+    assert len(fp1) == 64
+
+
+def test_finalize_cache_report_merges_pipeline_layers(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    report_path = write_cache_report_skeleton(
+        cache_root=cache,
+        run_id="run_finalize",
+        change_set_path=tmp_path / "change_set.json",
+        diff_summary={"added": 0, "removed": 0, "modified": 0, "unchanged": 1},
+        changed_partitions={"t_bet": [], "t_session": []},
+        elapsed_seconds=1.0,
+        hashed_bytes=100,
+    )
+    metrics = {
+        "source_manifest_v2_cache_report_path": str(report_path),
+        "session_clean_cache_hit": True,
+        "labels_cache_hit": False,
+        "labels_cache_elapsed_seconds": 0.5,
+        "labels_invalid_months": ["202503"],
+        "main_trainer_fe_short_term_cache": {
+            "cache_hit": True,
+            "cache_hit_ratio": 1.0,
+            "cache_hit_shards": ["202503"],
+            "cache_miss_shards": [],
+            "cache_reason_counts": {},
+        },
+        "l1_recompute_months": [],
+    }
+    from trainer_hightier.utils.source_manifest_v2 import finalize_cache_report_from_metrics
+
+    out = finalize_cache_report_from_metrics(metrics)
+    assert out is not None and out.is_file()
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    layer_names = [row["layer"] for row in payload["layers"]]
+    assert "source_manifest_v2" in layer_names
+    assert "l1_session_clean" in layer_names
+    assert "l4_walkaway_labels_v1" in layer_names
+    assert "l5_short_term_pit_primitive" in layer_names
+    assert payload["schema_version"] == 2
+
+
+def test_build_manifest_records_sorted_and_atomic_paths_exist(tmp_path: Path) -> None:
+    snap = tmp_path / "snap"
+    _write_legacy_snapshot(snap)
+    cache = tmp_path / "cache"
+    got = materialize_source_manifest_v2_phase1(snapshot_dir=snap, cache_root=cache, run_id="paths")
+    assert Path(got["source_manifest_v2_change_set_path"]).is_file()
+    assert Path(got["source_manifest_v2_cache_report_path"]).is_file()
+    assert Path(got["source_manifest_v2_current_path"]).is_file()
+    bets, sess = scan_partition_snapshot_dir(snap)
+    manifest, _, _ = build_source_manifest_v2(snapshot_dir=snap, snapshot_id="snap", bet_stats=bets, session_stats=sess)
+    paths = [f["relative_path"] for f in manifest["files"]]
+    assert paths == sorted(paths)
+
+
+def test_backup_all_training_caches_readonly_idempotent(tmp_path: Path, monkeypatch) -> None:
+    """Full-cache backup copies tiny fixture trees once and skips on second call."""
+    pkg = tmp_path / "trainer_hightier"
+    artifacts = pkg / "artifacts"
+    (artifacts / "cache" / "universe_v1").mkdir(parents=True)
+    (artifacts / "cache" / "universe_v1" / "marker.txt").write_text("u", encoding="utf-8")
+    (artifacts / "training_data" / "cache" / "short_term_pit_v1").mkdir(parents=True)
+    (artifacts / "training_data" / "cache" / "short_term_pit_v1" / "marker.txt").write_text(
+        "p",
+        encoding="utf-8",
+    )
+    (artifacts / "labels").mkdir(parents=True)
+    (artifacts / "labels" / "walkaway_labels.parquet").write_bytes(b"lbl")
+    (artifacts / "cleaned" / "cleaned__gmwds_t_bet").mkdir(parents=True)
+    (artifacts / "cleaned" / "cleaned__gmwds_t_bet" / "marker.txt").write_text("b", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "trainer_hightier.utils.source_manifest_v2.default_artifacts_root",
+        lambda **_: artifacts.resolve(),
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.utils.source_manifest_v2.default_training_caches_backup_root",
+        lambda **_: (artifacts / "cache__backup_test").resolve(),
+    )
+    first = backup_all_training_caches_readonly()
+    assert first["status"] == "completed"
+    assert (artifacts / "cache__backup_test" / "cache" / "universe_v1" / "marker.txt").is_file()
+    second = backup_all_training_caches_readonly()
+    assert second["status"] == "completed"
+    assert second["backup_root"] == first["backup_root"]

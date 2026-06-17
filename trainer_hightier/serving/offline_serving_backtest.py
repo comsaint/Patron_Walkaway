@@ -40,14 +40,14 @@ from typing import Any, Final, Iterator
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import average_precision_score
+from trainer_hightier.evaluation.metrics_blocks import split_metrics_block
 from zoneinfo import ZoneInfo
 
 from trainer_hightier.config import (
     TRAINER_HIGHTIER_PACKAGE_DIR,
+    DEFAULT_WALKAWAY_LABEL_CONTRACT,
     HightierServingConfig,
-    LABEL_LOOKAHEAD_MIN,
-    WALKAWAY_GAP_MIN,
+    WalkawayLabelContract,
     apply_hightier_serving_environ_overrides,
     set_hightier_serving_deploy_override,
 )
@@ -56,7 +56,7 @@ from trainer_hightier.core.model_bundle_paths import (
     model_bundle_report_path,
     resolve_model_bundle_for_reports,
 )
-from trainer_hightier.serving.adt_allowlist import load_adt_allowlist_ids
+from trainer_hightier.serving.adt_allowlist import load_adt_allowlist_ids, resolve_model_bundle_allowlist_parquet
 from trainer_hightier.serving.audit_production_readiness import (
     _load_bundle_rel,
     _load_dotenv,
@@ -109,6 +109,7 @@ from trainer_hightier.serving.snapshot_freshness import (
     post_join_feature_smoke,
     serving_day_for_eval_gaming_day_end,
 )
+from trainer_hightier.utils.walkaway_labels import label_window_ends_from_max_payout
 from trainer_hightier.walkaway_compute_labels import compute_labels
 
 logger = logging.getLogger(__name__)
@@ -441,17 +442,20 @@ def _normalize_payout_hk_naive(bets: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _label_payout_bounds(eval_bets: pd.DataFrame) -> tuple[datetime, datetime]:
+def _label_payout_bounds(
+    eval_bets: pd.DataFrame,
+    *,
+    label_contract: WalkawayLabelContract | None = None,
+) -> tuple[datetime, datetime]:
     """Return ``(window_end, extended_end)`` for walkaway label computation."""
+    contract = label_contract or DEFAULT_WALKAWAY_LABEL_CONTRACT
     ts = pd.to_datetime(eval_bets["payout_complete_dtm"], errors="coerce").dropna()
     if ts.empty:
         raise ValueError("eval bets have no valid payout_complete_dtm for label bounds")
     window_end = ts.max()
     if window_end.tzinfo is not None:
         window_end = window_end.tz_convert(HK_TZ).tz_localize(None)
-    extended_end = window_end + pd.Timedelta(
-        minutes=float(LABEL_LOOKAHEAD_MIN + WALKAWAY_GAP_MIN),
-    )
+    _, extended_end = label_window_ends_from_max_payout(window_end, label_contract=contract)
     return window_end.to_pydatetime(), extended_end.to_pydatetime()
 
 
@@ -464,7 +468,8 @@ def _attach_walkaway_labels_to_eval_bets(
     """Compute walkaway labels on a CH payout corpus and join onto eval rows."""
     if eval_bets.empty:
         return eval_bets.copy()
-    window_end, extended_end = _label_payout_bounds(eval_bets)
+    contract = cfg.walkaway_label_contract
+    window_end, extended_end = _label_payout_bounds(eval_bets, label_contract=contract)
     payout_start = _payout_bound_hk_naive(
         pd.to_datetime(eval_bets["payout_complete_dtm"], errors="coerce").min(),
     )
@@ -482,7 +487,12 @@ def _attach_walkaway_labels_to_eval_bets(
         raise ValueError("label corpus fetch returned 0 rows from ClickHouse")
     corpus = attach_canonical_id(corpus, mapping_parquet=mapping_parquet)
     corpus = _normalize_payout_hk_naive(corpus)
-    labeled = compute_labels(corpus, window_end=window_end, extended_end=extended_end)
+    labeled = compute_labels(
+        corpus,
+        window_end=window_end,
+        extended_end=extended_end,
+        label_contract=contract,
+    )
     labeled = labeled.loc[~labeled["censored"].astype(bool)].copy()
     if labeled.empty:
         raise ValueError("all eval bets censored after compute_labels")
@@ -528,6 +538,13 @@ def load_bets_from_cleaned_parquet(
             "CREATE TEMP TABLE allowlist AS SELECT * FROM (SELECT UNNEST(?) AS player_id)",
             [allow],
         )
+        from trainer_hightier.serving.feature_builder import cleaned_bet_sql_etl_insert_column
+
+        bet_from = f"read_parquet('{glob_path}', hive_partitioning=true)"
+        etl_col = cleaned_bet_sql_etl_insert_column(conn, bet_from)
+        from trainer_hightier.utils.cleaned_bet_pool_read import cleaned_bet_pool_game_id_sql
+
+        game_id_sql = cleaned_bet_pool_game_id_sql(conn, bet_from, alias="b")
         q = f"""
             SELECT
                 b.bet_id,
@@ -535,14 +552,16 @@ def load_bets_from_cleaned_parquet(
                 b.bet_type,
                 b.type_of_bet,
                 b.payout_complete_dtm,
+                {etl_col},
                 CAST(b.gaming_day_event AS TIMESTAMP) AS gaming_day_event,
                 b.session_id,
                 b.player_id,
+                {game_id_sql},
                 b.table_id,
                 b.wager,
                 b.casino_win,
                 b.payout_odds
-            FROM read_parquet('{glob_path}', hive_partitioning=true) AS b
+            FROM {bet_from} AS b
             INNER JOIN allowlist AS a ON b.player_id = a.player_id
             WHERE CAST(b.gaming_day_event AS DATE) >= CAST(? AS DATE)
               AND CAST(b.gaming_day_event AS DATE) <= CAST(? AS DATE)
@@ -559,7 +578,9 @@ def load_bets_from_cleaned_parquet(
         conn.close()
     if bets.empty:
         return bets
-    bets["__etl_insert_Dtm"] = bets["payout_complete_dtm"]
+    from trainer_hightier.serving.feature_builder import ensure_etl_observed_at_for_pit
+
+    bets = ensure_etl_observed_at_for_pit(bets)
     if "casino_player_id" not in bets.columns:
         bets["casino_player_id"] = None
     if "position_idx" not in bets.columns:
@@ -641,61 +662,6 @@ _TEST_BET_COLUMNS: tuple[str, ...] = (
 )
 
 
-def _metrics_at_threshold(
-    y_true: np.ndarray,
-    scores: np.ndarray,
-    threshold: float,
-) -> tuple[float, float, float, int]:
-    """Return precision, recall, f1, alert_count for ``scores >= threshold``."""
-    y = np.asarray(y_true, dtype=np.int8).reshape(-1)
-    s = np.asarray(scores, dtype=np.float64).reshape(-1)
-    if not math.isfinite(float(threshold)):
-        return 0.0, 0.0, 0.0, 0
-    pred = (s >= float(threshold)).astype(np.int8)
-    tp = int(np.sum((pred == 1) & (y == 1)))
-    fp = int(np.sum((pred == 1) & (y == 0)))
-    fn = int(np.sum((pred == 0) & (y == 1)))
-    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
-    return float(prec), float(rec), float(f1), int(np.sum(pred == 1))
-
-
-def _split_metrics_block(
-    split: str,
-    y_true: np.ndarray,
-    scores: np.ndarray,
-    threshold: float,
-    *,
-    window_hours: float | None,
-) -> dict[str, Any]:
-    """Build flat metrics keys aligned with ``05_lgbm_train`` naming."""
-    y = np.asarray(y_true, dtype=np.int8).reshape(-1)
-    s = np.asarray(scores, dtype=np.float64).reshape(-1)
-    n_pos = int(np.sum(y == 1))
-    n_neg = int(np.sum(y == 0))
-    has_both = n_pos >= 1 and n_neg >= 1 and np.isfinite(s).all()
-    ap = float(average_precision_score(y, s)) if has_both else 0.0
-    prec, rec, f1, alerts = _metrics_at_threshold(y, s, threshold)
-    out: dict[str, Any] = {
-        f"{split}_ap": ap,
-        f"{split}_precision": prec,
-        f"{split}_recall": rec,
-        f"{split}_f1": f1,
-        f"{split}_samples": int(len(y)),
-        f"{split}_positives": n_pos,
-        f"{split}_alerts": alerts,
-        f"{split}_window_hours": float(window_hours) if window_hours is not None else None,
-        f"{split}_alerts_per_hour": None,
-        f"{split}_true_labels_per_hour": None,
-    }
-    if window_hours is not None and math.isfinite(float(window_hours)) and float(window_hours) > 0:
-        wh = float(window_hours)
-        out[f"{split}_alerts_per_hour"] = float(alerts) / wh
-        out[f"{split}_true_labels_per_hour"] = float(n_pos) / wh
-    return out
-
-
 def _window_hours_from_payout(bets: pd.DataFrame) -> float:
     """Hours between min/max ``payout_complete_dtm`` (trainer density parity)."""
     ts = pd.to_datetime(bets["payout_complete_dtm"], errors="coerce").dropna()
@@ -729,11 +695,16 @@ def _bets_frame_from_test_batch(batch: pd.DataFrame) -> pd.DataFrame:
     miss = [c for c in _TEST_BET_COLUMNS if c not in batch.columns]
     if miss:
         raise ValueError(f"test split missing bet columns {miss}")
-    bets = batch[list(_TEST_BET_COLUMNS)].copy()
+    cols = list(_TEST_BET_COLUMNS)
+    if "__etl_insert_Dtm" in batch.columns:
+        cols.append("__etl_insert_Dtm")
+    bets = batch[cols].copy()
     bets["payout_complete_dtm"] = pandas_ts_series_to_hk_l0_contract(
         bets["payout_complete_dtm"],
     )
-    bets["__etl_insert_Dtm"] = bets["payout_complete_dtm"]
+    from trainer_hightier.serving.feature_builder import ensure_etl_observed_at_for_pit
+
+    bets = ensure_etl_observed_at_for_pit(bets)
     if "casino_player_id" not in bets.columns:
         bets["casino_player_id"] = None
     return bets
@@ -789,16 +760,19 @@ def build_pool_from_cleaned_parquet(
     cfg: HightierServingConfig,
     mapping_parquet: Path,
     expand_canonical_aliases: bool = False,
+    payout_yyyymm: str | None = None,
+    month_pool_conn: duckdb.DuckDBPyConnection | None = None,
+    month_pool_table: str | None = None,
 ) -> pd.DataFrame:
     """Bounded hot pool from local cleaned bet hive (no ClickHouse)."""
     import duckdb
 
     from trainer_hightier.serving.scorer import compute_scoring_bounds_for_bets
+    from trainer_hightier.utils.cleaned_bet_pool_read import cleaned_bet_pool_read_parquet_sql
 
     if bets.empty:
         return bets
     root = Path(cleaned_root).resolve()
-    glob_path = str((root / "**" / "*.parquet").as_posix())
     bounds = compute_scoring_bounds_for_bets(bets, cfg=cfg)
     if bounds.empty:
         raise ValueError("[offline_backtest] scoring bounds empty for non-empty bets batch")
@@ -819,12 +793,34 @@ def build_pool_from_cleaned_parquet(
     if len(pids) > fan_cap:
         logger.warning("[offline_backtest] pool fanout %d -> %d", len(pids), fan_cap)
         pids = pids[:fan_cap]
-    conn = duckdb.connect()
+    if month_pool_conn is not None:
+        if not month_pool_table:
+            raise ValueError("month_pool_table is required when month_pool_conn is set")
+        conn = month_pool_conn
+        own_conn = False
+        bet_from = month_pool_table
+    else:
+        conn = duckdb.connect()
+        own_conn = True
+        bet_from = cleaned_bet_pool_read_parquet_sql(
+            root,
+            pool_start=pool_start,
+            pool_end=pool_end,
+            payout_yyyymm=payout_yyyymm,
+            hk_tz=cfg.hk_tz,
+        )
     try:
+        conn.execute("DROP TABLE IF EXISTS allow_pids")
+        from trainer_hightier.serving.feature_builder import cleaned_bet_sql_etl_insert_column
+
         conn.execute(
             "CREATE TEMP TABLE allow_pids AS SELECT * FROM (SELECT UNNEST(?) AS player_id)",
             [pids],
         )
+        etl_col = cleaned_bet_sql_etl_insert_column(conn, bet_from)
+        from trainer_hightier.utils.cleaned_bet_pool_read import cleaned_bet_pool_game_id_sql
+
+        game_id_sql = cleaned_bet_pool_game_id_sql(conn, bet_from, alias="b")
         q = f"""
             SELECT
                 b.bet_id,
@@ -832,28 +828,33 @@ def build_pool_from_cleaned_parquet(
                 b.bet_type,
                 b.type_of_bet,
                 b.payout_complete_dtm,
+                {etl_col},
                 CAST(b.gaming_day_event AS TIMESTAMP) AS gaming_day_event,
                 b.session_id,
                 b.player_id,
+                {game_id_sql},
                 b.table_id,
                 b.wager,
                 b.casino_win,
                 b.payout_odds,
                 b.theo_win,
                 b.base_ha
-            FROM read_parquet('{glob_path}', hive_partitioning=true) AS b
+            FROM {bet_from} AS b
             INNER JOIN allow_pids AS p ON b.player_id = p.player_id
             WHERE b.payout_complete_dtm >= ?
               AND b.payout_complete_dtm <= ?
         """
         pool = conn.execute(q, [pool_start, pool_end]).fetchdf()
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
     if pool.empty:
         raise ValueError(
             "[offline_backtest] cleaned bet pool empty; check --local-cleaned-bet path and dates"
         )
-    pool["__etl_insert_Dtm"] = pool["payout_complete_dtm"]
+    from trainer_hightier.serving.feature_builder import ensure_etl_observed_at_for_pit
+
+    pool = ensure_etl_observed_at_for_pit(pool)
     _postprocess_cleaned_l0_bets_timestamps(pool)
     return attach_synthetic_etl_and_prediction_visible(pool)
 
@@ -975,6 +976,8 @@ def run_offline_production_pipeline(
         batch,
         mapping_parquet=ctx.mapping_parquet,
         supplier_plan=plan,
+        txn_use_cleaned_parquet=True,
+        cleaned_casino_txn_root=ctx.cfg.cleaned_casino_txn_root,
     )
     fail_frac = float(ctx.cfg.scorer_feast_entity_missing_fail_fraction)
     needs_feast = bool(plan.feast_mid_cols or plan.feast_slow_cols)
@@ -1139,7 +1142,7 @@ def evaluate_training_features_baseline(
     scores = ctx.bundle.model.predict_proba(x)[:, 1]
     thr = float(ctx.bundle.threshold)
     wh = _window_hours_from_payout(df)
-    metrics = _split_metrics_block("offline_training_features", y, scores, thr, window_hours=wh)
+    metrics = split_metrics_block("offline_training_features", y, scores, thr, window_hours=wh)
     ref = json.loads((ctx.model_dir / "training_metrics.json").read_text(encoding="utf-8"))
     deltas = {
         "ap_delta": metrics["offline_training_features_ap"] - float(ref.get("test_ap", 0.0)),
@@ -1233,7 +1236,7 @@ def evaluate_production_pipeline_on_test_split(
     labels = np.concatenate(label_parts) if label_parts else np.array([], dtype=np.int8)
     thr = float(ctx.bundle.threshold)
     wh = _window_hours_from_payout(test_df.head(len(scores)))
-    metrics = _split_metrics_block("offline_production_pipeline", labels, scores, thr, window_hours=wh)
+    metrics = split_metrics_block("offline_production_pipeline", labels, scores, thr, window_hours=wh)
     ref = json.loads((ctx.model_dir / "training_metrics.json").read_text(encoding="utf-8"))
     deltas = {
         "ap_delta": metrics["offline_production_pipeline_ap"] - float(ref.get("test_ap", 0.0)),
@@ -1286,7 +1289,7 @@ def run_test_split_comparison(
     """Compare training-feature baseline vs production pipeline on the same test split."""
     mroot = Path(model_dir).resolve()
     map_p = mapping_parquet or (mroot / "deploy_inputs" / "canonical_player_mapping.parquet")
-    allow_p = allowlist_parquet or (mroot / "deploy_inputs" / "adt_allowed_players_q0p99.parquet")
+    allow_p = allowlist_parquet or resolve_model_bundle_allowlist_parquet(mroot)
     ctx = resolve_offline_context(
         bundle_dir=None,
         model_dir=mroot,
@@ -1477,7 +1480,7 @@ def run_labeled_gaming_day_backtest(
     labels = np.concatenate(label_parts) if label_parts else np.array([], dtype=np.int8)
     thr = float(ctx.bundle.threshold)
     wh = _window_hours_from_payout(labeled.head(len(scores)))
-    metrics = _split_metrics_block("test", labels, scores, thr, window_hours=wh)
+    metrics = split_metrics_block("test", labels, scores, thr, window_hours=wh)
     ref_path = ctx.model_dir / "training_metrics.json"
     deltas: dict[str, Any] = {}
     if ref_path.is_file():

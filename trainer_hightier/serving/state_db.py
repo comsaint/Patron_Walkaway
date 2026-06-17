@@ -155,10 +155,23 @@ def init_state_db(path: Optional[Path] = None) -> Path:
             "CREATE INDEX IF NOT EXISTS idx_session_player ON session_stats(player_id)"
         )
         _init_validator_aux_tables(conn)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_alerts_player_game ON alerts(player_id, game_id)"
+        )
         _init_runtime_rated_threshold(conn)
+        from trainer_hightier.serving.player_game_ready_queue import (
+            init_player_game_ready_queue_tables,
+        )
+
+        init_player_game_ready_queue_tables(conn)
+        from trainer_hightier.serving.player_game_shadow_scorer import (
+            init_player_game_shadow_tables,
+        )
+
+        init_player_game_shadow_tables(conn)
         _meta_set_if_missing(conn, META_KEY_SCHEMA_VERSION, STATE_SCHEMA_VERSION)
         conn.commit()
-    logger.info("[state_db] initialized %s", db_path)
+    logger.debug("[state_db] initialized %s", db_path)
     return db_path
 
 
@@ -331,6 +344,9 @@ def append_alerts(conn: sqlite3.Connection, alerts_df: pd.DataFrame) -> None:
             _s(getattr(r, "model_version", None)),
             _f(getattr(r, "margin", None)),
             _ts(getattr(r, "scored_at", None)),
+            _s(getattr(r, "game_id", None)),
+            _f(getattr(r, "player_game_score", None)),
+            _i(getattr(r, "player_game_bet_count", None)),
         )
         for r in alerts_df.itertuples(index=False)
     ]
@@ -344,10 +360,10 @@ def append_alerts(conn: sqlite3.Connection, alerts_df: pd.DataFrame) -> None:
             wager_last_10m, wager_last_30m, cum_bets, cum_wager,
             avg_wager_sofar, session_duration_min, bets_per_minute,
             canonical_id, is_rated_obs, reason_codes, model_version,
-            margin, scored_at
+            margin, scored_at, game_id, player_game_score, player_game_bet_count
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(bet_id) DO UPDATE SET
             ts=excluded.ts,
@@ -359,7 +375,10 @@ def append_alerts(conn: sqlite3.Connection, alerts_df: pd.DataFrame) -> None:
             model_version=excluded.model_version,
             margin=excluded.margin,
             scored_at=excluded.scored_at,
-            casino_player_id=excluded.casino_player_id
+            casino_player_id=excluded.casino_player_id,
+            game_id=excluded.game_id,
+            player_game_score=excluded.player_game_score,
+            player_game_bet_count=excluded.player_game_bet_count
         """,
         rows,
     )

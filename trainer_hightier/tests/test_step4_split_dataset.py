@@ -135,3 +135,38 @@ def test_step4_invalid_day_fractions(tmp_path: Path) -> None:
             step4=Step4SplitConfig(train_day_fraction=0.7, val_day_fraction=0.35),
             splits_output_dir=tmp_path / "splits",
         )
+
+
+def test_step4_split_parquet_row_order_is_deterministic(tmp_path: Path) -> None:
+    """Two Step 4 runs on the same input must emit identical ``bet_id`` order per split."""
+
+    days = [f"2024-01-{i:02d}" for i in range(1, 11)]
+    rows = []
+    for i, gd in enumerate(days):
+        rows.append(
+            {
+                "bet_id": float(1000 - i),
+                "walkaway_label": i % 2,
+                "walkaway_censored": False,
+                "canonical_id": f"c{i % 3}",
+                "gaming_day_event": gd,
+                "payout_complete_dtm": f"2024-01-{i:02d}T12:00:00+08:00",
+            }
+        )
+    inp = tmp_path / "features.parquet"
+    pd.DataFrame(rows).to_parquet(inp, index=False)
+    duck = _tiny_duckdb(tmp_path)
+    cfg = Step4SplitConfig(train_day_fraction=0.7, val_day_fraction=0.15)
+
+    def train_bet_ids(run_dir: Path) -> list[float]:
+        res = _b4.arrange_and_split_training_data(
+            features_parquet=inp,
+            duckdb_runtime=duck,
+            step4=cfg,
+            splits_output_dir=run_dir,
+        )
+        return pd.read_parquet(res.train_parquet, columns=["bet_id"])["bet_id"].tolist()
+
+    first = train_bet_ids(tmp_path / "splits_a")
+    second = train_bet_ids(tmp_path / "splits_b")
+    assert first == second

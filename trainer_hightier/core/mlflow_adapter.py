@@ -10,8 +10,10 @@ from __future__ import annotations
 import logging
 import math
 import os
+import sys
 import time
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Optional
 
 from dotenv import load_dotenv
@@ -202,6 +204,52 @@ def warm_up_mlflow_run_safe() -> None:
     )
 
 
+_stdio_encode_guard_configured = False
+
+
+def _configure_stdio_replace_on_encode_error() -> None:
+    """Use replacement chars on stdout/stderr when emoji cannot encode (e.g. cp932)."""
+
+    global _stdio_encode_guard_configured
+    if _stdio_encode_guard_configured:
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except Exception as exc:
+            _log.debug("Could not reconfigure %s encoding errors policy: %s", stream.name, exc)
+    _stdio_encode_guard_configured = True
+
+
+class _SafeMlflowRunContextManager:
+    """Wrap MLflow ``start_run`` and swallow teardown ``UnicodeEncodeError``."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def __enter__(self) -> Any:
+        return self._inner.__enter__()
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> bool | None:
+        try:
+            return self._inner.__exit__(exc_type, exc_val, exc_tb)
+        except UnicodeEncodeError as err:
+            _log.warning(
+                "MLflow run teardown could not print run URL (stdout encoding=%s): %s",
+                getattr(sys.stdout, "encoding", "unknown"),
+                err,
+            )
+            return False
+
+
 def safe_start_run(
     experiment_name: Optional[str] = None,
     run_name: Optional[str] = None,
@@ -215,9 +263,12 @@ def safe_start_run(
         return nullcontext()
     import mlflow  # type: ignore[import-not-found]
 
+    _configure_stdio_replace_on_encode_error()
     if experiment_name is not None:
         mlflow.set_experiment(experiment_name)
-    return mlflow.start_run(run_name=run_name, tags=tags)
+    return _SafeMlflowRunContextManager(
+        mlflow.start_run(run_name=run_name, tags=tags),
+    )
 
 
 def log_params_safe(params: dict[str, Any]) -> None:
@@ -440,10 +491,17 @@ def end_run_safe() -> None:
 
     if not is_mlflow_available():
         return
+    _configure_stdio_replace_on_encode_error()
     try:
         import mlflow  # type: ignore[import-not-found]
 
         if mlflow.active_run():
             mlflow.end_run()
+    except UnicodeEncodeError as err:
+        _log.warning(
+            "MLflow end_run could not print run URL (stdout encoding=%s): %s",
+            getattr(sys.stdout, "encoding", "unknown"),
+            err,
+        )
     except Exception as e:
         _log.warning("MLflow end_run failed: %s", e)

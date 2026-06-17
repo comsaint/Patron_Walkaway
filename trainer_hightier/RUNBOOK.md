@@ -82,7 +82,7 @@
 
 - **`python -m trainer_hightier.trainer` 的 Step 5** 會讀 `trainer_hightier/contracts/feature_candidate_registry.yaml`（或 `--feature-candidate-registry`），以台帳中 **可選 baseline** 欄位（`status` 為 `active|experimental` 且 `enabled_for` 含 `baseline`）作為 `feature_columns`。
 - **單一真相**：baseline / candidate / ablation 選欄皆以 [`feature_candidate_registry.yaml`](trainer_hightier/contracts/feature_candidate_registry.yaml) 為準；baseline 列为 YAML 順序下 `enabled_for` 含 **`baseline`** 且 `status` 為 `active` 或 `experimental` 的列（**不可**對 `fe__*` 使用 baseline 槽）。主線 Step 5 與實驗皆由 `candidate_registry_loader` 載入。
-- **`run_report.json`** 會多出 `candidate_registry`：`registry_version`、`resolved_path`、`n_baseline_features` 等；Step 5 成功且凍結台帳時另有 **`feature_candidate_registry_snapshot`** / **`feature_candidate_registry_sha256`** / **`feature_candidate_registry_frozen_from`**（與 `training_metrics.json` 可對齊）。另含 **`feast_auto_apply`**：`feast_auto_apply_attempted`、`feast_apply_wall_sec`、`feast_registry_path`（Step 3 前 registry 準備紀錄），便於對齊實驗與主線。
+- **`run_report.json`**（schema `trainer_hightier.run_report.v1`）巢狀含 **`summary`**（跨 run 比較）、**`evaluation_detail`**、**`pipeline_debug`**、**`gates`**、**`artifacts`**。`evaluation_detail.candidate_registry` 與 `pipeline_debug.feast_auto_apply` 等取代舊版 flat dump；registry SHA 仍以 **`training_metrics.json`** 為 deploy 契約。
 
 **常見錯誤**
 
@@ -177,7 +177,7 @@ python -m trainer_hightier.trainer --partition-snapshot-dir "D:/exports/my_snaps
 
 - **訓練集**：`trainer_hightier/artifacts/training_data/training_set.parquet`  
 - **版本保留**：`trainer_hightier/artifacts/training_data/versions/training_set_*.parquet`（預設保留最近 10 個；`03_build_training_data.py` 的 `--training-retention`）  
-- **Run 報表**：成功且 Step 5 有跑時在 **`out/models_high_tier_mvp/<model_version>/run_report.json`**；內含 `model_version`、`model_bundle_dir`、`partition_snapshot_dir_effective`、`partition_inventory_baseline_path`、耗時、cache hit、partition fingerprint、`partition_recompute_months`、`feast_auto_apply` 等
+- **Run 報表**：**`run_report.json`**（巢狀 schema；見 [`doc/templates/Training logs - TEMPLATE.md`](doc/templates/Training%20logs%20-%20TEMPLATE.md)）。工程 lineage 在 **`pipeline_debug`**；核心 val/test 指標在 **`summary.metrics`** 與 **`training_metrics.json`**。
 
 ### 2.3 僅重跑 Step 3（preprocess 已完成時）
 
@@ -223,14 +223,14 @@ python -m trainer_hightier.trainer
 | Run artifacts 目錄前綴 | `trainer_hightier.config.MLFLOW_HIGHTIER_ARTIFACT_PREFIX`（預設 `hightier_run/`） |
 | 環境 | `credential/mlflow.env` 或 `local_state/mlflow.env`（載入 `MLFLOW_TRACKING_URI` 等；見 main trainer 慣例） |
 
-每次完整跑會上傳**最小白名單**（檔案存在才傳）：bundle 內 **`run_report.json`**、**`training_metrics.json`**、**`model.pkl`**，以及 **`step4_split_report`** 指向之 `split_report.json`。**不**整包上傳 `artifacts/` 或大 Parquet，避免筆電/網路耗時。
+每次完整跑會上傳 writer 註冊的 **JSON**（含 **`run_report.json`**、**`training_metrics.json`**、**`split_report.json`**、Step 6 gate 檔）以及 **`model.pkl`**。**不**整包上傳 `artifacts/` 或大 Parquet。
 
 **查核清單（成功）**
 
 - [ ] MLflow UI / API 可見單一 run，`tags.status` 終態為 **`SUCCESS`**。
 - [ ] Params 含 `pipeline=trainer_hightier`、`run_profile`（對應 `--run-profile`）、`feature_candidate_registry_path`；Step 5 成功時多有 `model_version`、`model_bundle_dir`。
-- [ ] Metrics 含 `step5_seconds` 與 val/test 品質指標（來源：`run_report.json` 的可數值化欄位）。
-- [ ] Artifacts 下 `hightier_run/` 至少含 `run_report.json`；Step 5 有跑時應另有 metrics JSON 與 model pickle。
+- [ ] Metrics 含 `step5_seconds` 與 val/test 品質（MLflow scalar 來自 in-memory metrics；詳情見 `run_report.json` → `summary.metrics`）。
+- [ ] Artifacts 下 `hightier_run/` 含 writer 註冊之 JSON + `model.pkl`（Step 5 有跑時應有 `training_metrics.json`）。
 
 **查核清單（失敗）**
 
@@ -297,6 +297,88 @@ run_training(args)
 
 變更台帳後建議跑：`python -m pytest trainer_hightier/tests/test_candidate_registry_loader.py trainer_hightier/tests/test_feature_experiment_ablation.py -q`。
 
+## 5.5 Source manifest v2（Phase 1：觀測 only）
+
+Phase 1 在 `prepare_training_frame` 的 partition inventory 之後，對 L0 snapshot parquet 做 **full-file SHA-256** 指紋與 diff；**不**改變 Step 2/3/3.5 cache 命中語意。
+
+| 項目 | 路徑 / 說明 |
+|------|-------------|
+| Current manifest | `trainer_hightier/artifacts/cache/source_manifest_v2/current.json` |
+| Diff baseline | `trainer_hightier/artifacts/cache/source_manifest_v2/previous.json`（上一輪 published） |
+| Change set | `trainer_hightier/artifacts/cache/source_change_sets/source_change_set_<snapshot_id>_<utc>.json` |
+| Cache report | `trainer_hightier/artifacts/cache/reports/cache_report_<run_id>.json` |
+
+**解讀 `source_change_set.json`：**
+
+- `diff_summary`：`added` / `removed` / `modified` / `unchanged`（以 `file_sha256` 比對；`mtime_ns_diagnostic` 不參與）。
+- `changed_partitions`：依 `table` + `partition_yyyymm` 彙總；單檔修改只會標記該月。
+- `hash_elapsed_seconds` / `hashed_bytes`：full SHA 成本（Phase 2 前評估用）。
+
+**與 `partition_recompute_months` 的關係：**`l1_recompute_months` 已由 source manifest v2 `changed_partitions` 驅動（Phase 2+）。`partition_recompute_months_inventory_legacy` 僅供對照；session/bet base L1 cache 以 `source_manifest_v2_fingerprint` 為主。
+
+**Run report keys：**`source_manifest_v2_elapsed_seconds`、`source_manifest_v2_hashed_bytes`、`source_manifest_v2_diff_summary`、`source_manifest_v2_changed_partitions`、`source_manifest_v2_change_set_path`。
+
+## 5.6 Entity set v1（Phase 2 cutover）
+
+預設 **`use_entity_set_v1=True`**：ADT 篩選改由 rank table → entity set 投影，輸出仍寫入 `cleaned__gmwds_t_bet`（Step 3 相容）。Legacy 路徑：`--use-legacy-bet-segment`。
+
+| 項目 | 路徑 / 說明 |
+|------|-------------|
+| Entity set cache | `trainer_hightier/artifacts/cache/entity_set_v1/quantile=…/scope=…/universe=…/` |
+| 按月 partition | `…/partitions/yyyymm=YYYYMM/`（自 `gaming_month` 歸檔） |
+| 訓練讀取路徑 | `trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet`（不變） |
+| Segment sidecar | **已退役**；entity set 成功後會刪除 `cleaned__gmwds_t_bet.cache.json` |
+
+**Quantile 變更：**bet **base** L1 cache 可 hit；entity set manifest miss → 只重跑投影，不重跑 base clean。
+
+## 5.7 Labels and feature primitive cache（Phase 3）
+
+### Walkaway labels cache（L4）
+
+| 項目 | 路徑 / 說明 |
+|------|-------------|
+| 輸出（相容） | `trainer_hightier/artifacts/labels/walkaway_labels.parquet` |
+| Cache policy | `trainer_hightier/artifacts/cache/labels_v1/entity_set=<fp16>/manifest.json` |
+| 命中條件 | `entity_set_policy_fingerprint` + `label_semantic_fingerprint` + gap/horizon 常數一致 |
+| 失效（MVP） | `labels_invalid_months = prev(dirty)+dirty+next(dirty)`，dirty 來自 `l1_recompute_months` |
+
+**Run report / cache report keys：**`labels_cache_hit`、`labels_cache_elapsed_seconds`、`labels_invalid_months`、`labels_semantic_fingerprint`；`pipeline_debug.labels_v1`。
+
+**分片（已實作，trainer 預設未啟用）：**`materialize_labels_v1_sharded_cached` 或 `materialize_labels_v1_cached(..., use_sharded_cache=True)` 會寫入 `labels_v1/entity_set=<fp>/month=YYYYMM/canonical_shard=N/data.parquet`，並 assemble 成 `walkaway_labels.parquet`。桶數由 `config.LABELS_CANONICAL_SHARD_COUNT`（預設 32）控制。smoke 通過後再接 Step 2c。
+
+### Short-term PIT primitive cache（L5）
+
+| 項目 | 路徑 / 說明 |
+|------|-------------|
+| Shard 根目錄 | `trainer_hightier/artifacts/training_data/cache/short_term_pit_v1/` |
+| Manifest schema | **v2**（`supplier_family=short_term:w1h`、`entity_set_fingerprint`、`source_invalid_months`） |
+| 主 miss 驅動 | `entity_set_fingerprint` 變更、training universe 變更、code/policy/mapping 變更 |
+| Source 失效 | `short_pit_invalid_months(l1_recompute_months)`；**不再**依 `partition_inventory_fingerprint` |
+| Schema 驗證 | `output_schema_fingerprint`（原 `columns_fingerprint`）僅驗證輸出欄位，不主導 registry 增刪 |
+
+**Run report keys：**`short_term_pit_primitive_hit_ratio`、`short_term_pit_recompute_months`、`short_term_pit_source_invalid_months`；`pipeline_debug.short_term_pit_v2`。
+
+### Quantile delta fill（P3-WP-6/7）
+
+quantile **降低**時：
+
+1. **Entity set delta（L3）**：`materialize_entity_set_v1_cached` 若發現同 scope/universe 下有更嚴格（更高）quantile 的 manifest，會寫入 `entity_set_v1/.../delta/latest/added_player_ids.parquet` + `manifest.json`。
+2. **Short PIT delta fill（L5）**：Step 3.5 若 shard 已存在且 manifest 的 `entity_set_fingerprint` 等於 `entity_delta_previous_entity_set_fingerprint`，僅對 `entity_delta_added_player_ids` 做 bounded materialize，再 merge 進既有 `data.parquet`（delta row 覆寫同 `bet_id`）。
+
+**Metrics：**`entity_delta_row_count`、`entity_delta_previous_quantile`、`short_term_pit_delta_fill_shards`、`entity_delta_fill_elapsed_seconds`。
+
+### Cache report 分層（`cache_report_<run_id>.json`）
+
+訓練結束時 `finalize_cache_report_from_metrics` 會將下列 layer 併入 report（schema v2）：
+
+| Layer | 對應 metrics |
+|-------|----------------|
+| `source_manifest_v2` | Phase 1 SHA diff（啟動時寫入） |
+| `l1_session_clean` / `l1_bet_base_clean` / `l3_entity_set_v1` | preprocess cache hit |
+| `l2_universe_adt_rank` | ADT rank table cache |
+| `l4_walkaway_labels_v1` | labels cache |
+| `l5_short_term_pit_primitive` | short PIT shard hit ratio + reason_counts |
+
 ## 6. Preprocess disk cache（session / bet）
 
 - **命中條件：**清洗目標 Parquet 已存在，且 sidecar JSON 與 `build_session_clean_cache_record()` 計出的指紋一致（含來源 `mtime`/`size`、列數 metadata、`session_l0_preprocess` 模組 hash、**合併後的 session shard 路徑清單** 與 **partition inventory fingerprint**）。Bet 清洗對應 `bet_l0_preprocess` 之 `build_bet_clean_cache_record()` / `build_bet_base_clean_cache_record()` 與側車（含 base vs segment、inventory fingerprint、**ADT allowlist 之 distinct `player_id` 集合 hash**，**不依** allowlist 檔案 mtime）。
@@ -308,7 +390,7 @@ run_training(args)
 
 - **位置：**`trainer_hightier/artifacts/training_data/cache/short_term_pit_v1/`（全域 `manifest.json` + `shards/yyyymm=YYYYMM/data.parquet`）。
 - **輸出：**仍彙整為 `_main_trainer_fe_short_term.parquet`，再 join 成 `training_set_fe_enriched.parquet`。
-- **命中條件：**分片 manifest 與 code / policy / mapping / partition inventory / training universe / 欄位 schema 指紋一致，且 cleaned bet 對應月份（含鄰月 backfill）未出現在 `partition_recompute_months`。
+- **命中條件（schema v2）：**分片 manifest 與 `entity_set_fingerprint`、code / policy / mapping / training universe / `output_schema_fingerprint` 一致，且 shard 月份不在 `short_pit_invalid_months(l1_recompute_months)` 展開窗內。
 - **僅改 baseline 欄位子集：**若 short 欄位已存在於 cache wide schema，通常只需重跑 enrich + Step 4/5。
 - **強制重算：**`--force-refresh-short-term-pit`（僅 short-term PIT）；或 `--ignore-caches`（含 preprocess + short-term PIT）。
 - **診斷：**run log / `run_report.json` 內 `main_trainer_fe_short_term_cache`（`cache_hit_ratio`、`cache_reason_counts`）。

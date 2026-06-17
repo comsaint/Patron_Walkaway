@@ -57,8 +57,13 @@ _WARNED_TASK9_RETRY_WINDOW_CLAMPED = False
 # Task 9B: round-robin offset for no-bet retry selection (fairness across > limit backlog).
 _NO_BET_RETRY_ROT_OFFSET: int = 0
 
+# Task 9C: bet_id lookup recovery survives bet_cache.clear() and suppresses repeat warnings.
+_NO_BET_BET_ID_RESOLVED_CACHE: Dict[str, List[datetime]] = {}
+_NO_BET_BET_ID_RESOLVED_BET_IDS: set[str] = set()
+
 # Throttle O(n) in-memory cache prune (see VALIDATOR_CACHE_PRUNE_INTERVAL_SECONDS).
 _CACHE_PRUNE_LAST_MONO: float = 0.0
+_VALIDATOR_HEARTBEAT_LAST_MONO: float = 0.0
 
 
 def _safe_int_config(name: str, default: int, *, min_value: int) -> int:
@@ -77,6 +82,72 @@ def _no_bet_bet_id_lookup_enabled() -> bool:
     if isinstance(raw, str):
         return raw.strip().lower() in ("1", "true", "yes", "on")
     return bool(raw)
+
+
+def _merge_bet_id_resolved_cache(bet_cache: Dict[str, List[datetime]]) -> None:
+    """Merge cross-cycle bet_id recovery payouts into the active validator bet_cache."""
+    for cid, vals in _NO_BET_BET_ID_RESOLVED_CACHE.items():
+        bet_cache.setdefault(cid, [])
+        bet_cache[cid].extend(vals)
+        bet_cache[cid] = sorted(set(bet_cache[cid]))
+
+
+def _bet_list_for_row(row: pd.Series, bet_cache: Dict[str, List[datetime]]) -> List[datetime]:
+    """Resolve bet payout times for a row from canonical_id-keyed bet_cache."""
+    cid_raw = row.get("canonical_id")
+    player_id = row.get("player_id")
+    if cid_raw is None or pd.isna(cid_raw) or str(cid_raw).strip() == "":
+        canonical_id = str(int(player_id)) if pd.notna(player_id) else None
+    else:
+        canonical_id = str(cid_raw)
+    if canonical_id is not None and canonical_id in bet_cache:
+        return bet_cache[canonical_id]
+    return bet_cache.get(str(int(player_id)) if pd.notna(player_id) else "", [])
+
+
+def _emit_no_bet_warning_if_still_empty(row: pd.Series, bet_cache: Dict[str, List[datetime]]) -> None:
+    """Emit no-bet WARNING after retry; skip rows recovered via bet_id lookup."""
+    bet_id = row.get("bet_id")
+    bid_key = str(bet_id) if bet_id is not None and not pd.isna(bet_id) else ""
+    if bid_key and bid_key in _NO_BET_BET_ID_RESOLVED_BET_IDS:
+        return
+    if _bet_list_for_row(row, bet_cache):
+        return
+
+    player_id = row.get("player_id")
+    casino_player_id = _norm_casino_player_id(row.get("casino_player_id"))
+    score_ts = pd.to_datetime(row["ts"])
+    if score_ts.tzinfo is None:
+        score_ts = score_ts.tz_localize(HK_TZ)
+    else:
+        score_ts = score_ts.tz_convert(HK_TZ)
+    bet_ts = row.get("bet_ts")
+    if pd.isna(bet_ts):
+        bet_ts = score_ts
+    else:
+        bet_ts = pd.to_datetime(bet_ts)
+        if bet_ts.tzinfo is None:
+            bet_ts = bet_ts.tz_localize(HK_TZ)
+        else:
+            bet_ts = bet_ts.tz_convert(HK_TZ)
+    scored_at = row.get("scored_at")
+    if pd.isna(scored_at):
+        scored_at_hk = score_ts
+    else:
+        scored_at_hk = pd.to_datetime(scored_at)
+        if scored_at_hk.tzinfo is None:
+            scored_at_hk = scored_at_hk.tz_localize(HK_TZ)
+        else:
+            scored_at_hk = scored_at_hk.tz_convert(HK_TZ)
+
+    logger.warning(
+        "[validator] No bet data for casino_player_id=%s player_id=%s bet_id=%s bet_ts=%s scored_at=%s — leaving PENDING (cannot verify late arrivals)",
+        casino_player_id,
+        player_id,
+        bet_id,
+        bet_ts.isoformat(),
+        scored_at_hk.isoformat(),
+    )
 
 
 def _record_validator_stage_timing(stage: str, seconds: float) -> None:
@@ -162,6 +233,133 @@ def _latest_model_version_from_alerts(alerts_df: pd.DataFrame) -> Optional[str]:
     return None
 
 
+def _to_hk_datetime_series(raw_col: pd.Series) -> pd.Series:
+    """Normalize a timestamp column to HK tz-aware datetimes (may contain NaT)."""
+    must_fallback = False
+    if raw_col.dtype == "object":
+        try:
+            s = raw_col.astype(str)
+            _tz_suffix_re = r"(?:Z|[+-]\d\d:\d\d)$"
+            has_tz_suffix = s.str.contains(_tz_suffix_re, regex=True).any()
+            has_no_tz_suffix = (
+                ~s.str.contains(_tz_suffix_re, regex=True)
+                & s.str.contains(r"^\d{4}-\d{2}-\d{2}", regex=True)
+            ).any()
+            if bool(has_tz_suffix) and bool(has_no_tz_suffix):
+                must_fallback = True
+        except Exception:
+            must_fallback = True
+
+    vt_raw = pd.to_datetime(raw_col, errors="coerce")
+    try:
+        if must_fallback:
+            raise ValueError("mixed tz string inputs; use fallback normalization")
+        if getattr(vt_raw.dt, "tz", None) is None:
+            return vt_raw.dt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
+        return vt_raw.dt.tz_convert(HK_TZ)
+    except Exception:
+        normalized: List[pd.Timestamp] = []
+        for x in raw_col.tolist():
+            ts = pd.to_datetime(x, errors="coerce")
+            if ts is pd.NaT:
+                normalized.append(pd.NaT)
+                continue
+            if getattr(ts, "tzinfo", None) is None:
+                normalized.append(ts.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward"))
+            else:
+                normalized.append(ts.tz_convert(HK_TZ))
+        return pd.Series(pd.DatetimeIndex(normalized), index=raw_col.index)
+
+
+def _match_precision_stats(df: pd.DataFrame) -> Tuple[float, int, int]:
+    """MATCH rate over all rows in *df*."""
+    if df.empty:
+        return 0.0, 0, 0
+    total = len(df)
+    matches = int(df["reason"].eq("MATCH").sum()) if "reason" in df.columns else 0
+    precision = (matches / total) if total > 0 else 0.0
+    return float(precision), matches, total
+
+
+def _effective_bet_ts_hk(df: pd.DataFrame) -> pd.Series:
+    """Per-row event time for KPI: ``bet_ts`` with ``alert_ts`` fallback."""
+    bt = _to_hk_datetime_series(df["bet_ts"]) if "bet_ts" in df.columns else None
+    at = _to_hk_datetime_series(df["alert_ts"]) if "alert_ts" in df.columns else None
+    if bt is None and at is None:
+        return pd.Series(pd.NaT, index=df.index)
+    if bt is None:
+        return at
+    if at is None:
+        return bt
+    return bt.fillna(at)
+
+
+def _alerts_per_hour_from_bet_ts(
+    df: pd.DataFrame,
+    *,
+    max_window_hours: float | None = None,
+) -> float | None:
+    """Average alerts per hour using ``bet_ts`` min–max span as the window base.
+
+    When *max_window_hours* is set (e.g. 24 for last-day KPI), the denominator is
+    ``min(max_window_hours, span_h)`` so short bet histories are not diluted by a
+    full 24h cap. A single timestamp uses *max_window_hours* when provided.
+    """
+    if df.empty:
+        return None
+    n = len(df)
+    ts = _effective_bet_ts_hk(df).dropna()
+    if ts.empty:
+        return None
+    span_h = 0.0
+    if len(ts) >= 2:
+        span_h = (ts.max() - ts.min()).total_seconds() / 3600.0
+    if max_window_hours is not None and max_window_hours > 0:
+        cap = float(max_window_hours)
+        window_h = min(cap, span_h) if span_h > 0 else cap
+    elif span_h > 0:
+        window_h = span_h
+    else:
+        return None
+    if window_h <= 0:
+        return None
+    return float(n) / window_h
+
+
+def _cumulative_precision_overall(
+    finalized_df: pd.DataFrame,
+) -> Tuple[float, int, int, float | None]:
+    """MATCH rate and alert rate over all finalized alerts."""
+    precision, matches, total = _match_precision_stats(finalized_df)
+    rate = _alerts_per_hour_from_bet_ts(finalized_df) if total > 0 else None
+    return precision, matches, total, rate
+
+
+def _cumulative_precision_last_day_by_bet_ts(
+    finalized_df: pd.DataFrame,
+    *,
+    now_hk: datetime,
+) -> Tuple[float, int, int, float | None]:
+    """MATCH rate and alert rate for alerts with ``bet_ts`` in the last 24 hours (HK)."""
+    if finalized_df.empty:
+        return 0.0, 0, 0, None
+    if now_hk.tzinfo is None:
+        now_hk = now_hk.replace(tzinfo=HK_TZ)
+    bt = _effective_bet_ts_hk(finalized_df)
+    cutoff = now_hk - timedelta(days=1)
+    sub = finalized_df[(bt >= cutoff) & (bt <= now_hk)]
+    precision, matches, total = _match_precision_stats(sub)
+    rate = _alerts_per_hour_from_bet_ts(sub, max_window_hours=24.0) if total > 0 else None
+    return precision, matches, total, rate
+
+
+def _format_alert_rate_per_hour(rate: float | None) -> str:
+    """Human-readable alerts/hour suffix for validator KPI logs."""
+    if rate is None:
+        return "n/a"
+    return f"{rate:.2f}/hr"
+
+
 def _rolling_precision_by_validated_at(
     finalized_df: pd.DataFrame,
     *,
@@ -179,50 +377,10 @@ def _rolling_precision_by_validated_at(
     if now_hk.tzinfo is None:
         now_hk = now_hk.replace(tzinfo=HK_TZ)
 
-    raw_col = finalized_df["validated_at"]
-    must_fallback = False
-    # Heuristic: mixed tz-aware (+08:00/Z) and tz-naive strings can silently coerce some rows to NaT.
-    if raw_col.dtype == "object":
-        try:
-            s = raw_col.astype(str)
-            _tz_suffix_re = r"(?:Z|[+-]\d\d:\d\d)$"
-            has_tz_suffix = s.str.contains(_tz_suffix_re, regex=True).any()
-            has_no_tz_suffix = (~s.str.contains(_tz_suffix_re, regex=True) & s.str.contains(r"^\d{4}-\d{2}-\d{2}", regex=True)).any()
-            if bool(has_tz_suffix) and bool(has_no_tz_suffix):
-                must_fallback = True
-        except Exception:
-            must_fallback = True
-
-    vt_raw = pd.to_datetime(raw_col, errors="coerce")
-    try:
-        # Fast path: datetime-like Series supports `.dt` accessors
-        if must_fallback:
-            raise ValueError("mixed tz string inputs; use fallback normalization")
-        if getattr(vt_raw.dt, "tz", None) is None:
-            vt = vt_raw.dt.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward")
-        else:
-            vt = vt_raw.dt.tz_convert(HK_TZ)
-    except Exception:
-        # Fallback for mixed tz-aware / tz-naive inputs that may produce non-datetimelike dtype.
-        normalized: List[pd.Timestamp] = []
-        for x in finalized_df["validated_at"].tolist():
-            ts = pd.to_datetime(x, errors="coerce")
-            if ts is pd.NaT:
-                normalized.append(pd.NaT)
-                continue
-            if getattr(ts, "tzinfo", None) is None:
-                normalized.append(ts.tz_localize(HK_TZ, ambiguous="NaT", nonexistent="shift_forward"))
-            else:
-                normalized.append(ts.tz_convert(HK_TZ))
-        vt = pd.Series(pd.DatetimeIndex(normalized), index=finalized_df.index)
+    vt = _to_hk_datetime_series(finalized_df["validated_at"])
     cutoff = now_hk - window
     sub = finalized_df[(vt >= cutoff) & (vt <= now_hk)]
-    if sub.empty:
-        return 0.0, 0, 0
-    total = len(sub)
-    matches = int(sub["reason"].eq("MATCH").sum()) if "reason" in sub.columns else 0
-    precision = (matches / total) if total > 0 else 0.0
-    return float(precision), matches, total
+    return _match_precision_stats(sub)
 
 
 def _append_validator_metrics(
@@ -352,6 +510,8 @@ def fetch_bets_by_canonical_id(
     cid_to_pids: Dict[str, List[int]],
     start: datetime,
     end: datetime,
+    *,
+    capture_frames: Optional[List[pd.DataFrame]] = None,
 ) -> Dict[str, List[datetime]]:
     """Fetch bets for all player_ids, returning a {canonical_id: [bet_times]} dict.
 
@@ -400,6 +560,8 @@ def fetch_bets_by_canonical_id(
             ORDER BY player_id, payout_complete_dtm
         """
         df = client.query_df(query, parameters=params)  # errors propagate (R41)
+        if capture_frames is not None:
+            capture_frames.append(df.copy())
         if df.empty:
             continue
 
@@ -428,6 +590,7 @@ def fetch_bet_payout_times_by_bet_ids(
     bet_ids: List[int],
     *,
     chunk_size: int,
+    capture_frames: Optional[List[pd.DataFrame]] = None,
 ) -> Tuple[Dict[str, Tuple[datetime, Optional[int]]], int, int, int]:
     """Fetch ``payout_complete_dtm`` (and ``player_id``) from TBET FINAL by ``bet_id``.
 
@@ -477,6 +640,8 @@ def fetch_bet_payout_times_by_bet_ids(
                 exc,
             )
             continue
+        if capture_frames is not None:
+            capture_frames.append(df.copy())
         if df.empty:
             continue
         rows_read += len(df)
@@ -697,15 +862,26 @@ def _fetch_bets_for_no_bet_rows(
             bet_to_alert_pid.setdefault(bkey, alert_pid)
 
         if unique_bids:
+            from trainer_hightier.serving.flight_recorder.session import get_active_validator_recorder
+
+            _bid_capture: Optional[List[pd.DataFrame]] = (
+                [] if get_active_validator_recorder() is not None else None
+            )
             bid_map, bet_id_chunks, bet_id_rows_raw, bet_id_failed_queries = fetch_bet_payout_times_by_bet_ids(
                 unique_bids,
                 chunk_size=bid_chunk_sz,
+                capture_frames=_bid_capture,
             )
+            if _bid_capture is not None:
+                from trainer_hightier.serving.flight_recorder.validator_hooks import on_bet_id_lookup
+
+                on_bet_id_lookup(_bid_capture, bet_ids=[int(x) for x in unique_bids])
             bet_id_hits = len(bid_map)
             for bid_str, (payout_hk, ch_pid) in bid_map.items():
                 alert_player_id = bet_to_alert_pid.get(bid_str)
                 if alert_player_id is None:
                     continue
+                _NO_BET_BET_ID_RESOLVED_BET_IDS.add(bid_str)
                 if ch_pid is not None and int(ch_pid) != int(alert_player_id):
                     logger.debug(
                         "[validator] no-bet retry bet_id lookup: TBET player_id=%s != alert player_id=%s bet_id=%s",
@@ -716,6 +892,15 @@ def _fetch_bets_for_no_bet_rows(
                 for cid in bet_to_cids.get(bid_str, ()):
                     cache.setdefault(cid, [])
                     cache[cid].append(payout_hk)
+                    _NO_BET_BET_ID_RESOLVED_CACHE.setdefault(cid, [])
+                    _NO_BET_BET_ID_RESOLVED_CACHE[cid].append(payout_hk)
+            if bet_id_hits > 0:
+                logger.info(
+                    "[validator] no-bet bet_id lookup resolved: n_ids=%s hits=%s failed_chunks=%s (player_id drift recovery)",
+                    len(unique_bids),
+                    bet_id_hits,
+                    bet_id_failed_queries,
+                )
             logger.debug(
                 "[validator] no-bet bet_id lookup: n_ids=%s chunks=%s rows_raw=%s hits=%s failed_chunks=%s",
                 len(unique_bids),
@@ -727,6 +912,8 @@ def _fetch_bets_for_no_bet_rows(
 
     for cid in list(cache.keys()):
         cache[cid] = sorted(set(cache[cid]))
+    for cid in list(_NO_BET_BET_ID_RESOLVED_CACHE.keys()):
+        _NO_BET_BET_ID_RESOLVED_CACHE[cid] = sorted(set(_NO_BET_BET_ID_RESOLVED_CACHE[cid]))
     return cache, {
         "selected": len(selected_rows),
         "queries": total_queries,
@@ -1220,6 +1407,7 @@ def validate_alert_row(
     force_finalize: bool = False,
     *,
     gap_base_at_bet_ts: bool = False,
+    defer_no_bet_warning: bool = False,
 ) -> Dict:
     """Validate a single alert row.
 
@@ -1307,10 +1495,8 @@ def validate_alert_row(
     # Do not conclude MATCH when we have no bet data (e.g. fetch failed, wrong range, or TZ mismatch).
     # Otherwise find_gap_within_window(..., []) would treat "no bets in window" as a LABEL_LOOKAHEAD_MIN gap and we'd falsely MATCH.
     if not bet_list:
-        logger.warning(
-            "[validator] No bet data for casino_player_id=%s player_id=%s bet_id=%s bet_ts=%s scored_at=%s — leaving PENDING (cannot verify late arrivals)",
-            casino_player_id, player_id, bet_id, bet_ts.isoformat(), scored_at_hk.isoformat(),
-        )
+        if not defer_no_bet_warning:
+            _emit_no_bet_warning_if_still_empty(row, bet_cache)
         res_base.update({"result": None, "reason": "PENDING"})
         res_base["_no_bet_data"] = True
         return res_base
@@ -1614,7 +1800,7 @@ def validate_predictions_once(
         updated_count = 0
         no_bet_pending_rows: List[pd.Series] = []
 
-        def _validate_prediction_row(prow: pd.Series) -> Dict:
+        def _validate_prediction_row(prow: pd.Series, *, defer_no_bet_warning: bool = False) -> Dict:
             vrow = _prediction_row_to_validator_series(prow)
             return validate_observation_row(
                 vrow,
@@ -1622,6 +1808,7 @@ def validate_predictions_once(
                 session_cache_disabled,
                 force_finalize=force_finalize,
                 gap_base_at_bet_ts=True,
+                defer_no_bet_warning=defer_no_bet_warning,
             )
 
         for _, prow in pending_df.iterrows():
@@ -1629,7 +1816,7 @@ def validate_predictions_once(
                 logger.debug("[validator][prediction] budget exhausted mid-batch")
                 break
             vrow = _prediction_row_to_validator_series(prow)
-            res = _validate_prediction_row(prow)
+            res = _validate_prediction_row(prow, defer_no_bet_warning=True)
             if res.get("result") is None:
                 if bool(res.get("_no_bet_data")):
                     no_bet_pending_rows.append(prow.copy())
@@ -1670,7 +1857,7 @@ def validate_predictions_once(
                 len(retry_slice),
                 len(retry_cache),
             )
-            for _, prow in retry_slice:
+            for prow in retry_slice:
                 if time.perf_counter() - cycle_start_mono >= float(budget_seconds):
                     break
                 vrow = _prediction_row_to_validator_series(prow)
@@ -1690,6 +1877,13 @@ def validate_predictions_once(
                 updated_count += updated_delta
                 if processed_added:
                     new_processed_ids.append(prow["bet_id"])
+
+        if no_bet_pending_rows:
+            for prow in no_bet_pending_rows:
+                _emit_no_bet_warning_if_still_empty(
+                    _prediction_row_to_validator_series(prow),
+                    bet_cache,
+                )
 
         for key, saved_row in list(existing_results.items()):
             if saved_row.get("reason") != "PENDING":
@@ -1791,6 +1985,61 @@ def validate_once(conn: sqlite3.Connection, force_finalize: bool = False, existi
         )
 
 
+def _maybe_emit_validator_heartbeat(
+    conn: sqlite3.Connection,
+    *,
+    alerts: pd.DataFrame,
+    verified_this_cycle: int,
+) -> None:
+    """Periodic INFO when no alerts were verified this cycle (operator visibility)."""
+    global _VALIDATOR_HEARTBEAT_LAST_MONO
+    if verified_this_cycle > 0:
+        _VALIDATOR_HEARTBEAT_LAST_MONO = time.perf_counter()
+        return
+    interval = float(getattr(config, "deploy_validator_heartbeat_seconds", 300))
+    now_mono = time.perf_counter()
+    if now_mono - _VALIDATOR_HEARTBEAT_LAST_MONO < interval:
+        return
+    _VALIDATOR_HEARTBEAT_LAST_MONO = now_mono
+
+    n_alerts = int(len(alerts))
+    n_pending = 0
+    if not alerts.empty:
+        processed = {str(bid) for bid in load_processed(conn)}
+        n_pending = int((~alerts["bet_id"].astype(str).isin(processed)).sum())
+
+    precision_1h, matches_1h, total_1h = 0.0, 0, 0
+    existing = load_existing_results(conn)
+    if existing:
+        final_df = pd.DataFrame(list(existing.values()))
+        for col in VALIDATION_COLUMNS:
+            if col not in final_df.columns:
+                final_df[col] = None
+        kpi_df = final_df[~final_df["reason"].isin(IGNORED_REASONS)]
+        finalized = kpi_df[kpi_df["reason"] != "PENDING"].copy()
+        precision_1h, matches_1h, total_1h = _rolling_precision_by_validated_at(
+            finalized,
+            now_hk=datetime.now(HK_TZ),
+            window=timedelta(hours=1),
+        )
+
+    if total_1h > 0:
+        logger.info(
+            "[validator] heartbeat alerts=%d pending=%d precision_1h=%.2f%% (%d/%d)",
+            n_alerts,
+            n_pending,
+            precision_1h * 100,
+            matches_1h,
+            total_1h,
+        )
+    else:
+        logger.info(
+            "[validator] heartbeat alerts=%d pending=%d precision_1h=n/a (0/0)",
+            n_alerts,
+            n_pending,
+        )
+
+
 def _validate_alerts_once(
     conn: sqlite3.Connection,
     *,
@@ -1799,6 +2048,7 @@ def _validate_alerts_once(
     bet_cache: Dict[str, List[datetime]],
 ) -> None:
     cycle_stage_seconds: Dict[str, float] = {}
+    verified_this_cycle = 0
     now_hk = datetime.now(HK_TZ)
     t_sqlite = time.perf_counter()
     prune_validator_retention(conn, now_hk)
@@ -1809,6 +2059,7 @@ def _validate_alerts_once(
     cycle_stage_seconds["sqlite"] += time.perf_counter() - t_sqlite
     if alerts.empty:
         logger.debug("[validator] No alerts to validate")
+        _maybe_emit_validator_heartbeat(conn, alerts=alerts, verified_this_cycle=0)
         _emit_validator_perf_summary(cycle_stage_seconds)
         return
 
@@ -1819,6 +2070,7 @@ def _validate_alerts_once(
     pending_all = alerts[~alerts["bet_id_str"].isin(processed)].copy()
     if pending_all.empty:
         logger.debug("[validator] Alerts: %d, Pending: 0 (all processed)", len(alerts))
+        _maybe_emit_validator_heartbeat(conn, alerts=alerts, verified_this_cycle=0)
         _emit_validator_perf_summary(cycle_stage_seconds)
         return
 
@@ -1855,6 +2107,7 @@ def _validate_alerts_once(
     pending = pending_all[effective_ts <= cutoff].copy()
     if pending.empty:
         logger.debug("[validator] %d pending, but all are too recent (<%sm)", len(pending_all), wait_minutes)
+        _maybe_emit_validator_heartbeat(conn, alerts=alerts, verified_this_cycle=0)
         _emit_validator_perf_summary(cycle_stage_seconds)
         return
 
@@ -1862,6 +2115,15 @@ def _validate_alerts_once(
         logger.warning("[validator] running with --force-finalize; PENDING candidates will be finalized now")
 
     logger.debug("[validator] Processing %d alerts (including re-checks)...", len(pending))
+
+    from trainer_hightier.serving.flight_recorder.validator_hooks import (
+        on_alert_decision,
+        on_canonical_fetch,
+        on_validate_begin,
+        on_validate_end,
+    )
+
+    on_validate_begin(n_alerts=int(len(alerts)), n_pending=int(len(pending)), pending=pending)
 
     t_sqlite = time.perf_counter()
     # DB-first: load SQLite deltas into a fresh dict, then merge in-process cache keys
@@ -1915,6 +2177,7 @@ def _validate_alerts_once(
         pass
 
     bet_cache.clear()
+    _merge_bet_id_resolved_cache(bet_cache)
     # Phase 1 (Task 3): keep validate_alert_row signature compatibility, but
     # disable session fetch/query path in validator cycle to cut ClickHouse load.
     session_cache_disabled: Dict[str, List[Dict]] = {}
@@ -1975,12 +2238,36 @@ def _validate_alerts_once(
         )
         try:
             t_clickhouse = time.perf_counter()
+            all_pids: set[int] = set()
+            for _pids in cid_to_pids.values():
+                all_pids.update(int(x) for x in _pids)
+            from trainer_hightier.serving.flight_recorder.session import (
+                get_active_validator_recorder,
+            )
+
+            ch_capture_frames: Optional[List[pd.DataFrame]] = (
+                [] if get_active_validator_recorder() is not None else None
+            )
             # R41: errors propagate so the cycle aborts rather than producing false MISSes
-            fetched = fetch_bets_by_canonical_id(cid_to_pids, fetch_start, fetch_end)
+            fetched = fetch_bets_by_canonical_id(
+                cid_to_pids,
+                fetch_start,
+                fetch_end,
+                capture_frames=ch_capture_frames,
+            )
             bet_cache.update(fetched)
+            if ch_capture_frames is not None:
+                on_canonical_fetch(
+                    ch_capture_frames,
+                    player_ids=sorted(all_pids),
+                    fetch_start=fetch_start,
+                    fetch_end=fetch_end,
+                )
             cycle_stage_seconds["clickhouse"] = time.perf_counter() - t_clickhouse
         except Exception as exc:
             logger.warning("[validator] DB fetch error — skipping alert validation this cycle: %s", exc)
+            on_validate_end(verified_count=0)
+            _maybe_emit_validator_heartbeat(conn, alerts=alerts, verified_this_cycle=0)
             _emit_validator_perf_summary(cycle_stage_seconds)
             return
 
@@ -2003,6 +2290,7 @@ def _validate_alerts_once(
                     )
                     if r.get("result") is not None:
                         existing_results[key] = r
+                    on_alert_decision(r)
             except Exception:
                 continue
 
@@ -2030,6 +2318,7 @@ def _validate_alerts_once(
                             _pb = saved_row.get("bet_id")
                         if _pb is not None and pd.notna(_pb):
                             cycle_bet_to_reason[str(_pb)] = str(newr.get("reason", "UNKNOWN"))
+                    on_alert_decision(newr)
         except Exception:
             continue
 
@@ -2040,7 +2329,9 @@ def _validate_alerts_once(
             bet_cache,
             session_cache_disabled,
             force_finalize=force_finalize,
+            defer_no_bet_warning=True,
         )
+        on_alert_decision(res)
         if res.get("result") is None:
             if bool(res.get("_no_bet_data")):
                 no_bet_pending_rows.append(row.copy())
@@ -2106,6 +2397,7 @@ def _validate_alerts_once(
                 session_cache_disabled,
                 force_finalize=force_finalize,
             )
+            on_alert_decision(res)
             if res.get("result") is None:
                 continue
             updated_delta, processed_added = _apply_pending_validation_result(
@@ -2120,12 +2412,16 @@ def _validate_alerts_once(
                 cycle_bet_to_reason[str(row["bet_id"])] = str(res.get("reason", "UNKNOWN"))
                 new_processed_ids.append(row["bet_id"])
 
+        for row in no_bet_pending_rows:
+            _emit_no_bet_warning_if_still_empty(row, bet_cache)
+
     if cycle_bet_to_reason:
+        verified_this_cycle = len(cycle_bet_to_reason)
         _vc = Counter(cycle_bet_to_reason.values())
         _parts = ", ".join(f"{_r}={_vc[_r]}" for _r in sorted(_vc.keys()))
         logger.info(
-            "[validator] This cycle: %d alert(s) verified — %s",
-            len(cycle_bet_to_reason),
+            "[validator] This cycle: %d alert(s) verified - %s",
+            verified_this_cycle,
             _parts,
         )
 
@@ -2141,27 +2437,32 @@ def _validate_alerts_once(
         finalized_or_old = kpi_df[kpi_df["reason"] != "PENDING"].copy()
         # Upper bound for rolling KPI: cycle end, not cycle start (validated_at is per-row "now").
         kpi_now_hk = datetime.now(HK_TZ)
-        precision_15m, matches_15m, total_15m = _rolling_precision_by_validated_at(
-            finalized_or_old, now_hk=kpi_now_hk, window=timedelta(minutes=15)
+        precision_all, matches_all, total_all, rate_all = _cumulative_precision_overall(
+            finalized_or_old
         )
-        precision_1h, matches_1h, total_1h = _rolling_precision_by_validated_at(
-            finalized_or_old, now_hk=kpi_now_hk, window=timedelta(hours=1)
-        )
-        logger.info(
-            "[validator] Cumulative Precision (15m window, by validated_at): %.2f%% (%d/%d)",
-            precision_15m * 100,
-            matches_15m,
-            total_15m,
+        precision_1d, matches_1d, total_1d, rate_1d = _cumulative_precision_last_day_by_bet_ts(
+            finalized_or_old, now_hk=kpi_now_hk
         )
         logger.info(
-            "[validator] Cumulative Precision (1h window, by validated_at): %.2f%% (%d/%d)",
-            precision_1h * 100,
-            matches_1h,
-            total_1h,
+            "[validator] Cumulative Precision (overall, all alerts): %.2f%% (%d/%d), alert_rate=%s",
+            precision_all * 100,
+            matches_all,
+            total_all,
+            _format_alert_rate_per_hour(rate_all),
+        )
+        logger.info(
+            "[validator] Cumulative Precision (last 24h, by bet_ts): %.2f%% (%d/%d), alert_rate=%s",
+            precision_1d * 100,
+            matches_1d,
+            total_1d,
+            _format_alert_rate_per_hour(rate_1d),
         )
 
         try:
             _mv = _latest_model_version_from_alerts(alerts)
+            precision_15m, matches_15m, total_15m = _rolling_precision_by_validated_at(
+                finalized_or_old, now_hk=kpi_now_hk, window=timedelta(minutes=15)
+            )
             _append_validator_metrics(
                 conn,
                 recorded_at=kpi_now_hk.isoformat(),
@@ -2189,6 +2490,12 @@ def _validate_alerts_once(
     if existing_results_cache is not None:
         existing_results_cache.clear()
         existing_results_cache.update(existing_results)
+    _maybe_emit_validator_heartbeat(
+        conn,
+        alerts=alerts,
+        verified_this_cycle=verified_this_cycle,
+    )
+    on_validate_end(verified_count=verified_this_cycle)
     _emit_validator_perf_summary(cycle_stage_seconds)
 
 

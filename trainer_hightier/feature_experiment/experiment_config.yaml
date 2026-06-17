@@ -21,3 +21,9 @@ feature_service_name: walkaway_bet_trial_v1
 
 # Trainer run profile (:data:`~trainer_hightier.config.RUN_PROFILES` key).
 run_profile: default
+
+# Wave 1b: external event sources (experiment-only; default off).
+external_sources:
+  t_casino_txn:
+    enabled: true
+    cleaned_root: trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_casino_txn

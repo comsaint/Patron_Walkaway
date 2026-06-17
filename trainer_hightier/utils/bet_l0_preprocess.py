@@ -26,6 +26,7 @@ from trainer_hightier.bet_contract import BET_INGEST_READ_COLS_ORDERED
 from trainer_hightier.config import (
     BET_AVAIL_DELAY_MIN,
     DuckDbRuntimeConfig,
+    L0PreprocessDataScopeConfig,
     PREPROCESS_DEDUP_BUCKET_ESCALATION_CEILING,
     BetPreprocessConfig,
     PLACEHOLDER_PLAYER_ID,
@@ -44,12 +45,13 @@ from trainer_hightier.utils.hk_time_semantics import (
     T_BET_TIMESTAMP_COLUMNS,
     assert_no_etl_before_event_violations,
     duckdb_gaming_day_event_sql,
+    duckdb_gaming_day_event_scope_and_sql,
     duckdb_quote_ident as _hk_quote_ident,
 )
 
 logger = logging.getLogger("trainer_hightier")
 
-_BET_CLEAN_CACHE_MANIFEST_VERSION = 10
+_BET_CLEAN_CACHE_MANIFEST_VERSION = 11
 
 
 def _duckdb_quote_ident(name: str) -> str:
@@ -343,16 +345,45 @@ def cleaned_bet_dataset_has_any_parquet(path: Path) -> bool:
     return False
 
 
+def _l0_parquet_schema_names(path: Path) -> frozenset[str]:
+    """Read schema from a parquet file or the first shard under a table-dir root."""
+    p = Path(path).resolve()
+    if p.is_file():
+        return frozenset(pq.read_schema(p).names)
+    if p.is_dir():
+        for candidate in sorted(p.rglob("*.parquet")):
+            if candidate.is_file() and not candidate.name.endswith(".gstmp"):
+                return frozenset(pq.read_schema(candidate).names)
+        raise FileNotFoundError(f"no parquet shards under {p}")
+    raise FileNotFoundError(p)
+
+
+def _is_l0_parquet_source(path: Path) -> bool:
+    """True when *path* is a parquet file or a directory containing parquet shards."""
+    p = Path(path).resolve()
+    if p.is_file():
+        return True
+    if p.is_dir():
+        return any(
+            child.is_file() and not child.name.endswith(".gstmp")
+            for child in p.rglob("*.parquet")
+        )
+    return False
+
+
 def _duckdb_read_parquet_sources_sql(paths: list[Path]) -> str:
     """Build DuckDB ``read_parquet([...])`` or single-file variant."""
     if not paths:
         raise ValueError("bet paths empty")
     if len(paths) == 1:
-        esc = _path_posix(paths[0].resolve()).replace("'", "''")
+        p = Path(paths[0]).resolve()
+        esc = _path_posix(p).replace("'", "''")
+        if p.is_dir():
+            return f"read_parquet('{esc}', union_by_name=true)"
         return f"read_parquet('{esc}')"
     parts = [_path_posix(p.resolve()).replace("'", "''") for p in paths]
     inner = ", ".join(f"'{p}'" for p in parts)
-    return "read_parquet([" + inner + "])"
+    return f"read_parquet([{inner}], union_by_name=true)"
 
 
 def _bet_hk_norm_select_list(read_cols_ordered: tuple[str, ...]) -> str:
@@ -389,6 +420,7 @@ def _duckdb_bet_clean_pipeline_select_sql(
     adt_allowed_players_posix: str | None = None,
     bet_avail_delay_min: int | None = None,
     poll_interval_sec: int | None = None,
+    data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> str:
     """DuckSQL: optional ADT allowlist join → DQ → synthetic cap → episode tag → ``bet_id`` dedup.
 
@@ -423,6 +455,17 @@ def _duckdb_bet_clean_pipeline_select_sql(
     if poll_interval_sec < 1:
         raise ValueError(f"poll_interval_sec must be >= 1, got {poll_interval_sec}")
     l0_projection = ", ".join(_duckdb_quote_ident(c) for c in read_cols_ordered)
+    scope = data_scope if data_scope is not None else L0PreprocessDataScopeConfig()
+    scope_and = duckdb_gaming_day_event_scope_and_sql(
+        min_day=scope.gaming_day_event_min,
+        max_day=scope.gaming_day_event_max,
+    )
+    hk_source = "hk_scoped" if scope_and else "hk"
+    hk_scoped_cte = (
+        f"hk_scoped AS (SELECT * FROM hk WHERE TRUE{scope_and}),\n"
+        if scope_and
+        else ""
+    )
     if adt_allowed_players_posix is not None:
         with_lf = f"""WITH allowed AS (
   SELECT DISTINCT TRY_CAST(player_id AS BIGINT) AS player_id
@@ -464,11 +507,11 @@ hk AS (
     {_bet_hk_norm_select_list(read_cols_ordered)}
   FROM lf AS lf
 ),
-obs AS (
+{hk_scoped_cte}obs AS (
   SELECT
     hk.*,
     {syn} AS "__etl_insert_Dtm_synthetic"
-  FROM hk AS hk
+  FROM {hk_source} AS hk
 ),
 tagged AS (
   SELECT
@@ -538,22 +581,53 @@ def _wrapped_bet_select_for_partitioned_copy(pipeline_sql: str) -> str:
     )
 
 
-def _consolidate_staged_bucket_partition_dirs(*, staged_root: Path, final_dataset_root: Path, n_buckets: int) -> None:
-    """Move per-bucket partition leaves into ``final_dataset_root`` with deterministic ``bucket_*.parquet`` names."""
+def _partitioned_parquet_footer_row_count(dataset_root: Path) -> int:
+    """Sum parquet footer ``num_rows`` under a partitioned dataset root (no full scan)."""
 
+    root = Path(dataset_root).resolve()
+    if not root.is_dir():
+        return 0
+    total = 0
+    for shard in sorted(root.rglob("*.parquet")):
+        meta = pq.ParquetFile(shard).metadata
+        if meta is not None:
+            total += int(meta.num_rows)
+    return total
+
+
+def _consolidate_staged_bucket_partition_dirs(*, staged_root: Path, final_dataset_root: Path, n_buckets: int) -> None:
+    """Move per-bucket partition leaves into ``final_dataset_root`` with unique shard filenames.
+
+    DuckDB ``PARTITION_BY`` may emit multiple parquet files per bucket/day. Each staged shard
+    must land under a unique deterministic name so rows are not overwritten.
+    """
+
+    staged_rows_before = _partitioned_parquet_footer_row_count(staged_root)
     for b in range(int(n_buckets)):
         st = staged_root / f"b{b:04d}"
         if not st.is_dir():
             raise FileNotFoundError(f"missing staged bucket partition root: {st}")
-        bucket_label = f"bucket_{b:04d}.parquet"
+        shard_idx_by_parent: dict[Path, int] = {}
         for pq_src in sorted(st.rglob("*.parquet")):
-            rel_parent = pq_src.relative_to(st).parent  # hive dirs only
+            rel_parent = pq_src.relative_to(st).parent
+            shard_idx = shard_idx_by_parent.get(rel_parent, 0)
+            bucket_label = f"bucket_{b:04d}_part_{shard_idx:04d}.parquet"
+            shard_idx_by_parent[rel_parent] = shard_idx + 1
             dest_dir = final_dataset_root / rel_parent
             dest_dir.mkdir(parents=True, exist_ok=True)
             dest = dest_dir / bucket_label
             if dest.is_file():
-                dest.unlink()
+                raise ValueError(
+                    "[Step 2b] consolidation destination already exists "
+                    f"(invariant violation): {dest}",
+                )
             shutil.move(str(pq_src), str(dest))
+    staged_rows_after = _partitioned_parquet_footer_row_count(final_dataset_root)
+    if staged_rows_before != staged_rows_after:
+        raise ValueError(
+            "[Step 2b] bucket consolidation row-count invariant failed: "
+            f"staged_rows={staged_rows_before} final_rows={staged_rows_after}",
+        )
 
 
 def _partitioned_parquet_manifest_block(dataset_root: Path) -> dict[str, Any]:
@@ -658,7 +732,7 @@ def _preprocess_bets_duckdb_single_copy(
     n = int(cfg.dedup_hash_buckets)
     if n < 1:
         raise ValueError(f"dedup_hash_buckets must be >= 1, got {n}")
-    schema_names = frozenset(pq.read_schema(Path(source_parquets[0])).names)
+    schema_names = _l0_parquet_schema_names(Path(source_parquets[0]))
     read_ordered = _bet_preprocess_read_columns_ordered(schema_names)
     cap_sec, _applied = _bet_cap_applied_rules(registry_yaml)
     tags = bulk_bet_episode_calendar_tags(registry_yaml)
@@ -679,6 +753,12 @@ def _preprocess_bets_duckdb_single_copy(
     adt_allowed_esc = _resolve_adt_allowed_players_posix(cfg)
     if adt_allowed_esc is not None:
         logger.info("[Step 2b] bet preprocess ADT segment: early join to allowlist Parquet")
+    if cfg.data_scope.gaming_day_event_min is not None or cfg.data_scope.gaming_day_event_max is not None:
+        logger.info(
+            "[Step 2b] bet L0 data scope gaming_day_event [%s, %s]",
+            cfg.data_scope.gaming_day_event_min,
+            cfg.data_scope.gaming_day_event_max,
+        )
 
     partition_opts = (
         "FORMAT PARQUET, COMPRESSION SNAPPY, PARTITION_BY (gaming_month, gaming_day_key), OVERWRITE_OR_IGNORE TRUE"
@@ -694,6 +774,7 @@ def _preprocess_bets_duckdb_single_copy(
             dedup_bucket_id=None,
             dedup_buckets=1,
             adt_allowed_players_posix=adt_allowed_esc,
+            data_scope=cfg.data_scope,
         )
         wrapped = _wrapped_bet_select_for_partitioned_copy(pipeline)
         sql = f"COPY ({wrapped}) TO '{out_esc}' ({partition_opts})"
@@ -718,6 +799,7 @@ def _preprocess_bets_duckdb_single_copy(
                     dedup_bucket_id=b,
                     dedup_buckets=n,
                     adt_allowed_players_posix=adt_allowed_esc,
+                    data_scope=cfg.data_scope,
                 )
                 wrapped = _wrapped_bet_select_for_partitioned_copy(pipeline)
                 bsql = f"COPY ({wrapped}) TO '{st_esc}' ({partition_opts})"
@@ -752,14 +834,14 @@ def preprocess_bets_from_parquet_streaming(
         ``(resolved output path, effective dedup_hash_buckets used)``.
     """
     src = Path(bet_parquet).resolve()
-    if not src.is_file():
+    if not _is_l0_parquet_source(src):
         raise FileNotFoundError(src)
     sources_list: list[Path] = [src]
     if extra_partition_sources:
         uniq = {str(src): src}
         for pp in extra_partition_sources:
             p = Path(pp).resolve()
-            if not p.is_file():
+            if not _is_l0_parquet_source(p):
                 raise FileNotFoundError(p)
             uniq[str(p)] = p
         sources_list = sorted(uniq.values(), key=lambda x: str(x))
@@ -843,8 +925,11 @@ def segment_cleaned_bet_from_base_parquet(
     output_parquet: Path,
     *,
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
+    hard_exclude_parquet: Path | None = None,
 ) -> Path:
     """Project partitioned all-player bets onto ADT allowlist rows; rewritten as Hive partitioned output."""
+
+    from trainer_hightier.utils.player_dq import hard_exclude_anti_join_sql
 
     base = Path(base_cleaned_parquet).resolve()
     allow = Path(allowlist_parquet).resolve()
@@ -857,6 +942,10 @@ def segment_cleaned_bet_from_base_parquet(
     b_from = resolved_cleaned_bet_read_parquet_sql(base)
     a_esc = _path_posix(allow).replace("'", "''")
     o_esc = _path_posix(out).replace("'", "''")
+    hard_clause = ""
+    if hard_exclude_parquet is not None and Path(hard_exclude_parquet).is_file():
+        hard_esc = _path_posix(Path(hard_exclude_parquet)).replace("'", "''")
+        hard_clause = hard_exclude_anti_join_sql(hard_exclude_parquet_esc=hard_esc)
     partition_opts = (
         "FORMAT PARQUET, COMPRESSION SNAPPY, PARTITION_BY (gaming_month, gaming_day_key), OVERWRITE_OR_IGNORE TRUE"
     )
@@ -874,6 +963,7 @@ COPY (
       FROM read_parquet('{a_esc}')
       WHERE TRY_CAST(player_id AS BIGINT) IS NOT NULL
     ) AS a ON TRY_CAST(b.player_id AS BIGINT) = a.pid
+    WHERE TRUE{hard_clause}
   ) AS s
 ) TO '{o_esc}' ({partition_opts})
 """.strip()
@@ -977,6 +1067,8 @@ def build_bet_base_clean_cache_record(
     dedup_hash_buckets: int | None = None,
     cleaned_session_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    source_manifest_v2_fingerprint_sha256_hex: str | None = None,
+    data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> dict[str, Any]:
     """Fingerprint intermediate base bet (raw sources + registry; no ADT).
 
@@ -1020,11 +1112,15 @@ def build_bet_base_clean_cache_record(
         "applied_registry_fix_rules": applied,
         "preprocess_registry": _registry_stat_dict(preprocess_registry_yaml),
         "source_bets": stats,
+        "l0_data_scope": (data_scope or BetPreprocessConfig().data_scope).manifest_block(),
     }
-    if partition_inventory_fingerprint_sha256_hex is not None:
-        rec["partition_inventory_fingerprint_sha256_hex"] = str(
-            partition_inventory_fingerprint_sha256_hex,
-        ).strip()
+    from trainer_hightier.utils.cache_invalidation_v1 import attach_l1_source_identity
+
+    attach_l1_source_identity(
+        rec,
+        source_manifest_v2_fingerprint_sha256_hex=source_manifest_v2_fingerprint_sha256_hex,
+        partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+    )
     return rec
 
 
@@ -1036,6 +1132,8 @@ def bet_base_clean_cache_is_hit(
     dedup_hash_buckets: int | None = None,
     cleaned_session_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    source_manifest_v2_fingerprint_sha256_hex: str | None = None,
+    data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> bool:
     """Return True if base cleaned bet exists and manifest matches."""
 
@@ -1064,6 +1162,8 @@ def bet_base_clean_cache_is_hit(
                 dedup_hash_buckets=nb,
                 cleaned_session_parquet=None,
                 partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+                source_manifest_v2_fingerprint_sha256_hex=source_manifest_v2_fingerprint_sha256_hex,
+                data_scope=data_scope,
             )
 
         return _bet_manifest_matches_with_bucket_alias(
@@ -1083,6 +1183,8 @@ def write_bet_base_clean_cache_manifest(
     dedup_hash_buckets: int | None = None,
     cleaned_session_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    source_manifest_v2_fingerprint_sha256_hex: str | None = None,
+    data_scope: L0PreprocessDataScopeConfig | None = None,
 ) -> Path:
     """Write manifest next to intermediate base cleaned parquet."""
 
@@ -1093,6 +1195,8 @@ def write_bet_base_clean_cache_manifest(
         dedup_hash_buckets=dedup_hash_buckets,
         cleaned_session_parquet=cleaned_session_parquet,
         partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+        source_manifest_v2_fingerprint_sha256_hex=source_manifest_v2_fingerprint_sha256_hex,
+        data_scope=data_scope,
     )
     mp = bet_base_clean_cache_manifest_path(Path(base_cleaned_parquet))
     mp.parent.mkdir(parents=True, exist_ok=True)
@@ -1159,6 +1263,8 @@ def build_bet_clean_cache_record(
     extra_source_bet_parquets: tuple[Path, ...] | None = None,
     bet_base_cleaned_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    data_scope: L0PreprocessDataScopeConfig | None = None,
+    hard_exclude_policy_fingerprint_sha256_hex: str | None = None,
 ) -> dict[str, Any]:
     """Fingerprint for cleaned bet parquet cache (raw t_bet + registry + optional ADT allowlist).
 
@@ -1188,6 +1294,7 @@ def build_bet_clean_cache_record(
         "bet_ingest_cap_sec": cap_sec,
         "applied_registry_fix_rules": applied,
         "preprocess_registry": _registry_stat_dict(preprocess_registry_yaml),
+        "l0_data_scope": (data_scope or BetPreprocessConfig().data_scope).manifest_block(),
     }
     if partition_inventory_fingerprint_sha256_hex is not None:
         rec["partition_inventory_fingerprint_sha256_hex"] = str(
@@ -1214,6 +1321,9 @@ def build_bet_clean_cache_record(
                 "adt_segment": seg,
             }
         )
+        hard_fp = str(hard_exclude_policy_fingerprint_sha256_hex or "").strip()
+        if hard_fp:
+            rec["hard_exclude_policy_fingerprint_sha256_hex"] = hard_fp
         return rec
 
     if len(merged_sources) > 1:
@@ -1254,6 +1364,8 @@ def bet_clean_cache_is_hit(
     extra_source_bet_parquets: tuple[Path, ...] | None = None,
     bet_base_cleaned_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    data_scope: L0PreprocessDataScopeConfig | None = None,
+    hard_exclude_policy_fingerprint_sha256_hex: str | None = None,
 ) -> bool:
     cleaned = Path(cleaned_parquet).resolve()
     reg = _resolve_preprocess_registry(preprocess_registry_yaml)
@@ -1284,6 +1396,8 @@ def bet_clean_cache_is_hit(
             extra_source_bet_parquets=extra_source_bet_parquets,
             bet_base_cleaned_parquet=bet_base_cleaned_parquet,
             partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+            data_scope=data_scope,
+            hard_exclude_policy_fingerprint_sha256_hex=hard_exclude_policy_fingerprint_sha256_hex,
         )
 
     try:
@@ -1310,6 +1424,8 @@ def write_bet_clean_cache_manifest(
     extra_source_bet_parquets: tuple[Path, ...] | None = None,
     bet_base_cleaned_parquet: Path | None = None,
     partition_inventory_fingerprint_sha256_hex: str | None = None,
+    data_scope: L0PreprocessDataScopeConfig | None = None,
+    hard_exclude_policy_fingerprint_sha256_hex: str | None = None,
 ) -> Path:
     reg = _resolve_preprocess_registry(preprocess_registry_yaml)
     rec = build_bet_clean_cache_record(
@@ -1324,6 +1440,8 @@ def write_bet_clean_cache_manifest(
         extra_source_bet_parquets=extra_source_bet_parquets,
         bet_base_cleaned_parquet=bet_base_cleaned_parquet,
         partition_inventory_fingerprint_sha256_hex=partition_inventory_fingerprint_sha256_hex,
+        data_scope=data_scope,
+        hard_exclude_policy_fingerprint_sha256_hex=hard_exclude_policy_fingerprint_sha256_hex,
     )
     mp = bet_clean_cache_manifest_path(Path(cleaned_parquet))
     mp.parent.mkdir(parents=True, exist_ok=True)
@@ -1380,12 +1498,17 @@ def refresh_bet_preprocess_cache_manifests(
     """
 
     from trainer_hightier.utils.partition_inventory import (
+        default_partition_snapshot_dir,
+        expect_default_partition_snapshot_dir,
         infer_snapshot_id,
         inventory_to_manifest_dict,
         scan_partition_snapshot_dir,
     )
 
-    snap = Path(partition_snapshot_dir or Path(__file__).resolve().parents[2] / "data" / "partitions").resolve()
+    if partition_snapshot_dir is not None:
+        snap = Path(partition_snapshot_dir).resolve()
+    else:
+        snap = default_partition_snapshot_dir() or expect_default_partition_snapshot_dir()
     reg = _resolve_preprocess_registry(
         preprocess_registry_yaml or default_preprocess_registry_yaml_path(),
     )

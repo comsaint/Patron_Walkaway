@@ -29,6 +29,7 @@ from trainer_hightier.serving.deploy_e2e_gate import (
     resolve_supplier_plan,
     run_deploy_e2e_gate,
     run_startup_refresh_gate,
+    run_supplier_contract_gate_step,
     validate_bundle_contract,
     write_gate_report,
 )
@@ -130,6 +131,169 @@ def _deploy_layout(
     return deploy
 
 
+def _write_matching_deploy_contract(
+    deploy: Path,
+    model_bundle: Path,
+    mapping: Path,
+    allowlist: Path,
+) -> None:
+    """Write ``deploy_contract.json`` aligned with the bundled model + registry."""
+
+    from trainer_hightier.serving.feature_contract import (
+        build_and_write_deploy_contract,
+        registry_fingerprint_from_model_bundle,
+    )
+    from trainer_hightier.serving.feature_supply import (
+        build_scorer_supplier_plan,
+        load_frozen_registry_for_bundle,
+        model_feature_columns_from_pickle,
+    )
+
+    snap = load_frozen_registry_for_bundle(model_bundle)
+    feats = model_feature_columns_from_pickle(model_bundle)
+    plan = build_scorer_supplier_plan(snap, feats)
+    build_and_write_deploy_contract(
+        plan=plan,
+        model_bundle_dir=model_bundle,
+        model_version=(model_bundle / "model_version").read_text(encoding="utf-8").strip(),
+        registry_fingerprint=registry_fingerprint_from_model_bundle(model_bundle),
+        feature_count=len(feats),
+        bundle_root=deploy,
+        mapping=mapping,
+        allowlist=allowlist,
+    )
+
+
+def test_supplier_contract_gate_step_pass_with_matching_contract(tmp_path: Path) -> None:
+    """supplier_contract step passes when on-disk contract matches live plan."""
+
+    from trainer_hightier.deploy import main as deploy_main
+
+    deploy = _deploy_layout(tmp_path, include_mid=False, include_slow=True)
+    rel = json.loads((deploy / "deploy_bundle_paths.json").read_text(encoding="utf-8"))
+    model_bundle = deploy / rel["model_bundle_dir"]
+    mapping = deploy / rel["canonical_mapping_parquet"]
+    allowlist = deploy / rel["adt_allowlist_parquet"]
+    _write_matching_deploy_contract(deploy, model_bundle, mapping, allowlist)
+    cfg = deploy_main._serving_config_for_bundle(deploy, rel)
+    plan = resolve_supplier_plan(model_bundle)
+
+    step = run_supplier_contract_gate_step(
+        bundle_root=deploy,
+        model_bundle=model_bundle,
+        plan=plan,
+        cfg=cfg,
+        mapping=mapping,
+        allowlist=allowlist,
+    )
+    assert step.ok, step.error
+    assert step.detail["cross_check"] == "pass"
+    assert "on_disk_fingerprint" in step.detail
+    assert "bundle_static_artifact" in step.detail["validators"]
+
+
+def test_supplier_contract_gate_step_report_only_without_contract(tmp_path: Path) -> None:
+    """Report-only deploy mode logs missing contract but does not fail the step."""
+
+    from trainer_hightier.deploy import main as deploy_main
+
+    deploy = _deploy_layout(tmp_path, include_mid=False, include_slow=True)
+    rel = json.loads((deploy / "deploy_bundle_paths.json").read_text(encoding="utf-8"))
+    model_bundle = deploy / rel["model_bundle_dir"]
+    mapping = deploy / rel["canonical_mapping_parquet"]
+    allowlist = deploy / rel["adt_allowlist_parquet"]
+    cfg = deploy_main._serving_config_for_bundle(deploy, rel)
+    plan = resolve_supplier_plan(model_bundle)
+
+    step = run_supplier_contract_gate_step(
+        bundle_root=deploy,
+        model_bundle=model_bundle,
+        plan=plan,
+        cfg=cfg,
+        mapping=mapping,
+        allowlist=allowlist,
+    )
+    assert step.ok, step.error
+    assert step.detail["cross_check"] == "missing_contract"
+
+
+def test_supplier_contract_gate_step_fail_on_strict_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Strict deploy mode fails when contract fingerprint drifts from live plan."""
+
+    from trainer_hightier.deploy import main as deploy_main
+
+    monkeypatch.setattr(
+        "trainer_hightier.config.FEATURE_CONTRACT_DEPLOY_STRICT",
+        True,
+    )
+    deploy = _deploy_layout(tmp_path, include_mid=False, include_slow=True)
+    rel = json.loads((deploy / "deploy_bundle_paths.json").read_text(encoding="utf-8"))
+    model_bundle = deploy / rel["model_bundle_dir"]
+    mapping = deploy / rel["canonical_mapping_parquet"]
+    allowlist = deploy / rel["adt_allowlist_parquet"]
+    _write_matching_deploy_contract(deploy, model_bundle, mapping, allowlist)
+    contract_path = model_bundle / "deploy_contract.json"
+    raw = json.loads(contract_path.read_text(encoding="utf-8"))
+    raw["feature_count"] = int(raw["feature_count"]) + 1
+    contract_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    cfg = deploy_main._serving_config_for_bundle(deploy, rel)
+    plan = resolve_supplier_plan(model_bundle)
+    step = run_supplier_contract_gate_step(
+        bundle_root=deploy,
+        model_bundle=model_bundle,
+        plan=plan,
+        cfg=cfg,
+        mapping=mapping,
+        allowlist=allowlist,
+    )
+    assert not step.ok
+    assert step.error is not None
+    assert "feature_count" in step.error or "fingerprint" in step.error
+
+
+def test_run_deploy_e2e_gate_fail_fast_on_supplier_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full gate aborts before startup_refresh when supplier_contract fails."""
+
+    deploy = _deploy_layout(tmp_path, include_mid=False, include_slow=True)
+    bet = tmp_path / "bet"
+    bet.mkdir()
+    sess = tmp_path / "session.parquet"
+    pd.DataFrame({"player_id": [1]}).to_parquet(sess, index=False)
+    startup_called = False
+
+    def _fake_startup(**_kwargs: object) -> GateStepResult:
+        nonlocal startup_called
+        startup_called = True
+        return GateStepResult(name="startup_refresh", ok=True, detail={})
+
+    monkeypatch.setattr(
+        "trainer_hightier.serving.deploy_e2e_gate.run_supplier_contract_gate_step",
+        lambda **_k: GateStepResult(
+            name="supplier_contract",
+            ok=False,
+            error="simulated contract failure",
+        ),
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.serving.deploy_e2e_gate.run_startup_refresh_gate",
+        _fake_startup,
+    )
+
+    report = run_deploy_e2e_gate(_gate_opts(deploy, bet, sess))
+    assert report.verdict == "fail"
+    assert report.failure_reason == "simulated contract failure"
+    assert startup_called is False
+    assert any(s.name == "supplier_contract" and not s.ok for s in report.steps)
+    assert not any(s.name == "startup_refresh" for s in report.steps)
+
+
 def test_resolve_model_bundle_test_gaming_days(tmp_path: Path) -> None:
     model_bundle = tmp_path / "models"
     model_bundle.mkdir()
@@ -181,6 +345,7 @@ def test_apply_default_scorability_gaming_days_from_split_report(tmp_path: Path)
         bundle_dir=tmp_path,
         local_cleaned_bet=tmp_path / "bet",
         local_cleaned_session=tmp_path / "sess.parquet",
+        local_cleaned_casino_txn=None,
         output_json=None,
         gaming_day_start=None,
         gaming_day_end=None,
@@ -376,6 +541,7 @@ def _gate_opts(
         "bundle_dir": deploy,
         "local_cleaned_bet": bet,
         "local_cleaned_session": sess,
+        "local_cleaned_casino_txn": None,
         "output_json": None,
         "gaming_day_start": None,
         "gaming_day_end": None,

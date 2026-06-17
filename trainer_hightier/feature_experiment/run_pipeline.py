@@ -15,7 +15,7 @@ import json
 import logging
 import pickle
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 from typing import Any, Mapping
@@ -23,6 +23,7 @@ from typing import Any, Mapping
 import duckdb
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import yaml
 from trainer_hightier.config import (
     DuckDbRuntimeConfig,
@@ -30,6 +31,7 @@ from trainer_hightier.config import (
     HighTierObjectiveConfig,
     Step4SplitConfig,
     Step5TrainConfig,
+    TXN_LITE_WINDOW_ABLATION_EXTRA_HOURS,
     configs_from_run_profile,
     get_run_profile,
 )
@@ -54,6 +56,11 @@ from trainer_hightier.feature_experiment.feature_registry import (
 )
 import trainer_hightier.feature_experiment.feature_registry as _feat_registry
 from trainer_hightier.feature_experiment.materialize_fe_derived import materialize_fe_derived_parquet
+from trainer_hightier.feature_experiment.materialize_txn_lite import (
+    default_cleaned_casino_txn_root,
+    materialize_txn_lite_parquet,
+    write_txn_lite_sidecars,
+)
 from trainer_hightier.feature_experiment.val_slices import (
     contiguous_val_day_masks,
     median_p25,
@@ -81,6 +88,7 @@ class FeatureExperimentPaths:
     run_dir: Path
     step3_training_parquet: Path
     fe_derived_parquet: Path
+    txn_lite_parquet: Path | None
     enriched_training_parquet: Path
     splits_dir: Path
     report_json: Path
@@ -90,6 +98,24 @@ def _feature_columns_intersect_allowlist(columns: tuple[str, ...], allow: frozen
     """Keep column order from ``columns`` but drop anything not in ``allow``."""
 
     return tuple(c for c in columns if c in allow)
+
+
+def _feature_columns_present_in_splits(
+    splits_dir: Path,
+    columns: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Drop registry columns that are absent from split Parquet (legacy enrich gaps)."""
+
+    train_p = Path(splits_dir) / "train.parquet"
+    names = frozenset(pq.read_schema(train_p).names)
+    present = tuple(c for c in columns if c in names)
+    missing = [c for c in columns if c not in names]
+    if missing:
+        logger.warning(
+            "[FE] Registry columns absent from splits (dropped for training): %s",
+            missing,
+        )
+    return present
 
 
 def _repo_root() -> Path:
@@ -170,6 +196,38 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--txn-window-ablation",
+        action="store_true",
+        help=(
+            "Materialize w4h/w24h txn sum probes (not in registry) and run add-one window arms "
+            "vs baseline; writes txn_window_ablation_report.json."
+        ),
+    )
+    p.add_argument(
+        "--txn-window-ablation-additive",
+        action="store_true",
+        help=(
+            "Like --txn-window-ablation but only v01_6col additive arms "
+            "(+net_w4h / +net_w24h / +both); still writes txn_window_ablation_report.json."
+        ),
+    )
+    p.add_argument(
+        "--txn-confirmatory-smoke",
+        action="store_true",
+        help=(
+            "Confirmatory smoke: train ref_v01_6col and promoted_v02_7col "
+            "(6-col + net_w4h) vs baseline; writes txn_window_ablation_report.json."
+        ),
+    )
+    p.add_argument(
+        "--clock-feature-ablation",
+        action="store_true",
+        help=(
+            "Add-one ablation for fe__clock__is_late_night, fe__clock__is_weekend, "
+            "and fe__clock__hour_of_day vs baseline; writes clock_feature_ablation_report.json."
+        ),
+    )
+    p.add_argument(
         "--skip-fqg",
         action="store_true",
         help="Skip Feature Quality Gate (FQG); for bring-up/debug only.",
@@ -209,6 +267,7 @@ def _resolve_paths(cfg: Mapping[str, Any], output_dir: Path | None) -> FeatureEx
         run_dir=run_root,
         step3_training_parquet=step3_out,
         fe_derived_parquet=fe,
+        txn_lite_parquet=None,
         enriched_training_parquet=enriched,
         splits_dir=splits,
         report_json=rep,
@@ -250,7 +309,7 @@ def _filter_train_floor(*, train_parquet: Path, min_day: date, duckdb_runtime: D
     day_s = min_day.isoformat()
     inner = f"""
 SELECT * FROM read_parquet('{mq}')
-WHERE TRY_CAST(gaming_day AS DATE) >= DATE '{day_s}'
+WHERE TRY_CAST(gaming_day_event AS DATE) >= DATE '{day_s}'
 """.strip()
     con = duckdb.connect(database=":memory:")
     try:
@@ -259,6 +318,56 @@ WHERE TRY_CAST(gaming_day AS DATE) >= DATE '{day_s}'
     finally:
         con.close()
     tmp.replace(Path(train_parquet))
+
+
+def _slice_training_parquet_by_gaming_day(
+    *,
+    in_parquet: Path,
+    out_parquet: Path,
+    min_day: date | None,
+    max_day: date | None,
+    duckdb_runtime: DuckDbRuntimeConfig,
+) -> Path:
+    """Filter training rows by ``gaming_day_event`` inclusive range (experiment subset)."""
+
+    if min_day is None and max_day is None:
+        return Path(in_parquet).resolve()
+    src = Path(in_parquet).resolve()
+    if not src.is_file():
+        raise FileNotFoundError(f"training parquet missing: {src}")
+    dst = Path(out_parquet).resolve()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    iq = str(src).replace("\\", "/").replace("'", "''")
+    oq = str(dst).replace("\\", "/").replace("'", "''")
+    clauses: list[str] = ["TRY_CAST(gaming_day_event AS DATE) IS NOT NULL"]
+    if min_day is not None:
+        clauses.append(f"TRY_CAST(gaming_day_event AS DATE) >= DATE '{min_day.isoformat()}'")
+    if max_day is not None:
+        clauses.append(f"TRY_CAST(gaming_day_event AS DATE) <= DATE '{max_day.isoformat()}'")
+    where = " AND ".join(clauses)
+    inner = f"SELECT * FROM read_parquet('{iq}') WHERE {where}"
+    con = duckdb.connect(database=":memory:")
+    try:
+        apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        n_before = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{iq}')").fetchone()[0])
+        con.execute(f"COPY ({inner}) TO '{oq}' (FORMAT PARQUET, COMPRESSION SNAPPY)")
+        n_after = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{oq}')").fetchone()[0])
+    finally:
+        con.close()
+    if n_after <= 0:
+        raise ValueError(
+            f"gaming_day_event slice [{min_day}, {max_day}] yielded 0 rows from {src} "
+            f"(before={n_before})",
+        )
+    logger.info(
+        "[FE] sliced training rows by gaming_day_event [%s, %s]: %d → %d → %s",
+        min_day,
+        max_day,
+        n_before,
+        n_after,
+        dst,
+    )
+    return dst
 
 
 def prepare_matrix_from_val_split(val_df: pd.DataFrame, pkt: dict[str, Any]) -> pd.DataFrame:
@@ -293,9 +402,12 @@ def _build_report(
     budget_sec: float,
     capacity_alerts_per_hour_cap: float,
     ablation_v0: dict[str, Any] | None = None,
+    txn_window_ablation_v0: dict[str, Any] | None = None,
+    clock_feature_ablation_v0: dict[str, Any] | None = None,
     feature_quality: dict[str, Any] | None = None,
     candidate_registry: dict[str, Any] | None = None,
     feast_auto_apply: Mapping[str, Any] | None = None,
+    external_sources: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     gate1_inner = compute_gate1_vs_baseline(
         baseline_report,
@@ -336,6 +448,12 @@ def _build_report(
         out["feature_quality"] = feature_quality
     if ablation_v0 is not None:
         out["ablation_v0"] = ablation_v0
+    if txn_window_ablation_v0 is not None:
+        out["txn_window_ablation_v0"] = txn_window_ablation_v0
+    if clock_feature_ablation_v0 is not None:
+        out["clock_feature_ablation_v0"] = clock_feature_ablation_v0
+    if external_sources is not None:
+        out["external_sources"] = external_sources
     return out
 
 
@@ -343,6 +461,230 @@ def _safe_ablation_dir_name(group_id: str) -> str:
     """Filesystem-safe subdirectory name for ``group_id``."""
 
     return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in group_id)
+
+
+_TXN_V01_6COL: tuple[str, ...] = (
+    "txn__has_cash_out__w15m",
+    "txn__cash_out_cnt__w1h",
+    "txn__cash_out_sum__w1h",
+    "txn__net_cash_flow__w1h",
+    "txn__buyin_cash_sum__w1h",
+    "txn__buyin_prize_redemption_flag__w1h",
+)
+
+_TXN_WINDOW_ABLATION_ARMS: dict[str, tuple[str, ...]] = {
+    "ref_v01_6col": _TXN_V01_6COL,
+    "w1h_trio": (
+        "txn__net_cash_flow__w1h",
+        "txn__buyin_cash_sum__w1h",
+        "txn__cash_out_sum__w1h",
+    ),
+    "w4h_trio": (
+        "txn__net_cash_flow__w4h",
+        "txn__buyin_cash_sum__w4h",
+        "txn__cash_out_sum__w4h",
+    ),
+    "w24h_trio": (
+        "txn__net_cash_flow__w24h",
+        "txn__buyin_cash_sum__w24h",
+        "txn__cash_out_sum__w24h",
+    ),
+    "net_w1h_only": ("txn__net_cash_flow__w1h",),
+    "net_w4h_only": ("txn__net_cash_flow__w4h",),
+    "net_w24h_only": ("txn__net_cash_flow__w24h",),
+}
+
+_TXN_WINDOW_ADDITIVE_ARMS: dict[str, tuple[str, ...]] = {
+    "ref_v01_6col": _TXN_V01_6COL,
+    "v01_6col_plus_net_w4h": _TXN_V01_6COL + ("txn__net_cash_flow__w4h",),
+    "v01_6col_plus_net_w24h": _TXN_V01_6COL + ("txn__net_cash_flow__w24h",),
+    "v01_6col_plus_net_w4h_w24h": _TXN_V01_6COL
+    + ("txn__net_cash_flow__w4h", "txn__net_cash_flow__w24h",),
+}
+
+_TXN_CONFIRMATORY_ARMS: dict[str, tuple[str, ...]] = {
+    "ref_v01_6col": _TXN_V01_6COL,
+    "promoted_v02_7col": _TXN_V01_6COL + ("txn__net_cash_flow__w4h",),
+}
+
+_CLOCK_FEATURE_ABLATION_ARMS: dict[str, tuple[str, ...]] = {
+    "add_fe__clock__is_late_night": ("fe__clock__is_late_night",),
+    "add_fe__clock__is_weekend": ("fe__clock__is_weekend",),
+    "add_fe__clock__hour_of_day": ("fe__clock__hour_of_day",),
+}
+
+
+def _txn_window_ablation_profile_and_arms(
+    ns: argparse.Namespace,
+    cfg_yaml: Mapping[str, Any],
+) -> tuple[str, dict[str, tuple[str, ...]]]:
+    """Return ``(arms_profile, arms)`` for the active txn ablation mode."""
+
+    blk = cfg_yaml.get("txn_window_ablation")
+    profile = ""
+    if isinstance(blk, dict) and blk.get("arms_profile"):
+        profile = str(blk["arms_profile"]).strip().lower()
+    if bool(getattr(ns, "txn_confirmatory_smoke", False)) or profile == "confirmatory":
+        return "confirmatory", _TXN_CONFIRMATORY_ARMS
+    if bool(getattr(ns, "txn_window_ablation_additive", False)) or profile == "additive":
+        return "additive", _TXN_WINDOW_ADDITIVE_ARMS
+    return "window", _TXN_WINDOW_ABLATION_ARMS
+
+
+def _txn_window_ablation_enabled(ns: argparse.Namespace, cfg_yaml: Mapping[str, Any]) -> bool:
+    """True when CLI flag or experiment config requests txn window ablation."""
+
+    if bool(getattr(ns, "txn_window_ablation", False)):
+        return True
+    if bool(getattr(ns, "txn_window_ablation_additive", False)):
+        return True
+    if bool(getattr(ns, "txn_confirmatory_smoke", False)):
+        return True
+    blk = cfg_yaml.get("txn_window_ablation")
+    return isinstance(blk, dict) and bool(blk.get("enabled"))
+
+
+def _txn_window_ablation_extra_hours(cfg_yaml: Mapping[str, Any]) -> tuple[int, ...]:
+    """Resolve extra lookback hours for window ablation materialize."""
+
+    blk = cfg_yaml.get("txn_window_ablation")
+    if isinstance(blk, dict) and blk.get("extra_windows"):
+        raw = blk["extra_windows"]
+        if not isinstance(raw, (list, tuple)):
+            raise ValueError(f"txn_window_ablation.extra_windows must be a list; got {type(raw)!r}")
+        return tuple(int(h) for h in raw)
+    return TXN_LITE_WINDOW_ABLATION_EXTRA_HOURS
+
+
+def _run_txn_window_ablation_phase(
+    *,
+    splits_dir: Path,
+    duckdb_runtime: DuckDbRuntimeConfig,
+    objective_min_precision: float,
+    random_seed: int,
+    step5: Step5TrainConfig,
+    run_dir: Path,
+    baseline_report: Mapping[str, Any],
+    baseline_cols: tuple[str, ...],
+    capacity_alerts_per_hour_cap: float,
+    budget_deadline_perf: float,
+    extra_window_hours: tuple[int, ...],
+    arms: Mapping[str, tuple[str, ...]],
+    arms_profile: str,
+) -> dict[str, Any]:
+    """Train baseline+txn window arms; compare Gate 1 vs baseline (registry unchanged)."""
+
+    arms_block: dict[str, Any] = {}
+    timing: dict[str, float] = {}
+    t0_all = time.perf_counter()
+    for arm_id, txn_cols in arms.items():
+        if time.perf_counter() > budget_deadline_perf:
+            raise RuntimeError("Exceeded single_round_budget_sec during txn window ablation arms")
+        present_txn = _feature_columns_present_in_splits(splits_dir, txn_cols)
+        cols = tuple(dict.fromkeys(baseline_cols + present_txn))
+        sub = _safe_ablation_dir_name(arm_id)
+        out_a = run_dir / f"txn_window_ablation_{sub}_lgbm"
+        logger.info("[FE] txn window ablation %s (%d txn cols) → %s", arm_id, len(present_txn), out_a)
+        t0 = time.perf_counter()
+        res_a = _b5.train_lgbm_from_splits(
+            splits_dir=splits_dir,
+            duckdb_runtime=duckdb_runtime,
+            objective_min_precision=float(objective_min_precision),
+            random_seed=random_seed,
+            step5=step5,
+            output_dir=out_a,
+            feature_columns=cols,
+        )
+        timing[f"train_txn_window_ablation_{sub}_sec"] = round(time.perf_counter() - t0, 3)
+        g1 = compute_gate1_vs_baseline(
+            dict(baseline_report),
+            res_a.report,
+            capacity_alerts_per_hour_cap=capacity_alerts_per_hour_cap,
+            arm_side_key_prefix="arm",
+        )
+        experiment_kind = "add_one_txn_window"
+        if arms_profile == "additive":
+            experiment_kind = "add_one_txn_window_additive"
+        elif arms_profile == "confirmatory":
+            experiment_kind = "add_one_txn_confirmatory"
+        arms_block[arm_id] = {
+            "experiment_kind": experiment_kind,
+            "txn_feature_columns": list(present_txn),
+            "feature_columns": list(cols),
+            "model_dir": str(out_a.resolve()),
+            "metrics": res_a.report,
+            "gate1_vs_baseline": g1,
+        }
+    timing["train_txn_window_ablation_total_sec"] = round(time.perf_counter() - t0_all, 3)
+    return {
+        "experiment_kind": "txn_window_ablation_v0",
+        "arms_profile": arms_profile,
+        "extra_window_hours": list(extra_window_hours),
+        "arms": arms_block,
+        "timing_sec": timing,
+        "note": "Probe columns not in feature_candidate_registry until an arm passes Gate 1.",
+    }
+
+
+def _run_clock_feature_ablation_phase(
+    *,
+    splits_dir: Path,
+    duckdb_runtime: DuckDbRuntimeConfig,
+    objective_min_precision: float,
+    random_seed: int,
+    step5: Step5TrainConfig,
+    run_dir: Path,
+    baseline_report: Mapping[str, Any],
+    baseline_cols: tuple[str, ...],
+    capacity_alerts_per_hour_cap: float,
+    budget_deadline_perf: float,
+    arms: Mapping[str, tuple[str, ...]],
+) -> dict[str, Any]:
+    """Train baseline+single clock-feature arms; compare Gate 1 vs baseline."""
+
+    arms_block: dict[str, Any] = {}
+    timing: dict[str, float] = {}
+    t0_all = time.perf_counter()
+    for arm_id, clock_cols in arms.items():
+        if time.perf_counter() > budget_deadline_perf:
+            raise RuntimeError("Exceeded single_round_budget_sec during clock feature ablation arms")
+        present = _feature_columns_present_in_splits(splits_dir, clock_cols)
+        cols = tuple(dict.fromkeys(baseline_cols + present))
+        sub = _safe_ablation_dir_name(arm_id)
+        out_a = run_dir / f"clock_feature_ablation_{sub}_lgbm"
+        logger.info("[FE] clock feature ablation %s (%d cols) → %s", arm_id, len(present), out_a)
+        t0 = time.perf_counter()
+        res_a = _b5.train_lgbm_from_splits(
+            splits_dir=splits_dir,
+            duckdb_runtime=duckdb_runtime,
+            objective_min_precision=float(objective_min_precision),
+            random_seed=random_seed,
+            step5=step5,
+            output_dir=out_a,
+            feature_columns=cols,
+        )
+        timing[f"train_clock_feature_ablation_{sub}_sec"] = round(time.perf_counter() - t0, 3)
+        g1 = compute_gate1_vs_baseline(
+            dict(baseline_report),
+            res_a.report,
+            capacity_alerts_per_hour_cap=capacity_alerts_per_hour_cap,
+            arm_side_key_prefix="arm",
+        )
+        arms_block[arm_id] = {
+            "experiment_kind": "add_one_clock_feature",
+            "clock_feature_columns": list(present),
+            "feature_columns": list(cols),
+            "model_dir": str(out_a.resolve()),
+            "metrics": res_a.report,
+            "gate1_vs_baseline": g1,
+        }
+    timing["train_clock_feature_ablation_total_sec"] = round(time.perf_counter() - t0_all, 3)
+    return {
+        "experiment_kind": "clock_feature_ablation_v0",
+        "arms": arms_block,
+        "timing_sec": timing,
+        "note": "Per-feature add-one for group_l_clock_context (excludes fe__clock__day_of_week).",
+    }
 
 
 def _ablation_train_add_one_arms(
@@ -593,6 +935,12 @@ def main() -> None:
     tp_val = float(cfg_yaml.get("val_day_fraction", 0.15))
     min_day_raw = cfg_yaml.get("training_sample_min_gaming_day", "2025-01-01")
     min_day = date.fromisoformat(str(min_day_raw))
+    max_day_raw = cfg_yaml.get("training_sample_max_gaming_day")
+    max_day = date.fromisoformat(str(max_day_raw)) if max_day_raw not in (None, "") else None
+    if max_day is not None and max_day < min_day:
+        raise ValueError(
+            f"training_sample_max_gaming_day={max_day} must be >= training_sample_min_gaming_day={min_day}",
+        )
     svc = str(cfg_yaml.get("feature_service_name", "walkaway_bet_trial_v1"))
     rnd = int(cfg_yaml.get("random_seed", 42))
 
@@ -632,6 +980,16 @@ def main() -> None:
         timing["step3_sec"] = round(time.perf_counter() - t0, 3)
         step3_in = step3_dest
 
+    if min_day is not None or max_day is not None:
+        sliced_path = (paths.run_dir / "training_set_sliced.parquet").resolve()
+        step3_in = _slice_training_parquet_by_gaming_day(
+            in_parquet=step3_in,
+            out_parquet=sliced_path,
+            min_day=min_day,
+            max_day=max_day,
+            duckdb_runtime=duck,
+        )
+
     if time.perf_counter() - t_wall0 > budget:
         raise RuntimeError(f"Exceeded single_round_budget_sec={budget} after Step 3")
 
@@ -646,6 +1004,48 @@ def main() -> None:
     )
     timing["fe_materialize_sec"] = round(time.perf_counter() - t0, 3)
 
+    external_sources_echo: list[dict[str, Any]] = []
+    txn_lite_path: Path | None = None
+    txn_extra_windows: tuple[int, ...] = ()
+    txn_feature_cols: tuple[str, ...] | None = None
+    if _txn_window_ablation_enabled(ns, cfg_yaml):
+        txn_extra_windows = _txn_window_ablation_extra_hours(cfg_yaml)
+        logger.info("[FE] txn window ablation enabled; extra_window_hours=%s", txn_extra_windows)
+    ext_root = cfg_yaml.get("external_sources")
+    txn_cfg = ext_root.get("t_casino_txn") if isinstance(ext_root, dict) else None
+    if isinstance(txn_cfg, dict) and bool(txn_cfg.get("enabled")):
+        cleaned_txn_root = Path(
+            str(txn_cfg.get("cleaned_root", default_cleaned_casino_txn_root())),
+        )
+        txn_lite_path = (paths.run_dir / "txn_lite.parquet").resolve()
+        logger.info(
+            "[FE] materializing txn_lite (L0 cleaned, BUYIN/CASHOUT) → %s",
+            txn_lite_path,
+        )
+        t_txn = time.perf_counter()
+        txn_meta = materialize_txn_lite_parquet(
+            cleaned_casino_txn_root=cleaned_txn_root,
+            training_parquet_for_bet_ids=step3_in,
+            out_parquet=txn_lite_path,
+            duckdb_runtime=duck,
+            extra_window_hours=txn_extra_windows,
+        )
+        txn_feature_cols = tuple(str(c) for c in txn_meta["feature_columns"])
+        mat_report_path, _src_meta_path = write_txn_lite_sidecars(
+            run_dir=paths.run_dir,
+            materialization_meta=txn_meta,
+            out_parquet=txn_lite_path,
+        )
+        timing["txn_lite_materialize_sec"] = round(time.perf_counter() - t_txn, 3)
+        paths = replace(paths, txn_lite_parquet=txn_lite_path)
+        external_sources_echo.append(
+            {
+                **txn_meta,
+                "materialization_report_path": str(mat_report_path.resolve()),
+                "enabled": True,
+            },
+        )
+
     # Enrich
     logger.info("[FE] joining FE columns → %s", paths.enriched_training_parquet)
     t0 = time.perf_counter()
@@ -654,6 +1054,8 @@ def main() -> None:
         fe_derived_parquet=paths.fe_derived_parquet,
         out_parquet=paths.enriched_training_parquet,
         duckdb_runtime=duck,
+        txn_lite_parquet=txn_lite_path,
+        txn_feature_columns=txn_feature_cols,
     )
     timing["enrich_sec"] = round(time.perf_counter() - t0, 3)
 
@@ -724,14 +1126,21 @@ def main() -> None:
             )
         allow_f = frozenset(fqg_result.allowlist)
 
-    baseline_cols = _feature_columns_intersect_allowlist(_feat_registry.MODEL_FEATURE_COLUMNS, allow_f)
-    if len(baseline_cols) != len(_feat_registry.MODEL_FEATURE_COLUMNS):
-        missing_mx = sorted(set(_feat_registry.MODEL_FEATURE_COLUMNS) - set(baseline_cols))
+    baseline_target = _feature_columns_present_in_splits(
+        paths.splits_dir,
+        _feat_registry.MODEL_FEATURE_COLUMNS,
+    )
+    baseline_cols = _feature_columns_intersect_allowlist(baseline_target, allow_f)
+    if not baseline_cols:
         raise RuntimeError(
-            "FQG allowlist dropped baseline columns "
-            f"{missing_mx}; fix PIPE/data or pass WARN approvals / widen thresholds.",
+            "No baseline feature columns remain after FQG allowlist and split schema filter.",
         )
-    full_cols = _feature_columns_intersect_allowlist(_feat_registry.FULL_CANDIDATE_FEATURE_COLUMNS, allow_f)
+    full_target = _feature_columns_present_in_splits(
+        paths.splits_dir,
+        _feat_registry.FULL_CANDIDATE_FEATURE_COLUMNS,
+    )
+    full_cols = _feature_columns_intersect_allowlist(full_target, allow_f)
+    allow_train = frozenset(full_cols)
     fq_quality_echo = {
         "fqg_version": FeatureQualityGateConfig().fqg_version,
         "fqg_status": ("skipped" if skip_fqg else (fqg_result.fqg_status if fqg_result is not None else "fail")),
@@ -745,6 +1154,9 @@ def main() -> None:
         "n_candidate_features_used": len(full_cols),
         "baseline_feature_columns_used": list(baseline_cols),
         "candidate_feature_columns_used": list(full_cols),
+        "registry_columns_dropped_not_in_splits": sorted(
+            set(_feat_registry.FULL_CANDIDATE_FEATURE_COLUMNS) - set(full_cols),
+        ),
     }
 
     step5 = Step5TrainConfig(run_step5=True, skip_optuna=True)
@@ -781,6 +1193,31 @@ def main() -> None:
 
     budget_deadline = t_wall0 + budget
     ablation_v0: dict[str, Any] | None = None
+    txn_window_ablation_v0: dict[str, Any] | None = None
+    clock_feature_ablation_v0: dict[str, Any] | None = None
+    if _txn_window_ablation_enabled(ns, cfg_yaml):
+        if txn_lite_path is None:
+            raise RuntimeError(
+                "txn window ablation requires external_sources.t_casino_txn.enabled=true",
+            )
+        arms_profile, ablation_arms = _txn_window_ablation_profile_and_arms(ns, cfg_yaml)
+        txn_window_ablation_v0 = _run_txn_window_ablation_phase(
+            splits_dir=paths.splits_dir,
+            duckdb_runtime=duck,
+            objective_min_precision=float(ns.min_precision),
+            random_seed=rnd,
+            step5=step5,
+            run_dir=paths.run_dir,
+            baseline_report=res_base.report,
+            baseline_cols=baseline_cols,
+            capacity_alerts_per_hour_cap=cap_alerts_hr,
+            budget_deadline_perf=budget_deadline,
+            extra_window_hours=txn_extra_windows,
+            arms=ablation_arms,
+            arms_profile=arms_profile,
+        )
+        for ak, av in txn_window_ablation_v0["timing_sec"].items():
+            timing[ak] = av
     if ns.ablation:
         ablation_v0 = _run_ablation_training_phase(
             splits_dir=paths.splits_dir,
@@ -793,9 +1230,25 @@ def main() -> None:
             full_candidate_report=res_cand.report,
             capacity_alerts_per_hour_cap=cap_alerts_hr,
             budget_deadline_perf=budget_deadline,
-            allow=allow_f,
+            allow=allow_train,
         )
         for ak, av in ablation_v0["timing_sec"].items():
+            timing[ak] = av
+    if bool(getattr(ns, "clock_feature_ablation", False)):
+        clock_feature_ablation_v0 = _run_clock_feature_ablation_phase(
+            splits_dir=paths.splits_dir,
+            duckdb_runtime=duck,
+            objective_min_precision=float(ns.min_precision),
+            random_seed=rnd,
+            step5=step5,
+            run_dir=paths.run_dir,
+            baseline_report=res_base.report,
+            baseline_cols=baseline_cols,
+            capacity_alerts_per_hour_cap=cap_alerts_hr,
+            budget_deadline_perf=budget_deadline,
+            arms=_CLOCK_FEATURE_ABLATION_ARMS,
+        )
+        for ak, av in clock_feature_ablation_v0["timing_sec"].items():
             timing[ak] = av
 
     if time.perf_counter() - t_wall0 > budget:
@@ -865,9 +1318,12 @@ def main() -> None:
         budget_sec=budget,
         capacity_alerts_per_hour_cap=cap_alerts_hr,
         ablation_v0=ablation_v0,
+        txn_window_ablation_v0=txn_window_ablation_v0,
+        clock_feature_ablation_v0=clock_feature_ablation_v0,
         feature_quality=fq_quality_echo,
         candidate_registry=registry_echo,
         feast_auto_apply=feast_apply_echo,
+        external_sources=external_sources_echo or None,
     )
     if bool(blob["gate1"].get("capacity_alarm")):
         logger.warning(
@@ -881,6 +1337,14 @@ def main() -> None:
         ga_path = paths.run_dir / "gate1_ablation_report.json"
         ga_path.write_text(json.dumps(ablation_v0, indent=2, default=str), encoding="utf-8")
         logger.info("[FE] wrote %s", ga_path)
+    if txn_window_ablation_v0 is not None:
+        tw_path = paths.run_dir / "txn_window_ablation_report.json"
+        tw_path.write_text(json.dumps(txn_window_ablation_v0, indent=2, default=str), encoding="utf-8")
+        logger.info("[FE] wrote %s", tw_path)
+    if clock_feature_ablation_v0 is not None:
+        clk_path = paths.run_dir / "clock_feature_ablation_report.json"
+        clk_path.write_text(json.dumps(clock_feature_ablation_v0, indent=2, default=str), encoding="utf-8")
+        logger.info("[FE] wrote %s", clk_path)
 
 
 if __name__ == "__main__":

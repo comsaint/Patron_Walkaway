@@ -24,6 +24,7 @@ _RUNTIME_INPUT_SUPPLIERS: Final[frozenset[str]] = frozenset(
         "short_term_pit_builder",
         "clickhouse_raw",
         "feast_trial_1h",
+        "txn_lite_builder",
     }
 )
 _RUNTIME_SUPPLIERS: Final[frozenset[str]] = _RUNTIME_INPUT_SUPPLIERS | frozenset({"composite"})
@@ -288,15 +289,21 @@ def _is_selectable(slot: str, row: FeatureRegistryEntryRow) -> bool:
     return row.status in {"active", "experimental"} and slot in row.enabled_for
 
 
+def _is_experimental_trainable_feature_id(feature_id: str) -> bool:
+    """Registry feature ids that may enter candidate/ablation training sets."""
+
+    return feature_id.startswith("fe__") or feature_id.startswith("txn__") or feature_id.startswith("sess__")
+
+
 def _ablation_groups_in_order(rows: tuple[FeatureRegistryEntryRow, ...]) -> tuple[str, ...]:
-    """``group_*`` IDs that contribute at least one selectable ``fe__*`` column for ablation."""
+    """``group_*`` IDs that contribute at least one selectable experimental column for ablation."""
 
     ordered: list[str] = []
     seen: set[str] = set()
     for r in rows:
         if not r.group_id.startswith("group_"):
             continue
-        if not r.feature_id.startswith("fe__"):
+        if not _is_experimental_trainable_feature_id(r.feature_id):
             continue
         if not _is_selectable("ablation", r):
             continue
@@ -348,7 +355,7 @@ def load_candidate_registry(path: Path | None = None) -> CandidateRegistrySnapsh
 
     fe_trainable_order: list[str] = []
     for r in rows:
-        if r.feature_id.startswith("fe__") and _is_selectable("candidate", r):
+        if _is_experimental_trainable_feature_id(r.feature_id) and _is_selectable("candidate", r):
             fe_trainable_order.append(r.feature_id)
     exp_num = tuple(dict.fromkeys(fe_trainable_order))
     full = tuple(dict.fromkeys(tuple(baseline_selected) + tuple(exp_num)))
@@ -388,11 +395,11 @@ def baseline_features_for_main_trainer(snapshot: CandidateRegistrySnapshot) -> t
 
 
 def candidate_features_for_group(snapshot: CandidateRegistrySnapshot, group_id: str, *, slot: str) -> tuple[str, ...]:
-    """Return ``fe__*`` ids in YAML order within ``group_id`` that are selectable for ``slot``."""
+    """Return experimental feature ids in YAML order within ``group_id`` for ``slot``."""
 
     out: list[str] = []
     for r in snapshot.rows:
-        if r.group_id != group_id or not r.feature_id.startswith("fe__"):
+        if r.group_id != group_id or not _is_experimental_trainable_feature_id(r.feature_id):
             continue
         if _is_selectable(slot, r):
             out.append(r.feature_id)
@@ -444,9 +451,14 @@ def default_time_horizon_for_row(source: str, feature_id: str) -> tuple[str, str
 
     special: dict[str, tuple[str, str]] = {
         "fe__stake__wager_step_pct": ("short_term", "PT1H"),
+        "fe__stake__wager_trend_slope__w1h": ("short_term", "PT1H"),
+        "fe__stake__wager_last3_vs_prior3_ratio__w1h": ("short_term", "PT1H"),
         "fe__odds__payout_odds_step_ratio": ("short_term", "PT1H"),
         "fe__time_since_last_bet_sec": ("mid_term", "PT24H"),
         "fe__outcome__last_3_bets_loss_count": ("short_term", "PT1H"),
+        "fe__outcome__consecutive_loss_streak": ("short_term", "PT1H"),
+        "fe__outcome__loss_then_double_ratio__w1h": ("short_term", "PT1H"),
+        "fe__outcome__wager_after_loss_step_ratio__w1h": ("short_term", "PT1H"),
         "fe__interarrival__lag2_sec": ("short_term", "PT1H"),
     }
     if fid in special:

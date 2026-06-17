@@ -4,11 +4,11 @@ Only bets present in the cleaned ``t_bet`` Parquet are considered. The successor
 of a bet is the **next cleaned bet** with the same ``canonical_id`` (after G3 sort);
 this matches passing a ``bets_df`` that already excludes non–high-tier rows.
 
-**Observation boundary (H1):** By default ``window_end`` and ``extended_end`` are
-both set to ``MAX(payout_complete_dtm)`` over the joined frame. Terminal bets whose
-``payout_complete_dtm + WALKAWAY_GAP_MIN`` exceeds that boundary are ``censored``.
-Override ``extended_end`` if your ingest truly allows observing silence beyond the
-last bet timestamp.
+**Observation boundary (H1):** By default ``window_end`` is ``MAX(payout_complete_dtm)`` and
+``extended_end`` is ``window_end + label_lookahead_min`` (``gap + alert_horizon`` from
+:class:`~trainer_hightier.config.WalkawayLabelContract`). Terminal bets whose
+``payout_complete_dtm + walkaway_gap_min`` exceeds ``extended_end`` are ``censored``.
+Override ``extended_end`` only when ingest truly allows observing silence beyond that boundary.
 
 **RAM:** This loads the joined ``(bet_id, canonical_id, payout_complete_dtm)``
 frame into pandas. ~30M rows may need tens of GB; use a workstation profile or
@@ -26,7 +26,13 @@ import pandas as pd
 import pyarrow.parquet as pq
 from zoneinfo import ZoneInfo
 
-from trainer_hightier.config import DuckDbRuntimeConfig, HK_TZ as HK_TZ_STR
+from trainer_hightier.config import (
+    DEFAULT_WALKAWAY_LABEL_CONTRACT,
+    DuckDbRuntimeConfig,
+    HK_TZ as HK_TZ_STR,
+    WALKAWAY_GAP_MIN,
+    WalkawayLabelContract,
+)
 from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_parquet_path
 from trainer_hightier.walkaway_compute_labels import compute_labels
 from trainer_hightier.utils.bet_l0_preprocess import (
@@ -51,11 +57,188 @@ def default_cleaned_bet_parquet_path(*, repo_root: Path | None = None) -> Path:
     return (base / "trainer_hightier" / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet").resolve()
 
 
-def default_walkaway_labels_parquet_path(*, repo_root: Path | None = None) -> Path:
-    """Default output: ``trainer_hightier/artifacts/labels/walkaway_labels.parquet``."""
+def default_walkaway_labels_parquet_path(
+    *,
+    repo_root: Path | None = None,
+    label_contract: WalkawayLabelContract | None = None,
+) -> Path:
+    """Default output under ``artifacts/labels/``; non-default gaps use ``walkaway_labels_gap{N}.parquet``."""
     base = Path(__file__).resolve().parents[2] if repo_root is None else repo_root
+    contract = label_contract or DEFAULT_WALKAWAY_LABEL_CONTRACT
     out_dir = base / "trainer_hightier" / "artifacts" / "labels"
-    return (out_dir / "walkaway_labels.parquet").resolve()
+    if int(contract.walkaway_gap_min) == int(WALKAWAY_GAP_MIN):
+        basename = "walkaway_labels.parquet"
+    else:
+        basename = f"walkaway_labels_gap{int(contract.walkaway_gap_min)}.parquet"
+    return (out_dir / basename).resolve()
+
+
+def build_joined_bets_sql(
+    cleaned_bet_parquet: Path,
+    canonical_mapping_parquet: Path,
+) -> str:
+    """Return DuckDB SQL for cleaned bets inner-joined to canonical mapping."""
+    src_bet = Path(cleaned_bet_parquet).resolve()
+    src_map = Path(canonical_mapping_parquet).resolve()
+    bet_from = resolved_cleaned_bet_read_parquet_sql(src_bet)
+    map_esc = _path_posix(src_map).replace("'", "''")
+    return f"""
+WITH cleaned AS (
+  SELECT
+    TRY_CAST(bet_id AS DOUBLE) AS bet_id,
+    TRY_CAST(player_id AS BIGINT) AS player_id,
+    CAST(payout_complete_dtm AS TIMESTAMPTZ) AS payout_complete_dtm
+  FROM {bet_from} AS _cbet
+),
+map_dedup AS (
+  SELECT
+    player_id,
+    ANY_VALUE(TRIM(CAST(canonical_id AS VARCHAR))) AS canonical_id
+  FROM read_parquet('{map_esc}')
+  WHERE TRY_CAST(player_id AS BIGINT) IS NOT NULL
+  GROUP BY player_id
+),
+joined AS (
+  SELECT
+    c.bet_id,
+    c.payout_complete_dtm,
+    m.canonical_id
+  FROM cleaned c
+  INNER JOIN map_dedup m ON c.player_id = m.player_id
+  WHERE c.bet_id IS NOT NULL
+    AND c.payout_complete_dtm IS NOT NULL
+    AND m.canonical_id IS NOT NULL
+    AND TRIM(m.canonical_id) <> ''
+)
+SELECT bet_id, canonical_id, payout_complete_dtm FROM joined
+""".strip()
+
+
+def load_joined_bets_dataframe(
+    cleaned_bet_parquet: Path,
+    canonical_mapping_parquet: Path,
+    *,
+    duckdb_runtime: DuckDbRuntimeConfig | None = None,
+    payout_yyyymm: str | None = None,
+    canonical_shard: int | None = None,
+    canonical_shard_count: int | None = None,
+) -> pd.DataFrame:
+    """Load joined bet rows; optional payout month and canonical shard filters."""
+    src_bet = Path(cleaned_bet_parquet).resolve()
+    src_map = Path(canonical_mapping_parquet).resolve()
+    if not (src_bet.is_file() or cleaned_bet_dataset_has_any_parquet(src_bet)):
+        raise FileNotFoundError(f"cleaned bet parquet not found: {src_bet}")
+    if not src_map.is_file():
+        raise FileNotFoundError(f"canonical mapping parquet not found: {src_map}")
+    sql = build_joined_bets_sql(src_bet, src_map)
+    filters: list[str] = []
+    if payout_yyyymm is not None:
+        ym = str(payout_yyyymm).strip()
+        if len(ym) != 6 or not ym.isdigit():
+            raise ValueError(f"payout_yyyymm must be six digits, got {payout_yyyymm!r}")
+        filters.append(
+            f"strftime(CAST(payout_complete_dtm AS TIMESTAMPTZ), '%Y%m') = '{ym}'",
+        )
+    if canonical_shard is not None:
+        if canonical_shard_count is None or int(canonical_shard_count) < 1:
+            raise ValueError("canonical_shard_count must be >= 1 when canonical_shard is set")
+        shard = int(canonical_shard)
+        count = int(canonical_shard_count)
+        if shard < 0 or shard >= count:
+            raise ValueError(f"canonical_shard must be in [0, {count}), got {shard!r}")
+        filters.append(
+            f"(abs(hash(CAST(canonical_id AS VARCHAR))) % {count}) = {shard}",
+        )
+    if filters:
+        sql = f"SELECT * FROM ({sql}) AS _j WHERE {' AND '.join(filters)}"
+    con = duckdb.connect(database=":memory:")
+    try:
+        if duckdb_runtime is not None:
+            apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        df = con.execute(sql).df()
+    finally:
+        con.close()
+    if df.empty:
+        return df
+    pcd_series = df["payout_complete_dtm"]
+    if pcd_series.dt.tz is not None:
+        df = df.copy()
+        df["payout_complete_dtm"] = pcd_series.dt.tz_convert(HK_TZ).dt.tz_localize(None)
+    return df
+
+
+def list_joined_bet_payout_months(
+    cleaned_bet_parquet: Path,
+    canonical_mapping_parquet: Path,
+    *,
+    duckdb_runtime: DuckDbRuntimeConfig | None = None,
+) -> tuple[str, ...]:
+    """List distinct payout ``YYYYMM`` months on joined cleaned bets."""
+    base = build_joined_bets_sql(cleaned_bet_parquet, canonical_mapping_parquet)
+    con = duckdb.connect(database=":memory:")
+    try:
+        if duckdb_runtime is not None:
+            apply_duckdb_runtime_pragmas(con, duckdb_runtime)
+        rows = con.execute(
+            f"""
+            SELECT DISTINCT strftime(CAST(payout_complete_dtm AS TIMESTAMPTZ), '%Y%m') AS yyyymm
+            FROM ({base}) AS _j
+            WHERE payout_complete_dtm IS NOT NULL
+            ORDER BY 1
+            """,
+        ).fetchall()
+    finally:
+        con.close()
+    return tuple(str(r[0]) for r in rows if r and r[0] is not None)
+
+
+def label_window_ends_from_max_payout(
+    max_pcd: datetime | pd.Timestamp,
+    *,
+    label_contract: WalkawayLabelContract | None = None,
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Return ``(window_end, extended_end)`` for dataset-boundary walkaway label materialize."""
+    contract = label_contract or DEFAULT_WALKAWAY_LABEL_CONTRACT
+    window_end = pd.Timestamp(max_pcd)
+    extended_end = window_end + pd.Timedelta(minutes=float(contract.label_lookahead_min))
+    return window_end, extended_end
+
+
+def write_walkaway_labels_from_joined_dataframe(
+    joined: pd.DataFrame,
+    out_parquet: Path,
+    *,
+    window_end: datetime | pd.Timestamp | None = None,
+    extended_end: datetime | pd.Timestamp | None = None,
+    label_contract: WalkawayLabelContract | None = None,
+) -> Path:
+    """Run :func:`~trainer_hightier.walkaway_compute_labels.compute_labels` and write Parquet."""
+    contract = label_contract or DEFAULT_WALKAWAY_LABEL_CONTRACT
+    dst = Path(out_parquet).resolve()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    df = joined
+    if df.empty:
+        empty = pd.DataFrame(
+            {
+                "bet_id": pd.Series(dtype="float64"),
+                "canonical_id": pd.Series(dtype="string"),
+                "payout_complete_dtm": pd.Series(dtype="datetime64[ns]"),
+                "label": pd.Series(dtype="int8"),
+                "censored": pd.Series(dtype=bool),
+            }
+        )
+        empty.to_parquet(dst, index=False)
+        return dst
+    max_pcd = pd.Timestamp(df["payout_complete_dtm"].max())
+    we = max_pcd if window_end is None else pd.Timestamp(window_end)
+    if extended_end is None:
+        _, ee = label_window_ends_from_max_payout(we, label_contract=contract)
+    else:
+        ee = pd.Timestamp(extended_end)
+    labeled = compute_labels(df, window_end=we, extended_end=ee, label_contract=contract)
+    out = labeled[["bet_id", "canonical_id", "payout_complete_dtm", "label", "censored"]]
+    out.to_parquet(dst, index=False)
+    return dst
 
 
 def materialize_walkaway_labels_from_cleaned_bet(
@@ -65,6 +248,7 @@ def materialize_walkaway_labels_from_cleaned_bet(
     window_end: datetime | pd.Timestamp | None = None,
     extended_end: datetime | pd.Timestamp | None = None,
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
+    label_contract: WalkawayLabelContract | None = None,
 ) -> Path:
     """Join cleaned bets to ``canonical_id``, then run :func:`~trainer_hightier.walkaway_compute_labels.compute_labels`.
 
@@ -99,53 +283,20 @@ def materialize_walkaway_labels_from_cleaned_bet(
     if missing:
         raise ValueError(f"cleaned bet missing columns {list(missing)}; got {sorted(cols)}")
 
+    sql = build_joined_bets_sql(src_bet, src_map)
     bet_from = resolved_cleaned_bet_read_parquet_sql(src_bet)
-    map_esc = _path_posix(src_map).replace("'", "''")
-    sql = f"""
-WITH cleaned AS (
-  SELECT
-    TRY_CAST(bet_id AS DOUBLE) AS bet_id,
-    TRY_CAST(player_id AS BIGINT) AS player_id,
-    CAST(payout_complete_dtm AS TIMESTAMPTZ) AS payout_complete_dtm
-  FROM {bet_from} AS _cbet
-),
-map_dedup AS (
-  SELECT
-    player_id,
-    ANY_VALUE(TRIM(CAST(canonical_id AS VARCHAR))) AS canonical_id
-  FROM read_parquet('{map_esc}')
-  WHERE TRY_CAST(player_id AS BIGINT) IS NOT NULL
-  GROUP BY player_id
-),
-joined AS (
-  SELECT
-    c.bet_id,
-    c.payout_complete_dtm,
-    m.canonical_id
-  FROM cleaned c
-  INNER JOIN map_dedup m ON c.player_id = m.player_id
-  WHERE c.bet_id IS NOT NULL
-    AND c.payout_complete_dtm IS NOT NULL
-    AND m.canonical_id IS NOT NULL
-    AND TRIM(m.canonical_id) <> ''
-)
-SELECT bet_id, canonical_id, payout_complete_dtm FROM joined
-""".strip()
-
     con = duckdb.connect(database=":memory:")
     try:
         if duckdb_runtime is not None:
             apply_duckdb_runtime_pragmas(con, duckdb_runtime)
-        n_matched = con.execute(
-            f"SELECT COUNT(*) FROM ({sql}) AS _j"
-        ).fetchone()[0]
+        n_matched = con.execute(f"SELECT COUNT(*) FROM ({sql}) AS _j").fetchone()[0]
         n_clean = con.execute(
             f"""
             SELECT COUNT(*) FROM {bet_from} AS _q
             WHERE TRY_CAST(bet_id AS DOUBLE) IS NOT NULL
               AND TRY_CAST(player_id AS BIGINT) IS NOT NULL
               AND payout_complete_dtm IS NOT NULL
-            """
+            """,
         ).fetchone()[0]
     finally:
         con.close()
@@ -159,45 +310,22 @@ SELECT bet_id, canonical_id, payout_complete_dtm FROM joined
             int(n_clean - n_matched),
         )
 
-    con2 = duckdb.connect(database=":memory:")
-    try:
-        if duckdb_runtime is not None:
-            apply_duckdb_runtime_pragmas(con2, duckdb_runtime)
-        df = con2.execute(sql).df()
-    finally:
-        con2.close()
-
-    pcd_series = df["payout_complete_dtm"]
-    if pcd_series.dt.tz is not None:
-        df = df.copy()
-        df["payout_complete_dtm"] = pcd_series.dt.tz_convert(HK_TZ).dt.tz_localize(None)
-
+    df = load_joined_bets_dataframe(
+        src_bet,
+        src_map,
+        duckdb_runtime=duckdb_runtime,
+    )
     if df.empty:
-        empty = pd.DataFrame(
-            {
-                "bet_id": pd.Series(dtype="float64"),
-                "canonical_id": pd.Series(dtype="string"),
-                "payout_complete_dtm": pd.Series(dtype="datetime64[ns]"),
-                "label": pd.Series(dtype="int8"),
-                "censored": pd.Series(dtype=bool),
-            }
-        )
-        empty.to_parquet(dst, index=False)
+        write_walkaway_labels_from_joined_dataframe(df, dst)
         logger.warning("walkaway labels: no rows after join; wrote empty parquet to %s", dst)
         return dst
 
-    max_pcd = pd.Timestamp(df["payout_complete_dtm"].max())
-    we = max_pcd if window_end is None else pd.Timestamp(window_end)
-    ee = we if extended_end is None else pd.Timestamp(extended_end)
-
-    labeled = compute_labels(df, window_end=we, extended_end=ee)
-    out = labeled[["bet_id", "canonical_id", "payout_complete_dtm", "label", "censored"]]
-    out.to_parquet(dst, index=False)
-    logger.info(
-        "walkaway labels: rows=%d written %s (window_end=%s extended_end=%s)",
-        len(out),
+    write_walkaway_labels_from_joined_dataframe(
+        df,
         dst,
-        we,
-        ee,
+        window_end=window_end,
+        extended_end=extended_end,
+        label_contract=label_contract,
     )
+    logger.info("walkaway labels: rows=%d written %s", int(len(df)), dst)
     return dst

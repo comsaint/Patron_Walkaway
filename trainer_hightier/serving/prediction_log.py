@@ -7,7 +7,10 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Mapping
+
+if TYPE_CHECKING:
+    from trainer_hightier.evaluation.player_alert_policy import PlayerAlertPolicyDecision
 
 import numpy as np
 import pandas as pd
@@ -25,6 +28,7 @@ except Exception:
 _HK_TZ_INFO = ZoneInfo(HK_TZ)
 
 _PREDICTION_LOG_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("game_id", "TEXT"),
     ("bet_ts", "TEXT"),
     ("threshold", "REAL"),
     ("features_json", "TEXT"),
@@ -39,6 +43,13 @@ _PREDICTION_LOG_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("mid_term_anchor_gaming_day_event_max", "TEXT"),
     ("mid_term_snapshot_age_days", "INTEGER"),
     ("mid_null_top_features_json", "TEXT"),
+    ("alert_policy_candidate", "INTEGER"),
+    ("alert_policy_raised", "INTEGER"),
+    ("alert_policy_suppressed", "INTEGER"),
+    ("alert_policy_suppression_reason", "TEXT"),
+    ("alert_policy_cooldown_min", "INTEGER"),
+    ("alert_policy_last_raised_ts", "TEXT"),
+    ("alert_policy_decision_ts", "TEXT"),
 )
 
 
@@ -113,6 +124,10 @@ def ensure_prediction_log_table(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_prediction_log_bet_ts ON prediction_log(bet_ts)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prediction_log_player_game "
+        "ON prediction_log(player_id, game_id)"
     )
 
 
@@ -217,6 +232,41 @@ def _count_fe_features_missing(feat: dict[str, Any]) -> int:
     return n
 
 
+def _normalize_bet_id_key(bet_id: object) -> str:
+    """Normalize staged / alert ``bet_id`` values for policy decision lookup."""
+
+    if bet_id is None:
+        return ""
+    try:
+        if pd.isna(bet_id):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(bet_id).strip()
+
+
+def _policy_fields_for_bet(
+    bet_key: str,
+    alert_policy_decisions: Mapping[str, "PlayerAlertPolicyDecision"] | None,
+) -> tuple[int | None, int | None, int | None, str | None, int | None, str | None, str | None]:
+    """Map optional policy decision to ``alert_policy_*`` insert values."""
+
+    if not alert_policy_decisions or not bet_key:
+        return None, None, None, None, None, None, None
+    decision = alert_policy_decisions.get(bet_key)
+    if decision is None:
+        return 0, 0, 0, None, None, None, None
+    return (
+        1 if decision.candidate else 0,
+        1 if decision.raised else 0,
+        1 if decision.suppressed else 0,
+        decision.suppression_reason,
+        decision.cooldown_min,
+        decision.last_raised_ts,
+        decision.decision_ts,
+    )
+
+
 def _str_or_none(v: Any) -> str | None:
     if v is None:
         return None
@@ -250,6 +300,7 @@ def append_hightier_prediction_log(
     mid_term_anchor_gaming_day_event_max: str | None = None,
     mid_term_snapshot_age_days: int | None = None,
     mid_null_top_features_json: str | None = None,
+    alert_policy_decisions: Mapping[str, "PlayerAlertPolicyDecision"] | None = None,
 ) -> None:
     """Batch-insert one scoring cycle into ``prediction_log`` (no-op if path disabled or frame empty).
 
@@ -317,13 +368,24 @@ def append_hightier_prediction_log(
                 fe_miss = _count_fe_features_missing(feat_map)
             if model_miss is None:
                 model_miss = sum(1 for c in feat_cols if feat_map.get(c) is None)
+        bet_key = _normalize_bet_id_key(row.get("bet_id"))
+        (
+            ap_candidate,
+            ap_raised,
+            ap_suppressed,
+            ap_reason,
+            ap_cooldown,
+            ap_last_raised,
+            ap_decision_ts,
+        ) = _policy_fields_for_bet(bet_key, alert_policy_decisions)
         rows.append(
             (
                 scored_at,
                 format_bet_ts_iso(row.get("payout_complete_dtm")),
-                _str_or_none(row.get("bet_id")),
+                bet_key or None,
                 _str_or_none(row.get("session_id")),
                 _str_or_none(row.get("player_id")),
+                _str_or_none(row.get("game_id")),
                 _str_or_none(row.get("canonical_id")),
                 _str_or_none(row.get("casino_player_id")),
                 _str_or_none(row.get("table_id")),
@@ -347,6 +409,13 @@ def append_hightier_prediction_log(
                 if mid_term_snapshot_age_days is not None
                 else None,
                 mid_null_top_features_json,
+                ap_candidate,
+                ap_raised,
+                ap_suppressed,
+                ap_reason,
+                ap_cooldown,
+                ap_last_raised,
+                ap_decision_ts,
             )
         )
 
@@ -359,14 +428,17 @@ def append_hightier_prediction_log(
         conn.executemany(
             """
             INSERT INTO prediction_log (
-                scored_at, bet_ts, bet_id, session_id, player_id, canonical_id,
+                scored_at, bet_ts, bet_id, session_id, player_id, game_id, canonical_id,
                 casino_player_id, table_id, model_version, score, margin,
                 is_alert, is_rated_obs, threshold, features_json, fe_features_missing,
                 snapshot_version, mid_term_freshness_status, slow_freshness_status,
                 snapshot_scoring_degraded, scoring_status, model_features_missing,
                 missing_family_json, mid_term_anchor_gaming_day_event_max,
-                mid_term_snapshot_age_days, mid_null_top_features_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                mid_term_snapshot_age_days, mid_null_top_features_json,
+                alert_policy_candidate, alert_policy_raised, alert_policy_suppressed,
+                alert_policy_suppression_reason, alert_policy_cooldown_min,
+                alert_policy_last_raised_ts, alert_policy_decision_ts
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )

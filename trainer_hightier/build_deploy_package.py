@@ -3,7 +3,7 @@
 Layout (resolved ``--output-dir``, default ``trainer_hightier.config.DEFAULT_DEPLOY_OUTPUT_ROOT`` / bundle ``model_version``):
 
 - ``main.py`` — standalone entrypoint (``python main.py`` after ``pip install -r requirements.txt``)
-- ``wheels/trainer_hightier-*.whl`` — serving package wheel (``pip wheel --no-deps`` from ``trainer_hightier/pyproject.toml``)
+- ``wheels/trainer_hightier-*.whl`` — serving package wheel (``pip wheel --no-deps`` from ``trainer_hightier/pyproject.toml``; optional ``--bump-version`` bumps patch only for the wheel build and restores ``pyproject.toml``)
 - ``requirements.txt`` — local wheel line (transitive deps from PyPI / internal index per wheel metadata)
 - ``.env.example`` — optional ClickHouse / log overrides for :mod:`trainer_hightier.deploy.main`
 - ``models/`` — ``model.pkl``, ``training_metrics.json``, ``feature_candidate_registry.snapshot.yaml`` (frozen feature registry YAML from Step 5), ``model_version``, …
@@ -19,10 +19,13 @@ import argparse
 import json
 import logging
 import pickle
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -54,7 +57,9 @@ from trainer_hightier.serving.adt_allowlist import sha256_file
 from trainer_hightier.serving.feature_supply import (
     MANIFEST_KEY_FE_DERIVED,
     assert_feature_supplyability_or_raise,
+    build_scorer_supplier_plan,
 )
+from trainer_hightier.serving.feature_contract import build_and_write_deploy_contract
 from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_parquet_path
 
 logger = logging.getLogger(__name__)
@@ -90,6 +95,7 @@ _METADATA_MANIFEST_PASS_THROUGH: frozenset[str] = frozenset(
         "slow_monthly_grace_days",
         "slow_stale_hard_cap_days",
         "sha256_by_layer",
+        "deploy_requires_ch_txn_supplier",
     }
 )
 
@@ -162,6 +168,19 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--skip-deploy-e2e-gate",
         action="store_true",
         help="Skip deploy E2E gate report check (default: require pass in strict mode).",
+    )
+    pr.add_argument(
+        "--bump-version",
+        action="store_true",
+        help=(
+            "Bump trainer_hightier patch version only for the wheel build; "
+            "pyproject.toml on disk is restored afterward."
+        ),
+    )
+    pr.add_argument(
+        "--no-bump-version",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     return pr.parse_args(argv)
 
@@ -672,16 +691,19 @@ def _write_bundle_info(
     *,
     model_version: str,
     manifest_version: str,
+    package_version: str | None,
     allowlist_sha: str | None,
     slow_patron_sha: str | None,
     canonical_mapping_sha: str | None,
     frozen_fingerprint_sha256: str,
     build_time_iso: str,
     feature_candidate_registry_sha256: str | None = None,
+    walkaway_fields: dict[str, Any] | None = None,
 ) -> None:
     payload = {
         "model_version": model_version,
         "manifest_version": manifest_version,
+        "package_version": package_version,
         "allowlist_sha256": allowlist_sha,
         "slow_patron_sha256": slow_patron_sha,
         "canonical_mapping_sha256": canonical_mapping_sha,
@@ -691,7 +713,24 @@ def _write_bundle_info(
     }
     if feature_candidate_registry_sha256 is not None:
         payload["feature_candidate_registry_sha256"] = feature_candidate_registry_sha256
+    if walkaway_fields:
+        payload.update(walkaway_fields)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _walkaway_fields_from_training_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Extract walkaway contract fields for deploy bundle manifests."""
+    out: dict[str, Any] = {}
+    gap = metrics.get("walkaway_gap_min")
+    if gap is not None:
+        out["walkaway_gap_min"] = int(gap)
+    horizon = metrics.get("alert_horizon_min")
+    if horizon is not None:
+        out["alert_horizon_min"] = int(horizon)
+    contract_id = metrics.get("walkaway_label_contract_id")
+    if isinstance(contract_id, str) and contract_id.strip():
+        out["walkaway_label_contract_id"] = contract_id.strip()
+    return out
 
 
 def _write_deploy_paths(
@@ -699,6 +738,7 @@ def _write_deploy_paths(
     *,
     mapping_name: str,
     adt_allowlist_basename: str = _ADT_ALLOWLIST_BUNDLE_BASENAME,
+    walkaway_fields: dict[str, Any] | None = None,
 ) -> None:
     payload = {
         "schema_version": 2,
@@ -711,6 +751,8 @@ def _write_deploy_paths(
         "feast_readiness_path": "artifacts/feast/feast_online_readiness.json",
         "adt_allowlist_parquet": f"mapping/{adt_allowlist_basename}",
     }
+    if walkaway_fields:
+        payload.update(walkaway_fields)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -762,7 +804,7 @@ Optional flags: `--skip-mlflow-upload`, `--output-zip PATH`.
 ## Prerequisites
 
 - Python 3.9+
-- ClickHouse reachable from the production host (credentials in `.env`)
+- ClickHouse reachable from the production host (credentials in `.env`); ``txn__*`` features are supplied live from ``t_casino_txn`` at score time
 - `pip install -r requirements.txt` using PyPI or an internal package index
 - `feast` CLI on PATH (used by startup refresh)
 
@@ -832,6 +874,96 @@ Keep previous bundle; stop processes; swap directory; restart `python main.py --
     path.write_text(body, encoding="utf-8")
 
 
+_PYPROJECT_VERSION_LINE_RE = re.compile(
+    r'^(?P<prefix>\s*version\s*=\s*")(?P<version>[^"]+)(?P<suffix>"\s*)$',
+    re.MULTILINE,
+)
+
+
+def _read_pyproject_version(pyproj: Path) -> str:
+    """Return ``[project].version`` from *pyproj* TOML."""
+
+    text = pyproj.read_text(encoding="utf-8")
+    match = _PYPROJECT_VERSION_LINE_RE.search(text)
+    if match is None:
+        raise ValueError(f"version = \"...\" line missing in {pyproj}")
+    version = match.group("version").strip()
+    if not version:
+        raise ValueError(f"empty version in {pyproj}")
+    return version
+
+
+def _bump_patch_version(version: str) -> str:
+    """Increment semver patch (``MAJOR.MINOR.PATCH``)."""
+
+    parts = version.strip().split(".")
+    if len(parts) != 3:
+        raise ValueError(f"expected semver MAJOR.MINOR.PATCH; got {version!r}")
+    major, minor, patch = parts
+    if not (major.isdigit() and minor.isdigit() and patch.isdigit()):
+        raise ValueError(f"expected numeric semver MAJOR.MINOR.PATCH; got {version!r}")
+    return f"{major}.{minor}.{int(patch) + 1}"
+
+
+def _write_pyproject_version(pyproj: Path, version: str) -> None:
+    """Replace ``version = "..."`` in *pyproj* with *version*."""
+
+    text = pyproj.read_text(encoding="utf-8")
+    match = _PYPROJECT_VERSION_LINE_RE.search(text)
+    if match is None:
+        raise ValueError(f"version = \"...\" line missing in {pyproj}")
+    updated = _PYPROJECT_VERSION_LINE_RE.sub(
+        lambda m: f"{m.group('prefix')}{version}{m.group('suffix')}",
+        text,
+        count=1,
+    )
+    pyproj.write_text(updated, encoding="utf-8")
+
+
+def bump_pyproject_patch_version(*, pyproj: Path | None = None) -> str:
+    """Persistently bump ``trainer_hightier`` patch version in ``pyproject.toml``; return new version.
+
+    Packager wheel builds do not call this; use :func:`_wheel_package_version` with a transient
+    :func:`_temporary_pyproject_version` context instead.
+    """
+
+    path = (pyproj or (_REPO_ROOT / "trainer_hightier" / "pyproject.toml")).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"trainer_hightier pyproject missing: {path}")
+    current = _read_pyproject_version(path)
+    bumped = _bump_patch_version(current)
+    _write_pyproject_version(path, bumped)
+    logger.info("[pack] bumped trainer_hightier package version %s -> %s", current, bumped)
+    return bumped
+
+
+def _wheel_package_version(*, pyproj: Path, bump_version: bool) -> str:
+    """Resolve wheel package version without mutating *pyproj* unless *bump_version* is requested."""
+
+    current = _read_pyproject_version(pyproj)
+    if not bump_version:
+        return current
+    bumped = _bump_patch_version(current)
+    logger.info(
+        "[pack] wheel build will use transient bumped package version %s -> %s",
+        current,
+        bumped,
+    )
+    return bumped
+
+
+@contextmanager
+def _temporary_pyproject_version(pyproj: Path, version: str):
+    """Temporarily set ``[project].version`` in *pyproj*; restore original bytes on exit."""
+
+    original = pyproj.read_text(encoding="utf-8")
+    _write_pyproject_version(pyproj, version)
+    try:
+        yield
+    finally:
+        pyproj.write_text(original, encoding="utf-8")
+
+
 def _clean_trainer_hightier_staging_build_dir() -> None:
     """Remove package-local ``build/`` so setuptools/PyPI tooling never packs deep ``build/lib`` trees.
 
@@ -847,29 +979,39 @@ def _clean_trainer_hightier_staging_build_dir() -> None:
         )
 
 
-def _build_trainer_hightier_wheel(*, wheels_dir: Path) -> str:
-    """Build ``trainer_hightier`` wheel into *wheels_dir*; return wheel filename."""
+def _build_trainer_hightier_wheel(*, wheels_dir: Path, bump_version: bool = False) -> tuple[str, str | None]:
+    """Build ``trainer_hightier`` wheel into *wheels_dir*; return (wheel filename, package version)."""
     wheels_dir.mkdir(parents=True, exist_ok=True)
+    for stale in wheels_dir.glob("trainer_hightier-*.whl"):
+        stale.unlink()
     pkg_root = _REPO_ROOT / "trainer_hightier"
     pyproj = pkg_root / "pyproject.toml"
     if not pyproj.is_file():
         raise FileNotFoundError(f"trainer_hightier pyproject missing: {pyproj}")
+    package_version = _wheel_package_version(pyproj=pyproj, bump_version=bump_version)
     _clean_trainer_hightier_staging_build_dir()
-    subprocess.run(
-        [sys.executable, "-m", "pip", "wheel", ".", "-w", str(wheels_dir), "--no-deps"],
-        check=True,
-        cwd=str(pkg_root),
+    version_ctx = (
+        _temporary_pyproject_version(pyproj, package_version)
+        if bump_version
+        else nullcontext()
     )
+    with version_ctx:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "wheel", ".", "-w", str(wheels_dir), "--no-deps", "--no-cache-dir"],
+            check=True,
+            cwd=str(pkg_root),
+        )
     matches = sorted(wheels_dir.glob("trainer_hightier-*.whl"))
     if not matches:
         raise FileNotFoundError(f"No trainer_hightier wheel found in {wheels_dir}")
     whl_path = matches[-1]
     logger.info(
-        "[pack] serving wheel written %s (%s bytes)",
+        "[pack] serving wheel written %s (%s bytes, package_version=%s)",
         whl_path.name,
         whl_path.stat().st_size,
+        package_version,
     )
-    return whl_path.name
+    return whl_path.name, package_version
 
 
 def _write_bundle_collect_diag_py(path: Path) -> None:
@@ -935,13 +1077,18 @@ def _write_dotenv_example(path: Path) -> None:
 # =============================================================================
 
 # CH_HOST=gdpedw
-# CH_PORT=8123
+# CH_PORT=8443
 CH_USER=
 CH_PASS=
 # CH_PASSWORD=
 
-# CH_SECURE=false
+# CH_SECURE=true
 # SOURCE_DB=GDP_GMWDS_Raw
+
+# txn__* features are supplied live from ClickHouse t_casino_txn (no cleaned partition copy required).
+
+# Optional: offline parity only
+# CLEANED_CASINO_TXN_ROOT=D:/data/cleaned__gmwds_t_casino_txn
 
 # DEPLOY_LOG_LEVEL=INFO
 """,
@@ -949,15 +1096,61 @@ CH_PASS=
     )
 
 
-def _write_standalone_requirements(dest: Path, *, wheel_filename: str) -> None:
-    """Write ``requirements.txt`` with a relative wheel path and comment header."""
+def _pip_freeze_package_name(line: str) -> str:
+    """Lowercase distribution name from a ``pip freeze`` line (``==`` or ``@ file://``)."""
+    head = line.strip().split(" @ ", 1)[0].split("==", 1)[0].strip()
+    if "[" in head:
+        head = head.split("[", 1)[0].strip()
+    return head.lower().replace("_", "-")
+
+
+def _freeze_wheel_transitive_requirements(wheel_path: Path) -> list[str]:
+    """Install *wheel_path* into a temp venv and return pinned ``pip freeze`` lines."""
+    wheel_path = Path(wheel_path).resolve()
+    if not wheel_path.is_file():
+        raise FileNotFoundError(f"trainer_hightier wheel missing for requirements freeze: {wheel_path}")
+    skip_packages = frozenset({"pip", "setuptools", "trainer-hightier"})
+    with tempfile.TemporaryDirectory(prefix="trainer_hightier_req_freeze_") as tmp:
+        venv_dir = Path(tmp) / "venv"
+        subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
+        if sys.platform == "win32":
+            pip_exe = venv_dir / "Scripts" / "pip.exe"
+        else:
+            pip_exe = venv_dir / "bin" / "pip"
+        subprocess.run([str(pip_exe), "install", str(wheel_path)], check=True)
+        proc = subprocess.run(
+            [str(pip_exe), "freeze"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    lines: list[str] = []
+    for raw in proc.stdout.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("-e "):
+            continue
+        if _pip_freeze_package_name(line) in skip_packages:
+            continue
+        lines.append(line)
+    return sorted(lines, key=str.lower)
+
+
+def _write_standalone_requirements(dest: Path, *, wheels_dir: Path, wheel_filename: str) -> None:
+    """Write ``requirements.txt`` with local wheel plus pinned transitive deps."""
     wheel_line = f"wheels/{wheel_filename}"
-    dest.write_text(
-        "# trainer_hightier standalone: local wheel; transitive deps from PyPI/internal index (wheel metadata).\n"
-        "# Run from THIS directory (bundle root): pip install -r requirements.txt\n"
-        f"{wheel_line}\n",
-        encoding="utf-8",
+    wheel_path = Path(wheels_dir) / wheel_filename
+    dep_lines = _freeze_wheel_transitive_requirements(wheel_path)
+    body = "\n".join(
+        [
+            "# trainer_hightier standalone: install from bundle root.",
+            "# pip install -r requirements.txt",
+            "# Do not use --no-deps on the local wheel; this file pins transitive deps.",
+            wheel_line,
+            *dep_lines,
+            "",
+        ]
     )
+    dest.write_text(body, encoding="utf-8")
 
 
 def _ensure_model_bundle(model_src: Path, models_dest: Path, *, strict: bool) -> str:
@@ -1133,11 +1326,20 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     _copy_feast_repo_to_bundle(root)
     wheels_dir = root / "wheels"
-    wheel_name = _build_trainer_hightier_wheel(wheels_dir=wheels_dir)
+    if bool(args.bump_version) and bool(args.no_bump_version):
+        raise SystemExit("Cannot pass both --bump-version and --no-bump-version")
+    wheel_name, package_version = _build_trainer_hightier_wheel(
+        wheels_dir=wheels_dir,
+        bump_version=bool(args.bump_version),
+    )
     _write_bundle_main_py(root / "main.py")
     _write_bundle_collect_diag_py(root / "collect_diag.py")
     _write_dotenv_example(root / ".env.example")
-    _write_standalone_requirements(root / "requirements.txt", wheel_filename=wheel_name)
+    _write_standalone_requirements(
+        root / "requirements.txt",
+        wheels_dir=wheels_dir,
+        wheel_filename=wheel_name,
+    )
     models_dir = root / "models"
     snap_dir = root / "snapshots"
     art_dir = snap_dir / "artifacts"
@@ -1209,6 +1411,31 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
             validation_stage="package",
             scorer_v2_feast_mode=True,
         )
+        plan = build_scorer_supplier_plan(frozen_snap, model_cols)
+        if plan.txn_cols:
+            logger.info(
+                "[pack] model uses txn__* (%d cols); production scorer queries ClickHouse t_casino_txn",
+                len(plan.txn_cols),
+            )
+            metadata_manifest["deploy_requires_ch_txn_supplier"] = True
+        reg_sha_metric = metrics.get("feature_candidate_registry_sha256") if metrics else None
+        reg_sha_s = (
+            reg_sha_metric.strip()
+            if isinstance(reg_sha_metric, str) and reg_sha_metric.strip()
+            else ""
+        )
+        contract_detail = build_and_write_deploy_contract(
+            plan=plan,
+            model_bundle_dir=models_dir,
+            model_version=mver,
+            registry_fingerprint=reg_sha_s,
+            feature_count=len(model_cols),
+            bundle_root=root,
+            mapping=map_dest_path,
+            allowlist=allow_pack_path,
+        )
+        metadata_manifest["deploy_contract_path"] = contract_detail["deploy_contract_path"]
+        metadata_manifest.update(contract_detail.get("flags", {}))
 
     out_manifest = snap_dir / "active_manifest.json"
     out_manifest.write_text(json.dumps(metadata_manifest, indent=2), encoding="utf-8")
@@ -1230,18 +1457,25 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
         slow_sha=slow_sha,
         mapping_sha=map_sha,
     )
+    walkaway_fields = _walkaway_fields_from_training_metrics(metrics)
     _write_bundle_info(
         root / "bundle_info.json",
         model_version=mver,
         manifest_version=man_version,
+        package_version=package_version,
         allowlist_sha=allow_sha,
         slow_patron_sha=slow_sha,
         canonical_mapping_sha=map_sha,
         frozen_fingerprint_sha256=fingerprint,
         build_time_iso=build_time_iso,
         feature_candidate_registry_sha256=reg_sha_s,
+        walkaway_fields=walkaway_fields,
     )
-    _write_deploy_paths(root / "deploy_bundle_paths.json", mapping_name=map_name)
+    _write_deploy_paths(
+        root / "deploy_bundle_paths.json",
+        mapping_name=map_name,
+        walkaway_fields=walkaway_fields,
+    )
     _write_readme(root / "README_DEPLOY.md")
 
     logger.info("[pack] wrote bundle %s", root)

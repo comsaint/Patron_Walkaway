@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -89,6 +90,22 @@ def test_check_training_allowlist_sha256_degraded_continue() -> None:
     b64 = "b" * 64
     ok = check_training_allowlist_sha256({"adt_allowlist_sha256": a64}, b64, fail_fast=False)
     assert ok is False
+
+
+def test_resolve_model_bundle_allowlist_parquet_from_manifest(tmp_path: Path) -> None:
+    model_dir = tmp_path / "bundle"
+    deploy_inputs = model_dir / "deploy_inputs"
+    deploy_inputs.mkdir(parents=True)
+    allow = deploy_inputs / "adt_allowed_players_q0p9.parquet"
+    pd.DataFrame({"player_id": [1]}).to_parquet(allow, index=False)
+    (deploy_inputs / "active_manifest.json").write_text(
+        json.dumps({"adt_allowlist_parquet": allow.name}),
+        encoding="utf-8",
+    )
+    from trainer_hightier.serving.adt_allowlist import resolve_model_bundle_allowlist_parquet
+
+    got = resolve_model_bundle_allowlist_parquet(model_dir)
+    assert got.resolve() == allow.resolve()
 
 
 def test_active_manifest_from_dict_adt_fields(tmp_path: Path) -> None:

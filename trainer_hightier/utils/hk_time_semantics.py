@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 from typing import Final, Sequence
 from zoneinfo import ZoneInfo
 
@@ -82,6 +84,32 @@ def duckdb_gaming_day_event_sql(event_time_column: str) -> str:
         f"CAST(timezone('{HK_TZ}', TRY_CAST({ident} AS TIMESTAMPTZ)) AS DATE) "
         f"AS {duckdb_quote_ident(GAMING_DAY_EVENT_COLUMN)}"
     )
+
+
+def duckdb_gaming_day_event_scope_and_sql(
+    *,
+    min_day: date | None,
+    max_day: date | None,
+    column_expr: str | None = None,
+) -> str:
+    """Return `` AND …`` SQL suffix for inclusive ``gaming_day_event`` bounds.
+
+    Parameters
+    ----------
+    min_day, max_day
+        Inclusive calendar-day bounds; ``None`` disables that side.
+    column_expr
+        DuckDB DATE expression to compare (defaults to cast ``gaming_day_event``).
+    """
+    col = column_expr or f'TRY_CAST({duckdb_quote_ident(GAMING_DAY_EVENT_COLUMN)} AS DATE)'
+    parts: list[str] = []
+    if min_day is not None:
+        parts.append(f"{col} >= DATE '{min_day.isoformat()}'")
+    if max_day is not None:
+        parts.append(f"{col} <= DATE '{max_day.isoformat()}'")
+    if not parts:
+        return ""
+    return " AND " + " AND ".join(parts)
 
 
 def duckdb_etl_before_event_violation_count_sql(

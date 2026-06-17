@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import date
 from pathlib import Path
 
+import duckdb
 import pyarrow.parquet as pq
 
 from trainer_hightier.config import DuckDbRuntimeConfig
@@ -28,6 +30,7 @@ _PROFILE_REQUIRED_CLEAN_COLS: frozenset[str] = frozenset(
     }
 )
 _MAPPING_COLS: frozenset[str] = frozenset({"player_id", "canonical_id"})
+PROFILE_CONTENT_ADT_ROUND_DIGITS: int = 8
 
 
 def default_patron_session_metrics_parquet_path() -> Path:
@@ -42,6 +45,36 @@ def default_patron_profile_csv_path() -> Path:
 
 def _path_posix(path: Path) -> str:
     return str(Path(path).resolve()).replace("\\", "/")
+
+
+def patron_profile_content_fingerprint(
+    profile_csv: Path,
+    *,
+    adt_round_digits: int = PROFILE_CONTENT_ADT_ROUND_DIGITS,
+) -> str:
+    """Content fingerprint for patron profile CSV (``canonical_id`` + rounded ``adt``)."""
+    src = Path(profile_csv).resolve()
+    if not src.is_file():
+        raise FileNotFoundError(f"patron profile csv missing: {src}")
+    if adt_round_digits < 0:
+        raise ValueError(f"adt_round_digits must be >= 0, got {adt_round_digits}")
+    esc = _path_posix(src).replace("'", "''")
+    con = duckdb.connect()
+    try:
+        rows = con.execute(
+            f"""
+            SELECT
+              TRIM(CAST(canonical_id AS VARCHAR)) AS canonical_id,
+              ROUND(TRY_CAST(adt AS DOUBLE), {int(adt_round_digits)}) AS adt_r
+            FROM read_csv_auto('{esc}')
+            WHERE TRY_CAST(adt AS DOUBLE) IS NOT NULL
+            ORDER BY 1 ASC
+            """,
+        ).fetchall()
+    finally:
+        con.close()
+    blob = "\n".join(f"{cid}\t{adt}" for cid, adt in rows).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
 
 
 def _validate_inputs(cleaned: Path, mapping: Path) -> None:
@@ -99,10 +132,10 @@ joined AS (
 agg AS (
   SELECT
     canonical_id,
-    CAST(SUM(theo_win) AS DOUBLE) AS total_theo_win,
-    CAST(SUM(turnover) AS DOUBLE) AS total_turnover,
-    CAST(SUM(cash_buyins) AS DOUBLE) AS total_cash_buyins,
-    CAST(SUM(player_win) AS DOUBLE) AS total_player_win,
+    ROUND(CAST(SUM(theo_win) AS DOUBLE), 8) AS total_theo_win,
+    ROUND(CAST(SUM(turnover) AS DOUBLE), 8) AS total_turnover,
+    ROUND(CAST(SUM(cash_buyins) AS DOUBLE), 8) AS total_cash_buyins,
+    ROUND(CAST(SUM(player_win) AS DOUBLE), 8) AS total_player_win,
     CAST(COUNT(DISTINCT gaming_day_event) AS BIGINT) AS unique_gaming_days,
     CAST(SUM(num_bets) AS BIGINT) AS total_num_bets,
     CAST(COUNT(*) AS BIGINT) AS session_count,
@@ -110,7 +143,10 @@ agg AS (
     CAST(MAX(gaming_day_event) AS VARCHAR) AS last_gaming_day,
     CASE
       WHEN COUNT(DISTINCT gaming_day_event) > 0 THEN
-        CAST(SUM(theo_win) AS DOUBLE) / CAST(COUNT(DISTINCT gaming_day_event) AS DOUBLE)
+        ROUND(
+          CAST(SUM(theo_win) AS DOUBLE) / CAST(COUNT(DISTINCT gaming_day_event) AS DOUBLE),
+          8
+        )
       ELSE NULL
     END AS adt
   FROM joined
