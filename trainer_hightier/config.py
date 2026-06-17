@@ -1123,8 +1123,6 @@ class HightierServingConfig:
     placeholder_player_id: int = -1
     walkaway_gap_min: int = 30
     alert_horizon_min: int = 15
-    #: ``trainer`` default is ``WALKAWAY_GAP_MIN + ALERT_HORIZON_MIN``.
-    label_lookahead_min: int = 45
     validator_alert_retention_days: int = 30
     validation_results_retention_days: int = 180
     validator_cache_prune_interval_seconds: int = 300
@@ -1266,6 +1264,52 @@ class HightierServingConfig:
     training_mid_snapshot_parquet: Path | None = None
     player_alert_policy: PlayerAlertPolicyConfig = field(
         default_factory=lambda: PlayerAlertPolicyConfig(cooldown_min=ALERT_HORIZON_MIN),
+    )
+
+    @property
+    def label_lookahead_min(self) -> int:
+        """Minutes from alert/bet_ts to observation boundary (``gap + horizon``)."""
+        return int(self.walkaway_gap_min) + int(self.alert_horizon_min)
+
+    @property
+    def walkaway_label_contract(self) -> WalkawayLabelContract:
+        """Walkaway label contract aligned with training materialize."""
+        return walkaway_label_contract_for_gap_min(
+            self.walkaway_gap_min,
+            alert_horizon_min=self.alert_horizon_min,
+        )
+
+
+def hightier_serving_config_for_deploy_bundle(
+    bundle_root: Path,
+    rel: dict[str, object],
+) -> HightierServingConfig:
+    """Build :class:`HightierServingConfig` paths and walkaway fields from a deploy bundle."""
+    br = Path(bundle_root).resolve()
+    ls = str(rel.get("local_state_dir", "local_state"))
+    feast_art = str(rel.get("feast_artifacts_dir", "artifacts/feast"))
+    feast_repo = str(rel.get("feast_repo_dir", "feast_repo"))
+    base = HightierServingConfig()
+    gap_raw = rel.get("walkaway_gap_min", base.walkaway_gap_min)
+    horizon_raw = rel.get("alert_horizon_min", base.alert_horizon_min)
+    return replace(
+        base,
+        walkaway_gap_min=int(gap_raw),
+        alert_horizon_min=int(horizon_raw),
+        state_db_path=br / ls / "state.db",
+        prediction_log_db_path=br / ls / "prediction_log.db",
+        feature_state_db_path=br / ls / "feature_state.db",
+        snapshot_manifest_dir=br / str(rel.get("snapshot_manifest_dir", "snapshots")),
+        validator_out_dir=br / ls / "validator_out",
+        production_cleaned_bet_mirror_dir=br / "source_mirror" / "cleaned_bet",
+        production_cleaned_session_mirror_parquet=br / "source_mirror" / "cleaned_session.parquet",
+        scorer_feast_repo_path=(br / feast_repo).resolve(),
+        scorer_feast_readiness_path=(
+            br / str(rel.get("feast_readiness_path", f"{feast_art}/feast_online_readiness.json"))
+        ).resolve(),
+        adt_allowed_players_parquet=(
+            br / str(rel.get("adt_allowlist_parquet", "mapping/adt_allowed_players_q0p99.parquet"))
+        ).resolve(),
     )
 
 

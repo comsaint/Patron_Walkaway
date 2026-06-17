@@ -45,9 +45,9 @@ from zoneinfo import ZoneInfo
 
 from trainer_hightier.config import (
     TRAINER_HIGHTIER_PACKAGE_DIR,
+    DEFAULT_WALKAWAY_LABEL_CONTRACT,
     HightierServingConfig,
-    LABEL_LOOKAHEAD_MIN,
-    WALKAWAY_GAP_MIN,
+    WalkawayLabelContract,
     apply_hightier_serving_environ_overrides,
     set_hightier_serving_deploy_override,
 )
@@ -109,6 +109,7 @@ from trainer_hightier.serving.snapshot_freshness import (
     post_join_feature_smoke,
     serving_day_for_eval_gaming_day_end,
 )
+from trainer_hightier.utils.walkaway_labels import label_window_ends_from_max_payout
 from trainer_hightier.walkaway_compute_labels import compute_labels
 
 logger = logging.getLogger(__name__)
@@ -441,17 +442,20 @@ def _normalize_payout_hk_naive(bets: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _label_payout_bounds(eval_bets: pd.DataFrame) -> tuple[datetime, datetime]:
+def _label_payout_bounds(
+    eval_bets: pd.DataFrame,
+    *,
+    label_contract: WalkawayLabelContract | None = None,
+) -> tuple[datetime, datetime]:
     """Return ``(window_end, extended_end)`` for walkaway label computation."""
+    contract = label_contract or DEFAULT_WALKAWAY_LABEL_CONTRACT
     ts = pd.to_datetime(eval_bets["payout_complete_dtm"], errors="coerce").dropna()
     if ts.empty:
         raise ValueError("eval bets have no valid payout_complete_dtm for label bounds")
     window_end = ts.max()
     if window_end.tzinfo is not None:
         window_end = window_end.tz_convert(HK_TZ).tz_localize(None)
-    extended_end = window_end + pd.Timedelta(
-        minutes=float(LABEL_LOOKAHEAD_MIN + WALKAWAY_GAP_MIN),
-    )
+    _, extended_end = label_window_ends_from_max_payout(window_end, label_contract=contract)
     return window_end.to_pydatetime(), extended_end.to_pydatetime()
 
 
@@ -464,7 +468,8 @@ def _attach_walkaway_labels_to_eval_bets(
     """Compute walkaway labels on a CH payout corpus and join onto eval rows."""
     if eval_bets.empty:
         return eval_bets.copy()
-    window_end, extended_end = _label_payout_bounds(eval_bets)
+    contract = cfg.walkaway_label_contract
+    window_end, extended_end = _label_payout_bounds(eval_bets, label_contract=contract)
     payout_start = _payout_bound_hk_naive(
         pd.to_datetime(eval_bets["payout_complete_dtm"], errors="coerce").min(),
     )
@@ -482,7 +487,12 @@ def _attach_walkaway_labels_to_eval_bets(
         raise ValueError("label corpus fetch returned 0 rows from ClickHouse")
     corpus = attach_canonical_id(corpus, mapping_parquet=mapping_parquet)
     corpus = _normalize_payout_hk_naive(corpus)
-    labeled = compute_labels(corpus, window_end=window_end, extended_end=extended_end)
+    labeled = compute_labels(
+        corpus,
+        window_end=window_end,
+        extended_end=extended_end,
+        label_contract=contract,
+    )
     labeled = labeled.loc[~labeled["censored"].astype(bool)].copy()
     if labeled.empty:
         raise ValueError("all eval bets censored after compute_labels")
@@ -532,6 +542,9 @@ def load_bets_from_cleaned_parquet(
 
         bet_from = f"read_parquet('{glob_path}', hive_partitioning=true)"
         etl_col = cleaned_bet_sql_etl_insert_column(conn, bet_from)
+        from trainer_hightier.utils.cleaned_bet_pool_read import cleaned_bet_pool_game_id_sql
+
+        game_id_sql = cleaned_bet_pool_game_id_sql(conn, bet_from, alias="b")
         q = f"""
             SELECT
                 b.bet_id,
@@ -543,6 +556,7 @@ def load_bets_from_cleaned_parquet(
                 CAST(b.gaming_day_event AS TIMESTAMP) AS gaming_day_event,
                 b.session_id,
                 b.player_id,
+                {game_id_sql},
                 b.table_id,
                 b.wager,
                 b.casino_win,
@@ -804,6 +818,9 @@ def build_pool_from_cleaned_parquet(
             [pids],
         )
         etl_col = cleaned_bet_sql_etl_insert_column(conn, bet_from)
+        from trainer_hightier.utils.cleaned_bet_pool_read import cleaned_bet_pool_game_id_sql
+
+        game_id_sql = cleaned_bet_pool_game_id_sql(conn, bet_from, alias="b")
         q = f"""
             SELECT
                 b.bet_id,
@@ -815,6 +832,7 @@ def build_pool_from_cleaned_parquet(
                 CAST(b.gaming_day_event AS TIMESTAMP) AS gaming_day_event,
                 b.session_id,
                 b.player_id,
+                {game_id_sql},
                 b.table_id,
                 b.wager,
                 b.casino_win,

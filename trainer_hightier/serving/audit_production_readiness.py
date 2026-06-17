@@ -26,6 +26,7 @@ import pandas as pd
 from trainer_hightier.config import (
     HightierServingConfig,
     apply_hightier_serving_environ_overrides,
+    hightier_serving_config_for_deploy_bundle,
     set_hightier_serving_deploy_override,
 )
 from trainer_hightier.feature_experiment.feature_cadence import _MID_TERM_COMPOSITE_FEAST_DEPS
@@ -67,25 +68,7 @@ def _load_bundle_rel(bundle_root: Path) -> dict[str, Any]:
 
 def _serving_config_for_bundle(bundle_root: Path, rel: dict[str, Any]) -> HightierServingConfig:
     """Mirror ``deploy/main.py`` path layout for serving modules."""
-    br = bundle_root.resolve()
-    ls = rel.get("local_state_dir", "local_state")
-    feast_art = rel.get("feast_artifacts_dir", "artifacts/feast")
-    feast_repo = rel.get("feast_repo_dir", "feast_repo")
-    base = HightierServingConfig()
-    return replace(
-        base,
-        state_db_path=br / ls / "state.db",
-        prediction_log_db_path=br / ls / "prediction_log.db",
-        feature_state_db_path=br / ls / "feature_state.db",
-        snapshot_manifest_dir=br / rel.get("snapshot_manifest_dir", "snapshots"),
-        adt_allowed_players_parquet=(
-            br / rel.get("adt_allowlist_parquet", "mapping/adt_allowed_players_q0p99.parquet")
-        ).resolve(),
-        scorer_feast_repo_path=(br / feast_repo).resolve(),
-        scorer_feast_readiness_path=(
-            br / rel.get("feast_readiness_path", f"{feast_art}/feast_online_readiness.json")
-        ).resolve(),
-    )
+    return hightier_serving_config_for_deploy_bundle(bundle_root, rel)
 
 
 def _load_dotenv(bundle_root: Path) -> None:

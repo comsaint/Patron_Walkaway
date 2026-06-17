@@ -698,6 +698,7 @@ def _write_bundle_info(
     frozen_fingerprint_sha256: str,
     build_time_iso: str,
     feature_candidate_registry_sha256: str | None = None,
+    walkaway_fields: dict[str, Any] | None = None,
 ) -> None:
     payload = {
         "model_version": model_version,
@@ -712,7 +713,24 @@ def _write_bundle_info(
     }
     if feature_candidate_registry_sha256 is not None:
         payload["feature_candidate_registry_sha256"] = feature_candidate_registry_sha256
+    if walkaway_fields:
+        payload.update(walkaway_fields)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _walkaway_fields_from_training_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Extract walkaway contract fields for deploy bundle manifests."""
+    out: dict[str, Any] = {}
+    gap = metrics.get("walkaway_gap_min")
+    if gap is not None:
+        out["walkaway_gap_min"] = int(gap)
+    horizon = metrics.get("alert_horizon_min")
+    if horizon is not None:
+        out["alert_horizon_min"] = int(horizon)
+    contract_id = metrics.get("walkaway_label_contract_id")
+    if isinstance(contract_id, str) and contract_id.strip():
+        out["walkaway_label_contract_id"] = contract_id.strip()
+    return out
 
 
 def _write_deploy_paths(
@@ -720,6 +738,7 @@ def _write_deploy_paths(
     *,
     mapping_name: str,
     adt_allowlist_basename: str = _ADT_ALLOWLIST_BUNDLE_BASENAME,
+    walkaway_fields: dict[str, Any] | None = None,
 ) -> None:
     payload = {
         "schema_version": 2,
@@ -732,6 +751,8 @@ def _write_deploy_paths(
         "feast_readiness_path": "artifacts/feast/feast_online_readiness.json",
         "adt_allowlist_parquet": f"mapping/{adt_allowlist_basename}",
     }
+    if walkaway_fields:
+        payload.update(walkaway_fields)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -1436,6 +1457,7 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
         slow_sha=slow_sha,
         mapping_sha=map_sha,
     )
+    walkaway_fields = _walkaway_fields_from_training_metrics(metrics)
     _write_bundle_info(
         root / "bundle_info.json",
         model_version=mver,
@@ -1447,8 +1469,13 @@ def build_deploy_package(argv: list[str] | None = None) -> Path:
         frozen_fingerprint_sha256=fingerprint,
         build_time_iso=build_time_iso,
         feature_candidate_registry_sha256=reg_sha_s,
+        walkaway_fields=walkaway_fields,
     )
-    _write_deploy_paths(root / "deploy_bundle_paths.json", mapping_name=map_name)
+    _write_deploy_paths(
+        root / "deploy_bundle_paths.json",
+        mapping_name=map_name,
+        walkaway_fields=walkaway_fields,
+    )
     _write_readme(root / "README_DEPLOY.md")
 
     logger.info("[pack] wrote bundle %s", root)

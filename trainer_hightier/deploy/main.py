@@ -25,6 +25,7 @@ from trainer_hightier.config import (
     HK_TZ,
     HightierServingConfig,
     apply_hightier_serving_environ_overrides,
+    hightier_serving_config_for_deploy_bundle,
     set_hightier_serving_deploy_override,
 )
 from trainer_hightier.serving.contracts import (
@@ -142,29 +143,7 @@ def _load_rel_paths(bundle_root: Path) -> dict[str, Any]:
 
 
 def _serving_config_for_bundle(bundle_root: Path, rel: dict[str, Any]) -> HightierServingConfig:
-    br = bundle_root.resolve()
-    ls = rel.get("local_state_dir", "local_state")
-    feast_art = rel.get("feast_artifacts_dir", "artifacts/feast")
-    feast_repo = rel.get("feast_repo_dir", "feast_repo")
-    base = HightierServingConfig()
-    return replace(
-        base,
-        state_db_path=br / ls / "state.db",
-        prediction_log_db_path=br / ls / "prediction_log.db",
-        feature_state_db_path=br / ls / "feature_state.db",
-        snapshot_manifest_dir=br / rel.get("snapshot_manifest_dir", "snapshots"),
-        validator_out_dir=br / ls / "validator_out",
-        production_cleaned_bet_mirror_dir=br / "source_mirror" / "cleaned_bet",
-        production_cleaned_session_mirror_parquet=br / "source_mirror" / "cleaned_session.parquet",
-        cleaned_casino_txn_root=None,
-        scorer_feast_repo_path=(br / feast_repo).resolve(),
-        scorer_feast_readiness_path=(br / rel.get(
-            "feast_readiness_path", f"{feast_art}/feast_online_readiness.json"
-        )).resolve(),
-        adt_allowed_players_parquet=(br / rel.get(
-            "adt_allowlist_parquet", "mapping/adt_allowed_players_q0p99.parquet"
-        )).resolve(),
-    )
+    return hightier_serving_config_for_deploy_bundle(bundle_root, rel)
 
 
 def _load_dotenv_if_present(bundle_root: Path) -> None:
