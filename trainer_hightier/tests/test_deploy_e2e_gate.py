@@ -652,10 +652,39 @@ def test_resolve_cli_data_path_prefers_repo_root_when_cwd_is_bundle(
 ) -> None:
     from trainer_hightier.serving.deploy_e2e_gate import _resolve_cli_data_path
 
-    repo = Path(__file__).resolve().parents[2]
+    fake_repo = tmp_path / "repo"
+    rel = Path("trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet")
+    artifact = fake_repo / rel
+    artifact.mkdir(parents=True)
+    (artifact / "marker.parquet").write_bytes(b"pq")
+
+    bundle = tmp_path / "deploy_bundle"
+    bundle.mkdir()
+    monkeypatch.chdir(bundle)
+    monkeypatch.setattr(
+        "trainer_hightier.serving.deploy_e2e_gate._repo_root_from_gate_module",
+        lambda: fake_repo,
+    )
+    resolved = _resolve_cli_data_path(rel)
+    assert resolved == artifact.resolve()
+
+
+def test_resolve_cli_data_path_fallback_repo_when_neither_path_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bundle cwd with no local mirror falls back to repo-relative path for clearer errors."""
+    from trainer_hightier.serving.deploy_e2e_gate import _resolve_cli_data_path
+
+    fake_repo = tmp_path / "repo"
     rel = Path("trainer_hightier/artifacts/cleaned/cleaned__gmwds_t_bet")
     bundle = tmp_path / "deploy_bundle"
     bundle.mkdir()
     monkeypatch.chdir(bundle)
+    monkeypatch.setattr(
+        "trainer_hightier.serving.deploy_e2e_gate._repo_root_from_gate_module",
+        lambda: fake_repo,
+    )
     resolved = _resolve_cli_data_path(rel)
-    assert resolved == (repo / rel).resolve()
+    assert resolved == (fake_repo / rel).resolve()
+    assert not resolved.exists()

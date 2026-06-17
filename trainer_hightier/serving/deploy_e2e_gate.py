@@ -483,7 +483,7 @@ def _repo_root_from_gate_module() -> Path:
 
 
 def _resolve_cli_data_path(path: Path | str) -> Path:
-    """Resolve CLI path to absolute; prefer cwd then repo root when relative."""
+    """Resolve CLI path to absolute; prefer cwd when present, else repo checkout."""
     p = Path(path).expanduser()
     if p.is_absolute():
         return p.resolve()
@@ -493,7 +493,7 @@ def _resolve_cli_data_path(path: Path | str) -> Path:
     from_repo = (_repo_root_from_gate_module() / p).resolve()
     if from_repo.exists():
         return from_repo
-    return from_cwd
+    return from_repo
 
 
 def _argv_for_bundle_venv_reexec(opts: DeployE2EGateOptions) -> list[str]:
