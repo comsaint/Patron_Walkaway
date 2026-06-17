@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -18,6 +19,7 @@ import pandas as pd
 
 from trainer_hightier.utils.cache_invalidation_v1 import label_invalid_months
 from trainer_hightier.utils.labels_cache_v1 import (
+    _query_global_label_window_ends,
     label_semantic_fingerprint,
     labels_cache_is_hit,
     labels_policy_dir,
@@ -26,6 +28,7 @@ from trainer_hightier.utils.labels_cache_v1 import (
     materialize_labels_v1_cached,
     materialize_labels_v1_sharded_cached,
 )
+from trainer_hightier.utils.walkaway_labels import label_window_ends_from_max_payout
 
 
 def test_label_semantic_fingerprint_stable() -> None:
@@ -33,6 +36,41 @@ def test_label_semantic_fingerprint_stable() -> None:
     assert len(label_semantic_fingerprint()) == 64
     gap60 = walkaway_label_contract_for_gap_min(60)
     assert label_semantic_fingerprint(gap60) != label_semantic_fingerprint()
+
+
+def test_label_semantic_fingerprint_includes_extended_end_policy_v2() -> None:
+    """Fingerprint must encode extended_end_policy=v2 so pre-fix caches miss."""
+    contract = DEFAULT_WALKAWAY_LABEL_CONTRACT
+    mod_path = Path(__file__).resolve().parents[1] / "walkaway_compute_labels.py"
+    digest = hashlib.sha256(mod_path.read_bytes()).hexdigest()
+    v1_blob = (
+        f"{digest}|gap={int(contract.walkaway_gap_min)}"
+        f"|horizon={int(contract.alert_horizon_min)}"
+    )
+    v1_fp = hashlib.sha256(v1_blob.encode()).hexdigest()
+    assert label_semantic_fingerprint(contract) != v1_fp
+
+
+def test_query_global_label_window_ends_extends_by_lookahead(tmp_path: Path) -> None:
+    """Sharded label materialize must extend observation window by gap + horizon."""
+    paths = _tiny_labels_inputs(tmp_path)
+    contract = DEFAULT_WALKAWAY_LABEL_CONTRACT
+    window_end, extended_end = _query_global_label_window_ends(
+        paths["bet"],
+        paths["map"],
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        label_contract=contract,
+    )
+    # Join loader normalizes payout_complete_dtm to HK wall clock (naive).
+    assert window_end == pd.Timestamp("2024-06-01 20:35:00")
+    expected_we, expected_ee = label_window_ends_from_max_payout(
+        window_end,
+        label_contract=contract,
+    )
+    assert expected_we == window_end
+    assert extended_end == expected_ee
+    delta_min = (extended_end - window_end).total_seconds() / 60.0
+    assert delta_min == contract.label_lookahead_min
 
 
 def test_labels_policy_dir_includes_gap_partition() -> None:

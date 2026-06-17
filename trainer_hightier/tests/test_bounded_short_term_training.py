@@ -102,6 +102,91 @@ def test_open_month_hot_pool_session_loads_once(tmp_path: Path) -> None:
         session.close()
 
 
+def _legacy_pool_row(
+  *,
+  bet_id: float,
+  payout_complete_dtm: pd.Timestamp,
+  game_id: int | None = None,
+) -> dict[str, object]:
+    """Minimal cleaned-bet row for month hot-pool tests (game_id optional)."""
+    row: dict[str, object] = {
+        "bet_id": bet_id,
+        "player_id": 10,
+        "session_id": 1,
+        "table_id": 1,
+        "gaming_day_event": pd.Timestamp("2025-01-15"),
+        "payout_complete_dtm": payout_complete_dtm,
+        "wager": 10.0,
+        "is_back_bet": 0,
+        "payout_odds": 2.0,
+        "casino_win": 0.0,
+        "theo_win": 1.0,
+        "base_ha": 0.01,
+        "bet_type": "PLAYER",
+        "type_of_bet": "MAIN",
+    }
+    if game_id is not None:
+        row["game_id"] = game_id
+    return row
+
+
+def test_open_month_hot_pool_session_null_game_id_when_column_missing(tmp_path: Path) -> None:
+    """Legacy cleaned-bet fixtures without game_id must load with NULL game_id."""
+    root = tmp_path / "cleaned"
+    part_dir = root / "gaming_month=202501" / "gaming_day_key=2025-01-15"
+    part_dir.mkdir(parents=True)
+    t0 = pd.Timestamp("2025-01-15 12:00:00", tz="UTC")
+    pq.write_table(
+        pa.Table.from_pandas(pd.DataFrame([_legacy_pool_row(bet_id=1.0, payout_complete_dtm=t0)])),
+        part_dir / "part.parquet",
+    )
+    session = open_month_hot_pool_session(
+        root,
+        payout_yyyymm="202501",
+        duckdb_runtime=DuckDbRuntimeConfig(),
+    )
+    try:
+        cols = {
+            str(row[0])
+            for row in session.conn.execute(f"DESCRIBE {session.table_name}").fetchall()
+        }
+        assert "game_id" in cols
+        got = session.conn.execute(
+            f"SELECT game_id FROM {session.table_name}",
+        ).fetchone()
+        assert got is not None
+        assert got[0] is None
+    finally:
+        session.close()
+
+
+def test_open_month_hot_pool_session_preserves_game_id_when_present(tmp_path: Path) -> None:
+    """When game_id exists in source parquet, pool projection must preserve values."""
+    root = tmp_path / "cleaned"
+    part_dir = root / "gaming_month=202501" / "gaming_day_key=2025-01-15"
+    part_dir.mkdir(parents=True)
+    t0 = pd.Timestamp("2025-01-15 12:00:00", tz="UTC")
+    pq.write_table(
+        pa.Table.from_pandas(
+            pd.DataFrame([_legacy_pool_row(bet_id=1.0, payout_complete_dtm=t0, game_id=42)]),
+        ),
+        part_dir / "part.parquet",
+    )
+    session = open_month_hot_pool_session(
+        root,
+        payout_yyyymm="202501",
+        duckdb_runtime=DuckDbRuntimeConfig(),
+    )
+    try:
+        got = session.conn.execute(
+            f"SELECT game_id FROM {session.table_name}",
+        ).fetchone()
+        assert got is not None
+        assert float(got[0]) == 42.0
+    finally:
+        session.close()
+
+
 def test_build_pool_uses_month_hot_pool_without_parquet_rescan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
