@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import warnings
+import os
 from typing import Any, Dict, Final, Optional
 
 try:
@@ -86,6 +87,21 @@ def get_clickhouse_client():
         raise RuntimeError("clickhouse_connect is required for serving; install clickhouse-connect.")
     cfg = default_hightier_serving_config()
     if not hasattr(_thread_local, "client") or _thread_local.client is None:
+        # Allow optional environment overrides for connection / request timeouts so deploys
+        # can tune ClickHouse read/connect timeouts without changing package config.
+        timeout_kwargs: dict = {}
+        try:
+            if os.environ.get("CH_CONNECT_TIMEOUT"):
+                timeout_kwargs["connect_timeout"] = int(os.environ["CH_CONNECT_TIMEOUT"])
+            if os.environ.get("CH_SEND_RECEIVE_TIMEOUT"):
+                timeout_kwargs["send_receive_timeout"] = int(os.environ["CH_SEND_RECEIVE_TIMEOUT"])
+            # Backwards-compatible aliases
+            if os.environ.get("CH_REQUEST_TIMEOUT") and "send_receive_timeout" not in timeout_kwargs:
+                timeout_kwargs["send_receive_timeout"] = int(os.environ["CH_REQUEST_TIMEOUT"])
+        except Exception:
+            # Ignore malformed env overrides; fall back to library defaults
+            logger.warning("[ch_adapter] failed to parse CH_* timeout env vars; using defaults")
+
         _thread_local.client = clickhouse_connect.get_client(
             host=cfg.ch_host,
             port=int(cfg.ch_port),
@@ -93,7 +109,13 @@ def get_clickhouse_client():
             password=cfg.ch_password,
             secure=bool(cfg.ch_secure),
             database=cfg.source_db,
+            **timeout_kwargs,
         )
+        if timeout_kwargs:
+            logger.info(
+                "[ch_adapter] created clickhouse client with timeouts %s",
+                timeout_kwargs,
+            )
     return _thread_local.client
 
 

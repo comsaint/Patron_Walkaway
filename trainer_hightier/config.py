@@ -1090,11 +1090,11 @@ class HightierServingConfig:
     scorer_dynamic_lookback_cap_hours: int = 8
     hightier_scorer_max_bets_per_cycle: int = 2000
     #: Wave 4: enqueue / defer player-games without changing production alerts.
-    player_game_ready_queue_dry_run_enabled: bool = False
+    player_game_ready_queue_dry_run_enabled: bool = True
     #: Lookback window for player-game re-fetch during ready-queue dry-run.
-    player_game_ready_queue_refetch_lookback_hours: float = 8.0
+    player_game_ready_queue_refetch_lookback_hours: float = 48.0
     #: Wave 5: shadow native player-game scoring (requires ready-queue dry-run).
-    player_game_shadow_scoring_enabled: bool = False
+    player_game_shadow_scoring_enabled: bool = True
     player_game_shadow_model_bundle_dir: Path | None = field(
         default_factory=lambda: _REPO_ROOT
         / "out"

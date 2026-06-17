@@ -397,26 +397,89 @@ def process_due_player_games(
     holdback_seconds: int = SCORER_POLL_INTERVAL_SECONDS,
 ) -> PlayerGameReadyDryRunSummary:
     """Process all due pending player-games without scoring."""
-
     due_keys = _list_due_pending(conn, now_ts)
     n_deferred = 0
     n_completed = 0
     n_skipped = 0
-    for pid, gid in due_keys:
-        result = process_one_pending_player_game(
-            conn,
-            pid,
-            gid,
-            now_ts=now_ts,
-            fetch_fn=fetch_fn,
-            holdback_seconds=holdback_seconds,
-        )
-        if result.action == "deferred":
+
+    cfg = default_hightier_serving_config()
+    # If using the default ClickHouse refetch function, prefer chunked multi-player refetches
+    # to reduce per-player HTTP query fanout. Fall back to per-player refetch on errors.
+    try:
+        chunk_sz = int(cfg.hightier_scorer_player_id_chunk_size)
+    except Exception:
+        chunk_sz = 500
+
+    # Helper to update counters from a result
+    def _count_result(res: PlayerGameReadyProcessResult) -> None:
+        nonlocal n_deferred, n_completed, n_skipped
+        if res.action == "deferred":
             n_deferred += 1
-        elif result.action == "completed":
+        elif res.action == "completed":
             n_completed += 1
         else:
             n_skipped += 1
+
+    if fetch_fn is None:
+        # Default to the ClickHouse refetch path
+        from trainer_hightier.serving.scorer import fetch_bets_incremental
+
+        for i in range(0, len(due_keys), chunk_sz):
+            chunk = due_keys[i : i + chunk_sz]
+            player_ids = frozenset(int(pid) for pid, _ in chunk)
+            try:
+                bets_chunk = fetch_bets_incremental(
+                    None,
+                    lookback_hours=float(cfg.player_game_ready_queue_refetch_lookback_hours),
+                    limit_rows=int(cfg.hightier_scorer_max_bets_per_cycle),
+                    allowlist_player_ids=player_ids,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[pg_ready_queue] chunked refetch failed (%s); falling back to per-player refetch",
+                    exc,
+                )
+                # fallback: process per-player in this chunk
+                for pid, gid in chunk:
+                    res = process_one_pending_player_game(
+                        conn,
+                        pid,
+                        gid,
+                        now_ts=now_ts,
+                        fetch_fn=fetch_fn,
+                        holdback_seconds=holdback_seconds,
+                    )
+                    _count_result(res)
+                continue
+
+            # For each player-game in the chunk, provide a fetch_fn that extracts the player's
+            # subset from the pre-fetched DataFrame to avoid additional ClickHouse round-trips.
+            for pid, gid in chunk:
+                def _make_fetch(frame: pd.DataFrame):
+                    return lambda p, g: refetch_player_game_from_frame(frame, p, g)
+
+                res = process_one_pending_player_game(
+                    conn,
+                    pid,
+                    gid,
+                    now_ts=now_ts,
+                    fetch_fn=_make_fetch(bets_chunk),
+                    holdback_seconds=holdback_seconds,
+                )
+                _count_result(res)
+    else:
+        # Non-default fetch_fn (test hooks, injected frames): preserve per-player processing.
+        for pid, gid in due_keys:
+            res = process_one_pending_player_game(
+                conn,
+                pid,
+                gid,
+                now_ts=now_ts,
+                fetch_fn=fetch_fn,
+                holdback_seconds=holdback_seconds,
+            )
+            _count_result(res)
+
     return PlayerGameReadyDryRunSummary(
         n_enqueued=0,
         n_due_processed=len(due_keys),
