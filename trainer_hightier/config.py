@@ -1097,6 +1097,35 @@ class Step6ParityConfig:
 
 PRE_TRAIN_FEATURE_GATE_JSON_BASENAME: Final[str] = "pre_train_feature_gate.json"
 
+# Time-CV feature selection (Feature experimentation §1.8 / Wave 4).
+FEATURE_SELECTION_TIME_CV_N_FOLDS: Final[int] = 5
+FEATURE_SELECTION_TIME_CV_VAL_WINDOW_DAYS: Final[int] = 30
+FEATURE_SELECTION_TIME_CV_MIN_TRAIN_DAYS: Final[int] = 90
+FEATURE_SELECTION_TIME_CV_EARLY_STOP_FOLDS: Final[int] = 3
+FEATURE_SELECTION_TIME_CV_MEAN_DELTA_P1HR_PP: Final[float] = 1.0
+FEATURE_SELECTION_TIME_CV_MAX_CV_RATIO: Final[float] = 0.5
+FEATURE_SELECTION_TIME_CV_DROP_THRESHOLD_PP: Final[float] = -0.5
+FEATURE_SELECTION_TIME_CV_MARGINAL_LOW_PP: Final[float] = -0.5
+FEATURE_SELECTION_TIME_CV_WALL_TIME_LIMIT_SEC: Final[float] = 1200.0
+FEATURE_SELECTION_TIME_CV_PROTOTYPE_N_FOLDS: Final[int] = 3
+
+
+@dataclass(frozen=True)
+class FeatureSelectionTimeCvConfig:
+    """Expanding-window Time-CV for baseline feature pruning (operational P@1hr)."""
+
+    n_folds: int = FEATURE_SELECTION_TIME_CV_N_FOLDS
+    val_window_days: int = FEATURE_SELECTION_TIME_CV_VAL_WINDOW_DAYS
+    min_train_days: int = FEATURE_SELECTION_TIME_CV_MIN_TRAIN_DAYS
+    early_stop_folds: int = FEATURE_SELECTION_TIME_CV_EARLY_STOP_FOLDS
+    mean_delta_p1hr_pp: float = FEATURE_SELECTION_TIME_CV_MEAN_DELTA_P1HR_PP
+    max_cv_ratio: float = FEATURE_SELECTION_TIME_CV_MAX_CV_RATIO
+    drop_threshold_pp: float = FEATURE_SELECTION_TIME_CV_DROP_THRESHOLD_PP
+    marginal_low_pp: float = FEATURE_SELECTION_TIME_CV_MARGINAL_LOW_PP
+    wall_time_limit_sec: float = FEATURE_SELECTION_TIME_CV_WALL_TIME_LIMIT_SEC
+    prototype_n_folds: int = FEATURE_SELECTION_TIME_CV_PROTOTYPE_N_FOLDS
+    deployment_target_alerts_per_hour: float = 1.0
+
 
 @dataclass(frozen=True)
 class HightierServingConfig:
