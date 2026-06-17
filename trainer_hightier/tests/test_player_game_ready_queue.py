@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from trainer_hightier.config import SCORER_POLL_INTERVAL_SECONDS
 from trainer_hightier.serving.player_game_ready_queue import (
@@ -244,3 +245,83 @@ def test_late_side_bet_defers_then_completes(tmp_path: Path) -> None:
     assert summary.n_completed == 1
     assert metrics["n_completed"] == 1
     assert metrics["n_late_hypothetical"] >= 1
+
+
+def test_process_due_chunked_clickhouse_batches_incremental_fetch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default ClickHouse path issues one incremental fetch per player-id chunk."""
+
+    from dataclasses import replace
+
+    from trainer_hightier.config import default_hightier_serving_config
+
+    db = tmp_path / "state.db"
+    conn = _conn(db)
+    pv = "2026-05-28T22:54:45+00:00"
+    bets = pd.DataFrame(
+        [
+            {
+                "bet_id": 1,
+                "player_id": 10,
+                "game_id": 100,
+                "payout_complete_dtm": pd.Timestamp("2026-05-28 14:52:45+00:00"),
+                "prediction_visible_ts_cf": pd.Timestamp(pv),
+                "wager": 100.0,
+                "casino_win": 0.0,
+                "is_back_bet": 0,
+                "bet_type": "MAIN",
+                "type_of_bet": "MAIN_BET",
+                "__etl_insert_Dtm": pd.Timestamp("2026-05-28 14:53:00+00:00"),
+            },
+            {
+                "bet_id": 2,
+                "player_id": 11,
+                "game_id": 101,
+                "payout_complete_dtm": pd.Timestamp("2026-05-28 14:52:50+00:00"),
+                "prediction_visible_ts_cf": pd.Timestamp(pv),
+                "wager": 50.0,
+                "casino_win": 0.0,
+                "is_back_bet": 0,
+                "bet_type": "MAIN",
+                "type_of_bet": "MAIN_BET",
+                "__etl_insert_Dtm": pd.Timestamp("2026-05-28 14:53:05+00:00"),
+            },
+        ],
+    )
+    enqueue_player_games_from_bets(
+        conn,
+        bets,
+        now_ts=datetime(2026, 5, 28, 14, 53, 0, tzinfo=timezone.utc),
+    )
+    fetch_calls: list[frozenset[int] | None] = []
+
+    def _fake_incremental(
+        _last_etl: object,
+        *,
+        lookback_hours: float,
+        limit_rows: int,
+        allowlist_player_ids: frozenset[int] | None = None,
+    ) -> pd.DataFrame:
+        fetch_calls.append(allowlist_player_ids)
+        return bets.copy()
+
+    monkeypatch.setattr(
+        "trainer_hightier.serving.scorer.fetch_bets_incremental",
+        _fake_incremental,
+    )
+    cfg = replace(default_hightier_serving_config(), hightier_scorer_player_id_chunk_size=500)
+    monkeypatch.setattr(
+        "trainer_hightier.serving.player_game_ready_queue.default_hightier_serving_config",
+        lambda: cfg,
+    )
+    summary = process_due_player_games(
+        conn,
+        now_ts=datetime(2026, 5, 28, 22, 56, 0, tzinfo=timezone.utc),
+        fetch_fn=None,
+    )
+    conn.close()
+    assert len(fetch_calls) == 1
+    assert fetch_calls[0] == frozenset({10, 11})
+    assert summary.n_completed == 2

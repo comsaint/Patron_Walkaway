@@ -1090,6 +1090,7 @@ class HightierServingConfig:
     scorer_dynamic_lookback_cap_hours: int = 8
     hightier_scorer_max_bets_per_cycle: int = 2000
     #: Wave 4: enqueue / defer player-games without changing production alerts.
+    #: Enabled on this branch for W6 staging shadow; set False before merging to master.
     player_game_ready_queue_dry_run_enabled: bool = True
     #: Lookback window for player-game re-fetch during ready-queue dry-run.
     player_game_ready_queue_refetch_lookback_hours: float = 48.0

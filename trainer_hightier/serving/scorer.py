@@ -1242,6 +1242,24 @@ def score_once(
         allowlist_ids=allowlist_ids,
     )
     if batch is None:
+        if cfg.player_game_ready_queue_dry_run_enabled:
+            try:
+                from trainer_hightier.serving.player_game_ready_queue import (
+                    process_due_player_games,
+                )
+
+                now_hk = datetime.now(ZoneInfo(cfg.hk_tz))
+                proc = process_due_player_games(conn, now_ts=now_hk, fetch_fn=None)
+                logger.info(
+                    "[pg_ready_queue] due-only cycle (no incremental bets) "
+                    "due=%d deferred=%d completed=%d skipped=%d",
+                    proc.n_due_processed,
+                    proc.n_deferred,
+                    proc.n_completed,
+                    proc.n_skipped_completed,
+                )
+            except Exception as exc:
+                logger.warning("[hightier_scorer] player_game due-only dry-run failed: %s", exc)
         _flight_rec.on_score_once_empty(model_version=str(bundle.model_version))
         _record_scorer_cycle_metrics(
             model_version=str(bundle.model_version),

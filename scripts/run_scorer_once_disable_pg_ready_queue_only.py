@@ -9,10 +9,12 @@ Run from project root (cmd.exe):
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 
-BUNDLE_ROOT = Path(r"C:\Projects\Patron_Walkaway\out\gmwds_deploy_20260613-162313-3eb8de4").resolve()
+_DEFAULT_BUNDLE = r"C:\Projects\Patron_Walkaway\out\gmwds_deploy_20260613-162313-3eb8de4"
+BUNDLE_ROOT = Path(os.environ.get("HIGHTIER_DEPLOY_BUNDLE_DIR", _DEFAULT_BUNDLE)).resolve()
 
 # Try to load bundle .env if python-dotenv available so CH_* / other creds are available
 try:
