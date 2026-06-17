@@ -26,7 +26,13 @@ import pandas as pd
 import pyarrow.parquet as pq
 from zoneinfo import ZoneInfo
 
-from trainer_hightier.config import DuckDbRuntimeConfig, HK_TZ as HK_TZ_STR
+from trainer_hightier.config import (
+    DEFAULT_WALKAWAY_LABEL_CONTRACT,
+    DuckDbRuntimeConfig,
+    HK_TZ as HK_TZ_STR,
+    WALKAWAY_GAP_MIN,
+    WalkawayLabelContract,
+)
 from trainer_hightier.utils.canonical_mapping import default_canonical_mapping_parquet_path
 from trainer_hightier.walkaway_compute_labels import compute_labels
 from trainer_hightier.utils.bet_l0_preprocess import (
@@ -51,11 +57,20 @@ def default_cleaned_bet_parquet_path(*, repo_root: Path | None = None) -> Path:
     return (base / "trainer_hightier" / "artifacts" / "cleaned" / "cleaned__gmwds_t_bet").resolve()
 
 
-def default_walkaway_labels_parquet_path(*, repo_root: Path | None = None) -> Path:
-    """Default output: ``trainer_hightier/artifacts/labels/walkaway_labels.parquet``."""
+def default_walkaway_labels_parquet_path(
+    *,
+    repo_root: Path | None = None,
+    label_contract: WalkawayLabelContract | None = None,
+) -> Path:
+    """Default output under ``artifacts/labels/``; non-default gaps use ``walkaway_labels_gap{N}.parquet``."""
     base = Path(__file__).resolve().parents[2] if repo_root is None else repo_root
+    contract = label_contract or DEFAULT_WALKAWAY_LABEL_CONTRACT
     out_dir = base / "trainer_hightier" / "artifacts" / "labels"
-    return (out_dir / "walkaway_labels.parquet").resolve()
+    if int(contract.walkaway_gap_min) == int(WALKAWAY_GAP_MIN):
+        basename = "walkaway_labels.parquet"
+    else:
+        basename = f"walkaway_labels_gap{int(contract.walkaway_gap_min)}.parquet"
+    return (out_dir / basename).resolve()
 
 
 def build_joined_bets_sql(
@@ -183,6 +198,7 @@ def write_walkaway_labels_from_joined_dataframe(
     *,
     window_end: datetime | pd.Timestamp | None = None,
     extended_end: datetime | pd.Timestamp | None = None,
+    label_contract: WalkawayLabelContract | None = None,
 ) -> Path:
     """Run :func:`~trainer_hightier.walkaway_compute_labels.compute_labels` and write Parquet."""
     dst = Path(out_parquet).resolve()
@@ -203,7 +219,7 @@ def write_walkaway_labels_from_joined_dataframe(
     max_pcd = pd.Timestamp(df["payout_complete_dtm"].max())
     we = max_pcd if window_end is None else pd.Timestamp(window_end)
     ee = we if extended_end is None else pd.Timestamp(extended_end)
-    labeled = compute_labels(df, window_end=we, extended_end=ee)
+    labeled = compute_labels(df, window_end=we, extended_end=ee, label_contract=label_contract)
     out = labeled[["bet_id", "canonical_id", "payout_complete_dtm", "label", "censored"]]
     out.to_parquet(dst, index=False)
     return dst
@@ -216,6 +232,7 @@ def materialize_walkaway_labels_from_cleaned_bet(
     window_end: datetime | pd.Timestamp | None = None,
     extended_end: datetime | pd.Timestamp | None = None,
     duckdb_runtime: DuckDbRuntimeConfig | None = None,
+    label_contract: WalkawayLabelContract | None = None,
 ) -> Path:
     """Join cleaned bets to ``canonical_id``, then run :func:`~trainer_hightier.walkaway_compute_labels.compute_labels`.
 
@@ -292,6 +309,7 @@ def materialize_walkaway_labels_from_cleaned_bet(
         dst,
         window_end=window_end,
         extended_end=extended_end,
+        label_contract=label_contract,
     )
     logger.info("walkaway labels: rows=%d written %s", int(len(df)), dst)
     return dst

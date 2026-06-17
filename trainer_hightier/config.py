@@ -200,6 +200,59 @@ PLAYER_ALERT_COOLDOWN_MIN: Final[int] = 120
 LABELS_CANONICAL_SHARD_COUNT: Final[int] = 32
 DEFAULT_USE_SHARDED_LABELS_CACHE: Final[bool] = False
 LABEL_LOOKAHEAD_MIN: Final[int] = 45
+#: Read-only sibling backup of pre–gap-partition ``labels_v1`` cache (Phase 1 walkaway experiments).
+LABELS_CACHE_READONLY_BACKUP_DIRNAME: Final[str] = "labels_v1__readonly_backup_gap30_20260617"
+#: Read-only backup basename for default ``walkaway_labels.parquet`` (gap=30 production).
+WALKAWAY_LABELS_READONLY_BACKUP_BASENAME: Final[str] = "walkaway_labels_gap30_readonly_backup_20260617.parquet"
+#: Full readonly snapshot of training caches before walkaway gap ablation runs.
+TRAINING_CACHES_READONLY_BACKUP_DIRNAME: Final[str] = (
+    "cache__readonly_backup_pre_walkaway_gap_ablation_20260617"
+)
+TRAINING_CACHES_BACKUP_MANIFEST_BASENAME: Final[str] = "BACKUP_MANIFEST.json"
+
+
+@dataclass(frozen=True)
+class WalkawayLabelContract:
+    """Named walkaway label semantics: gap *X* minutes without bets, alert horizon *Y* minutes."""
+
+    contract_id: str
+    walkaway_gap_min: int
+    alert_horizon_min: int
+
+    @property
+    def label_lookahead_min(self) -> int:
+        """Minutes from observation to label observation boundary (``gap + horizon``)."""
+        return int(self.walkaway_gap_min) + int(self.alert_horizon_min)
+
+
+DEFAULT_WALKAWAY_LABEL_CONTRACT: Final[WalkawayLabelContract] = WalkawayLabelContract(
+    contract_id="walkaway_v1_gap30",
+    walkaway_gap_min=WALKAWAY_GAP_MIN,
+    alert_horizon_min=ALERT_HORIZON_MIN,
+)
+
+
+def walkaway_label_contract_for_gap_min(
+    gap_min: int,
+    *,
+    alert_horizon_min: int | None = None,
+) -> WalkawayLabelContract:
+    """Resolve a :class:`WalkawayLabelContract` for experimental gap values."""
+    gap = int(gap_min)
+    if gap < 1:
+        raise ValueError(f"walkaway_gap_min must be >= 1, got {gap_min!r}")
+    horizon = int(ALERT_HORIZON_MIN if alert_horizon_min is None else alert_horizon_min)
+    if horizon < 1:
+        raise ValueError(f"alert_horizon_min must be >= 1, got {alert_horizon_min!r}")
+    if gap == WALKAWAY_GAP_MIN and horizon == ALERT_HORIZON_MIN:
+        return DEFAULT_WALKAWAY_LABEL_CONTRACT
+    return WalkawayLabelContract(
+        contract_id=f"walkaway_v1_gap{gap}",
+        walkaway_gap_min=gap,
+        alert_horizon_min=horizon,
+    )
+
+
 #: Bet availability delay before scoring (minutes). Keep >= ingest_delay_cap_sec (122s)
 #: from preprocess_l0_data_contract_registry so ``prediction_visible_ts_cf`` guarantees
 #: synthetic observed-at visibility at score time.

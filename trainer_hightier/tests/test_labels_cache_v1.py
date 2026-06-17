@@ -8,7 +8,12 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from trainer_hightier.config import DuckDbRuntimeConfig
+from trainer_hightier.config import (
+    DEFAULT_WALKAWAY_LABEL_CONTRACT,
+    DuckDbRuntimeConfig,
+    WALKAWAY_GAP_MIN,
+    walkaway_label_contract_for_gap_min,
+)
 import pandas as pd
 
 from trainer_hightier.utils.cache_invalidation_v1 import label_invalid_months
@@ -26,20 +31,40 @@ from trainer_hightier.utils.labels_cache_v1 import (
 def test_label_semantic_fingerprint_stable() -> None:
     assert label_semantic_fingerprint() == label_semantic_fingerprint()
     assert len(label_semantic_fingerprint()) == 64
+    gap60 = walkaway_label_contract_for_gap_min(60)
+    assert label_semantic_fingerprint(gap60) != label_semantic_fingerprint()
+
+
+def test_labels_policy_dir_includes_gap_partition() -> None:
+    root = Path("/tmp/cache")
+    p30 = labels_policy_dir(
+        cache_root=root,
+        entity_set_fingerprint="entity_fp_test_123456",
+        walkaway_gap_min=30,
+    )
+    p60 = labels_policy_dir(
+        cache_root=root,
+        entity_set_fingerprint="entity_fp_test_123456",
+        walkaway_gap_min=60,
+    )
+    assert p30 != p60
+    assert "gap=30" in str(p30)
+    assert "gap=60" in str(p60)
 
 
 def test_labels_cache_hit_requires_matching_manifest(tmp_path: Path) -> None:
     labels_p = tmp_path / "labels.parquet"
     pq.write_table(pa.table({"bet_id": [1.0], "canonical_id": ["c1"], "label": [0]}), labels_p)
     manifest_p = tmp_path / "manifest.json"
-    semantic = label_semantic_fingerprint()
+    contract = DEFAULT_WALKAWAY_LABEL_CONTRACT
+    semantic = label_semantic_fingerprint(contract)
     manifest_p.write_text(
         json.dumps(
             {
                 "entity_set_fingerprint": "abc",
                 "label_semantic_fingerprint": semantic,
-                "walkaway_gap_min": 30,
-                "alert_horizon_min": 15,
+                "walkaway_gap_min": contract.walkaway_gap_min,
+                "alert_horizon_min": contract.alert_horizon_min,
             }
         ),
         encoding="utf-8",
@@ -49,12 +74,14 @@ def test_labels_cache_hit_requires_matching_manifest(tmp_path: Path) -> None:
         labels_parquet_path=labels_p,
         entity_set_fingerprint="abc",
         label_semantic_fp=semantic,
+        label_contract=contract,
     )
     assert not labels_cache_is_hit(
         manifest_path=manifest_p,
         labels_parquet_path=labels_p,
         entity_set_fingerprint="different",
         label_semantic_fp=semantic,
+        label_contract=contract,
     )
 
 
@@ -123,6 +150,7 @@ def test_sharded_labels_cache_hit_on_second_call(tmp_path: Path) -> None:
     policy = labels_policy_dir(
         cache_root=tmp_path / "cache",
         entity_set_fingerprint="entity_fp_sharded_test",
+        walkaway_gap_min=WALKAWAY_GAP_MIN,
     )
     shard_dir = labels_shard_dir(policy_dir=policy, month="202406", canonical_shard=0)
     assert (shard_dir / "data.parquet").is_file()
@@ -133,6 +161,7 @@ def test_sharded_labels_cache_hit_on_second_call(tmp_path: Path) -> None:
         label_semantic_fp=label_semantic_fingerprint(),
         month="202406",
         canonical_shard=0,
+        label_contract=DEFAULT_WALKAWAY_LABEL_CONTRACT,
     )
     second = materialize_labels_v1_sharded_cached(**kwargs)
     assert second["labels_cache_hit"] is True
@@ -220,6 +249,57 @@ def test_sharded_labels_miss_when_entity_set_fingerprint_changes(tmp_path: Path,
     materialize_labels_v1_sharded_cached(**base, entity_set_fingerprint="entity_fp_b" * 4)
     assert len(shard_calls) == 2
     assert shard_calls[0] != shard_calls[1]
+
+
+def test_sharded_labels_legacy_policy_dir_cache_hit(tmp_path: Path) -> None:
+    """Pre–gap-partition cache under ``entity_set=`` still hits for gap=30."""
+    paths = _tiny_labels_inputs(tmp_path)
+    legacy_policy = (
+        tmp_path
+        / "cache_legacy"
+        / "entity_set=entity_fp_legacy"
+    )
+    shard_dir = legacy_policy / "month=202406" / "canonical_shard=0"
+    shard_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.table({"bet_id": [1.0], "canonical_id": ["c1"], "label": [0], "censored": [False]}),
+        shard_dir / "data.parquet",
+    )
+    contract = DEFAULT_WALKAWAY_LABEL_CONTRACT
+    semantic = label_semantic_fingerprint(contract)
+    (shard_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "entity_set_fingerprint": "entity_fp_legacy",
+                "label_semantic_fingerprint": semantic,
+                "month": "202406",
+                "canonical_shard": 0,
+                "walkaway_gap_min": contract.walkaway_gap_min,
+                "alert_horizon_min": contract.alert_horizon_min,
+            }
+        ),
+        encoding="utf-8",
+    )
+    resolved = __import__(
+        "trainer_hightier.utils.labels_cache_v1",
+        fromlist=["_resolve_shard_cache_paths"],
+    )._resolve_shard_cache_paths(
+        policy_dirs=(
+            labels_policy_dir(
+                cache_root=tmp_path / "cache_legacy",
+                entity_set_fingerprint="entity_fp_legacy",
+                walkaway_gap_min=30,
+            ),
+            legacy_policy,
+        ),
+        month="202406",
+        canonical_shard=0,
+        entity_set_fingerprint="entity_fp_legacy",
+        label_semantic_fp=semantic,
+        label_contract=contract,
+    )
+    assert resolved is not None
+    assert resolved[1] == shard_dir / "data.parquet"
 
 
 def test_materialize_labels_use_sharded_flag(tmp_path: Path, monkeypatch) -> None:

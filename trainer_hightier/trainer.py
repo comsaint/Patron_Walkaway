@@ -43,6 +43,7 @@ from trainer_hightier.config import (
     DEFAULT_DEPLOY_OUTPUT_ROOT,
     DEFAULT_MODEL_DIR,
     DEFAULT_RANDOM_SEED,
+    DEFAULT_WALKAWAY_LABEL_CONTRACT,
     FEATURE_CANDIDATE_REGISTRY_SNAPSHOT_FILENAME,
     DEFAULT_RUN_PROFILE_NAME,
     DEFAULT_TRAINING_FEATURE_SERVICE,
@@ -73,12 +74,15 @@ from trainer_hightier.config import (
     DATA_COMPLETENESS_MODE_STRICT,
     ResolvedTrainingScope,
     TrainingDataScopeConfig,
+    WALKAWAY_GAP_MIN,
+    WalkawayLabelContract,
     feature_selection_policy_fingerprint,
     resolve_training_scope,
     sample_policy_fingerprint,
     training_scope_policy_fingerprint,
     validate_sample_policy_for_run,
     validate_feature_screening_policy,
+    walkaway_label_contract_for_gap_min,
     configs_from_run_profile,
     get_run_profile,
     list_run_profile_names,
@@ -226,6 +230,10 @@ class HighTierTrainArgs:
     use_entity_set_v1: bool = True
     #: When True: Step 2c labels use month×canonical_shard cache (default off until smoke sign-off).
     use_sharded_labels_cache: bool = False
+    #: Walkaway label contract (gap X + horizon Y); default production gap=30.
+    walkaway_label_contract: WalkawayLabelContract = field(
+        default_factory=lambda: DEFAULT_WALKAWAY_LABEL_CONTRACT,
+    )
     # Step 4: deterministic arrange + time split on ``gaming_day`` (after Step 3 or --start-from-features).
     run_step4: bool = True
     step4_split: Step4SplitConfig = field(default_factory=Step4SplitConfig)
@@ -1070,7 +1078,10 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                     partition_inventory_fingerprint_sha256_hex=inv_fp,
                 )
             labels_invalid = tuple(sorted(label_invalid_months(set(recompute_months))))
-            labels_out = args.objective.labels_parquet or default_walkaway_labels_parquet_path()
+            labels_out = (
+                args.objective.labels_parquet
+                or default_walkaway_labels_parquet_path(label_contract=args.walkaway_label_contract)
+            )
             lbl_meta = materialize_labels_v1_cached(
                 cleaned_bet_parquet=cleaned_bet_path,
                 canonical_mapping_parquet=mapping_parquet_path,
@@ -1080,11 +1091,14 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 invalid_months=labels_invalid,
                 use_cache=use_preprocess_caches,
                 use_sharded_cache=bool(args.use_sharded_labels_cache),
+                label_contract=args.walkaway_label_contract,
             )
             if metrics is not None:
                 metrics.update(lbl_meta)
                 metrics["entity_set_policy_fingerprint_sha256_hex"] = labels_fp
                 metrics["labels_invalid_months"] = list(labels_invalid)
+                metrics["walkaway_label_contract_id"] = str(args.walkaway_label_contract.contract_id)
+                metrics["walkaway_gap_min"] = int(args.walkaway_label_contract.walkaway_gap_min)
             logger.info(
                 "[Step 2c] walkaway labels %s cache_hit=%s rows=%d -> %s",
                 "OK" if lbl_meta.get("labels_row_count", 0) > 0 else "empty",
@@ -1926,7 +1940,10 @@ def _maybe_build_training_dataset(args: HighTierTrainArgs, *, metrics: dict[str,
             cleaned_bet_path.resolve(),
         )
         return
-    labels_path = args.objective.labels_parquet or default_walkaway_labels_parquet_path()
+    labels_path = (
+        args.objective.labels_parquet
+        or default_walkaway_labels_parquet_path(label_contract=args.walkaway_label_contract)
+    )
     if not labels_path.is_file():
         logger.warning(
             "[Step 3] skip training dataset: labels missing at %s (enable walkaway labels or materialize separately)",
@@ -2871,6 +2888,17 @@ def _build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--walkaway-gap-min",
+        type=int,
+        default=WALKAWAY_GAP_MIN,
+        metavar="MINUTES",
+        help=(
+            "Walkaway gap X (minutes without bets) for Step 2c label contract. "
+            "Default 30 (production). Use 60 or 1440 for gap ablation; "
+            "non-default gaps write separate labels parquet and gap-partitioned L4 cache."
+        ),
+    )
+    p.add_argument(
         "--skip-walkaway-labels",
         action="store_true",
         dest="skip_walkaway_labels",
@@ -3087,6 +3115,7 @@ def _train_args_from_cli_namespace(ns: argparse.Namespace) -> HighTierTrainArgs:
         skip_bet_preprocess=bool(ns.skip_bet_preprocess),
         use_entity_set_v1=not bool(ns.use_legacy_bet_segment),
         use_sharded_labels_cache=bool(ns.use_sharded_labels_cache),
+        walkaway_label_contract=walkaway_label_contract_for_gap_min(int(ns.walkaway_gap_min)),
         materialize_walkaway_labels=not bool(ns.skip_walkaway_labels),
         build_training_dataset=not bool(ns.skip_training_dataset),
         training_materialize_derived=not bool(ns.skip_training_materialize_derived),

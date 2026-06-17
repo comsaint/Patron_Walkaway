@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import shutil
+import stat
 import tempfile
 import time
 from dataclasses import dataclass
@@ -568,3 +570,172 @@ def materialize_source_manifest_v2_phase1(
         "source_manifest_v2_cache_report_path": str(cache_report_path.resolve()),
         "source_manifest_v2_current_path": str(current_path.resolve()),
     }
+
+
+def default_artifacts_root(*, package_dir: Path | None = None) -> Path:
+    """Return ``trainer_hightier/artifacts``."""
+    base = Path(package_dir).resolve() if package_dir is not None else Path(__file__).resolve().parents[1]
+    return (base / "artifacts").resolve()
+
+
+def default_training_caches_backup_root(*, package_dir: Path | None = None) -> Path:
+    """Return readonly full-cache backup root under ``artifacts/``."""
+    from trainer_hightier.config import TRAINING_CACHES_READONLY_BACKUP_DIRNAME
+
+    return default_artifacts_root(package_dir=package_dir) / TRAINING_CACHES_READONLY_BACKUP_DIRNAME
+
+
+def _make_path_tree_readonly(root: Path) -> None:
+    """Best-effort read-only chmod for a copied backup tree (Windows + POSIX)."""
+    for path in sorted(root.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        if path.is_file():
+            path.chmod(stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
+        elif path.is_dir():
+            path.chmod(
+                stat.S_IREAD
+                | stat.S_IXUSR
+                | stat.S_IRGRP
+                | stat.S_IXGRP
+                | stat.S_IROTH
+                | stat.S_IXOTH,
+            )
+
+
+def _dir_size_bytes(root: Path) -> int:
+    """Return total file bytes under ``root`` (best-effort)."""
+    total = 0
+    if not root.exists():
+        return 0
+    for path in root.rglob("*"):
+        if path.is_file():
+            try:
+                total += int(path.stat().st_size)
+            except OSError:
+                continue
+    return total
+
+
+def _copy_tree_excluding(
+    src: Path,
+    dst: Path,
+    *,
+    exclude_dir_names: frozenset[str],
+) -> None:
+    """Copy directory tree, skipping immediate child directory names in ``exclude_dir_names``."""
+    src_r = Path(src).resolve()
+    dst_r = Path(dst).resolve()
+    if not src_r.is_dir():
+        raise FileNotFoundError(f"backup source directory not found: {src_r}")
+
+    def _ignore(_directory: str, names: list[str]) -> list[str]:
+        return [name for name in names if name in exclude_dir_names]
+
+    shutil.copytree(src_r, dst_r, ignore=_ignore if exclude_dir_names else None)
+
+
+def backup_all_training_caches_readonly(
+    *,
+    package_dir: Path | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Copy all training cache trees once into a readonly backup root (idempotent).
+
+    Backs up:
+    - ``artifacts/cache`` (L2–L4 shared caches; skips prior labels-only backup dir)
+    - ``artifacts/training_data/cache`` (Feast month-group + short-term PIT)
+    - ``artifacts/labels`` (walkaway labels parquet)
+    - ``artifacts/cleaned`` (L1 cleaned bet/session)
+    """
+    from trainer_hightier.config import (
+        LABELS_CACHE_READONLY_BACKUP_DIRNAME,
+        TRAINING_CACHES_BACKUP_MANIFEST_BASENAME,
+    )
+
+    t0 = time.perf_counter()
+    artifacts_root = default_artifacts_root(package_dir=package_dir)
+    backup_root = default_training_caches_backup_root(package_dir=package_dir)
+    manifest_path = backup_root / TRAINING_CACHES_BACKUP_MANIFEST_BASENAME
+    if manifest_path.is_file() and not force:
+        try:
+            prev = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeError):
+            prev = None
+        if isinstance(prev, dict) and prev.get("status") == "completed":
+            logger.info(
+                "training caches readonly backup already exists at %s; skipping",
+                backup_root.resolve(),
+            )
+            return prev
+
+    specs: tuple[tuple[str, str, Path, frozenset[str]], ...] = (
+        (
+            "shared_l2_l4_cache",
+            "cache",
+            artifacts_root / "cache",
+            frozenset({LABELS_CACHE_READONLY_BACKUP_DIRNAME}),
+        ),
+        (
+            "step3_feast_and_short_pit_cache",
+            "training_data/cache",
+            artifacts_root / "training_data" / "cache",
+            frozenset(),
+        ),
+        ("labels_parquet", "labels", artifacts_root / "labels", frozenset()),
+        ("l1_cleaned_source", "cleaned", artifacts_root / "cleaned", frozenset()),
+    )
+    entries: list[dict[str, Any]] = []
+    backup_root.mkdir(parents=True, exist_ok=True)
+    for label, rel_dest, source, exclude in specs:
+        dst = backup_root / rel_dest
+        entry: dict[str, Any] = {
+            "label": label,
+            "source_path": str(source.resolve()),
+            "backup_path": str(dst.resolve()),
+        }
+        if not source.exists():
+            entry["status"] = "skipped_missing_source"
+            entries.append(entry)
+            logger.warning("cache backup skip missing source %s", source.resolve())
+            continue
+        if dst.exists() and not force:
+            entry["status"] = "reused_existing"
+            entry["size_bytes"] = _dir_size_bytes(dst)
+            entries.append(entry)
+            logger.info("cache backup reuse existing %s", dst.resolve())
+            continue
+        if dst.exists() and force:
+            shutil.rmtree(dst)
+        logger.info("cache backup copying %s -> %s", source.resolve(), dst.resolve())
+        t_copy = time.perf_counter()
+        _copy_tree_excluding(source, dst, exclude_dir_names=exclude)
+        _make_path_tree_readonly(dst)
+        entry["status"] = "copied"
+        entry["copy_elapsed_seconds"] = round(time.perf_counter() - t_copy, 3)
+        entry["size_bytes"] = _dir_size_bytes(dst)
+        entries.append(entry)
+        logger.info(
+            "cache backup done %s size_bytes=%d elapsed=%.1fs",
+            label,
+            int(entry["size_bytes"]),
+            float(entry["copy_elapsed_seconds"]),
+        )
+
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "training_caches_readonly_backup_v1",
+        "status": "completed",
+        "backup_root": str(backup_root.resolve()),
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "elapsed_seconds": round(time.perf_counter() - t0, 3),
+        "entries": entries,
+        "total_size_bytes": int(sum(int(e.get("size_bytes") or 0) for e in entries)),
+    }
+    write_json_atomic(manifest_path, payload)
+    _make_path_tree_readonly(backup_root)
+    logger.info(
+        "training caches readonly backup completed at %s (%.1fs, %d bytes)",
+        backup_root.resolve(),
+        float(payload["elapsed_seconds"]),
+        int(payload["total_size_bytes"]),
+    )
+    return payload

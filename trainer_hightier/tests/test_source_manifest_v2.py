@@ -22,6 +22,7 @@ from trainer_hightier.utils.source_manifest_v2 import (
     CHANGE_REMOVED,
     CHANGE_UNCHANGED,
     aggregate_source_files_fingerprint_sha256_hex,
+    backup_all_training_caches_readonly,
     build_source_file_record,
     build_source_manifest_v2,
     diff_source_manifests,
@@ -229,3 +230,35 @@ def test_build_manifest_records_sorted_and_atomic_paths_exist(tmp_path: Path) ->
     manifest, _, _ = build_source_manifest_v2(snapshot_dir=snap, snapshot_id="snap", bet_stats=bets, session_stats=sess)
     paths = [f["relative_path"] for f in manifest["files"]]
     assert paths == sorted(paths)
+
+
+def test_backup_all_training_caches_readonly_idempotent(tmp_path: Path, monkeypatch) -> None:
+    """Full-cache backup copies tiny fixture trees once and skips on second call."""
+    pkg = tmp_path / "trainer_hightier"
+    artifacts = pkg / "artifacts"
+    (artifacts / "cache" / "universe_v1").mkdir(parents=True)
+    (artifacts / "cache" / "universe_v1" / "marker.txt").write_text("u", encoding="utf-8")
+    (artifacts / "training_data" / "cache" / "short_term_pit_v1").mkdir(parents=True)
+    (artifacts / "training_data" / "cache" / "short_term_pit_v1" / "marker.txt").write_text(
+        "p",
+        encoding="utf-8",
+    )
+    (artifacts / "labels").mkdir(parents=True)
+    (artifacts / "labels" / "walkaway_labels.parquet").write_bytes(b"lbl")
+    (artifacts / "cleaned" / "cleaned__gmwds_t_bet").mkdir(parents=True)
+    (artifacts / "cleaned" / "cleaned__gmwds_t_bet" / "marker.txt").write_text("b", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "trainer_hightier.utils.source_manifest_v2.default_artifacts_root",
+        lambda **_: artifacts.resolve(),
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.utils.source_manifest_v2.default_training_caches_backup_root",
+        lambda **_: (artifacts / "cache__backup_test").resolve(),
+    )
+    first = backup_all_training_caches_readonly()
+    assert first["status"] == "completed"
+    assert (artifacts / "cache__backup_test" / "cache" / "universe_v1" / "marker.txt").is_file()
+    second = backup_all_training_caches_readonly()
+    assert second["status"] == "completed"
+    assert second["backup_root"] == first["backup_root"]

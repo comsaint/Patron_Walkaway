@@ -11,10 +11,9 @@ import numpy as np
 import pandas as pd
 
 from trainer_hightier.config import (
-    ALERT_HORIZON_MIN,
+    DEFAULT_WALKAWAY_LABEL_CONTRACT,
     HK_TZ,
-    LABEL_LOOKAHEAD_MIN,
-    WALKAWAY_GAP_MIN,
+    WalkawayLabelContract,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,8 +27,14 @@ def compute_labels(
     bets_df: pd.DataFrame,
     window_end: datetime,
     extended_end: datetime,
+    *,
+    label_contract: WalkawayLabelContract | None = None,
 ) -> pd.DataFrame:
     """Compute walkaway labels (label + censored columns). Mirrors legacy trainer semantics."""
+    contract = label_contract or DEFAULT_WALKAWAY_LABEL_CONTRACT
+    walkaway_gap_min = int(contract.walkaway_gap_min)
+    alert_horizon_min = int(contract.alert_horizon_min)
+    label_lookahead_min = int(contract.label_lookahead_min)
 
     missing = _REQUIRED_BET_COLS - set(bets_df.columns)
     if missing:
@@ -45,10 +50,10 @@ def compute_labels(
     if extended_end_ts < window_end_ts:
         raise ValueError(f"extended_end ({extended_end}) must be >= window_end ({window_end})")
 
-    _min_extended_end = window_end_ts + pd.Timedelta(minutes=float(LABEL_LOOKAHEAD_MIN))
+    _min_extended_end = window_end_ts + pd.Timedelta(minutes=float(label_lookahead_min))
     if extended_end_ts < _min_extended_end:
         logger.warning(
-            "compute_labels: extended_end (%s) < window_end + LABEL_LOOKAHEAD_MIN (%s); "
+            "compute_labels: extended_end (%s) < window_end + label_lookahead_min (%s); "
             "terminal bets near boundary will be censored.",
             extended_end_ts,
             _min_extended_end,
@@ -88,25 +93,25 @@ def compute_labels(
     is_terminal = df["_next_payout"].isna()
     gap_duration_min = (df["_next_payout"] - df["payout_complete_dtm"]).dt.total_seconds().div(60)
 
-    walkaway_gap_delta = pd.Timedelta(minutes=float(WALKAWAY_GAP_MIN))
+    walkaway_gap_delta = pd.Timedelta(minutes=float(walkaway_gap_min))
 
     terminal_determinable = is_terminal & (
         df["payout_complete_dtm"] + walkaway_gap_delta <= extended_end_ts
     )
     df["_gap_start"] = (
-        (~is_terminal & (gap_duration_min >= float(WALKAWAY_GAP_MIN))) | terminal_determinable
+        (~is_terminal & (gap_duration_min >= float(walkaway_gap_min))) | terminal_determinable
     )
     df["censored"] = (is_terminal & ~terminal_determinable).astype(bool)
 
-    df["label"] = _compute_labels_vectorized(df)
+    df["label"] = _compute_labels_vectorized(df, alert_horizon_min=alert_horizon_min)
     df = df.drop(columns=["_next_payout", "_gap_start"])
     return df
 
 
-def _compute_labels_vectorized(df: pd.DataFrame) -> pd.Series:
+def _compute_labels_vectorized(df: pd.DataFrame, *, alert_horizon_min: int) -> pd.Series:
     """Vectorized horizon labels per canonical_id group."""
 
-    horizon_ns = int(float(ALERT_HORIZON_MIN) * 60 * 1e9)
+    horizon_ns = int(float(alert_horizon_min) * 60 * 1e9)
     times_all: np.ndarray = (
         df["payout_complete_dtm"].values.astype("datetime64[ns]").astype("int64")
     )
