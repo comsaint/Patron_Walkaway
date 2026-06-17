@@ -168,6 +168,33 @@ def test_sharded_labels_cache_hit_on_second_call(tmp_path: Path) -> None:
     assert second["labels_cache_miss_shards"] == []
 
 
+def test_sharded_labels_aggregate_extended_end_includes_lookahead(tmp_path: Path) -> None:
+    """Sharded L4 cache must stamp extended_end = window_end + label_lookahead_min."""
+    paths = _tiny_labels_inputs(tmp_path)
+    kwargs = dict(
+        cleaned_bet_parquet=paths["bet"],
+        canonical_mapping_parquet=paths["map"],
+        entity_set_fingerprint="entity_fp_extended_end_test",
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        cache_root=tmp_path / "cache_extended",
+        out_parquet=paths["out"],
+        canonical_shard_count=1,
+        use_cache=True,
+    )
+    materialize_labels_v1_sharded_cached(**kwargs)
+    policy = labels_policy_dir(
+        cache_root=tmp_path / "cache_extended",
+        entity_set_fingerprint="entity_fp_extended_end_test",
+        walkaway_gap_min=WALKAWAY_GAP_MIN,
+    )
+    aggregate = json.loads((policy / "aggregate_manifest.json").read_text(encoding="utf-8"))
+    window_end = pd.Timestamp(aggregate["window_end"])
+    extended_end = pd.Timestamp(aggregate["extended_end"])
+    contract = DEFAULT_WALKAWAY_LABEL_CONTRACT
+    assert extended_end == window_end + pd.Timedelta(minutes=contract.label_lookahead_min)
+    assert extended_end > window_end
+
+
 def test_sharded_labels_invalid_month_recomputes_shard(tmp_path: Path) -> None:
     """P3-T-10: dirty month safety window recomputes only affected month×shard entries."""
     paths = _tiny_labels_inputs(tmp_path)

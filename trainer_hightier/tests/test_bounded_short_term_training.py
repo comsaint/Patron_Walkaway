@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import duckdb
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -15,9 +16,12 @@ from trainer_hightier.feature_experiment.materialize_fe_derived import (
 )
 from trainer_hightier.serving.offline_serving_backtest import resolve_hot_pool_player_ids
 from trainer_hightier.utils.cleaned_bet_pool_read import (
+    cleaned_bet_pool_game_id_sql,
     cleaned_bet_pool_read_parquet_sql,
+    cleaned_bet_pool_source_has_column,
     gaming_months_for_bounded_pool,
     open_month_hot_pool_session,
+    pool_source_select_sql,
 )
 from trainer_hightier.utils.trial_bet_behavior_1h import materialize_trial_bet_behavior_1h
 
@@ -51,6 +55,71 @@ def test_cleaned_bet_pool_read_parquet_sql_scopes_partitions(tmp_path: Path) -> 
     assert "gaming_month=202501" in sql
     assert "gaming_month=202502" not in sql
     assert "hive_partitioning=false" in sql
+
+
+def _legacy_pool_bet_row(*, bet_id: float, payout: pd.Timestamp, game_id: float | None = None) -> dict:
+    row = {
+        "bet_id": bet_id,
+        "player_id": 10,
+        "session_id": 1,
+        "table_id": 1,
+        "gaming_day_event": pd.Timestamp("2025-01-01"),
+        "payout_complete_dtm": payout,
+        "wager": 10.0,
+        "is_back_bet": 0,
+        "payout_odds": 2.0,
+        "casino_win": 0.0,
+        "theo_win": 1.0,
+        "base_ha": 0.01,
+        "bet_type": "PLAYER",
+        "type_of_bet": "MAIN",
+    }
+    if game_id is not None:
+        row["game_id"] = game_id
+    return row
+
+
+def test_pool_source_select_sql_null_game_id_when_column_missing(tmp_path: Path) -> None:
+    """Legacy cleaned-bet fixtures without game_id must still open month hot pools."""
+    parquet = tmp_path / "legacy_bets.parquet"
+    payout = pd.Timestamp("2025-01-15 12:00:00", tz="UTC")
+    pq.write_table(
+        pa.Table.from_pandas(pd.DataFrame([_legacy_pool_bet_row(bet_id=1.0, payout=payout)])),
+        parquet,
+    )
+    bet_from = f"read_parquet('{parquet.as_posix()}')"
+    conn = duckdb.connect(database=":memory:")
+    try:
+        assert cleaned_bet_pool_source_has_column(conn, bet_from, "game_id") is False
+        assert "CAST(NULL AS DOUBLE) AS game_id" in cleaned_bet_pool_game_id_sql(conn, bet_from)
+        pool_sql = f"{pool_source_select_sql(conn, bet_from)} FROM {bet_from} AS b"
+        got = conn.execute(pool_sql).fetchdf()
+        assert "game_id" in got.columns
+        assert got["game_id"].isna().all()
+    finally:
+        conn.close()
+
+
+def test_pool_source_select_sql_preserves_game_id_when_present(tmp_path: Path) -> None:
+    """When game_id exists in the source parquet, pool projection must pass it through."""
+    parquet = tmp_path / "modern_bets.parquet"
+    payout = pd.Timestamp("2025-01-15 12:00:00", tz="UTC")
+    pq.write_table(
+        pa.Table.from_pandas(
+            pd.DataFrame([_legacy_pool_bet_row(bet_id=1.0, payout=payout, game_id=42.0)]),
+        ),
+        parquet,
+    )
+    bet_from = f"read_parquet('{parquet.as_posix()}')"
+    conn = duckdb.connect(database=":memory:")
+    try:
+        assert cleaned_bet_pool_source_has_column(conn, bet_from, "game_id") is True
+        assert cleaned_bet_pool_game_id_sql(conn, bet_from) == "b.game_id"
+        pool_sql = f"{pool_source_select_sql(conn, bet_from)} FROM {bet_from} AS b"
+        got = conn.execute(pool_sql).fetchdf()
+        assert float(got["game_id"].iloc[0]) == 42.0
+    finally:
+        conn.close()
 
 
 def test_open_month_hot_pool_session_loads_once(tmp_path: Path) -> None:
@@ -98,6 +167,36 @@ def test_open_month_hot_pool_session_loads_once(tmp_path: Path) -> None:
             f"SELECT bet_id FROM {session.table_name} ORDER BY bet_id",
         ).fetchall()
         assert [row[0] for row in got] == [1.0, 2.0]
+    finally:
+        session.close()
+
+
+def test_open_month_hot_pool_session_tolerates_missing_game_id(tmp_path: Path) -> None:
+    """Month pool materialization must not fail when legacy parquet omits game_id."""
+    root = tmp_path / "cleaned"
+    part_dir = root / "gaming_month=202501" / "gaming_day_key=2025-01-01"
+    part_dir.mkdir(parents=True)
+    payout = pd.Timestamp("2025-01-15 12:00:00", tz="UTC")
+    pq.write_table(
+        pa.Table.from_pandas(pd.DataFrame([_legacy_pool_bet_row(bet_id=1.0, payout=payout)])),
+        part_dir / "part.parquet",
+    )
+    session = open_month_hot_pool_session(
+        root,
+        payout_yyyymm="202501",
+        duckdb_runtime=DuckDbRuntimeConfig(),
+    )
+    try:
+        assert session.row_count == 1
+        cols = {
+            str(row[0])
+            for row in session.conn.execute(f"DESCRIBE {session.table_name}").fetchall()
+        }
+        assert "game_id" in cols
+        game_id = session.conn.execute(
+            f"SELECT game_id FROM {session.table_name}",
+        ).fetchone()[0]
+        assert game_id is None
     finally:
         session.close()
 
