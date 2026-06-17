@@ -4,11 +4,11 @@ Only bets present in the cleaned ``t_bet`` Parquet are considered. The successor
 of a bet is the **next cleaned bet** with the same ``canonical_id`` (after G3 sort);
 this matches passing a ``bets_df`` that already excludes non–high-tier rows.
 
-**Observation boundary (H1):** By default ``window_end`` and ``extended_end`` are
-both set to ``MAX(payout_complete_dtm)`` over the joined frame. Terminal bets whose
-``payout_complete_dtm + WALKAWAY_GAP_MIN`` exceeds that boundary are ``censored``.
-Override ``extended_end`` if your ingest truly allows observing silence beyond the
-last bet timestamp.
+**Observation boundary (H1):** By default ``window_end`` is ``MAX(payout_complete_dtm)`` and
+``extended_end`` is ``window_end + label_lookahead_min`` (``gap + alert_horizon`` from
+:class:`~trainer_hightier.config.WalkawayLabelContract`). Terminal bets whose
+``payout_complete_dtm + walkaway_gap_min`` exceeds ``extended_end`` are ``censored``.
+Override ``extended_end`` only when ingest truly allows observing silence beyond that boundary.
 
 **RAM:** This loads the joined ``(bet_id, canonical_id, payout_complete_dtm)``
 frame into pandas. ~30M rows may need tens of GB; use a workstation profile or
@@ -192,6 +192,18 @@ def list_joined_bet_payout_months(
     return tuple(str(r[0]) for r in rows if r and r[0] is not None)
 
 
+def label_window_ends_from_max_payout(
+    max_pcd: datetime | pd.Timestamp,
+    *,
+    label_contract: WalkawayLabelContract | None = None,
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Return ``(window_end, extended_end)`` for dataset-boundary walkaway label materialize."""
+    contract = label_contract or DEFAULT_WALKAWAY_LABEL_CONTRACT
+    window_end = pd.Timestamp(max_pcd)
+    extended_end = window_end + pd.Timedelta(minutes=float(contract.label_lookahead_min))
+    return window_end, extended_end
+
+
 def write_walkaway_labels_from_joined_dataframe(
     joined: pd.DataFrame,
     out_parquet: Path,
@@ -201,6 +213,7 @@ def write_walkaway_labels_from_joined_dataframe(
     label_contract: WalkawayLabelContract | None = None,
 ) -> Path:
     """Run :func:`~trainer_hightier.walkaway_compute_labels.compute_labels` and write Parquet."""
+    contract = label_contract or DEFAULT_WALKAWAY_LABEL_CONTRACT
     dst = Path(out_parquet).resolve()
     dst.parent.mkdir(parents=True, exist_ok=True)
     df = joined
@@ -218,8 +231,11 @@ def write_walkaway_labels_from_joined_dataframe(
         return dst
     max_pcd = pd.Timestamp(df["payout_complete_dtm"].max())
     we = max_pcd if window_end is None else pd.Timestamp(window_end)
-    ee = we if extended_end is None else pd.Timestamp(extended_end)
-    labeled = compute_labels(df, window_end=we, extended_end=ee, label_contract=label_contract)
+    if extended_end is None:
+        _, ee = label_window_ends_from_max_payout(we, label_contract=contract)
+    else:
+        ee = pd.Timestamp(extended_end)
+    labeled = compute_labels(df, window_end=we, extended_end=ee, label_contract=contract)
     out = labeled[["bet_id", "canonical_id", "payout_complete_dtm", "label", "censored"]]
     out.to_parquet(dst, index=False)
     return dst

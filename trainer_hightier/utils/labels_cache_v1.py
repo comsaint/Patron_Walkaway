@@ -59,6 +59,7 @@ def label_semantic_fingerprint(
     blob = (
         f"{digest}|gap={int(contract.walkaway_gap_min)}"
         f"|horizon={int(contract.alert_horizon_min)}"
+        f"|extended_end_policy=v2"
     )
     return hashlib.sha256(blob.encode()).hexdigest()
 
@@ -316,8 +317,11 @@ def _query_global_label_window_ends(
     canonical_mapping_parquet: Path,
     *,
     duckdb_runtime: DuckDbRuntimeConfig,
+    label_contract: WalkawayLabelContract,
 ) -> tuple[pd.Timestamp, pd.Timestamp]:
     """Return global ``(window_end, extended_end)`` over all joined bets."""
+    from trainer_hightier.utils.walkaway_labels import label_window_ends_from_max_payout
+
     df = load_joined_bets_dataframe(
         cleaned_bet_parquet,
         canonical_mapping_parquet,
@@ -327,7 +331,7 @@ def _query_global_label_window_ends(
         now = pd.Timestamp.utcnow().tz_localize(None)
         return now, now
     max_pcd = pd.Timestamp(df["payout_complete_dtm"].max())
-    return max_pcd, max_pcd
+    return label_window_ends_from_max_payout(max_pcd, label_contract=label_contract)
 
 
 def _write_labels_shard_manifest(
@@ -511,6 +515,7 @@ def materialize_labels_v1_sharded_cached(
         cleaned_bet_parquet,
         canonical_mapping_parquet,
         duckdb_runtime=duckdb_runtime,
+        label_contract=contract,
     )
     hit_shards: list[str] = []
     miss_shards: list[str] = []

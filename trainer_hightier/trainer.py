@@ -1047,8 +1047,6 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
 
     if (
         args.materialize_walkaway_labels
-        and not args.skip_bet_preprocess
-        and bool(bet_partition_paths)
         and _hbet.cleaned_bet_dataset_has_any_parquet(cleaned_bet_path)
     ):
         if not mapping_parquet_path.is_file():
@@ -1099,6 +1097,7 @@ def prepare_training_frame(args: HighTierTrainArgs, *, metrics: dict[str, Any] |
                 metrics["labels_invalid_months"] = list(labels_invalid)
                 metrics["walkaway_label_contract_id"] = str(args.walkaway_label_contract.contract_id)
                 metrics["walkaway_gap_min"] = int(args.walkaway_label_contract.walkaway_gap_min)
+                metrics["alert_horizon_min"] = int(args.walkaway_label_contract.alert_horizon_min)
             logger.info(
                 "[Step 2c] walkaway labels %s cache_hit=%s rows=%d -> %s",
                 "OK" if lbl_meta.get("labels_row_count", 0) > 0 else "empty",
