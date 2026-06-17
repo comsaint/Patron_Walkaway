@@ -15,14 +15,20 @@
 
 ### 1.1 本 working plan 的範圍
 
-- **In**：候選生成與 group 化管理、**特徵品質閘門 FQG（§1.5）**、Gate 0/1/2 篩選、外部事件來源之 experiment-only materialization 接入、短中長窗分級與快照物化、`feature_compute_range` / `training_sample_range` 解耦、固定 eval 下之訓練視窗策略比較、每輪實驗之報表與 go/no-go。
+- **In**：候選生成與 group 化管理、**特徵品質閘門 FQG（§1.5）**、Gate 0/1/2 篩選、**Time-CV feature selection（§1.8）與 pruning**、外部事件來源之 experiment-only materialization 接入、短中長窗分級與快照物化、`feature_compute_range` / `training_sample_range` 解耦、固定 eval 下之訓練視窗策略比較、每輪實驗之報表與 go/no-go。
 - **Out**：模型家族替換決策、線上 serving infra、ClickHouse 生產變更、單一 raw source 的欄位級清洗規則。
 
 ### 1.2 已鎖定的設計決策（對齊 SSOT + Implementation Plan）
 
 | 項目 | 決策 |
 |------|------|
-| 主評估指標 | **Average Precision（AP）** 作為不均衡目標之主指標；搭配 precision floor 下之 **Recall@Pmin（R@Pmin）**，其 `min_precision` 對齊 `config.py` 之 `HighTierObjectiveConfig.min_precision`（現行預設 **0.60**）。 |
+| 主評估指標 | **Average Precision（AP）** 作為不均衡目標之主指標；搭配 precision floor 下之 **Recall@Pmin（R@Pmin）**，其 `min_precision` 對齊 `config.py` 之 `HighTierObjectiveConfig.min_precision`（現行預設 **0.60**）。Time-CV（§1.8）以 **P@1hr** 為主決策指標。 |
+| Time-CV 主指標 | **P@1hr**（在 val 上依各 arm 各自 score 分布找 threshold，使 alert rate = 1 alert/hour，再比較 precision）。AP 與 Recall@Pmin 為輔助。 |
+| Time-CV 設計 | **Expanding window**、預設 **K=5**（prototype **K=3**）、val 窗口 **30d**（`gaming_day_event`）、min train **90d**；程式落點 `feature_experiment/time_cv/`。 |
+| Time-CV v0 超參 | **固定超參**（所有 fold 同一組 LightGBM）；不做 per-fold Optuna。 |
+| Time-CV v0 起點 | **Baseline LOO pruning**（首輪目標）；add-one promote 留待 LOO wave 後。 |
+| Time-CV v0 閾值 | `FEATURE_SELECTION_TIME_CV_*` **試跑預設**；noise 未知，首輪 report 校準後再定 promote 門檻。 |
+| Time-CV config 命名 | 前綴 **`FEATURE_SELECTION_TIME_CV_*`**；未來 training Time-CV 另用 **`TRAINING_TIME_CV_*`**（本輪不實作）。 |
 | 篩選節奏 | **Group-first**：以 feature group 為最小實驗單位；通過 Gate 才進下一層。 |
 | 視窗分級 | **短窗** `≤ 1d`；**中窗** `> 1d 且 ≤ 30d`（預設 **daily snapshot**）；**長窗** `> 30d`（預設 **monthly snapshot** + cache + as-of join）。 |
 | 歷史邊界 | **解耦並落盤**：`feature_compute_range` = `full_available_history`（PIT 正確）；`training_sample_range` = **no earlier than &lt;date&gt;**（僅縮 training 列，不把特徵回溯裁掉）。 |
@@ -94,7 +100,8 @@ python -m trainer_hightier.feature_experiment.run_pipeline \
 
 | 指標 | v0 門檻 |
 |------|---------|
-| ΔAP（candidate − baseline） | **≥ +0.003** |
+| **ΔP@1hr**（candidate − baseline，pp） | **≥ +1.0pp**（主決策指標；Time-CV 邊際或 pruning 候選須再跑 §1.8） |
+| ΔAP（candidate − baseline） | **≥ +0.003**（輔助） |
 | ΔR@Pmin（candidate − baseline） | **> 0**（Recall 必須嚴格上升；不得僅以容忍下降過關） |
 | val `alerts/hour`（與 Step 5 報表口徑一致） | **≤ 120**（約 2 alerts/min）；超限須 `capacity_alarm=true` 並預設 **no-go**（除非業務核准豁免並記錄） |
 | 單 round wall time | **≤ 60 min**（§5） |
@@ -184,9 +191,83 @@ python -m trainer_hightier.feature_experiment.run_pipeline \
 2. **`feature_allowlist.json`**：允許進 Gate 1 之欄位；WARN 核准須附 **approval** 物件（核准人、理由、時間、可選過期日）。
 3. **`feature_blocklist.json`**：BLOCK 欄位與 **reason_code** 清單。
 
+### 1.8 Time-CV feature selection（邊際特徵穩健性確認與 pruning）
+
+**目的**：對 single-split Gate 1 邊際特徵（`ΔP@1hr ∈ [-0.5pp, +1.0pp]`）或 baseline pruning 候選，以 **時間交叉驗證** 評估跨時段穩定性，避免「恰好在當前 val 有用」的假陽性／假陰性。
+
+#### 核心設計（對齊 Implementation Plan §2.6 / D-006 / D-007 / D-008）
+
+| 項目 | v0 決策 |
+|------|---------|
+| CV 類型 | **Expanding window**（train 自左向右延伸；val 為 fixed-length non-overlapping 窗口） |
+| K folds | **K=5**（可配 3–8；成本 vs 穩定性） |
+| Val 窗口長度 | **30 天**（`gaming_day_event`），對齊既有 test split 習慣 |
+| 最小 train 長度 | **90 天**；不足時降低 K 並於報表註明 |
+| 主決策指標 | **ΔP@1hr**（percentage points）：在 val 上依各 arm 各自 score 分布找 threshold 使 alert rate = 1 alert/hour，再比較 precision |
+| 輔助指標 | P@2hr（capacity 參考）、AP（ranking quality）、Recall@Pmin（對齊 `config.py`） |
+| 超參策略（v0） | **固定超參**（所有 fold 同一組 LightGBM）；不做 per-fold Optuna |
+| 程式落點 | `trainer_hightier/feature_experiment/time_cv/`（fold 定義、runner、report） |
+
+#### v0 實作鎖定（2026-06-17）
+
+| 項目 | 鎖定決策 |
+|------|----------|
+| Coding prototype | **K=3**、**2–3** feature/group arms；驗證 fold／metrics／report 後擴至 **K=5** 全量 LOO |
+| 輸入 parquet | `training_set_fe_enriched.parquet`（或等價 enriched training parquet） |
+| Pruning 起點 | Baseline **LOO**（非 add-one） |
+| 決策閾值 | 試跑預設；首輪 **不得** 未校準即 registry promote |
+| Config 前綴 | `FEATURE_SELECTION_TIME_CV_*`（training 用途預留 `TRAINING_TIME_CV_*`） |
+
+**`config.py` 常數（v0 預設，試跑後可校準）**
+
+| 常數 | 預設 |
+|------|------|
+| `FEATURE_SELECTION_TIME_CV_N_FOLDS` | `5`（prototype 覆寫 `3`） |
+| `FEATURE_SELECTION_TIME_CV_VAL_WINDOW_DAYS` | `30` |
+| `FEATURE_SELECTION_TIME_CV_MIN_TRAIN_DAYS` | `90` |
+| `FEATURE_SELECTION_TIME_CV_EARLY_STOP_FOLDS` | `3` |
+| `FEATURE_SELECTION_TIME_CV_MEAN_DELTA_P1HR_PP` | `1.0` |
+| `FEATURE_SELECTION_TIME_CV_MAX_CV_RATIO` | `0.5` |
+| `FEATURE_SELECTION_TIME_CV_DROP_THRESHOLD_PP` | `-0.5` |
+| `FEATURE_SELECTION_TIME_CV_MARGINAL_LOW_PP` | `-0.5` |
+| `FEATURE_SELECTION_TIME_CV_WALL_TIME_LIMIT_SEC` | `1200` |
+
+#### 決策框架（v0）
+
+| 信號 | 判定 |
+|------|------|
+| `mean(ΔP@1hr) ≥ +1.0pp` 且 `cv_ratio = std / \|mean\| < 0.5` | **KEEP** — 穩定正向 operational 貢獻 |
+| `mean(ΔP@1hr) ≥ +1.0pp` 且 `cv_ratio ≥ 0.5` | **REVIEW** — 平均正向但不穩定，需 investigate |
+| `mean(ΔP@1hr) ∈ [-0.5pp, +1.0pp]` | **MARGINAL** — 邊際，看 AP + Recall@Pmin 輔助判斷 |
+| `mean(ΔP@1hr) < -0.5pp` | **DROP** — average operational 有害 |
+| 所有 fold `ΔP@1hr < 0` | **STRONG DROP** — 一致有害，直接淘汰 |
+
+#### 與 single-split Gate 1 路由（對齊 Implementation Plan §7）
+
+- Single-split Gate 1 `ΔP@1hr > +1.0pp` 且無爭議 → 可 **跳過 Time-CV**，直接進 Gate 2。
+- Single-split Gate 1 `ΔP@1hr ∈ [-0.5pp, +1.0pp]` → **必須** Time-CV。
+- Single-split Gate 1 `ΔP@1hr < -0.5pp` → 直接 DROP，不進 Time-CV。
+
+#### Pruning（baseline LOO）語意
+
+對 baseline 中既有 feature / group 做 leave-one-out Time-CV；若 STRONG DROP 或 DROP，列為 registry `disabled` 候選（reason code 落盤）。
+
+#### 成本控制（v0）
+
+- **Group-first**：先 group-level add-one Time-CV；通過後才做 group 內 leave-one-out。
+- **Early stop**：前 3 fold 已一致 `ΔP@1hr < 0` → 跳過剩餘 fold（STRONG DROP）。
+- **Shared baseline**：同一 fold 的 baseline fit 可被所有 arm 共享。
+- **單 group Time-CV（K=5）wall clock ≤ 20 分鐘**（或已核准豁免並記錄）。
+
+#### 輸入與輸出
+
+- **輸入**：既有 `training_set_fe_enriched.parquet`（或等價 enriched training parquet；含 baseline + candidate 欄位）；**不需**重跑特徵物化。
+- **輸出**：`time_cv_ablation_report.json`（per-group / per-feature：mean/std/cv_ratio、per-fold detail、decision code）。
+
 #### 一次性／週期工作
 
 - **現行常用特徵全集**：至少執行一次 **FQG L1** 盤點以建立品質基線（建議併 **Wave 0 exit** 或 Wave 1 entry，見 §2）。
+- **Time-CV pruning wave**：待 Wave 4（§2）上線後，對 baseline 全量 LOO Time-CV，產出 registry `disabled` 候選清單。
 
 ### 1.6 外部事件來源 artifact 契約 v0
 
@@ -340,9 +421,35 @@ python -m trainer_hightier.feature_experiment.run_pipeline \
 
 ---
 
+### Wave 4 — Time-CV Feature Selection（邊際特徵穩健性確認與 pruning）
+
+**目的**：對 single-split Gate 1 邊際特徵或 baseline pruning 候選，以時間交叉驗證評估跨時段穩定性，避免「恰好在當前 val 有用」的假陽性／假陰性。
+
+**Entry criteria**
+
+- Wave 1 **exit** 達成（FQG + Gate 0/1 runner 已可對單一 group 產出標準報表）。
+- Time-CV fold 定義工具可用（`feature_experiment/time_cv/fold_definitions.py`）。
+- Time-CV runner 工具可用（`feature_experiment/time_cv/runner.py`）。
+- Time-CV report 工具可用（`feature_experiment/time_cv/report.py`）。
+
+**Exit criteria**
+
+- **Prototype（Wave 4a）**：K=3、2–3 arms 完成 end-to-end；`time_cv_folds_manifest.json` 與 `time_cv_ablation_report.json` 可重現；per-fold `P@1hr` 分布已落盤供閾值校準。
+- **Full wave（Wave 4b）**：至少 **1 個** baseline LOO pruning 候選（或邊際 add-one 候選）完成 **K=5** Time-CV；決策框架可重現。
+- Time-CV 決策框架（KEEP / REVIEW / MARGINAL / DROP / STRONG DROP）與 §1.8 一致。
+- 若使用小型時間切片或 subset，報表須標註 subset policy 與不可直接與全量比較。
+
+**產出 artifacts（最低）**
+
+- `time_cv/<run_id>/time_cv_ablation_report.json`
+- `time_cv/<run_id>/time_cv_folds_manifest.json`
+- 更新後之 registry：若 STRONG DROP / DROP，標記 `status: disabled` 與 `drop_reason_code: time_cv_drop`。
+
+---
+
 ## 3) 任務拆解（Task breakdown）
 
-以下依 Implementation Plan **Workstream A–E**（含 **C2 外部事件來源接入**）拆分；**Owner** 以占位表示，開始執行前指派。
+以下依 Implementation Plan **Workstream A–F**（含 **C2 外部事件來源接入**、**F Time-CV**）拆分；**Owner** 以占位表示，開始執行前指派。
 
 ### Workstream A — Registry 與語意契約
 
@@ -402,6 +509,18 @@ python -m trainer_hightier.feature_experiment.run_pipeline \
 | E2 | artifacts retention（最短保留期） | TBD | E1 | 與磁碟预算一致 | `retention_policy.md` |
 | E3 | 串接既有 `run_report` | TBD | C2,D5 | 欄位不缺 | 範例 run 目錄 |
 
+### Workstream F — Time-CV Feature Selection
+
+| Task ID | Task | Owner | 依賴 | DoD | 產出 |
+|---------|------|-------|------|-----|------|
+| F0 | **Prototype slice**（K=3、2–3 LOO arms、enriched parquet） | TBD | C2 | end-to-end 可跑；per-fold P@1hr 分布落盤 | `time_cv/<run_id>/` |
+| F1 | 實作 expanding-window **fold 生成器**（`feature_experiment/time_cv/fold_definitions.py`） | TBD | A4 | 可產出 `TimeFold` manifest；K、val 窗口長度、min train 天數可配 | `time_cv_folds_manifest.json` |
+| F2 | 實作 **Time-CV ablation runner**（`feature_experiment/time_cv/runner.py`） | TBD | F1, C2 | 自 enriched training parquet 依 fold 切 train/val；fit shared baseline + arm；計算 per-fold P@1hr / AP / Recall@Pmin；early stop 邏輯可用 | `time_cv_ablation_report.json` |
+| F3 | 實作 **cross-fold 聚合與決策框架**（`feature_experiment/time_cv/report.py`） | TBD | F2 | 計算 mean / std / cv_ratio；判定 KEEP / REVIEW / MARGINAL / DROP / STRONG DROP；與 §1.8 閾值一致 | `time_cv_ablation_report.json` |
+| F4 | **config 集中閾值**（`config.py`：`FEATURE_SELECTION_TIME_CV_*` 常數族） | TBD | F3 | 不仰賴環境變數；v0 預設試跑、report 可校準 | `config.py` |
+| F5 | 與 single-split Gate 1 **路由整合**（依 single-split 結果決定是否進入 Time-CV） | TBD | F3, C2 | `time_cv_required` 標記自動觸發 Time-CV；report 串接 Gate 1 output | `gate1_compare_*.json` + `time_cv_ablation_report.json` |
+| F6 | **Pruning（LOO）wave**：對 baseline 全量做 leave-one-out Time-CV | TBD | F5 | 產出 registry `disabled` 候選清單；reason code 落盤 | `registry` 更新 + `time_cv_ablation_report.json` |
+
 ---
 
 ## 4) Decision gates 與升級／回退規則
@@ -438,19 +557,20 @@ python -m trainer_hightier.feature_experiment.run_pipeline \
 
 ### 4.2 Gate 1 — 群組增量（baseline + group）
 
-**目標**：證明「加上整包 group」帶來 **AP 與 R@Pmin** 之淨利，且成本可接受。**數值門檻**以 §1.4 為準。
+**目標**：證明「加上整包 group」帶來 **P@1hr 與 AP 與 R@Pmin** 之淨利，且成本可接受。**數值門檻**以 §1.4 為準。
 
 檢查項：
 
 - [ ] 訓練與推論使用之 **feature 欄位 ⊆ `feature_allowlist.json`**（§4.0）。
 - [ ] 若本輪含外部事件來源：`gate1_compare_*.json` 必須引用 materialized artifact path 與 source metadata；不得只記 raw source path。
 - [ ] 與 **同一 baseline** 對照（同 eval fingerprint、同模型搜尋 budget 或同固定超參—擇一並落盤）。
-- [ ] **ΔAP ≥ +0.003** 且 **ΔR@Pmin > 0**（單次固定 val/test；Recall 嚴格上升）。
+- [ ] **ΔP@1hr ≥ +1.0pp**（主）；輔助 **ΔAP ≥ +0.003** 且 **ΔR@Pmin > 0**（單次固定 val/test；Recall 嚴格上升）。
+- [ ] **邊際特徵路由**：若 `ΔP@1hr ∈ [-0.5pp, +1.0pp]`，標記 `time_cv_required=true` 並進入 §1.8 Time-CV 評估。
 - [ ] **val `alerts/hour` ≤ 120**；若 **> 120**，報表必須 `capacity_alarm=true` 且預設 **no-go**（除非業務核准豁免並記錄）。
 - [ ] 報表含 §6 成本欄位；**單 round runtime ≤ 60 分鐘**（§5）或已核准豁免並記錄。
-- [ ] 若 **ΔR@Pmin ≤ 0**（即使 ΔAP 上升），預設 **no-go** 除非業務書面豁免。
+- [ ] 若 **ΔR@Pmin ≤ 0**（即使 ΔP@1hr / ΔAP 上升），預設 **no-go** 除非業務書面豁免。
 
-**輸出**：`gate1_decision` + `uplift_ap`、`uplift_r_at_pmin`、`val_alerts_per_hour`、`capacity_alarm`、`cost_delta`。
+**輸出**：`gate1_decision` + `uplift_p1hr_pp`、`uplift_ap`、`uplift_r_at_pmin`、`val_alerts_per_hour`、`capacity_alarm`、`time_cv_required`、`cost_delta`。
 
 ### 4.3 Gate 2 — 群內去冗餘
 
@@ -465,12 +585,35 @@ python -m trainer_hightier.feature_experiment.run_pipeline \
 
 **輸出**：`promoted_features` / `pruned_features` / `record`.
 
-### 4.4 Group 升級／淘汰／回退
+### 4.6 Time-CV feature selection（§1.8 補充）
+
+**目標**：對 single-split Gate 1 邊際特徵或 baseline pruning 候選，以時間交叉驗證評估跨時段穩定性。
+
+檢查項：
+
+- [ ] Time-CV fold 定義已落盤（`time_cv_folds_manifest.json`）；K、val 窗口長度、min train 天數可追溯。
+- [ ] 每 fold 使用**同一組固定超參**（D-010）；tuning budget 寫入 report（v0 預期為 0）。
+- [ ] **主決策指標**：`mean(ΔP@1hr)` 與 `cv_ratio = std / |mean|`。
+- [ ] **判定規則**（v0，對齊 §1.8）：
+  - KEEP：`mean(ΔP@1hr) ≥ +1.0pp` 且 `cv_ratio < 0.5`
+  - REVIEW：`mean(ΔP@1hr) ≥ +1.0pp` 但 `cv_ratio ≥ 0.5`
+  - MARGINAL：`mean(ΔP@1hr) ∈ [-0.5pp, +1.0pp]`
+  - DROP：`mean(ΔP@1hr) < -0.5pp`
+  - STRONG DROP：所有 fold `ΔP@1hr < 0`
+- [ ] **輔助**：`mean(ΔAP) ≥ 0`（不得所有 fold 一致為負）；`Recall@Pmin` 不得在所有 fold 一致劣化。
+- [ ] **Early stop**：前 3 fold 一致 `ΔP@1hr < 0` → abort 該 arm（STRONG DROP）。
+- [ ] **閾值校準**：首輪 report 已檢視 per-fold `ΔP@1hr` noise；若調整 `FEATURE_SELECTION_TIME_CV_*` 已 bump 版本並記錄理由。
+- [ ] **成本（v0）**：單 group Time-CV（K=5）wall clock **≤ 20 分鐘**（或已核准豁免並記錄）。
+- [ ] **Pruning（LOO）**：對 baseline 中既有 feature / group 做 leave-one-out Time-CV；若 STRONG DROP 或 DROP，列為 registry `disabled` 候選（reason code 落盤）。
+
+**輸出**：`time_cv_ablation_report.json`（含 per-fold `P@1hr` / `AP` / `Recall@Pmin`、mean / std / cv_ratio、decision code）。
+
+### 4.7 Group 升級／淘汰／回退（Time-CV 整合）
 
 | 規則 | 內容 |
 |------|------|
-| 升級（promote group） | **§4.0 FQG pass**（無未處理 BLOCK；WARN 已核准）；Gate 0–2 全通過且符合 §1.4 數值（含 **ΔR@Pmin > 0** 與 **val alerts/hour ≤ 120**）；成本不超 **§5**；決策紀錄齊全。 |
-| 淘汰（reject group） | **FQG BLOCK** 或 Gate 0 fail；或 Gate 1 未達 §1.4；或 Gate 2 顯示可由既有代表完全替代且無邊際貢獻。 |
+| 升級（promote group） | **§4.0 FQG pass**（無未處理 BLOCK；WARN 已核准）；Gate 0–2 全通過且符合 §1.4 數值（含 **ΔP@1hr ≥ +1.0pp** 與 **val alerts/hour ≤ 120**）；若 Time-CV required（§4.2），須達 §1.8 KEEP；成本不超 **§5**；決策紀錄齊全。 |
+| 淘汰（reject group） | **FQG BLOCK** 或 Gate 0 fail；或 Gate 1 未達 §1.4；或 Gate 2 顯示可由既有代表完全替代且無邊際貢獻；或 Time-CV 判定 DROP / STRONG DROP。 |
 | 同時升級數量上限 | **每個實驗 wave 最多正式 promote 2 個新 group**（其餘標 `deferred` 排隊）；若需突破，需記錄理由與資源預算。 |
 | 回退（rollback） | 保留上一檔 `promoted_groups` 清單與完整 report；觸發條件見 **§1.4 回退（rollback）觸發 v0**（與訓練視窗策略之 P25 規則一致精神：尾部切片不可顯著劣化）。 |
 | 外部事件來源升級限制 | v0 只允許升級到 **experiment candidate / further investigation**；不得直接進 production baseline 或 serving，除非另有 production supplyability / serving implementation plan。 |
@@ -491,6 +634,7 @@ python -m trainer_hightier.feature_experiment.run_pipeline \
 
 - **營運承接護欄（v0）**：以 **val** 上與 Step 5 一致口徑計算之 **`alerts/hour` 平均 ≤ 120**（約 2 alerts/min）。超過則報表必須標 **`capacity_alarm=true`**，並預設阻擋升級／需人工確認（與 §1.4 Gate 1、§6 報表欄位一致）。
 - **單 round（單一 Gate 1 或單一 window 策略 run）目標 wall time ≤ 60 分鐘**。超時需：縮小 `training_sample_range`、降低搜尋 budget、或改走 snapshot 命中路徑—擇一並記錄。
+- **單 group Time-CV（K=5 folds）目標 wall time ≤ 20 分鐘**。超時需評估 train subsample 或降低 K。
 - **Peak RAM**：預設以 `config.py` 中既有 DuckDB / profile 設定為起點；若需提高，必須在報表 `resource_notes` 註明。
 - **並行**：筆電環境避免預設多組 heavy materialization 並行；registry 標記 `compute_tier` 協調排程。
 
@@ -549,6 +693,9 @@ python -m trainer_hightier.feature_experiment.run_pipeline \
     "warn_approved_feature_count": 0
   },
   "metrics": {
+    "p_at_1hr_val": 0.0,
+    "p_at_1hr_test": 0.0,
+    "p_at_2hr_val": 0.0,
     "ap_val": 0.0,
     "ap_test": 0.0,
     "r_at_pmin_val": 0.0,
@@ -557,6 +704,8 @@ python -m trainer_hightier.feature_experiment.run_pipeline \
     "val_alerts_per_hour": 0.0,
     "capacity_alerts_per_hour_cap": 120,
     "capacity_alarm": false,
+    "time_cv_required": false,
+    "time_cv_decision": null,
     "val_slice_robustness_v0": {
       "k_slices": 4,
       "delta_ap_per_slice": [],
@@ -584,15 +733,17 @@ python -m trainer_hightier.feature_experiment.run_pipeline \
 ### 6.1 驗收（本 working plan 文件層級）
 
 - [ ] **§1.5 FQG v0** 已定義（L1/L2、PASS/WARN/BLOCK、抽樣與產物）。
-- [ ] 已涵蓋 Wave 0–3 之 entry/exit 與 artifacts（含 Wave 0 **FQG L1 基線**、Wave 1 **FQG 產物**）。
+- [ ] 已涵蓋 Wave 0–4 之 entry/exit 與 artifacts（含 Wave 0 **FQG L1 基線**、Wave 1 **FQG 產物**、Wave 4 **Time-CV 產物**）。
 - [ ] 已涵蓋 **Wave 1b 外部事件來源最小接入** 之 entry/exit、artifacts 與 fail-fast 條件。
 - [ ] **§4.0 FQG** 與 Gate 0/1/2 已轉為可勾選清單與必填輸出，且與 **§1.4 v0** 數值一致。
+- [ ] **§4.6 Time-CV** 決策檢查清單已定義（fold manifest、超參策略、KEEP/REVIEW/MARGINAL/DROP/STRONG DROP 判定、early stop、成本門檻）。
 - [ ] 訓練視窗比較報表可填 **§6** 之 `val_slice_robustness_v0`（或等價欄位）以支撐 median／P25 門檻。
 - [ ] 升級／回退／同 wave promote 上限已載明。
 - [ ] 單 round runtime ≤ 60 分鐘與資源注意事項已載明。
-- [ ] 報表模板含：`feature_quality`（FQG 路徑與狀態）、`feature_list_version`、`group_set`、`window_policy`、`AP`、`R@Pmin`、`val_alerts_per_hour`、`capacity_alarm`、`runtime`、`peak RAM`、`cache_hit_ratio`、`go/no-go` + reason。
+- [ ] 報表模板含：`feature_quality`（FQG 路徑與狀態）、`feature_list_version`、`group_set`、`window_policy`、**`p_at_1hr_val`**、`ap_val`、`r_at_pmin_val`、`val_alerts_per_hour`、`capacity_alarm`、`time_cv_required`、`time_cv_decision`、`runtime`、`peak RAM`、`cache_hit_ratio`、`go/no-go` + reason。
 - [ ] 報表模板含：`external_sources` metadata（source contract、cleaning policy、raw/materialized fingerprint、artifact path、row counts）。
 - [ ] **txn_lite v0** 已鎖定 BUYIN/CASHOUT only、**不含 CHANGE**（§1.7）。
+- [ ] **Time-CV v0**：§1.8 定義完整（K/val 窗口/決策框架/路由/pruning）；§4.6 檢查清單可用；Wave 4 entry/exit 與 artifacts 已定義；Workstream F 任務拆解已列出。
 - [ ] **未修改** `trainer-hightier-working-plan_c12558b9.plan.md`。
 
 ---
@@ -610,4 +761,4 @@ python -m trainer_hightier.feature_experiment.run_pipeline \
 
 ---
 
-*文件版本：依 registry / experiment 慣例自行 bump；本檔對齊 SSOT 與 Implementation Plan，並已納入 **FQG v0（§1.5、§4.0）**、**外部事件來源 experiment-only 接入（§1.6、Wave 1b）**、以及 **txn_lite v0（§1.7，BUYIN/CASHOUT only、不含 CHANGE）** 之執行與驗收敘述。**§1.7 自 2026-06-10 起標 PAUSED**；`t_casino_txn` L0 主線見獨立 Source Integration IP。*
+*文件版本：依 registry / experiment 慣例自行 bump；本檔對齊 SSOT 與 Implementation Plan，並已納入 **FQG v0（§1.5、§4.0）**、**外部事件來源 experiment-only 接入（§1.6、Wave 1b）**、**txn_lite v0（§1.7，BUYIN/CASHOUT only、不含 CHANGE）**、**Time-CV feature selection（§1.8、Wave 4、§4.6；v0 鎖定 2026-06-17、`FEATURE_SELECTION_TIME_CV_*`）** 之執行與驗收敘述。**§1.7 自 2026-06-10 起標 PAUSED**；`t_casino_txn` L0 主線見獨立 Source Integration IP。*
