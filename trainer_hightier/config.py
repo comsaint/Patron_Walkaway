@@ -141,6 +141,22 @@ def txn_lite_feature_columns(*, extra_window_hours: tuple[int, ...] = ()) -> tup
             ),
         )
     return tuple(dict.fromkeys(TXN_LITE_FEATURE_COLUMNS + tuple(extra_cols)))
+
+# ``t_session`` closed-session PIT features (experiment / session_pit supplier).
+SESSION_L0_EVENT_TIME_COLUMN: Final[str] = "session_end_dtm"
+SESSION_L0_OBSERVED_AT_COLUMN: Final[str] = "__etl_insert_Dtm"
+SESSION_L0_SYNTHETIC_OBSERVED_AT_COLUMN: Final[str] = "__etl_insert_Dtm_synthetic"
+SESSION_L0_INGEST_CAP_SEC: Final[int] = 636
+SESSION_PIT_MATERIALIZER_VERSION: Final[str] = "session_pit_closed_session_v1"
+SESSION_PIT_SOURCE_CONTRACT_REF: Final[str] = "contracts/preprocess_l0_data_contract_registry.yaml#t_session"
+SESSION_PIT_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
+    "fe__session__num_games_with_wager_log1p",
+    "fe__session__num_bets_log1p",
+    "fe__session__turnover_log1p",
+    "fe__session__theo_win_log1p_signed",
+    "fe__session__bet_wager_over_sess_avg_log1p",
+)
+
 # Month-sharded short-term PIT cache under ``artifacts/training_data/cache/``.
 SHORT_TERM_PIT_CACHE_DIRNAME: Final[str] = "short_term_pit_v1"
 SHORT_TERM_PIT_CACHE_SCHEMA_VERSION: Final[int] = 2
