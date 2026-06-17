@@ -14,6 +14,7 @@ import duckdb
 
 from trainer_hightier.config import (
     DuckDbRuntimeConfig,
+    HK_TZ,
     MID_TERM_ANCHOR_AUDIT_COLUMN,
     MID_TERM_SNAPSHOT_AGE_AUDIT_COLUMN,
     MID_TERM_SNAPSHOT_MISSING_AUDIT_COLUMN,
@@ -62,6 +63,19 @@ CASE
    AND b._snap_payout_odds_avg_w7d IS NOT NULL AND TRY_CAST(b.payout_odds AS DOUBLE) IS NOT NULL
   THEN CAST((TRY_CAST(b.payout_odds AS DOUBLE) - b._snap_payout_odds_avg_w7d) / b._snap_payout_odds_std_w7d AS DOUBLE)
   ELSE CAST(NULL AS DOUBLE)
+END""".strip(),
+    "fe__clock__day_of_week": f"""
+CAST(
+  EXTRACT(
+    dow FROM CAST(b.payout_complete_dtm AS TIMESTAMPTZ) AT TIME ZONE '{HK_TZ}'
+  ) AS DOUBLE
+)""".strip(),
+    "fe__clock__is_weekend": f"""
+CASE
+  WHEN EXTRACT(
+    dow FROM CAST(b.payout_complete_dtm AS TIMESTAMPTZ) AT TIME ZONE '{HK_TZ}'
+  ) IN (0, 6) THEN 1.0
+  ELSE 0.0
 END""".strip(),
 }
 
