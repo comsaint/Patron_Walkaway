@@ -1,8 +1,8 @@
 # Feature layers (naming SSOT): raw | short (PIT per bet_id) | mid (daily snapshot ASOF) | long (monthly).
 # Short includes bet__* and short-horizon fe__*; allowed_training_supplier short_term_pit_builder.
 # source feast_trial_1h on bet__* is a legacy registry label—not a separate horizon from fe_derived short.
-registry_version: v0.8
-updated_at: '2026-06-09'
+registry_version: v1.1
+updated_at: '2026-06-17'
 features:
 - feature_id: wager
   group_id: baseline_model
@@ -489,56 +489,60 @@ features:
   group_id: group_l_clock_context
   source: fe_derived
   semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-  status: experimental
+  status: active
   enabled_for:
+  - baseline
   - candidate
   - ablation
   drop_reason_code: null
-  last_updated_experiment: run_20260515T175157Z
-  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0019,
-    ΔRecall +0.0140 (mixed_leave_one_out_signals).'
+  last_updated_experiment: run_20260616_clock_promote
+  note: 'PROMOTED (run_20260616_clock_promote): add-one LOO dRecall +0.0140; zero materialize
+    cost; HK wall-clock from payout_complete_dtm.'
   time_horizon: short_term
   max_lookback: PT1H
 - feature_id: fe__clock__day_of_week
   group_id: group_l_clock_context
   source: fe_derived
   semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-  status: experimental
+  status: active
   enabled_for:
+  - baseline
   - candidate
   - ablation
   drop_reason_code: null
-  last_updated_experiment: run_20260515T175157Z
-  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0019,
-    ΔRecall +0.0140 (mixed_leave_one_out_signals).'
+  last_updated_experiment: run_20260616_clock_promote
+  note: 'PROMOTED (run_20260616_clock_promote): add-one LOO dRecall +0.0140; zero materialize
+    cost; HK wall-clock from payout_complete_dtm.'
   time_horizon: mid_term
   max_lookback: P7D
 - feature_id: fe__clock__is_weekend
   group_id: group_l_clock_context
   source: fe_derived
   semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-  status: experimental
+  status: active
   enabled_for:
+  - baseline
   - candidate
   - ablation
   drop_reason_code: null
-  last_updated_experiment: run_20260515T175157Z
-  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0019,
-    ΔRecall +0.0140 (mixed_leave_one_out_signals).'
+  last_updated_experiment: run_20260616_clock_promote
+  note: 'PROMOTED (run_20260616_clock_promote): add-one LOO dRecall +0.0140; zero materialize
+    cost; HK wall-clock from payout_complete_dtm.'
   time_horizon: mid_term
   max_lookback: P7D
 - feature_id: fe__clock__is_late_night
   group_id: group_l_clock_context
   source: fe_derived
   semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
-  status: experimental
+  status: active
   enabled_for:
+  - baseline
   - candidate
   - ablation
   drop_reason_code: null
-  last_updated_experiment: run_20260515T175157Z
-  note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0019,
-    ΔRecall +0.0140 (mixed_leave_one_out_signals).'
+  last_updated_experiment: run_20260616_clock_promote
+  note: 'PROMOTED (run_20260616_clock_promote): add-one LOO dRecall +0.0140; zero materialize
+    cost; HK wall-clock from payout_complete_dtm.'
   time_horizon: short_term
   max_lookback: PT1H
 - feature_id: fe__outcome__casino_win_sum__w15m
@@ -634,6 +638,44 @@ features:
     ΔRecall +0.0042 (mixed_leave_one_out_signals).'
   time_horizon: short_term
   max_lookback: PT1H
+- feature_id: fe__outcome__consecutive_loss_streak
+  group_id: group_m_outcome_state
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: experimental
+  enabled_for:
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260617_p1p2_ablation
+  note: 'REVIEW: p1p2 ablation Δval_ap=+0.00106 (best single P1 feature, below Gate1 0.003).
+    val_alerts/hr 1.541 vs baseline 1.611. Kept for further experimentation.'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__outcome__loss_then_double_ratio__w1h
+  group_id: group_m_outcome_state
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: disabled
+  enabled_for:
+  - candidate
+  drop_reason_code: p1p2_ablation_drop_20260617
+  last_updated_experiment: run_20260617_p1p2_ablation
+  note: 'DROP: p1p2 ablation Δval_ap=+0.00012 (negligible). Disabled.'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__outcome__wager_after_loss_step_ratio__w1h
+  group_id: group_m_outcome_state
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: disabled
+  enabled_for:
+  - candidate
+  drop_reason_code: p1p2_ablation_drop_20260617
+  last_updated_experiment: run_20260617_p1p2_ablation
+  note: 'DROP: p1p2 ablation Δval_ap=-0.00008 (slightly negative). Disabled.'
+  time_horizon: short_term
+  max_lookback: PT1H
 - feature_id: fe__stake__wager_z__w1h
   group_id: group_n_stake_dynamics
   source: fe_derived
@@ -688,6 +730,33 @@ features:
   last_updated_experiment: run_20260515T175157Z
   note: 'Ablation REVIEW (run_20260515T175157Z): add-one Gate1 failed; LOO ΔAP +0.0007,
     ΔRecall +0.0024 (mixed_leave_one_out_signals).'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__stake__wager_trend_slope__w1h
+  group_id: group_n_stake_dynamics
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: disabled
+  enabled_for:
+  - candidate
+  drop_reason_code: p1p2_ablation_drop_20260617
+  last_updated_experiment: run_20260617_p1p2_ablation
+  note: 'DROP: p1p2 ablation Δval_ap≈0 (no contribution). Disabled.'
+  time_horizon: short_term
+  max_lookback: PT1H
+- feature_id: fe__stake__wager_last3_vs_prior3_ratio__w1h
+  group_id: group_n_stake_dynamics
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: active
+  enabled_for:
+  - baseline
+  - candidate
+  - ablation
+  drop_reason_code: null
+  last_updated_experiment: run_20260617_p2_clean_promote
+  note: 'PROMOTED (run_20260617_p2_clean_promote): add_p2_clean test op P@1hr +1.44pp
+    (0.5663→0.5807) at ~1.03 alerts/hr; val_ap +0.00068; stable vs add_p2_wager_last3 confirmatory.'
   time_horizon: short_term
   max_lookback: PT1H
 - feature_id: fe__canonical__bets_cnt__today
@@ -1187,6 +1256,71 @@ features:
   time_horizon: short_term
   max_lookback: PT1H
   allowed_training_supplier: external_txn_lite_materializer
+- feature_id: fe__session__num_games_with_wager_log1p
+  group_id: group_session_pit
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: disabled
+  enabled_for:
+  - candidate
+  drop_reason_code: session_features_deprioritized_20260616
+  note: 'Deprioritized 2026-06-16: session cumulative overlaps w15m/w1h; PIT unclear at
+    player-game grain.'
+  time_horizon: mid_term
+  max_lookback: P1D
+  allowed_training_supplier: fe_derived_materializer
+- feature_id: fe__session__num_bets_log1p
+  group_id: group_session_pit
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: disabled
+  enabled_for:
+  - candidate
+  drop_reason_code: session_features_deprioritized_20260616
+  note: 'Deprioritized 2026-06-16: session cumulative overlaps w15m/w1h; PIT unclear at
+    player-game grain.'
+  time_horizon: mid_term
+  max_lookback: P1D
+  allowed_training_supplier: fe_derived_materializer
+- feature_id: fe__session__turnover_log1p
+  group_id: group_session_pit
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: disabled
+  enabled_for:
+  - candidate
+  drop_reason_code: session_features_deprioritized_20260616
+  note: 'Deprioritized 2026-06-16: session cumulative overlaps w15m/w1h; PIT unclear at
+    player-game grain.'
+  time_horizon: mid_term
+  max_lookback: P1D
+  allowed_training_supplier: fe_derived_materializer
+- feature_id: fe__session__theo_win_log1p_signed
+  group_id: group_session_pit
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: disabled
+  enabled_for:
+  - candidate
+  drop_reason_code: session_features_deprioritized_20260616
+  note: 'Deprioritized 2026-06-16: session cumulative overlaps w15m/w1h; PIT unclear at
+    player-game grain.'
+  time_horizon: mid_term
+  max_lookback: P1D
+  allowed_training_supplier: fe_derived_materializer
+- feature_id: fe__session__bet_wager_over_sess_avg_log1p
+  group_id: group_session_pit
+  source: fe_derived
+  semantic_owner: trainer_hightier/feature_experiment/materialize_fe_derived.py
+  status: disabled
+  enabled_for:
+  - candidate
+  drop_reason_code: session_features_deprioritized_20260616
+  note: 'Deprioritized 2026-06-16: session cumulative overlaps w15m/w1h; PIT unclear at
+    player-game grain.'
+  time_horizon: mid_term
+  max_lookback: P1D
+  allowed_training_supplier: fe_derived_materializer
 - feature_id: fe__hot__wager_today_over_peer_p95__adt_decile
   group_id: group_hot_patron_robust
   source: hot_patron_experiment

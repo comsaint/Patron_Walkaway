@@ -292,7 +292,7 @@ def _is_selectable(slot: str, row: FeatureRegistryEntryRow) -> bool:
 def _is_experimental_trainable_feature_id(feature_id: str) -> bool:
     """Registry feature ids that may enter candidate/ablation training sets."""
 
-    return feature_id.startswith("fe__") or feature_id.startswith("txn__")
+    return feature_id.startswith("fe__") or feature_id.startswith("txn__") or feature_id.startswith("sess__")
 
 
 def _ablation_groups_in_order(rows: tuple[FeatureRegistryEntryRow, ...]) -> tuple[str, ...]:
@@ -451,9 +451,14 @@ def default_time_horizon_for_row(source: str, feature_id: str) -> tuple[str, str
 
     special: dict[str, tuple[str, str]] = {
         "fe__stake__wager_step_pct": ("short_term", "PT1H"),
+        "fe__stake__wager_trend_slope__w1h": ("short_term", "PT1H"),
+        "fe__stake__wager_last3_vs_prior3_ratio__w1h": ("short_term", "PT1H"),
         "fe__odds__payout_odds_step_ratio": ("short_term", "PT1H"),
         "fe__time_since_last_bet_sec": ("mid_term", "PT24H"),
         "fe__outcome__last_3_bets_loss_count": ("short_term", "PT1H"),
+        "fe__outcome__consecutive_loss_streak": ("short_term", "PT1H"),
+        "fe__outcome__loss_then_double_ratio__w1h": ("short_term", "PT1H"),
+        "fe__outcome__wager_after_loss_step_ratio__w1h": ("short_term", "PT1H"),
         "fe__interarrival__lag2_sec": ("short_term", "PT1H"),
     }
     if fid in special:
