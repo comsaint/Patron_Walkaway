@@ -26,23 +26,56 @@ logger = logging.getLogger(__name__)
 
 MONTH_HOT_POOL_TABLE: Final[str] = "_month_hot_pool_bets"
 
-_POOL_SOURCE_SELECT_SQL: Final[str] = """
+
+def cleaned_bet_pool_source_has_column(
+    conn: duckdb.DuckDBPyConnection,
+    bet_from: str,
+    column: str,
+) -> bool:
+    """Return whether *bet_from* exposes *column* (parquet glob or temp table)."""
+    rows = conn.execute(f"DESCRIBE SELECT * FROM {bet_from} LIMIT 0").fetchall()
+    return column in {str(row[0]) for row in rows}
+
+
+def cleaned_bet_pool_game_id_sql(
+    conn: duckdb.DuckDBPyConnection,
+    bet_from: str,
+    *,
+    alias: str = "b",
+) -> str:
+    """Select ``game_id`` when present; otherwise emit NULL for legacy test fixtures."""
+    if cleaned_bet_pool_source_has_column(conn, bet_from, "game_id"):
+        return f"{alias}.game_id"
+    return "CAST(NULL AS DOUBLE) AS game_id"
+
+
+def pool_source_select_sql(
+    conn: duckdb.DuckDBPyConnection,
+    bet_from: str,
+    *,
+    alias: str = "b",
+) -> str:
+    """Column projection for bounded month hot pools."""
+    game_id_sql = cleaned_bet_pool_game_id_sql(conn, bet_from, alias=alias)
+    a = alias
+    return f"""
     SELECT
-        b.bet_id,
-        b.is_back_bet,
-        b.bet_type,
-        b.type_of_bet,
-        b.payout_complete_dtm,
-        CAST(b.gaming_day_event AS TIMESTAMP) AS gaming_day_event,
-        b.session_id,
-        b.player_id,
-        b.table_id,
-        b.wager,
-        b.casino_win,
-        b.payout_odds,
-        b.theo_win,
-        b.base_ha
-"""
+        {a}.bet_id,
+        {a}.is_back_bet,
+        {a}.bet_type,
+        {a}.type_of_bet,
+        {a}.payout_complete_dtm,
+        CAST({a}.gaming_day_event AS TIMESTAMP) AS gaming_day_event,
+        {a}.session_id,
+        {a}.player_id,
+        {game_id_sql},
+        {a}.table_id,
+        {a}.wager,
+        {a}.casino_win,
+        {a}.payout_odds,
+        {a}.theo_win,
+        {a}.base_ha
+    """.strip()
 
 
 @dataclass(frozen=True)
@@ -194,10 +227,11 @@ def open_month_hot_pool_session(
     player_filter = _player_id_filter_sql(restrict_player_ids)
     conn = duckdb.connect(database=":memory:")
     apply_duckdb_runtime_pragmas(conn, duckdb_runtime)
+    pool_select = pool_source_select_sql(conn, bet_from, alias="b")
     conn.execute(
         f"""
         CREATE TEMP TABLE {table_name} AS
-        {_POOL_SOURCE_SELECT_SQL}
+        {pool_select}
         FROM {bet_from} AS b
         {player_filter}
         """,
