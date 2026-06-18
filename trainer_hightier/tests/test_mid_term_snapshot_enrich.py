@@ -181,6 +181,51 @@ def test_asof_enrich_does_not_use_target_day_snapshot(tmp_path: Path) -> None:
     assert int(got.iloc[0]["mid_term_snapshot_missing_flag"]) == 1
 
 
+def test_asof_enrich_backfills_clock_day_of_week_from_payout(tmp_path: Path) -> None:
+    """Promoted fe__clock__* columns derive from payout_complete_dtm when absent in sidecars."""
+    base = tmp_path / "base_clock.parquet"
+    mid = tmp_path / "mid_clock.parquet"
+    out = tmp_path / "enriched_clock.parquet"
+    # 2026-06-06 is Saturday in HK (dow=6, is_weekend=1).
+    pcd = pd.Timestamp("2026-06-06 14:00:00", tz="Asia/Hong_Kong")
+    pd.DataFrame(
+        {
+            "bet_id": [20.0],
+            "canonical_id": ["c3"],
+            "gaming_day_event": pd.Timestamp("2026-06-06"),
+            "payout_complete_dtm": pcd,
+            "payout_odds": [2.0],
+        }
+    ).to_parquet(base, index=False)
+    pd.DataFrame(
+        {
+            "canonical_id": ["c3"],
+            "anchor_gaming_day_event": pd.to_datetime(["2026-06-05"]),
+            "fe__bets_cnt__w1d": [1],
+            "fe__wager_sum__w1d": [10.0],
+            "fe__prior_odds_mean_w30d": [1.0],
+            "fe__prior_odds_std_w30d": [0.1],
+            "fe__std_wager_w7d": [1.0],
+            "fe__avg_abs_wager_w7d": [1.0],
+            "fe__interarrival_avg_w7d": [1.0],
+            "fe__interarrival_std_w7d": [1.0],
+        }
+    ).to_parquet(mid, index=False)
+
+    enrich_training_parquet_with_cadence_suppliers(
+        base_training_parquet=base,
+        fe_short_term_parquet=None,
+        mid_term_snapshot_parquet=mid,
+        out_parquet=out,
+        duckdb_runtime=DuckDbRuntimeConfig(),
+        short_term_columns=(),
+        mid_term_columns=("fe__clock__day_of_week", "fe__clock__is_weekend"),
+    )
+    got = pd.read_parquet(out)
+    assert float(got.iloc[0]["fe__clock__day_of_week"]) == pytest.approx(6.0)
+    assert float(got.iloc[0]["fe__clock__is_weekend"]) == pytest.approx(1.0)
+
+
 def test_training_snapshot_scope_metadata(tmp_path: Path) -> None:
     """Training-scoped materialization must record scope in sidecar metadata."""
 
