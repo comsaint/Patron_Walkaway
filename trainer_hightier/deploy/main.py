@@ -1214,6 +1214,16 @@ def _feast_refresh_supervisor_once(
         )
         report = refresh_mod.run_feast_online_refresh(opts)
         if report.get("verdict") == "ok":
+            # Invalidate the cached FeatureStore so the scorer's next lookup
+            # picks up the newly materialized online store data.  Without this
+            # the scorer keeps using a stale cache keyed on registry.db mtime,
+            # which is NOT updated by materialize(), causing all mid-term
+            # fe__* features to return null (post-join smoke failure).
+            from trainer_hightier.serving.feast_online_adapter import (
+                clear_feature_store_cache,
+            )
+
+            clear_feature_store_cache()
             feature_state_meta_set(
                 META_KEY_FEAST_REFRESH_SUPERVISOR_LAST_SUCCESS,
                 datetime.now(timezone.utc).isoformat(),
