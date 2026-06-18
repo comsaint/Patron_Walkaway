@@ -359,3 +359,125 @@ def test_feast_refresh_supervisor_once_fail_soft(
         require_mid=True,
         require_slow=False,
     )
+
+
+def _seed_feature_store_cache(
+    feast_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Populate the in-process FeatureStore cache."""
+    from trainer_hightier.serving import feast_online_adapter as adapter_mod
+
+    class _FakeStore:
+        def __init__(self, repo_path: str) -> None:
+            self.repo_path = repo_path
+
+    monkeypatch.setattr("feast.FeatureStore", _FakeStore)
+    adapter_mod.clear_feature_store_cache()
+    adapter_mod.get_cached_feature_store(feast_repo)
+    assert adapter_mod._FEAST_SDK_CACHE is not None
+    _, _, reused = adapter_mod.get_cached_feature_store(feast_repo)
+    assert reused is True
+
+
+def _supervisor_refresh_mocks(monkeypatch: pytest.MonkeyPatch, *, verdict: str) -> None:
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_refresh.run_feast_online_refresh",
+        lambda _opts: {"verdict": verdict},
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_adapter.feast_registry_missing",
+        lambda _repo: False,
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_adapter.feast_schema_drift_issues",
+        lambda _repo: (),
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_refresh._resolve_refresh_options",
+        lambda **_k: object(),
+    )
+    monkeypatch.setattr(deploy_main, "_feast_mid_refresh_needed", lambda *_a, **_k: (True, "stale"))
+    monkeypatch.setattr(deploy_main, "_feast_slow_refresh_needed", lambda *_a, **_k: (False, "fresh"))
+
+
+def test_feast_refresh_supervisor_once_clears_feature_store_cache_on_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Successful background refresh must drop cached FeatureStore.
+
+    ``materialize()`` updates online store data but not ``registry.db`` mtime, so
+    without explicit invalidation the scorer keeps a stale FeatureStore and
+    mid-term ``fe__*`` lookups return null.
+    """
+    cfg = _cfg(tmp_path)
+    init_feature_state_db(cfg.feature_state_db_path)
+    feast_repo = tmp_path / "feast_repo"
+    (feast_repo / "data").mkdir(parents=True)
+    (feast_repo / "data" / "registry.db").write_bytes(b"v1")
+
+    _seed_feature_store_cache(feast_repo, monkeypatch)
+    _supervisor_refresh_mocks(monkeypatch, verdict="ok")
+
+    clear_calls: list[str] = []
+    from trainer_hightier.serving import feast_online_adapter as adapter_mod
+
+    real_clear = adapter_mod.clear_feature_store_cache
+
+    def _spy_clear() -> None:
+        clear_calls.append("clear")
+        real_clear()
+
+    monkeypatch.setattr(adapter_mod, "clear_feature_store_cache", _spy_clear)
+
+    deploy_main._feast_refresh_supervisor_once(
+        tmp_path,
+        {"model_bundle_dir": "models"},
+        cfg,
+        mapping=tmp_path / "mapping.parquet",
+        allowlist=tmp_path / "allowlist.parquet",
+        require_mid=True,
+        require_slow=False,
+    )
+
+    assert clear_calls == ["clear"]
+    assert adapter_mod._FEAST_SDK_CACHE is None
+
+
+def test_feast_refresh_supervisor_once_keeps_feature_store_cache_on_non_ok_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Non-ok refresh verdict must not drop a still-valid FeatureStore cache."""
+    cfg = _cfg(tmp_path)
+    init_feature_state_db(cfg.feature_state_db_path)
+    feast_repo = tmp_path / "feast_repo"
+    (feast_repo / "data").mkdir(parents=True)
+    (feast_repo / "data" / "registry.db").write_bytes(b"v1")
+
+    _seed_feature_store_cache(feast_repo, monkeypatch)
+    _supervisor_refresh_mocks(monkeypatch, verdict="degraded")
+
+    clear_calls: list[str] = []
+    from trainer_hightier.serving import feast_online_adapter as adapter_mod
+
+    real_clear = adapter_mod.clear_feature_store_cache
+
+    def _spy_clear() -> None:
+        clear_calls.append("clear")
+        real_clear()
+
+    monkeypatch.setattr(adapter_mod, "clear_feature_store_cache", _spy_clear)
+
+    deploy_main._feast_refresh_supervisor_once(
+        tmp_path,
+        {"model_bundle_dir": "models"},
+        cfg,
+        mapping=tmp_path / "mapping.parquet",
+        allowlist=tmp_path / "allowlist.parquet",
+        require_mid=True,
+        require_slow=False,
+    )
+
+    assert clear_calls == []
+    assert adapter_mod._FEAST_SDK_CACHE is not None
+    _, _, reused_after = adapter_mod.get_cached_feature_store(feast_repo)
+    assert reused_after is True
