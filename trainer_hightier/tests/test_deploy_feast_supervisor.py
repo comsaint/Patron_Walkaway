@@ -359,3 +359,94 @@ def test_feast_refresh_supervisor_once_fail_soft(
         require_mid=True,
         require_slow=False,
     )
+
+
+def test_feast_refresh_supervisor_once_clears_feature_store_cache_on_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: post-materialize refresh must drop cached FeatureStore (registry mtime unchanged)."""
+    cfg = _cfg(tmp_path)
+    init_feature_state_db(cfg.feature_state_db_path)
+    (tmp_path / "feast_repo").mkdir()
+    cleared: list[str] = []
+
+    def _fake_refresh(_opts: object) -> dict[str, str]:
+        return {"verdict": "ok"}
+
+    def _fake_clear() -> None:
+        cleared.append("cleared")
+
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_refresh.run_feast_online_refresh",
+        _fake_refresh,
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_adapter.feast_registry_missing",
+        lambda _repo: False,
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_refresh._resolve_refresh_options",
+        lambda **_k: object(),
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_adapter.clear_feature_store_cache",
+        _fake_clear,
+    )
+    monkeypatch.setattr(deploy_main, "_feast_mid_refresh_needed", lambda *_a, **_k: (True, "stale"))
+    monkeypatch.setattr(deploy_main, "_feast_slow_refresh_needed", lambda *_a, **_k: (False, "fresh"))
+
+    deploy_main._feast_refresh_supervisor_once(
+        tmp_path,
+        {"model_bundle_dir": "models"},
+        cfg,
+        mapping=tmp_path / "mapping.parquet",
+        allowlist=tmp_path / "allowlist.parquet",
+        require_mid=True,
+        require_slow=False,
+    )
+    assert cleared == ["cleared"]
+
+
+def test_feast_refresh_supervisor_once_skips_cache_clear_on_non_ok_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _cfg(tmp_path)
+    init_feature_state_db(cfg.feature_state_db_path)
+    (tmp_path / "feast_repo").mkdir()
+    cleared: list[str] = []
+
+    def _fake_refresh(_opts: object) -> dict[str, str]:
+        return {"verdict": "fail"}
+
+    def _fake_clear() -> None:
+        cleared.append("cleared")
+
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_refresh.run_feast_online_refresh",
+        _fake_refresh,
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_adapter.feast_registry_missing",
+        lambda _repo: False,
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_refresh._resolve_refresh_options",
+        lambda **_k: object(),
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_adapter.clear_feature_store_cache",
+        _fake_clear,
+    )
+    monkeypatch.setattr(deploy_main, "_feast_mid_refresh_needed", lambda *_a, **_k: (True, "stale"))
+    monkeypatch.setattr(deploy_main, "_feast_slow_refresh_needed", lambda *_a, **_k: (False, "fresh"))
+
+    deploy_main._feast_refresh_supervisor_once(
+        tmp_path,
+        {"model_bundle_dir": "models"},
+        cfg,
+        mapping=tmp_path / "mapping.parquet",
+        allowlist=tmp_path / "allowlist.parquet",
+        require_mid=True,
+        require_slow=False,
+    )
+    assert cleared == []
