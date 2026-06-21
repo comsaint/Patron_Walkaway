@@ -8,6 +8,11 @@ import pytest
 
 from trainer_hightier.config import FeatureSelectionTimeCvConfig
 from trainer_hightier.feature_experiment.time_cv.fold_definitions import generate_expanding_folds
+from trainer_hightier.feature_experiment.time_cv.metrics import (
+    delta_p1hr_pp,
+    precision_to_pp,
+    val_p1hr_precision_from_report,
+)
 from trainer_hightier.feature_experiment.time_cv.report import (
     aggregate_arm_decision,
     feature_pruning_decision_from_loo,
@@ -71,3 +76,35 @@ def test_feature_pruning_decision_inverts_loo_semantics() -> None:
     useful = aggregate_arm_decision((-0.2, -0.5, -0.1), arm_id="loo__good", cfg=cfg)
     assert feature_pruning_decision_from_loo(harmful) == "STRONG_DROP_FEATURE"
     assert feature_pruning_decision_from_loo(useful) == "KEEP_FEATURE"
+
+
+def test_val_p1hr_precision_from_alert_band_points() -> None:
+    report = {
+        "step5_val_alert_band": {
+            "points": [
+                {"target_alerts_per_hour": 2.0, "precision": 0.4},
+                {"target_alerts_per_hour": 1.0, "precision": 0.55},
+            ]
+        }
+    }
+    assert val_p1hr_precision_from_report(report) == pytest.approx(0.55)
+
+
+def test_val_p1hr_precision_from_flat_key() -> None:
+    report = {"val_op_precision_at_1p0_alerts_per_hour": 0.42}
+    assert val_p1hr_precision_from_report(report) == pytest.approx(0.42)
+
+
+def test_val_p1hr_precision_from_pick_and_deploy_target() -> None:
+    report = {
+        "step5_val_precision_at_pick": 0.33,
+        "step5_deployment_target_alerts_per_hour": 1.0,
+    }
+    assert val_p1hr_precision_from_report(report) == pytest.approx(0.33)
+
+
+def test_delta_p1hr_pp_baseline_minus_arm() -> None:
+    baseline = {"val_op_precision_at_1p0_alerts_per_hour": 0.40}
+    arm = {"val_op_precision_at_1p0_alerts_per_hour": 0.45}
+    assert delta_p1hr_pp(baseline, arm) == pytest.approx(5.0)
+    assert precision_to_pp(None) is None

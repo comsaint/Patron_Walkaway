@@ -20,7 +20,10 @@ from trainer_hightier.build_deploy_package import (
     _pip_freeze_package_name,
     _read_pyproject_version,
     _temporary_pyproject_version,
+    _walkaway_fields_from_training_metrics,
     _wheel_package_version,
+    _write_bundle_info,
+    _write_deploy_paths,
     _write_pyproject_version,
     build_deploy_package,
 )
@@ -32,6 +35,61 @@ from trainer_hightier.serving.adt_allowlist import sha256_file
 def test_bump_patch_version_increments_numeric_patch() -> None:
     assert _bump_patch_version("0.3.0") == "0.3.1"
     assert _bump_patch_version("1.2.9") == "1.2.10"
+
+
+def test_walkaway_fields_from_training_metrics_extracts_contract() -> None:
+    metrics = {
+        "walkaway_gap_min": 60,
+        "alert_horizon_min": 15,
+        "walkaway_label_contract_id": "walkaway_v1_gap60",
+        "unrelated": "ignored",
+    }
+    assert _walkaway_fields_from_training_metrics(metrics) == {
+        "walkaway_gap_min": 60,
+        "alert_horizon_min": 15,
+        "walkaway_label_contract_id": "walkaway_v1_gap60",
+    }
+
+
+def test_walkaway_fields_from_training_metrics_omits_empty_contract_id() -> None:
+    assert _walkaway_fields_from_training_metrics(
+        {"walkaway_gap_min": 30, "walkaway_label_contract_id": "  "}
+    ) == {"walkaway_gap_min": 30}
+
+
+def test_write_bundle_info_and_deploy_paths_stamp_walkaway_fields(tmp_path: Path) -> None:
+    walkaway_fields = _walkaway_fields_from_training_metrics(
+        {
+            "walkaway_gap_min": 60,
+            "alert_horizon_min": 15,
+            "walkaway_label_contract_id": "walkaway_v1_gap60",
+        }
+    )
+    bundle_info = tmp_path / "bundle_info.json"
+    deploy_paths = tmp_path / "deploy_bundle_paths.json"
+    _write_bundle_info(
+        bundle_info,
+        model_version="mv",
+        manifest_version="manv",
+        package_version="0.1.0",
+        allowlist_sha="a" * 64,
+        slow_patron_sha="b" * 64,
+        canonical_mapping_sha="c" * 64,
+        frozen_fingerprint_sha256="d" * 64,
+        build_time_iso="2026-06-21T00:00:00+00:00",
+        walkaway_fields=walkaway_fields,
+    )
+    _write_deploy_paths(deploy_paths, mapping_name="canonical.parquet", walkaway_fields=walkaway_fields)
+
+    bio = json.loads(bundle_info.read_text(encoding="utf-8"))
+    assert bio["walkaway_gap_min"] == 60
+    assert bio["alert_horizon_min"] == 15
+    assert bio["walkaway_label_contract_id"] == "walkaway_v1_gap60"
+
+    rel = json.loads(deploy_paths.read_text(encoding="utf-8"))
+    assert rel["walkaway_gap_min"] == 60
+    assert rel["alert_horizon_min"] == 15
+    assert rel["walkaway_label_contract_id"] == "walkaway_v1_gap60"
 
 
 def test_bump_pyproject_patch_version_writes_toml(tmp_path: Path) -> None:
