@@ -292,6 +292,94 @@ def test_feast_refresh_supervisor_once_calls_refresh(
     ) is not None
 
 
+def test_feast_refresh_supervisor_once_clears_feature_store_cache_on_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: post-refresh cache clear so scorer picks up materialized online data."""
+    cfg = _cfg(tmp_path)
+    init_feature_state_db(cfg.feature_state_db_path)
+    (tmp_path / "feast_repo").mkdir()
+    cache_clears: list[bool] = []
+
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_refresh.run_feast_online_refresh",
+        lambda _opts: {"verdict": "ok"},
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_adapter.feast_registry_missing",
+        lambda _repo: False,
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_refresh._resolve_refresh_options",
+        lambda **_k: object(),
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_adapter.clear_feature_store_cache",
+        lambda: cache_clears.append(True),
+    )
+    monkeypatch.setattr(deploy_main, "_feast_mid_refresh_needed", lambda *_a, **_k: (True, "stale"))
+    monkeypatch.setattr(deploy_main, "_feast_slow_refresh_needed", lambda *_a, **_k: (False, "fresh"))
+
+    deploy_main._feast_refresh_supervisor_once(
+        tmp_path,
+        {"model_bundle_dir": "models"},
+        cfg,
+        mapping=tmp_path / "mapping.parquet",
+        allowlist=tmp_path / "allowlist.parquet",
+        require_mid=True,
+        require_slow=False,
+    )
+    assert cache_clears == [True]
+
+
+def test_feast_refresh_supervisor_once_skips_cache_clear_when_verdict_not_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _cfg(tmp_path)
+    init_feature_state_db(cfg.feature_state_db_path)
+    (tmp_path / "feast_repo").mkdir()
+    cache_clears: list[bool] = []
+
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_refresh.run_feast_online_refresh",
+        lambda _opts: {"verdict": "failed"},
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_adapter.feast_registry_missing",
+        lambda _repo: False,
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_refresh._resolve_refresh_options",
+        lambda **_k: object(),
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.serving.feast_online_adapter.clear_feature_store_cache",
+        lambda: cache_clears.append(True),
+    )
+    monkeypatch.setattr(deploy_main, "_feast_mid_refresh_needed", lambda *_a, **_k: (True, "stale"))
+    monkeypatch.setattr(deploy_main, "_feast_slow_refresh_needed", lambda *_a, **_k: (False, "fresh"))
+
+    deploy_main._feast_refresh_supervisor_once(
+        tmp_path,
+        {"model_bundle_dir": "models"},
+        cfg,
+        mapping=tmp_path / "mapping.parquet",
+        allowlist=tmp_path / "allowlist.parquet",
+        require_mid=True,
+        require_slow=False,
+    )
+    assert cache_clears == []
+    from trainer_hightier.serving.contracts import META_KEY_FEAST_REFRESH_SUPERVISOR_LAST_SUCCESS
+
+    assert (
+        feature_state_meta_get(
+            META_KEY_FEAST_REFRESH_SUPERVISOR_LAST_SUCCESS,
+            path=cfg.feature_state_db_path,
+        )
+        is None
+    )
+
+
 def test_feast_refresh_supervisor_once_skips_when_lock_held(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
