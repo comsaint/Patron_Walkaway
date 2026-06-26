@@ -20,7 +20,10 @@ from trainer_hightier.build_deploy_package import (
     _pip_freeze_package_name,
     _read_pyproject_version,
     _temporary_pyproject_version,
+    _walkaway_fields_from_training_metrics,
     _wheel_package_version,
+    _write_bundle_info,
+    _write_deploy_paths,
     _write_pyproject_version,
     build_deploy_package,
 )
@@ -32,6 +35,29 @@ from trainer_hightier.serving.adt_allowlist import sha256_file
 def test_bump_patch_version_increments_numeric_patch() -> None:
     assert _bump_patch_version("0.3.0") == "0.3.1"
     assert _bump_patch_version("1.2.9") == "1.2.10"
+
+
+def test_walkaway_fields_from_training_metrics_extracts_contract() -> None:
+    metrics = {
+        "walkaway_gap_min": 30,
+        "alert_horizon_min": 15,
+        "walkaway_label_contract_id": "walkaway_v2",
+        "unrelated": "ignored",
+    }
+    got = _walkaway_fields_from_training_metrics(metrics)
+    assert got == {
+        "walkaway_gap_min": 30,
+        "alert_horizon_min": 15,
+        "walkaway_label_contract_id": "walkaway_v2",
+    }
+
+
+def test_walkaway_fields_from_training_metrics_omits_missing_keys() -> None:
+    assert _walkaway_fields_from_training_metrics({}) == {}
+    assert _walkaway_fields_from_training_metrics({"walkaway_gap_min": 45}) == {
+        "walkaway_gap_min": 45,
+    }
+    assert _walkaway_fields_from_training_metrics({"walkaway_label_contract_id": "  "}) == {}
 
 
 def test_bump_pyproject_patch_version_writes_toml(tmp_path: Path) -> None:
@@ -1156,6 +1182,41 @@ def test_build_bundle_rewrites_manifest_relative_paths(tmp_path: Path) -> None:
     assert "file://" not in req_txt.lower()
     assert " @ " not in req_txt
     assert "six==" in req_txt
+
+
+def test_write_bundle_info_and_deploy_paths_stamp_walkaway_fields(tmp_path: Path) -> None:
+    """Walkaway contract fields merge into bundle_info and deploy_bundle_paths payloads."""
+    walkaway = _walkaway_fields_from_training_metrics(
+        {
+            "walkaway_gap_min": 30,
+            "alert_horizon_min": 15,
+            "walkaway_label_contract_id": "walkaway_v2",
+        }
+    )
+    bio_path = tmp_path / "bundle_info.json"
+    paths_path = tmp_path / "deploy_bundle_paths.json"
+    _write_bundle_info(
+        bio_path,
+        model_version="mv1",
+        manifest_version="m1",
+        package_version="0.3.0",
+        allowlist_sha=None,
+        slow_patron_sha=None,
+        canonical_mapping_sha=None,
+        frozen_fingerprint_sha256="a" * 64,
+        build_time_iso="2026-06-25T00:00:00+00:00",
+        walkaway_fields=walkaway,
+    )
+    _write_deploy_paths(
+        paths_path,
+        mapping_name="canonical_player_mapping.parquet",
+        walkaway_fields=walkaway,
+    )
+    bio = json.loads(bio_path.read_text(encoding="utf-8"))
+    deploy_paths = json.loads(paths_path.read_text(encoding="utf-8"))
+    for key, val in walkaway.items():
+        assert bio[key] == val
+        assert deploy_paths[key] == val
 
 
 def test_pip_freeze_package_name_handles_direct_url() -> None:
