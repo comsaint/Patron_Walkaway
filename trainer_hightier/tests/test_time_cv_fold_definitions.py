@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
+import pandas as pd
 import pytest
 
 from trainer_hightier.config import FeatureSelectionTimeCvConfig
-from trainer_hightier.feature_experiment.time_cv.fold_definitions import generate_expanding_folds
+from trainer_hightier.feature_experiment.time_cv.fold_definitions import (
+    GAMING_DAY_COLUMN,
+    generate_expanding_folds,
+    unique_gaming_days_from_series,
+)
 from trainer_hightier.feature_experiment.time_cv.report import (
     aggregate_arm_decision,
     feature_pruning_decision_from_loo,
@@ -71,3 +76,31 @@ def test_feature_pruning_decision_inverts_loo_semantics() -> None:
     useful = aggregate_arm_decision((-0.2, -0.5, -0.1), arm_id="loo__good", cfg=cfg)
     assert feature_pruning_decision_from_loo(harmful) == "STRONG_DROP_FEATURE"
     assert feature_pruning_decision_from_loo(useful) == "KEEP_FEATURE"
+
+
+def test_unique_gaming_days_from_series_coerces_and_dedupes() -> None:
+    series = pd.Series(
+        [
+            date(2026, 1, 1),
+            datetime(2026, 1, 2, 12, 0),
+            "2026-01-03",
+            None,
+            float("nan"),
+            date(2026, 1, 1),
+        ],
+        name=GAMING_DAY_COLUMN,
+    )
+    assert unique_gaming_days_from_series(series) == (
+        date(2026, 1, 1),
+        date(2026, 1, 2),
+        date(2026, 1, 3),
+    )
+
+
+def test_unique_gaming_days_from_series_empty_returns_empty_tuple() -> None:
+    assert unique_gaming_days_from_series(pd.Series([], dtype=object)) == ()
+
+
+def test_unique_gaming_days_from_series_raises_when_all_unparseable() -> None:
+    with pytest.raises(ValueError, match="no parseable dates"):
+        unique_gaming_days_from_series(pd.Series([None, "not-a-date"]))
