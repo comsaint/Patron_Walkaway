@@ -14,7 +14,9 @@ import pytest
 
 from trainer_hightier.serving.feast_online_adapter import MockFeastOnlineAdapter
 from trainer_hightier.serving.feast_online_refresh import _mid_export_bounds, _slow_export_bounds
+from trainer_hightier.config import hightier_serving_config_for_deploy_bundle
 from trainer_hightier.serving.offline_serving_backtest import (
+    _attach_walkaway_labels_to_eval_bets,
     _label_payout_bounds,
     fetch_bets_gaming_day_window,
     run_labeled_gaming_day_backtest,
@@ -62,6 +64,65 @@ def test_label_payout_bounds_extends_lookahead() -> None:
     assert extended_end > window_end
     delta_min = (pd.Timestamp(extended_end) - pd.Timestamp(window_end)).total_seconds() / 60.0
     assert abs(delta_min - 45.0) < 1e-6
+
+
+def test_attach_walkaway_labels_uses_bundle_contract_lookahead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deploy bundle walkaway_gap_min drives label corpus payout_end (gap + horizon)."""
+    deploy = _deploy_layout(tmp_path)
+    rel = json.loads((deploy / "deploy_bundle_paths.json").read_text(encoding="utf-8"))
+    rel["walkaway_gap_min"] = 60
+    rel["alert_horizon_min"] = 15
+    cfg = hightier_serving_config_for_deploy_bundle(deploy, rel)
+    assert cfg.label_lookahead_min == 75
+
+    bets = _fake_bets()
+    captured: dict[str, object] = {}
+
+    def _fake_fetch(**kwargs: object) -> pd.DataFrame:
+        captured["payout_end"] = kwargs.get("payout_end")
+        corpus = bets.copy()
+        corpus["player_id"] = pd.to_numeric(corpus["player_id"], errors="coerce")
+        return corpus
+
+    def _fake_attach_canonical(df: pd.DataFrame, mapping_parquet: Path | None = None) -> pd.DataFrame:
+        out = df.copy()
+        out["canonical_id"] = "c1"
+        return out
+
+    def _fake_compute_labels(
+        corpus: pd.DataFrame,
+        *,
+        window_end: object,
+        extended_end: object,
+        label_contract: object = None,
+    ) -> pd.DataFrame:
+        labeled = corpus.copy()
+        labeled["label"] = 1
+        labeled["censored"] = False
+        return labeled
+
+    monkeypatch.setattr(
+        "trainer_hightier.serving.offline_serving_backtest.fetch_bets_payout_window",
+        lambda **kw: _fake_fetch(**kw),
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.serving.offline_serving_backtest.attach_canonical_id",
+        _fake_attach_canonical,
+    )
+    monkeypatch.setattr(
+        "trainer_hightier.serving.offline_serving_backtest.compute_labels",
+        _fake_compute_labels,
+    )
+
+    map_path = deploy / "mapping" / "canonical_player_mapping.parquet"
+    out = _attach_walkaway_labels_to_eval_bets(bets, cfg=cfg, mapping_parquet=map_path)
+    assert not out.empty
+    window_end, extended_end = _label_payout_bounds(bets, label_contract=cfg.walkaway_label_contract)
+    assert captured["payout_end"] == extended_end
+    delta_min = (pd.Timestamp(extended_end) - pd.Timestamp(window_end)).total_seconds() / 60.0
+    assert abs(delta_min - 75.0) < 1e-6
 
 
 def test_payout_bound_hk_naive_mixed_tz_compare() -> None:
